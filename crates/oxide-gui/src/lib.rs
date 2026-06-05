@@ -761,11 +761,27 @@ fn list_sessions(ws: &Path) -> Vec<(String, usize, PathBuf)> {
         .collect()
 }
 
+/// Delete a saved session file.
+fn delete_session(path: &Path) {
+    let _ = std::fs::remove_file(path);
+}
+
+/// Move a saved session into `.oxide/sessions/archive/` (hidden from the list).
+fn archive_session(path: &Path) {
+    if let Some(dir) = path.parent() {
+        let arch = dir.join("archive");
+        let _ = std::fs::create_dir_all(&arch);
+        if let Some(name) = path.file_name() {
+            let _ = std::fs::rename(path, arch.join(name));
+        }
+    }
+}
+
 /// Recent non-empty sessions `(path, title, msg_count)`, newest first. Deletes
 /// empty/0-byte session files as it scans (cleanup).
-fn recent_sessions(ws: &Path) -> Vec<(PathBuf, String, usize)> {
+fn recent_sessions(ws: &Path) -> Vec<(PathBuf, std::time::SystemTime, String)> {
     let dir = ws.join(".oxide/sessions");
-    let mut items: Vec<(PathBuf, std::time::SystemTime, String, usize)> = Vec::new();
+    let mut items: Vec<(PathBuf, std::time::SystemTime, String)> = Vec::new();
     if let Ok(rd) = std::fs::read_dir(&dir) {
         for e in rd.flatten() {
             let p = e.path();
@@ -795,12 +811,50 @@ fn recent_sessions(ws: &Path) -> Vec<(PathBuf, String, usize)> {
                 })
                 .filter(|t| !t.trim().is_empty())
                 .unwrap_or_else(|| "Chat".to_string());
+            let _ = count;
             let mtime = meta.and_then(|m| m.modified().ok()).unwrap_or(std::time::UNIX_EPOCH);
-            items.push((p, mtime, title, count));
+            items.push((p, mtime, title));
         }
     }
     items.sort_by(|a, b| b.1.cmp(&a.1));
-    items.into_iter().take(15).map(|(p, _, t, c)| (p, t, c)).collect()
+    items.into_iter().take(30).collect()
+}
+
+/// Short relative time like "5m", "3h", "2d", "1w".
+fn relative_time(t: std::time::SystemTime) -> String {
+    let secs = std::time::SystemTime::now().duration_since(t).map(|d| d.as_secs()).unwrap_or(0);
+    if secs < 3600 {
+        format!("{}m", (secs / 60).max(1))
+    } else if secs < 86_400 {
+        format!("{}h", secs / 3600)
+    } else if secs < 604_800 {
+        format!("{}d", secs / 86_400)
+    } else {
+        format!("{}w", secs / 604_800)
+    }
+}
+
+/// Group recent sessions by project: `(workspace, name, [(path, title, reltime)])`.
+fn build_projects(current: &Path, recents: &[PathBuf]) -> Vec<(PathBuf, String, Vec<(PathBuf, String, String)>)> {
+    let mut seen = HashSet::new();
+    let mut wss: Vec<PathBuf> = Vec::new();
+    for w in std::iter::once(current.to_path_buf()).chain(recents.iter().cloned()) {
+        if seen.insert(w.clone()) {
+            wss.push(w);
+        }
+    }
+    let mut out = Vec::new();
+    for ws in wss {
+        let sessions = recent_sessions(&ws);
+        if sessions.is_empty() {
+            continue;
+        }
+        let name = project_name(&ws);
+        let items: Vec<(PathBuf, String, String)> =
+            sessions.into_iter().map(|(p, m, t)| (p, t, relative_time(m))).collect();
+        out.push((ws, name, items));
+    }
+    out
 }
 
 /// Open a saved session transcript in a new tab (view).
@@ -927,7 +981,10 @@ fn app() -> Element {
     let mut show_board = use_signal(|| false);
     let mut board = use_signal(board::Board::default);
     let mut new_card_title = use_signal(String::new);
-    let mut past_sessions = use_signal(Vec::<(PathBuf, String, usize)>::new);
+    type ProjGroup = (PathBuf, String, Vec<(PathBuf, String, String)>);
+    let mut projects_list = use_signal(Vec::<ProjGroup>::new);
+    let mut session_menu = use_signal(|| None::<PathBuf>);
+    let mut expanded_projects = use_signal(HashSet::<String>::new);
     // Agent tabs (multiple agent sessions in one workspace).
     let initial_provider = cfg.read().provider.clone();
     let initial_model = cfg.read().model.clone();
@@ -1003,6 +1060,15 @@ fn app() -> Element {
         });
     });
 
+    // Disable the WebView's native right-click menu (Reload / Inspect Element).
+    use_effect(move || {
+        spawn(async move {
+            let _ = dioxus::document::eval(
+                "if(!window.__oxnoctx){window.__oxnoctx=1;document.addEventListener('contextmenu',function(e){e.preventDefault();},{capture:true});}",
+            );
+        });
+    });
+
     // Auto-scroll the chat to the bottom as content streams in.
     use_effect(move || {
         let _ = messages.read(); // subscribe to any transcript change
@@ -1020,7 +1086,7 @@ fn app() -> Element {
         let ws = ui.workspace.read().clone();
         if cfg.read().workspace.is_some() {
             board.set(board::Board::load(&ws));
-            past_sessions.set(recent_sessions(&ws));
+            projects_list.set(build_projects(&ws, &cfg.read().recent_workspaces));
         }
     });
 
@@ -1393,45 +1459,88 @@ fn app() -> Element {
                 }
                 div { class: "projects",
                     if cfg.read().workspace.is_some() {
-                        div { class: "project",
-                            Icon { name: "folder" }
-                            span { class: "project-name", "{project}" }
-                            button { class: "project-add", title: "New chat", onclick: move |_| {
-                                    show_board.set(false);
-                                    let mut op = ui.open_path; op.set(None);
-                                    let prov = cfg.read().provider.clone();
-                                    let model = cfg.read().model.clone();
-                                    let title = provider_title(&prov).to_string();
-                                    new_agent_tab(tabs, active_tab, messages, cfg, engine, next_tab_id, &prov, &model, &title);
-                                },
-                                Icon { name: "plus" }
-                            }
-                        }
-                        for (i, t) in tabs.read().iter().enumerate() {
+                        for (pws, pname, sessions) in projects_list.read().clone() {
                             {
-                                let i = i;
-                                let id = t.id;
-                                let title = if t.title.is_empty() { "New chat".to_string() } else { t.title.clone() };
-                                let is_active = i == *active_tab.read();
+                                let is_current = pws == workspace;
+                                let pname2 = pname.clone();
+                                let expanded = expanded_projects.read().contains(&pname);
+                                let shown = if expanded { sessions.len() } else { sessions.len().min(5) };
+                                let total = sessions.len();
+                                let ws_rebuild = workspace.clone();
                                 rsx! {
-                                    div { key: "{id}", class: if is_active { "thread active" } else { "thread" },
-                                        onclick: move |_| { show_board.set(false); switch_tab(tabs, active_tab, messages, cfg, engine, i); },
-                                        "{title}"
-                                    }
-                                }
-                            }
-                        }
-                        if !past_sessions.read().is_empty() {
-                            div { class: "section-label recent-label", "Recent chats" }
-                            for (path, title, count) in past_sessions.read().clone() {
-                                {
-                                    let path = path.clone();
-                                    let title = title.clone();
-                                    rsx! {
-                                        div { class: "thread recent", title: "{count} messages",
-                                            onclick: move |_| { show_board.set(false); open_session_tab(tabs, active_tab, messages, next_tab_id, cfg, path.clone(), title.clone()); },
-                                            "{title}"
+                                    div { class: "project",
+                                        Icon { name: "folder" }
+                                        span { class: "project-name", "{pname}" }
+                                        if is_current {
+                                            button { class: "project-add", title: "New chat", onclick: move |_| {
+                                                    show_board.set(false);
+                                                    let mut op = ui.open_path; op.set(None);
+                                                    let prov = cfg.read().provider.clone();
+                                                    let model = cfg.read().model.clone();
+                                                    let title = provider_title(&prov).to_string();
+                                                    new_agent_tab(tabs, active_tab, messages, cfg, engine, next_tab_id, &prov, &model, &title);
+                                                },
+                                                Icon { name: "plus" }
+                                            }
                                         }
+                                    }
+                                    if is_current {
+                                        for (i, t) in tabs.read().iter().enumerate() {
+                                            {
+                                                let i = i;
+                                                let id = t.id;
+                                                let ttl = if t.title.is_empty() { "New chat".to_string() } else { t.title.clone() };
+                                                let is_active = i == *active_tab.read();
+                                                rsx! {
+                                                    div { key: "tab{id}", class: if is_active { "thread active" } else { "thread" },
+                                                        onclick: move |_| { show_board.set(false); switch_tab(tabs, active_tab, messages, cfg, engine, i); },
+                                                        "{ttl}"
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    for (path, title, reltime) in sessions.iter().take(shown).cloned() {
+                                        {
+                                            let p_open = path.clone();
+                                            let p_dbl = path.clone();
+                                            let p_del = path.clone();
+                                            let p_arch = path.clone();
+                                            let menu_open = session_menu.read().as_ref() == Some(&path);
+                                            let ws_d = ws_rebuild.clone();
+                                            let ws_ar = ws_rebuild.clone();
+                                            rsx! {
+                                                div { class: "thread-anchor",
+                                                    div { class: "thread recent", title: "right-click / double-click for options",
+                                                        onclick: move |_| { show_board.set(false); open_session_tab(tabs, active_tab, messages, next_tab_id, cfg, p_open.clone(), title.clone()); },
+                                                        oncontextmenu: {
+                                                            let p = p_dbl.clone();
+                                                            move |e: dioxus::prelude::MouseEvent| { e.prevent_default(); session_menu.set(Some(p.clone())); }
+                                                        },
+                                                        ondoubleclick: move |_| { let cur = session_menu.read().clone(); session_menu.set(if cur.as_ref() == Some(&p_dbl) { None } else { Some(p_dbl.clone()) }); },
+                                                        span { class: "thread-title", "{title}" }
+                                                        span { class: "thread-time", "{reltime}" }
+                                                    }
+                                                    if menu_open {
+                                                        div { class: "menu-backdrop", onclick: move |_| session_menu.set(None) }
+                                                        div { class: "thread-menu",
+                                                            button { class: "menu-item", onclick: move |_| { archive_session(&p_arch); session_menu.set(None); projects_list.set(build_projects(&ws_ar, &cfg.read().recent_workspaces)); },
+                                                                Icon { name: "folder" } span { class: "menu-name", "Archive" }
+                                                            }
+                                                            button { class: "menu-item danger", onclick: move |_| { delete_session(&p_del); session_menu.set(None); projects_list.set(build_projects(&ws_d, &cfg.read().recent_workspaces)); },
+                                                                Icon { name: "trash" } span { class: "menu-name", "Delete" }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if total > 5 {
+                                        button { class: "show-more", onclick: move |_| {
+                                            let mut e = expanded_projects.write();
+                                            if e.contains(&pname2) { e.remove(&pname2); } else { e.insert(pname2.clone()); }
+                                        }, if expanded { "Show less" } else { "Show more" } }
                                     }
                                 }
                             }
@@ -3628,6 +3737,7 @@ fn Icon(name: &'static str) -> Element {
         "zap" => rsx! { polygon { points: "13 2 3 14 11 14 9 22 21 10 13 10 13 2" } },
         "chevron" => rsx! { polyline { points: "6 9 12 15 18 9" } },
         "plus" => rsx! { line { x1: "12", y1: "5", x2: "12", y2: "19" } line { x1: "5", y1: "12", x2: "19", y2: "12" } },
+        "trash" => rsx! { polyline { points: "3 6 5 6 21 6" } path { d: "M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" } },
         "paperclip" => rsx! { path { d: "M21 12.5l-8.5 8.5a5 5 0 0 1-7-7l9-9a3.3 3.3 0 0 1 4.7 4.7l-9 9a1.7 1.7 0 0 1-2.4-2.4l8-8" } },
         "list" => rsx! {
             polyline { points: "3 6 4 7 6 5" }

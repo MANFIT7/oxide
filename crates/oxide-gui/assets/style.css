@@ -1062,3 +1062,18 @@ svg { width: 17px; height: 17px; flex-shrink: 0; }
 .mcp-cmd { font-family: ui-monospace, Menlo, monospace; font-size: 11.5px; color: var(--muted); margin-top: 5px; }
 .mcp-st { font-size: 11px; color: var(--faint); margin-top: 4px; }
 .mcp-add { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--border); }
+
+/* sidebar chat context menu (double-click) */
+.thread-anchor { position: relative; }
+.thread-menu { position: absolute; top: 100%; left: 8px; z-index: 50; width: 150px; background: #232327; border: 1px solid #34343a; border-radius: 10px; padding: 5px; box-shadow: 0 12px 30px rgba(0,0,0,.5); }
+.thread-menu .menu-item { width: 100%; }
+.thread-menu .menu-item.danger:hover .menu-name { color: var(--danger); }
+.thread-menu .menu-item.danger:hover svg { color: var(--danger); }
+
+/* grouped project chats + relative time */
+.thread.recent { display: flex; align-items: center; gap: 8px; }
+.thread-title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.thread-time { font-size: 11px; color: var(--faint); flex-shrink: 0; }
+.show-more { background: transparent; border: none; color: var(--faint); font-size: 12.5px; cursor: pointer; padding: 6px 10px 10px; font-family: inherit; text-align: left; width: 100%; }
+.show-more:hover { color: var(--text); }
+.project { margin-top: 10px; }
