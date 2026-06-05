@@ -112,6 +112,20 @@ so it works even with the black-box CLI providers.
 - **Harnesses** — drop a `*.toml` manifest into `harness_dir` to add/update behavior without recompiling.
 - **MCP** — add `[[mcp_servers]]` entries in `oxide.toml`.
 
+## Install (macOS)
+
+Download `Oxide.dmg` from [Releases](https://github.com/MANFIT7/oxide/releases), open it, and drag
+**Oxide.app** to Applications.
+
+The app is **ad-hoc signed, not notarized**, so on first launch macOS Gatekeeper shows
+*"Apple could not verify Oxide…"*. Clear the quarantine flag once:
+
+```sh
+xattr -dr com.apple.quarantine /Applications/Oxide.app
+```
+
+…then open it normally. (Alternatively: **System Settings → Privacy & Security → Open Anyway**.)
+
 ## Packaging (macOS)
 
 ```sh
