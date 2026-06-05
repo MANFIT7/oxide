@@ -299,21 +299,22 @@ fn diff_counts(diff: &str) -> (u32, u32) {
     (adds, dels)
 }
 
-/// Icon + label for a tool activity row.
+/// `(icon, verb, detail)` for a tool activity row, joined as "icon\tverb\tdetail".
 fn activity_label(tool: &str, args: &serde_json::Value) -> String {
     let s = |k: &str| args.get(k).and_then(|v| v.as_str()).unwrap_or("");
-    let short = |t: &str| t.chars().take(80).collect::<String>();
-    match tool {
-        "shell" => format!("⌘ {}", short(s("command"))),
-        "write_file" => format!("✎ {}", s("path")),
-        "read_file" => format!("📖 {}", s("path")),
-        "search" => format!("🔎 {}", s("pattern")),
-        "browser_navigate" => format!("🌐 {}", s("url")),
-        t if t.starts_with("browser_") => format!("🌐 {t}"),
-        "remember" => "🧠 remember".to_string(),
-        "save_skill" => "🧠 save skill".to_string(),
-        other => format!("⚙ {other}"),
-    }
+    let short = |t: &str| t.chars().take(90).collect::<String>();
+    let (icon, verb, detail) = match tool {
+        "shell" => ("terminal", "Run", short(s("command"))),
+        "write_file" => ("edit", "Edit", s("path").to_string()),
+        "read_file" => ("file", "Read", s("path").to_string()),
+        "search" => ("search", "Search", s("pattern").to_string()),
+        "browser_navigate" => ("globe", "Open", s("url").to_string()),
+        t if t.starts_with("browser_") => ("globe", "Browser", t.trim_start_matches("browser_").to_string()),
+        "remember" => ("brain", "Remember", String::new()),
+        "save_skill" => ("brain", "Save skill", String::new()),
+        other => ("spark", "Tool", other.to_string()),
+    };
+    format!("{icon}\t{verb}\t{detail}")
 }
 
 #[derive(Clone, PartialEq)]
@@ -916,7 +917,7 @@ fn app() -> Element {
     let mut update_info = use_signal(|| None::<update::UpdateInfo>);
     let mut updating = use_signal(|| false);
     use_effect(move || {
-        let repo = cfg.read().github_repo.clone();
+        let repo = { let r = cfg.read().github_repo.clone(); if r.trim().is_empty() { "MANFIT7/oxide".to_string() } else { r } };
         let url = cfg.read().update_url.clone();
         spawn(async move {
             if let Some(info) = update::check(&repo, &url).await {
@@ -1087,8 +1088,11 @@ fn app() -> Element {
                         match ev {
                             Event::AgentMessageDelta { text, .. } => {
                                 let mut m = messages.write();
-                                if let Some(last) = m.last_mut() {
-                                    if last.author == Author::Agent { last.text.push_str(&text); }
+                                match m.last_mut() {
+                                    // Append to the open agent bubble; but if tools/diffs came after it,
+                                    // start a NEW bubble so the answer shows below them (not lost).
+                                    Some(last) if last.author == Author::Agent => last.text.push_str(&text),
+                                    _ => m.push(ChatMsg { author: Author::Agent, text }),
                                 }
                             }
                             Event::ReasoningDelta { text, .. } => {
@@ -1118,7 +1122,7 @@ fn app() -> Element {
                             }
                             Event::TurnStarted { turn } => {
                                 thinking.set(String::new());
-                                status.set("Thinking…".to_string());
+                                status.set("Working…".to_string());
                                 turn_edits.write().clear();
                                 edits_expanded.set(false);
                                 timeline.write().push(TimelineItem { title: format!("Turn {turn} started"), sub: String::new() });
@@ -2440,7 +2444,7 @@ fn SettingsModal(
     let mut backend = use_signal(|| base.backend_provider.clone());
     let mut subagents = use_signal(|| base.subagents);
     let mut upd_url = use_signal(|| base.update_url.clone());
-    let mut gh_repo = use_signal(|| base.github_repo.clone());
+    let mut gh_repo = use_signal(|| if base.github_repo.trim().is_empty() { "MANFIT7/oxide".to_string() } else { base.github_repo.clone() });
     let mut tab_mode = use_signal(|| base.default_tab_mode.clone());
     let mut browser_headless = use_signal(|| base.browser_headless);
 
@@ -3361,9 +3365,15 @@ fn TerminalView(id: u64, bin: String, ws: String) -> Element {
 #[component]
 fn ActivityRow(text: String, running: bool, ok: bool) -> Element {
     let cls = if running { "activity-card running" } else if ok { "activity-card done" } else { "activity-card fail" };
+    // text is "icon\tverb\tdetail"
+    let mut parts = text.splitn(3, '\t');
+    let icon = parts.next().unwrap_or("spark").to_string();
+    let verb = parts.next().unwrap_or("").to_string();
+    let detail = parts.next().unwrap_or("").to_string();
     rsx! {
         div { class: "row activity",
             div { class: "{cls}",
+                span { class: "activity-tic", Icon { name: icon_static(&icon) } }
                 if running {
                     span { class: "activity-spin" }
                 } else if ok {
@@ -3371,9 +3381,23 @@ fn ActivityRow(text: String, running: bool, ok: bool) -> Element {
                 } else {
                     span { class: "activity-ic fail", "✕" }
                 }
-                span { class: "activity-text", "{text}" }
+                span { class: "activity-verb", "{verb}" }
+                if !detail.is_empty() { span { class: "activity-text", "{detail}" } }
             }
         }
+    }
+}
+
+/// Map a dynamic icon key to the static name the Icon component expects.
+fn icon_static(key: &str) -> &'static str {
+    match key {
+        "terminal" => "terminal",
+        "edit" => "edit",
+        "file" => "file",
+        "search" => "search",
+        "globe" => "globe",
+        "brain" => "brain",
+        _ => "spark",
     }
 }
 
