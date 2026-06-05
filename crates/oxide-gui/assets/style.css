@@ -1046,3 +1046,19 @@ svg { width: 17px; height: 17px; flex-shrink: 0; }
 .activity-card.running .activity-tic svg { color: var(--accent); }
 .activity-verb { font-size: 12.5px; font-weight: 500; color: var(--text); flex-shrink: 0; }
 .activity-card.done .activity-verb { color: var(--muted); }
+
+/* recent (past) chat sessions in sidebar */
+.recent-label { margin-top: 16px; }
+.thread.recent { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.thread.recent:hover { color: var(--text); }
+
+/* ── MCP manager ─────────────────────────────────────── */
+.mcp-item { padding: 11px 4px; border-bottom: 1px solid var(--border); }
+.mcp-top { display: flex; align-items: center; gap: 9px; }
+.mcp-dot { width: 8px; height: 8px; border-radius: 50%; background: #555; flex-shrink: 0; }
+.mcp-dot.on { background: #3ad29f; box-shadow: 0 0 6px rgba(58,210,159,.6); }
+.mcp-remove { margin-left: auto; background: transparent; border: 1px solid var(--border); color: var(--muted); border-radius: 7px; padding: 4px 11px; font-size: 12px; cursor: pointer; font-family: inherit; }
+.mcp-remove:hover { color: var(--danger); border-color: rgba(239,93,93,.4); }
+.mcp-cmd { font-family: ui-monospace, Menlo, monospace; font-size: 11.5px; color: var(--muted); margin-top: 5px; }
+.mcp-st { font-size: 11px; color: var(--faint); margin-top: 4px; }
+.mcp-add { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--border); }

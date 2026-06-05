@@ -761,6 +761,80 @@ fn list_sessions(ws: &Path) -> Vec<(String, usize, PathBuf)> {
         .collect()
 }
 
+/// Recent non-empty sessions `(path, title, msg_count)`, newest first. Deletes
+/// empty/0-byte session files as it scans (cleanup).
+fn recent_sessions(ws: &Path) -> Vec<(PathBuf, String, usize)> {
+    let dir = ws.join(".oxide/sessions");
+    let mut items: Vec<(PathBuf, std::time::SystemTime, String, usize)> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let meta = e.metadata().ok();
+            if meta.as_ref().map(|m| m.len()).unwrap_or(0) == 0 {
+                let _ = std::fs::remove_file(&p);
+                continue;
+            }
+            let text = std::fs::read_to_string(&p).unwrap_or_default();
+            let count = text.lines().filter(|l| !l.trim().is_empty()).count();
+            if count == 0 {
+                let _ = std::fs::remove_file(&p);
+                continue;
+            }
+            let title = text
+                .lines()
+                .find_map(|l| {
+                    let v: serde_json::Value = serde_json::from_str(l).ok()?;
+                    if v["role"].as_str()? == "user" {
+                        Some(v["content"].as_str()?.lines().next().unwrap_or("").chars().take(38).collect::<String>())
+                    } else {
+                        None
+                    }
+                })
+                .filter(|t| !t.trim().is_empty())
+                .unwrap_or_else(|| "Chat".to_string());
+            let mtime = meta.and_then(|m| m.modified().ok()).unwrap_or(std::time::UNIX_EPOCH);
+            items.push((p, mtime, title, count));
+        }
+    }
+    items.sort_by(|a, b| b.1.cmp(&a.1));
+    items.into_iter().take(15).map(|(p, _, t, c)| (p, t, c)).collect()
+}
+
+/// Open a saved session transcript in a new tab (view).
+fn open_session_tab(
+    mut tabs: Signal<Vec<AgentTab>>,
+    mut active_tab: Signal<usize>,
+    mut messages: Signal<Vec<ChatMsg>>,
+    mut next_id: Signal<u64>,
+    cfg: Signal<Config>,
+    path: PathBuf,
+    title: String,
+) {
+    let loaded = load_session(&path);
+    let cur = *active_tab.read();
+    if let Some(t) = tabs.write().get_mut(cur) {
+        t.messages = messages.read().clone();
+    }
+    let id = *next_id.read();
+    next_id.set(id + 1);
+    let (provider, model) = { let c = cfg.read(); (c.provider.clone(), c.model.clone()) };
+    tabs.write().push(AgentTab {
+        id,
+        title,
+        provider,
+        model,
+        messages: loaded.clone(),
+        mode: "gui".to_string(),
+        bin: String::new(),
+    });
+    let idx = tabs.read().len() - 1;
+    active_tab.set(idx);
+    messages.set(loaded);
+}
+
 /// Load a session transcript into chat messages.
 fn load_session(path: &Path) -> Vec<ChatMsg> {
     let Ok(text) = std::fs::read_to_string(path) else {
@@ -848,9 +922,12 @@ fn app() -> Element {
     let mut show_terminal = use_signal(|| false);
     let mut show_settings = use_signal(|| false);
     let mut show_skills = use_signal(|| false);
+    let mut show_mcp = use_signal(|| false);
+    let mut mcp_status = use_signal(std::collections::HashMap::<String, String>::new);
     let mut show_board = use_signal(|| false);
     let mut board = use_signal(board::Board::default);
     let mut new_card_title = use_signal(String::new);
+    let mut past_sessions = use_signal(Vec::<(PathBuf, String, usize)>::new);
     // Agent tabs (multiple agent sessions in one workspace).
     let initial_provider = cfg.read().provider.clone();
     let initial_model = cfg.read().model.clone();
@@ -938,11 +1015,12 @@ fn app() -> Element {
         });
     });
 
-    // Load the kanban board for the active workspace.
+    // Load the kanban board + recent chat sessions for the active workspace.
     use_effect(move || {
         let ws = ui.workspace.read().clone();
         if cfg.read().workspace.is_some() {
             board.set(board::Board::load(&ws));
+            past_sessions.set(recent_sessions(&ws));
         }
     });
 
@@ -1111,10 +1189,7 @@ fn app() -> Element {
                             Event::Error { message } => messages.write().push(ChatMsg { author: Author::Note, text: format!("error: {message}") }),
                             Event::ContextWindow { limit } => context_limit.set(Some(limit)),
                             Event::McpServerStatus { name, status, tool_count, detail, .. } => {
-                                messages.write().push(ChatMsg {
-                                    author: Author::Note,
-                                    text: format!("mcp {name}: {status} · {tool_count} tool(s) · {detail}"),
-                                });
+                                mcp_status.write().insert(name.clone(), format!("{status} · {tool_count} tool(s) · {detail}"));
                             }
                             // ── Inspector capture ──────────────────────────
                             Event::Ready { harness } => {
@@ -1300,8 +1375,8 @@ fn app() -> Element {
                         Icon { name: "edit" } span { "New chat" }
                     }
                     button { class: "nav-item", Icon { name: "search" } span { "Search" } }
-                    button { class: "nav-item", onclick: move |_| { let v = *show_files.read(); show_files.set(!v); },
-                        Icon { name: "plugins" } span { "Files" }
+                    button { class: "nav-item", onclick: move |_| show_mcp.set(true),
+                        Icon { name: "plugins" } span { "MCP" }
                     }
                     button { class: "nav-item", onclick: move |_| show_skills.set(true),
                         Icon { name: "target" } span { "Skills" }
@@ -1342,6 +1417,21 @@ fn app() -> Element {
                                     div { key: "{id}", class: if is_active { "thread active" } else { "thread" },
                                         onclick: move |_| { show_board.set(false); switch_tab(tabs, active_tab, messages, cfg, engine, i); },
                                         "{title}"
+                                    }
+                                }
+                            }
+                        }
+                        if !past_sessions.read().is_empty() {
+                            div { class: "section-label recent-label", "Recent chats" }
+                            for (path, title, count) in past_sessions.read().clone() {
+                                {
+                                    let path = path.clone();
+                                    let title = title.clone();
+                                    rsx! {
+                                        div { class: "thread recent", title: "{count} messages",
+                                            onclick: move |_| { show_board.set(false); open_session_tab(tabs, active_tab, messages, next_tab_id, cfg, path.clone(), title.clone()); },
+                                            "{title}"
+                                        }
                                     }
                                 }
                             }
@@ -2058,6 +2148,72 @@ fn app() -> Element {
             if *show_skills.read() {
                 SkillsModal { workspace: workspace.clone(), on_close: move |_| show_skills.set(false) }
             }
+            if *show_mcp.read() {
+                McpModal { cfg, engine, status: mcp_status, on_close: move |_| show_mcp.set(false) }
+            }
+        }
+    }
+}
+
+#[component]
+fn McpModal(cfg: Signal<Config>, engine: Coroutine<EngineCmd>, status: Signal<std::collections::HashMap<String, String>>, on_close: EventHandler<()>) -> Element {
+    let mut name = use_signal(String::new);
+    let mut command = use_signal(String::new);
+    let mut args = use_signal(String::new);
+    let servers = cfg.read().mcp_servers.clone();
+    rsx! {
+        div { class: "modal-overlay", onclick: move |_| on_close.call(()),
+            div { class: "modal skills-modal", onclick: move |e| e.stop_propagation(),
+                div { class: "modal-head",
+                    h2 { "MCP servers" }
+                    button { class: "term-x", onclick: move |_| on_close.call(()), "✕" }
+                }
+                div { class: "modal-body skills-body",
+                    if servers.is_empty() {
+                        div { class: "insp-empty", "No MCP servers. Add one below (e.g. npx @modelcontextprotocol/server-filesystem)." }
+                    }
+                    for (i, s) in servers.iter().enumerate() {
+                        {
+                            let i = i;
+                            let st = status.read().get(&s.name).cloned();
+                            let connected = st.as_deref().map(|x| x.starts_with("connected")).unwrap_or(false);
+                            let cmdline = format!("{} {}", s.command, s.args.join(" "));
+                            let servers2 = servers.clone();
+                            rsx! {
+                                div { class: "mcp-item",
+                                    div { class: "mcp-top",
+                                        span { class: if connected { "mcp-dot on" } else { "mcp-dot" } }
+                                        span { class: "skill-name", "{s.name}" }
+                                        button { class: "mcp-remove", onclick: move |_| {
+                                            let mut list = servers2.clone(); list.remove(i);
+                                            let mut c = cfg.read().clone(); c.mcp_servers = list; cfg.set(c.clone());
+                                            let _ = engine.send(EngineCmd::Reconfigure(c));
+                                        }, "Remove" }
+                                    }
+                                    div { class: "mcp-cmd", "{cmdline}" }
+                                    if let Some(st) = st { div { class: "mcp-st", "{st}" } }
+                                }
+                            }
+                        }
+                    }
+                    div { class: "mcp-add",
+                        input { class: "field-input", placeholder: "name (e.g. fs)", value: "{name}", oninput: move |e| name.set(e.value()) }
+                        input { class: "field-input", style: "margin-top:6px", placeholder: "command (e.g. npx)", value: "{command}", oninput: move |e| command.set(e.value()) }
+                        input { class: "field-input", style: "margin-top:6px", placeholder: "args (space-separated)", value: "{args}", oninput: move |e| args.set(e.value()) }
+                        button { class: "board-btn", style: "margin-top:8px", onclick: move |_| {
+                            let n = name.read().trim().to_string();
+                            let cmd = command.read().trim().to_string();
+                            if n.is_empty() || cmd.is_empty() { return; }
+                            let a: Vec<String> = args.read().split_whitespace().map(String::from).collect();
+                            let mut list = cfg.read().mcp_servers.clone();
+                            list.push(oxide_config::McpServerConfig { name: n, command: cmd, args: a });
+                            let mut c = cfg.read().clone(); c.mcp_servers = list; cfg.set(c.clone());
+                            let _ = engine.send(EngineCmd::Reconfigure(c));
+                            name.set(String::new()); command.set(String::new()); args.set(String::new());
+                        }, "+ Add server" }
+                    }
+                }
+            }
         }
     }
 }
@@ -2445,6 +2601,7 @@ fn SettingsModal(
     let mut subagents = use_signal(|| base.subagents);
     let mut upd_url = use_signal(|| base.update_url.clone());
     let mut gh_repo = use_signal(|| if base.github_repo.trim().is_empty() { "MANFIT7/oxide".to_string() } else { base.github_repo.clone() });
+    let mut upd_status = use_signal(|| "Up to date".to_string());
     let mut tab_mode = use_signal(|| base.default_tab_mode.clone());
     let mut browser_headless = use_signal(|| base.browser_headless);
 
@@ -2680,11 +2837,21 @@ fn SettingsModal(
                   if settings_tab.read().as_str() == "updates" {
                     div { class: "field",
                         span { class: "field-label", "Updates · current v{update::CURRENT}" }
-                        input { class: "field-input", placeholder: "GitHub repo (owner/name)",
-                            value: "{gh_repo}", oninput: move |e| gh_repo.set(e.value()) }
-                        input { class: "field-input", style: "margin-top:8px", placeholder: "or manifest URL (https://…/latest.json)",
-                            value: "{upd_url}", oninput: move |e| upd_url.set(e.value()) }
-                        span { class: "field-hint", "Set a GitHub repo → reads the latest release + picks the macOS asset. Checked on startup; a banner appears when newer." }
+                        div { class: "field-folder",
+                            span { class: "folder-path", "{upd_status}" }
+                            button { class: "ed-close", onclick: move |_| {
+                                upd_status.set("Checking…".to_string());
+                                let repo = gh_repo.read().clone();
+                                let url = upd_url.read().clone();
+                                spawn(async move {
+                                    match update::check(&repo, &url).await {
+                                        Some(info) => upd_status.set(format!("Update available · v{}", info.version)),
+                                        None => upd_status.set("Up to date".to_string()),
+                                    }
+                                });
+                            }, "Check for updates" }
+                        }
+                        span { class: "field-hint", "Checked automatically on startup; a banner appears when a newer release is available." }
                     }
                   }
                 }
