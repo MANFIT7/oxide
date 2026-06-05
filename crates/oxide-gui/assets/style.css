@@ -1086,3 +1086,54 @@ svg { width: 17px; height: 17px; flex-shrink: 0; }
 .usage-fill { display: block; height: 100%; background: var(--accent); border-radius: 3px; }
 .usage-v { font-size: 10.5px; color: var(--muted); white-space: nowrap; }
 .usage-plan { font-size: 10px; color: var(--faint); text-transform: uppercase; letter-spacing: .3px; }
+
+/* ── Tiling split view ───────────────────────────────── */
+.split { display: flex; width: 100%; height: 100%; }
+.split-row { flex-direction: row; }
+.split-col { flex-direction: column; }
+.split-cell { display: flex; min-width: 0; min-height: 0; overflow: hidden; }
+.split-cell-inner { display: flex; width: 100%; height: 100%; }
+.split-divider { flex: 0 0 6px; background: var(--border); cursor: col-resize; }
+.split-divider.horz { cursor: row-resize; }
+.split-divider:hover { background: var(--accent); }
+.pane { display: flex; flex-direction: column; width: 100%; height: 100%; border: 1px solid var(--border); border-radius: 10px; overflow: hidden; background: var(--bg); }
+.pane-head { display: flex; align-items: center; justify-content: space-between; padding: 7px 11px; border-bottom: 1px solid var(--border); background: var(--surface); }
+.pane-title { font-size: 12px; color: var(--muted); text-transform: capitalize; }
+.pane-actions { display: flex; gap: 3px; }
+.pane-btn { background: transparent; border: none; color: var(--faint); cursor: pointer; padding: 3px 7px; border-radius: 6px; font-size: 12px; font-family: inherit; }
+.pane-btn:hover { background: var(--surface-hi); color: var(--text); }
+.pane-scroll { flex: 1; overflow-y: auto; padding: 14px; min-height: 0; }
+.pane-composer { display: flex; align-items: flex-end; gap: 8px; padding: 10px; border-top: 1px solid var(--border); }
+.pane-composer .input { flex: 1; min-height: 38px; max-height: 120px; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; color: var(--text); padding: 9px 12px; font-family: inherit; font-size: 13px; resize: none; }
+.pane-scroll .row.agent .agent-text, .pane-scroll .row.user { font-size: 13px; }
+
+/* pane mode menu (GUI/TUI) */
+.pane-mode-anchor { position: relative; }
+.pane-mode-menu { position: absolute; top: calc(100% + 4px); right: 0; width: 180px; background: #232327; border: 1px solid #34343a; border-radius: 10px; padding: 5px; z-index: 60; box-shadow: 0 12px 30px rgba(0,0,0,.5); }
+.pane-body { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+.pane > .xterm-host { flex: 1; }
+
+/* ── Tiling polish ───────────────────────────────────── */
+.center:has(.split), .center:has(.pane) { padding: 10px; }
+.split { gap: 8px; }
+.split-divider { flex: 0 0 8px; background: transparent; border-radius: 4px; position: relative; }
+.split-divider::after { content: ""; position: absolute; inset: 4px; border-radius: 3px; background: var(--border); transition: background .12s; }
+.split-divider.horz::after { inset: 0 4px; }
+.split-divider:hover::after { background: var(--accent); }
+.pane { border: 1px solid var(--border); border-radius: 12px; background: var(--surface); box-shadow: 0 1px 0 rgba(0,0,0,.2); }
+.pane-head { gap: 8px; padding: 8px 12px; border-radius: 12px 12px 0 0; }
+.pane-head .prov-logo { width: 15px; height: 15px; flex-shrink: 0; }
+.pane-head .prov-logo svg { width: 15px; height: 15px; }
+.pane-title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pane-scroll { background: var(--bg); }
+.pane-composer { padding: 9px; gap: 7px; align-items: center; }
+.pane-composer .input { min-height: 36px; max-height: 96px; border-radius: 10px; }
+.pane-composer .send { width: 32px; height: 32px; min-width: 32px; font-size: 14px; flex-shrink: 0; }
+.pane-mode-menu .prov-logo { width: 15px; height: 15px; }
+
+/* pane title is the mode picker now */
+.pane-mode-anchor { position: relative; }
+.pane-label { display: flex; align-items: center; gap: 7px; background: transparent; border: none; color: var(--muted); cursor: pointer; padding: 3px 7px; border-radius: 7px; font-family: inherit; font-size: 12px; }
+.pane-label:hover { background: var(--surface-hi); color: var(--text); }
+.pane-caret svg { width: 12px; height: 12px; color: var(--faint); }
+.pane-mode-menu { left: 0; right: auto; }

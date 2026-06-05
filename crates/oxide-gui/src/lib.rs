@@ -999,6 +999,13 @@ fn app() -> Element {
     let mut mcp_status = use_signal(std::collections::HashMap::<String, String>::new);
     // ChatGPT subscription usage: (plan, 5h %, weekly %, 5h reset s, weekly reset s).
     let mut usage_info = use_signal(|| None::<(String, u8, u8, u64, u64)>);
+    // Tiling split-view (each pane its own live engine).
+    let mut show_split = use_signal(|| false);
+    let split_panes = use_signal(|| vec![(0u64, "gui".to_string(), cfg.read().provider.clone(), cfg.read().model.clone())]);
+    let split_layout = use_signal(|| Tile::Leaf(0));
+    let split_next_id = use_signal(|| 1u64);
+    let split_drag = use_signal(|| None::<u64>);
+    let split_rects = use_signal(std::collections::HashMap::<u64, (f64, f64, f64, f64)>::new);
     let mut show_board = use_signal(|| false);
     let mut board = use_signal(board::Board::default);
     let mut new_card_title = use_signal(String::new);
@@ -1681,12 +1688,27 @@ fn app() -> Element {
                             button { class: if *show_terminal.read() { "top-btn on" } else { "top-btn" },
                                 onclick: move |_| { let v = *show_terminal.read(); show_terminal.set(!v); }, Icon { name: "terminal" } "Terminal"
                             }
+                            button { class: if *show_split.read() { "top-btn on" } else { "top-btn" },
+                                onclick: move |_| { let v = *show_split.read(); show_split.set(!v); }, Icon { name: "plugins" } "Split"
+                            }
                         }
                     }
                 }
 
                 div { class: "center",
-                    if *show_board.read() && cfg.read().workspace.is_some() {
+                    if *show_split.read() && cfg.read().workspace.is_some() {
+                        SplitView {
+                            node: split_layout.read().clone(),
+                            workspace: workspace.clone(),
+                            panes: split_panes,
+                            layout: split_layout,
+                            next_id: split_next_id,
+                            drag: split_drag,
+                            rects: split_rects,
+                            def_provider: cfg.read().provider.clone(),
+                            def_model: cfg.read().model.clone(),
+                        }
+                    } else if *show_board.read() && cfg.read().workspace.is_some() {
                         div { class: "board",
                             div { class: "board-head",
                                 h2 { "Board" }
@@ -3676,6 +3698,83 @@ fn TerminalView(id: u64, bin: String, ws: String) -> Element {
     rsx! { div { id: "{host}", class: "xterm-host" } }
 }
 
+/// Commands into a ChatPane's own engine.
+enum PaneCmd {
+    Submit(String),
+    Interrupt,
+}
+
+/// A tiling layout node: a leaf pane (by id) or a split of two nodes.
+#[derive(Clone, PartialEq)]
+enum Tile {
+    Leaf(u64),
+    Split { id: u64, vertical: bool, ratio: f64, a: Box<Tile>, b: Box<Tile> },
+}
+
+/// Replace leaf `target` with a split containing it plus a new leaf `new_pane`.
+fn tile_split(node: &Tile, target: u64, vertical: bool, split_id: u64, new_pane: u64) -> Tile {
+    match node {
+        Tile::Leaf(id) if *id == target => Tile::Split {
+            id: split_id,
+            vertical,
+            ratio: 0.5,
+            a: Box::new(Tile::Leaf(*id)),
+            b: Box::new(Tile::Leaf(new_pane)),
+        },
+        Tile::Leaf(id) => Tile::Leaf(*id),
+        Tile::Split { id, vertical: v, ratio, a, b } => Tile::Split {
+            id: *id,
+            vertical: *v,
+            ratio: *ratio,
+            a: Box::new(tile_split(a, target, vertical, split_id, new_pane)),
+            b: Box::new(tile_split(b, target, vertical, split_id, new_pane)),
+        },
+    }
+}
+
+/// Remove leaf `target`, collapsing its split. Returns None if the tree becomes empty.
+fn tile_close(node: &Tile, target: u64) -> Option<Tile> {
+    match node {
+        Tile::Leaf(id) if *id == target => None,
+        Tile::Leaf(id) => Some(Tile::Leaf(*id)),
+        Tile::Split { id, vertical, ratio, a, b } => {
+            match (tile_close(a, target), tile_close(b, target)) {
+                (None, Some(x)) | (Some(x), None) => Some(x),
+                (Some(a), Some(b)) => Some(Tile::Split {
+                    id: *id,
+                    vertical: *vertical,
+                    ratio: *ratio,
+                    a: Box::new(a),
+                    b: Box::new(b),
+                }),
+                (None, None) => None,
+            }
+        }
+    }
+}
+
+/// Set the ratio of split `split_id`.
+fn tile_set_ratio(node: &Tile, split_id: u64, ratio: f64) -> Tile {
+    match node {
+        Tile::Leaf(id) => Tile::Leaf(*id),
+        Tile::Split { id, vertical, ratio: r, a, b } => Tile::Split {
+            id: *id,
+            vertical: *vertical,
+            ratio: if *id == split_id { ratio.clamp(0.12, 0.88) } else { *r },
+            a: Box::new(tile_set_ratio(a, split_id, ratio)),
+            b: Box::new(tile_set_ratio(b, split_id, ratio)),
+        },
+    }
+}
+
+/// Collect leaf ids in order.
+fn tile_leaves(node: &Tile, out: &mut Vec<u64>) {
+    match node {
+        Tile::Leaf(id) => out.push(*id),
+        Tile::Split { a, b, .. } => { tile_leaves(a, out); tile_leaves(b, out); }
+    }
+}
+
 #[component]
 fn ActivityRow(text: String, running: bool, ok: bool) -> Element {
     let cls = if running { "activity-card running" } else if ok { "activity-card done" } else { "activity-card fail" };
@@ -3712,6 +3811,315 @@ fn icon_static(key: &str) -> &'static str {
         "globe" => "globe",
         "brain" => "brain",
         _ => "spark",
+    }
+}
+
+/// Recursive tiling view: renders the layout tree as live `ChatPane`s with
+/// draggable split dividers.
+#[component]
+fn SplitView(
+    node: Tile,
+    workspace: PathBuf,
+    panes: Signal<Vec<(u64, String, String, String)>>,
+    layout: Signal<Tile>,
+    next_id: Signal<u64>,
+    drag: Signal<Option<u64>>,
+    rects: Signal<std::collections::HashMap<u64, (f64, f64, f64, f64)>>,
+    def_provider: String,
+    def_model: String,
+) -> Element {
+    match node {
+        Tile::Leaf(pid) => {
+            let (mode, target, model) = panes
+                .read()
+                .iter()
+                .find(|p| p.0 == pid)
+                .map(|p| (p.1.clone(), p.2.clone(), p.3.clone()))
+                .unwrap_or_else(|| ("gui".to_string(), def_provider.clone(), def_model.clone()));
+            let closable = {
+                let mut l = Vec::new();
+                tile_leaves(&layout.read(), &mut l);
+                l.len() > 1
+            };
+            // New panes inherit the current pane's mode/target so a Claude tile
+            // splits into more Claude tiles.
+            let (im, it, imod) = (mode.clone(), target.clone(), model.clone());
+            rsx! {
+                SplitLeaf {
+                    pane_id: pid,
+                    workspace: workspace.clone(),
+                    mode: mode.clone(),
+                    target: target.clone(),
+                    model: model.clone(),
+                    closable,
+                    on_split: move |vertical: bool| {
+                        let base = *next_id.read();
+                        next_id.set(base + 2);
+                        panes.write().push((base, im.clone(), it.clone(), imod.clone()));
+                        let new_layout = tile_split(&layout.read(), pid, vertical, base + 1, base);
+                        layout.set(new_layout);
+                    },
+                    on_close: move |_| {
+                        let closed = tile_close(&layout.read(), pid);
+                        if let Some(t) = closed {
+                            layout.set(t);
+                        }
+                        panes.write().retain(|p| p.0 != pid);
+                    },
+                    on_set_mode: move |(m, t): (String, String)| {
+                        let mut ps = panes.write();
+                        if let Some(p) = ps.iter_mut().find(|p| p.0 == pid) { p.1 = m; p.2 = t; }
+                    },
+                }
+            }
+        }
+        Tile::Split { id, vertical, ratio, a, b } => {
+            let na = *a;
+            let nb = *b;
+            let cls = if vertical { "split split-row" } else { "split split-col" };
+            rsx! {
+                div {
+                    class: "{cls}",
+                    onmounted: move |e| {
+                        async move {
+                            if let Ok(r) = e.get_client_rect().await {
+                                rects.write().insert(id, (r.origin.x, r.origin.y, r.size.width, r.size.height));
+                            }
+                        }
+                    },
+                    onmousemove: move |e| {
+                        if *drag.read() == Some(id) {
+                            if let Some(&(x, y, w, h)) = rects.read().get(&id) {
+                                let c = e.client_coordinates();
+                                let ratio = if vertical { (c.x - x) / w.max(1.0) } else { (c.y - y) / h.max(1.0) };
+                                let nl = tile_set_ratio(&layout.read(), id, ratio);
+                                layout.set(nl);
+                            }
+                        }
+                    },
+                    onmouseup: move |_| drag.set(None),
+                    div { class: "split-cell", style: "flex: {ratio}",
+                        SplitView { node: na, workspace: workspace.clone(), panes, layout, next_id, drag, rects, def_provider: def_provider.clone(), def_model: def_model.clone() }
+                    }
+                    div { class: if vertical { "split-divider vert" } else { "split-divider horz" },
+                        onmousedown: move |_| drag.set(Some(id)),
+                    }
+                    div { class: "split-cell", style: "flex: {1.0 - ratio}",
+                        SplitView { node: nb, workspace: workspace.clone(), panes, layout, next_id, drag, rects, def_provider: def_provider.clone(), def_model: def_model.clone() }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Leaf wrapper: header (split/close/mode) + a GUI chat pane or an embedded TUI.
+#[component]
+fn SplitLeaf(
+    pane_id: u64,
+    workspace: PathBuf,
+    mode: String,
+    target: String,
+    model: String,
+    closable: bool,
+    on_split: EventHandler<bool>,
+    on_close: EventHandler<()>,
+    on_set_mode: EventHandler<(String, String)>,
+) -> Element {
+    let mut show_menu = use_signal(|| false);
+    let is_tui = mode == "tui";
+    let label = if is_tui { format!("{target} · TUI") } else { target.clone() };
+    rsx! {
+        div { class: "pane", key: "pane{pane_id}-{mode}-{target}",
+            div { class: "pane-head",
+                div { class: "pane-mode-anchor",
+                    button { class: "pane-label", title: "Change pane type", onclick: move |_| { let v = *show_menu.read(); show_menu.set(!v); },
+                        if let Some(l) = provider_logo(&target) { span { class: "agent-tab-logo prov-logo", dangerous_inner_html: l } }
+                        span { class: "pane-title", "{label}" }
+                        span { class: "pane-caret", Icon { name: "chevron" } }
+                    }
+                    if *show_menu.read() {
+                        div { class: "menu-backdrop", onclick: move |_| show_menu.set(false) }
+                        div { class: "pane-mode-menu",
+                            button { class: "menu-item", onclick: move |_| { show_menu.set(false); on_set_mode.call(("gui".into(), "chatgpt".into())); },
+                                if let Some(l) = provider_logo("chatgpt") { span { class: "agent-tab-logo prov-logo", dangerous_inner_html: l } }
+                                span { class: "menu-name", "GUI · ChatGPT" }
+                            }
+                            button { class: "menu-item", onclick: move |_| { show_menu.set(false); on_set_mode.call(("tui".into(), "codex".into())); },
+                                if let Some(l) = provider_logo("codex") { span { class: "agent-tab-logo prov-logo", dangerous_inner_html: l } }
+                                span { class: "menu-name", "TUI · Codex" }
+                            }
+                            button { class: "menu-item", onclick: move |_| { show_menu.set(false); on_set_mode.call(("tui".into(), "claude".into())); },
+                                if let Some(l) = provider_logo("claude") { span { class: "agent-tab-logo prov-logo", dangerous_inner_html: l } }
+                                span { class: "menu-name", "TUI · Claude Code" }
+                            }
+                        }
+                    }
+                }
+                div { class: "pane-actions",
+                    button { class: "pane-btn", title: "Split right", onclick: move |_| on_split.call(true), "⊞" }
+                    button { class: "pane-btn", title: "Split down", onclick: move |_| on_split.call(false), "⊟" }
+                    if closable {
+                        button { class: "pane-btn", title: "Close pane", onclick: move |_| on_close.call(()), "✕" }
+                    }
+                }
+            }
+            if is_tui {
+                TerminalView { id: pane_id, bin: target.clone(), ws: workspace.display().to_string() }
+            } else {
+                ChatPane { pane_id, workspace: workspace.clone(), provider: target.clone(), model: model.clone() }
+            }
+        }
+    }
+}
+
+/// A self-contained live chat pane: its own engine, transcript, and composer.
+/// The surrounding header (split/close/mode) is provided by `SplitLeaf`.
+#[component]
+fn ChatPane(
+    pane_id: u64,
+    workspace: PathBuf,
+    provider: String,
+    model: String,
+) -> Element {
+    let mut messages = use_signal(Vec::<ChatMsg>::new);
+    let mut input = use_signal(String::new);
+    let mut streaming = use_signal(|| false);
+    let mut thinking = use_signal(String::new);
+    let mut status = use_signal(String::new);
+
+    let p0 = provider.clone();
+    let m0 = model.clone();
+    let w0 = workspace.clone();
+    let pane = use_coroutine(move |mut rx: UnboundedReceiver<PaneCmd>| {
+        let (p, m, w) = (p0.clone(), m0.clone(), w0.clone());
+        async move {
+            let (ev_tx, mut ev_rx) = tokio::sync::mpsc::channel::<Event>(256);
+            let mut cfg = Config::load().unwrap_or_default();
+            cfg.workspace = Some(w);
+            cfg.provider = p;
+            cfg.model = m;
+            cfg.approval_policy = oxide_protocol::ApprovalPolicy::Never;
+            cfg.persist = true;
+            cfg.resume = false;
+            cfg.orchestrate = false;
+            cfg.subagents = false;
+            let handle = match oxide_core::spawn(cfg) {
+                Ok((h, mut events)) => {
+                    let tx = ev_tx.clone();
+                    tokio::spawn(async move {
+                        while let Some(e) = events.recv().await {
+                            if tx.send(e).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                    h
+                }
+                Err(_) => return,
+            };
+            loop {
+                tokio::select! {
+                    cmd = rx.next() => match cmd {
+                        Some(PaneCmd::Submit(t)) => {
+                            messages.write().push(ChatMsg { author: Author::User, text: t.clone() });
+                            messages.write().push(ChatMsg { author: Author::Agent, text: String::new() });
+                            streaming.set(true);
+                            let _ = handle.submit(Op::UserTurn { text: t }).await;
+                        }
+                        Some(PaneCmd::Interrupt) => { let _ = handle.submit(Op::Interrupt).await; streaming.set(false); }
+                        None => break,
+                    },
+                    ev = ev_rx.recv() => match ev {
+                        Some(Event::AgentMessageDelta { text, .. }) => {
+                            let mut mm = messages.write();
+                            match mm.last_mut() {
+                                Some(l) if l.author == Author::Agent => l.text.push_str(&text),
+                                _ => mm.push(ChatMsg { author: Author::Agent, text }),
+                            }
+                        }
+                        Some(Event::ReasoningDelta { text, .. }) => { thinking.write().push_str(&text); }
+                        Some(Event::ToolCallBegin { tool, args, .. }) => {
+                            if tool != "ask_user" {
+                                messages.write().push(ChatMsg { author: Author::Activity { running: true, ok: true }, text: activity_label(&tool, &args) });
+                            }
+                        }
+                        Some(Event::ToolCallEnd { ok, .. }) => {
+                            let mut mm = messages.write();
+                            if let Some(c) = mm.iter_mut().rev().find(|c| matches!(c.author, Author::Activity { running: true, .. })) {
+                                c.author = Author::Activity { running: false, ok };
+                            }
+                        }
+                        Some(Event::FileDiff { path, diff, checkpoint, .. }) => { messages.write().push(ChatMsg { author: Author::Diff(path, checkpoint), text: diff }); }
+                        Some(Event::TurnStarted { .. }) => { thinking.set(String::new()); status.set("Working…".to_string()); }
+                        Some(Event::TurnFinished { .. }) => { streaming.set(false); status.set(String::new()); }
+                        Some(Event::Info { text }) => { if text.starts_with(['🧭','⚙','🔍','🤖','🧩','🔁','✓','⚠']) { status.set(text); } }
+                        Some(Event::Error { message }) => { messages.write().push(ChatMsg { author: Author::Note, text: format!("error: {message}") }); }
+                        Some(Event::Shutdown) | None => break,
+                        _ => {}
+                    }
+                }
+            }
+        }
+    });
+
+    rsx! {
+        div { class: "pane-body",
+            div { class: "pane-scroll",
+                for msg in messages.read().iter() {
+                    {
+                        match &msg.author {
+                            Author::Diff(path, _) => {
+                                let path = path.clone();
+                                let diff = msg.text.clone();
+                                let (adds, dels) = diff_counts(&diff);
+                                rsx! {
+                                    div { class: "row diffrow",
+                                        details { class: "diff-card",
+                                            summary { class: "diff-head",
+                                                span { class: "diff-caret", Icon { name: "chevron" } }
+                                                span { class: "diff-path", "{path}" }
+                                                span { class: "diff-adds", "+{adds}" }
+                                                span { class: "diff-dels", "−{dels}" }
+                                            }
+                                            DiffBody { diff }
+                                        }
+                                    }
+                                }
+                            }
+                            _ => rsx! { Message { author: msg.author.clone(), text: msg.text.clone() } }
+                        }
+                    }
+                }
+                if !thinking.read().is_empty() {
+                    details { class: "thinking-box", open: *streaming.read(),
+                        summary { class: "thinking-sum", "💭 Thinking" }
+                        div { class: "thinking-body", "{thinking}" }
+                    }
+                }
+                if *streaming.read() && !status.read().is_empty() {
+                    div { class: "status-pill", span { class: "status-spinner" } span { class: "status-shimmer", "{status}" } }
+                }
+            }
+            div { class: "pane-composer",
+                textarea { class: "input", placeholder: "Message…", value: "{input}",
+                    oninput: move |e| input.set(e.value()),
+                    onkeydown: move |e| if e.key() == Key::Enter && !e.modifiers().shift() {
+                        e.prevent_default();
+                        let t = input.read().trim().to_string();
+                        if !t.is_empty() { input.set(String::new()); pane.send(PaneCmd::Submit(t)); }
+                    }
+                }
+                if *streaming.read() {
+                    button { class: "send stop", onclick: move |_| pane.send(PaneCmd::Interrupt), "■" }
+                } else {
+                    button { class: "send", onclick: move |_| {
+                        let t = input.read().trim().to_string();
+                        if !t.is_empty() { input.set(String::new()); pane.send(PaneCmd::Submit(t)); }
+                    }, "↑" }
+                }
+            }
+        }
     }
 }
 
