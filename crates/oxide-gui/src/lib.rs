@@ -820,6 +820,19 @@ fn recent_sessions(ws: &Path) -> Vec<(PathBuf, std::time::SystemTime, String)> {
     items.into_iter().take(30).collect()
 }
 
+/// Format a reset-after duration (seconds) like "in 5h" / "in 5d".
+fn fmt_reset(secs: u64) -> String {
+    if secs == 0 {
+        "—".to_string()
+    } else if secs < 3600 {
+        format!("{}m", (secs / 60).max(1))
+    } else if secs < 86_400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86_400)
+    }
+}
+
 /// Short relative time like "5m", "3h", "2d", "1w".
 fn relative_time(t: std::time::SystemTime) -> String {
     let secs = std::time::SystemTime::now().duration_since(t).map(|d| d.as_secs()).unwrap_or(0);
@@ -984,6 +997,8 @@ fn app() -> Element {
     let mut show_skills = use_signal(|| false);
     let mut show_mcp = use_signal(|| false);
     let mut mcp_status = use_signal(std::collections::HashMap::<String, String>::new);
+    // ChatGPT subscription usage: (plan, 5h %, weekly %, 5h reset s, weekly reset s).
+    let mut usage_info = use_signal(|| None::<(String, u8, u8, u64, u64)>);
     let mut show_board = use_signal(|| false);
     let mut board = use_signal(board::Board::default);
     let mut new_card_title = use_signal(String::new);
@@ -1311,6 +1326,9 @@ fn app() -> Element {
                             Event::QuestionAsked { request_id, question, options } => {
                                 questions.write().push((request_id, question, options));
                             }
+                            Event::RateLimit { plan, primary_pct, secondary_pct, primary_reset_s, secondary_reset_s } => {
+                                usage_info.set(Some((plan, primary_pct, secondary_pct, primary_reset_s, secondary_reset_s)));
+                            }
                             Event::CheckpointCreated { id, label, .. } => {
                                 checkpoints.write().push((id, label.clone()));
                                 timeline.write().push(TimelineItem { title: format!("⎌ checkpoint #{id}"), sub: label });
@@ -1555,6 +1573,21 @@ fn app() -> Element {
                         button { class: "open-codebase", onclick: move |_| open_folder(cfg, ui, engine),
                             Icon { name: "folder" } span { "Open codebase" }
                         }
+                    }
+                }
+                if let Some((plan, p, s, p_reset, s_reset)) = usage_info.read().clone() {
+                    div { class: "usage-chip", title: "ChatGPT subscription usage",
+                        div { class: "usage-row",
+                            span { class: "usage-k", "5h" }
+                            span { class: "usage-bar", span { class: "usage-fill", style: "width:{p}%" } }
+                            span { class: "usage-v", "{p}% · {fmt_reset(p_reset)}" }
+                        }
+                        div { class: "usage-row",
+                            span { class: "usage-k", "wk" }
+                            span { class: "usage-bar", span { class: "usage-fill", style: "width:{s}%" } }
+                            span { class: "usage-v", "{s}% · {fmt_reset(s_reset)}" }
+                        }
+                        div { class: "usage-plan", "ChatGPT {plan}" }
                     }
                 }
                 button { class: "settings-btn", onclick: move |_| show_settings.set(true),

@@ -179,6 +179,9 @@ async fn run_exec(config: Config, prompt: String, yes: bool) -> Result<()> {
             Event::HookFired { hook, command, blocked } => {
                 println!("[hook] {hook}: {command}{}", if blocked { " (blocked)" } else { "" })
             }
+            Event::RateLimit { plan, primary_pct, secondary_pct, .. } => {
+                println!("[usage] {plan}: 5h {primary_pct}% · weekly {secondary_pct}%")
+            }
             Event::QuestionAsked { question, options, .. } => {
                 println!("[question] {question}");
                 for (i, o) in options.iter().enumerate() {

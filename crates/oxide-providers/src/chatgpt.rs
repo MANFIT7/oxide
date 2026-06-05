@@ -156,6 +156,26 @@ impl Provider for ChatGptProvider {
             anyhow::bail!("chatgpt {status}: {text}");
         }
 
+        // Subscription rate-limit snapshot from response headers.
+        {
+            let h = resp.headers();
+            let hv = |k: &str| h.get(k).and_then(|v| v.to_str().ok());
+            let pct = |k: &str| hv(k).and_then(|s| s.parse::<u8>().ok());
+            if let (Some(p), Some(sec)) = (pct("x-codex-primary-used-percent"), pct("x-codex-secondary-used-percent")) {
+                let plan = hv("x-codex-plan-type").or_else(|| hv("x-codex-active-limit")).unwrap_or("").to_string();
+                let resets = |k: &str| hv(k).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+                let _ = sink
+                    .send(StreamItem::RateLimit {
+                        plan,
+                        primary_pct: p,
+                        secondary_pct: sec,
+                        primary_reset_s: resets("x-codex-primary-reset-after-seconds"),
+                        secondary_reset_s: resets("x-codex-secondary-reset-after-seconds"),
+                    })
+                    .await;
+            }
+        }
+
         let mut stream = resp.bytes_stream().eventsource();
         while let Some(ev) = stream.next().await {
             let ev = ev?;

@@ -97,6 +97,14 @@ pub enum Event {
         question: String,
         options: Vec<String>,
     },
+    /// Subscription usage snapshot (ChatGPT plan rate limits).
+    RateLimit {
+        plan: String,
+        primary_pct: u8,
+        secondary_pct: u8,
+        primary_reset_s: u64,
+        secondary_reset_s: u64,
+    },
     /// A checkpoint was recorded before a mutating tool ran.
     CheckpointCreated {
         turn: TurnId,

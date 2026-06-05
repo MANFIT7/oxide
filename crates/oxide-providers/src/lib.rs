@@ -61,6 +61,14 @@ pub enum StreamItem {
         output: u64,
         context_window: Option<u64>,
     },
+    /// Subscription rate-limit snapshot (from ChatGPT-subscription headers).
+    RateLimit {
+        plan: String,
+        primary_pct: u8,
+        secondary_pct: u8,
+        primary_reset_s: u64,
+        secondary_reset_s: u64,
+    },
     /// Stream finished cleanly.
     Done,
 }

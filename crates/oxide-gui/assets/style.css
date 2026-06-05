@@ -1077,3 +1077,12 @@ svg { width: 17px; height: 17px; flex-shrink: 0; }
 .show-more { background: transparent; border: none; color: var(--faint); font-size: 12.5px; cursor: pointer; padding: 6px 10px 10px; font-family: inherit; text-align: left; width: 100%; }
 .show-more:hover { color: var(--text); }
 .project { margin-top: 10px; }
+
+/* ── ChatGPT usage chip ──────────────────────────────── */
+.usage-chip { margin: 8px 10px; padding: 9px 11px; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; }
+.usage-row { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.usage-k { font-size: 10.5px; color: var(--faint); width: 18px; text-transform: uppercase; font-weight: 700; }
+.usage-bar { flex: 1; height: 5px; background: #2a2a30; border-radius: 3px; overflow: hidden; }
+.usage-fill { display: block; height: 100%; background: var(--accent); border-radius: 3px; }
+.usage-v { font-size: 10.5px; color: var(--muted); white-space: nowrap; }
+.usage-plan { font-size: 10px; color: var(--faint); text-transform: uppercase; letter-spacing: .3px; }

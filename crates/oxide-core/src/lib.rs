@@ -527,6 +527,9 @@ impl Engine {
                         self.emit(Event::ContextWindow { limit }).await;
                     }
                 }
+                StreamItem::RateLimit { plan, primary_pct, secondary_pct, primary_reset_s, secondary_reset_s } => {
+                    self.emit(Event::RateLimit { plan, primary_pct, secondary_pct, primary_reset_s, secondary_reset_s }).await;
+                }
                 StreamItem::ToolCall { .. } => {}
                 StreamItem::Done => break,
             }
@@ -770,6 +773,9 @@ impl Engine {
                                 if let Some(limit) = context_window {
                                     self.emit(Event::ContextWindow { limit }).await;
                                 }
+                            }
+                            Some(StreamItem::RateLimit { plan, primary_pct, secondary_pct, primary_reset_s, secondary_reset_s }) => {
+                                self.emit(Event::RateLimit { plan, primary_pct, secondary_pct, primary_reset_s, secondary_reset_s }).await;
                             }
                             Some(StreamItem::Done) | None => break,
                         }
