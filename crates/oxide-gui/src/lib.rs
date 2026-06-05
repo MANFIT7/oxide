@@ -839,6 +839,12 @@ fn build_projects(current: &Path, recents: &[PathBuf]) -> Vec<(PathBuf, String, 
     let mut seen = HashSet::new();
     let mut wss: Vec<PathBuf> = Vec::new();
     for w in std::iter::once(current.to_path_buf()).chain(recents.iter().cloned()) {
+        // Skip recents on removable volumes (except the active one) to avoid
+        // macOS re-prompting for "access files on a removable volume".
+        let is_current = w == current;
+        if !is_current && w.starts_with("/Volumes/") {
+            continue;
+        }
         if seen.insert(w.clone()) {
             wss.push(w);
         }
