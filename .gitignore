@@ -1,0 +1,14 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+.DS_Store
+.env
+*.log
+/dist/
+/oxide.toml
+.oxide/sessions/
+.oxide/memory/
+.oxide/**/.DS_Store
+**/.oxide/sessions/
+**/.oxide/memory/
+**/.oxide/checkpoints/

@@ -1,0 +1,14 @@
+[package]
+name = "oxide-harness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pluggable harness system for Oxide — swap/update agent behavior (prompt, tools, loop policy) without touching the engine."
+
+[dependencies]
+oxide-protocol = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }

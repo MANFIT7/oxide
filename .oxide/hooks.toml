@@ -1,0 +1,4 @@
+# Lifecycle hooks — uncomment to enable. Payload JSON in $OXIDE_HOOK_PAYLOAD.
+# pre_tool  = ["./scripts/guard.sh"]   # non-zero exit BLOCKS the tool
+# post_tool = ["cargo fmt"]            # runs after each tool
+# stop      = ["cargo test"]           # runs when a turn finishes

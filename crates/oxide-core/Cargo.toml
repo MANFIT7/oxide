@@ -1,0 +1,22 @@
+[package]
+name = "oxide-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The Oxide engine: a frontend-agnostic async submit/event agent loop. Reusable library that TUI, GUI, headless and RPC frontends all drive."
+
+[dependencies]
+oxide-protocol = { workspace = true }
+oxide-config = { workspace = true }
+oxide-harness = { workspace = true }
+oxide-providers = { workspace = true }
+oxide-mcp = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+similar = { workspace = true }
+toml = { workspace = true }

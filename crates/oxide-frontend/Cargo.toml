@@ -1,0 +1,13 @@
+[package]
+name = "oxide-frontend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Frontend trait shared by every Oxide UI (TUI today, GUI in Fase 7). One contract, interchangeable shells."
+
+[dependencies]
+oxide-core = { workspace = true }
+oxide-protocol = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+anyhow = { workspace = true }

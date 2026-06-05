@@ -1,0 +1,17 @@
+[package]
+name = "oxide-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Terminal UI for Oxide (ratatui + crossterm), implementing the oxide-frontend contract."
+
+[dependencies]
+oxide-core = { workspace = true }
+oxide-protocol = { workspace = true }
+oxide-frontend = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+anyhow = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+futures = { workspace = true }

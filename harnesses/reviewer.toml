@@ -1,0 +1,27 @@
+# Example external harness — drop a TOML like this into your harness dir and
+# Oxide registers it at startup (no recompile). This is the "update features
+# from harnesses like hermes" path: behavior is data, not code.
+#
+# Enable by setting in oxide.toml:
+#   harness = "reviewer"
+#   harness_dir = "harnesses"
+
+id = "reviewer"
+name = "Code Reviewer"
+system_prompt = """
+You are Oxide running the Reviewer harness. Do not edit code. Read the diff and
+the surrounding files, then report correctness bugs and risky changes as a terse
+numbered list with file:line references. Verify each finding before reporting it.
+"""
+max_steps = 32
+temperature = 0.0
+
+[[tools]]
+name = "read_file"
+description = "Read a file from the workspace."
+mutating = false
+
+[[tools]]
+name = "search"
+description = "Search the workspace for a pattern."
+mutating = false

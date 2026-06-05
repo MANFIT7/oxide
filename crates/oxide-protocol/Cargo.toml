@@ -1,0 +1,10 @@
+[package]
+name = "oxide-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Wire types (Op/Event) shared between the Oxide engine and any frontend (TUI/GUI/RPC)."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

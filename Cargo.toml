@@ -1,0 +1,66 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/oxide-protocol",
+    "crates/oxide-config",
+    "crates/oxide-harness",
+    "crates/oxide-providers",
+    "crates/oxide-mcp",
+    "crates/oxide-core",
+    "crates/oxide-frontend",
+    "crates/oxide-tui",
+    "crates/oxide-gui",
+    "crates/oxide-desktop",
+    "crates/oxide-cli",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["Oxide contributors"]
+repository = "https://example.com/oxide"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# internal
+oxide-protocol = { path = "crates/oxide-protocol" }
+oxide-config = { path = "crates/oxide-config" }
+oxide-harness = { path = "crates/oxide-harness" }
+oxide-providers = { path = "crates/oxide-providers" }
+oxide-mcp = { path = "crates/oxide-mcp" }
+oxide-core = { path = "crates/oxide-core" }
+oxide-frontend = { path = "crates/oxide-frontend" }
+oxide-tui = { path = "crates/oxide-tui" }
+oxide-gui = { path = "crates/oxide-gui" }
+oxide-desktop = { path = "crates/oxide-desktop" }
+
+# external
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "signal", "time", "io-std", "sync"] }
+tokio-stream = "0.1"
+tokio-util = "0.7"
+futures = "0.3"
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+clap = { version = "4", features = ["derive"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+eventsource-stream = "0.2"
+base64 = "0.22"
+rfd = "0.15"
+similar = "2"
+self-replace = "1"
+eframe = "0.29"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
