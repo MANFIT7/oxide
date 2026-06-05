@@ -1562,7 +1562,6 @@ fn app() -> Element {
                     div { class: "update-banner",
                         span { class: "update-text",
                             "⬆ Update available · v{info.version}"
-                            if !info.notes.is_empty() { span { class: "update-notes", " — {info.notes}" } }
                         }
                         div { class: "update-actions",
                             button { class: "update-btn", disabled: *updating.read(),
