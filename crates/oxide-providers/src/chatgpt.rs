@@ -8,7 +8,7 @@
 //! it can change without notice and is ToS-grey. It is gated behind the explicit
 //! `chatgpt` provider so nothing uses it unless asked.
 
-use crate::{Message, Provider, Role, StreamItem, TurnRequest};
+use crate::{Provider, Role, StreamItem, TurnRequest};
 use async_trait::async_trait;
 use eventsource_stream::Eventsource;
 use futures::StreamExt;

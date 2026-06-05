@@ -278,6 +278,42 @@ enum Author {
     Note,
     /// A reviewable file diff: (path, checkpoint id to rewind).
     Diff(String, u64),
+    /// A tool activity row (terminal/edit/read/…): (running, ok).
+    Activity { running: bool, ok: bool },
+}
+
+/// Count added/removed lines in a unified diff (excludes the +++/--- headers).
+fn diff_counts(diff: &str) -> (u32, u32) {
+    let mut adds = 0;
+    let mut dels = 0;
+    for l in diff.lines() {
+        if l.starts_with("+++") || l.starts_with("---") {
+            continue;
+        }
+        if l.starts_with('+') {
+            adds += 1;
+        } else if l.starts_with('-') {
+            dels += 1;
+        }
+    }
+    (adds, dels)
+}
+
+/// Icon + label for a tool activity row.
+fn activity_label(tool: &str, args: &serde_json::Value) -> String {
+    let s = |k: &str| args.get(k).and_then(|v| v.as_str()).unwrap_or("");
+    let short = |t: &str| t.chars().take(80).collect::<String>();
+    match tool {
+        "shell" => format!("⌘ {}", short(s("command"))),
+        "write_file" => format!("✎ {}", s("path")),
+        "read_file" => format!("📖 {}", s("path")),
+        "search" => format!("🔎 {}", s("pattern")),
+        "browser_navigate" => format!("🌐 {}", s("url")),
+        t if t.starts_with("browser_") => format!("🌐 {t}"),
+        "remember" => "🧠 remember".to_string(),
+        "save_skill" => "🧠 save skill".to_string(),
+        other => format!("⚙ {other}"),
+    }
 }
 
 #[derive(Clone, PartialEq)]
@@ -856,6 +892,10 @@ fn app() -> Element {
     let mut queue = use_signal(Vec::<String>::new);
     let mut questions = use_signal(Vec::<(u64, String, Vec<String>)>::new);
     let mut q_answer = use_signal(String::new);
+    let mut reverted = use_signal(HashSet::<u64>::new);
+    // Edits made this turn: (path, adds, dels, checkpoint).
+    let mut turn_edits = use_signal(Vec::<(String, u32, u32, u64)>::new);
+    let mut edits_expanded = use_signal(|| false);
     let mut status = use_signal(String::new);
 
     // File/editor signals, shared with tree/editor via context.
@@ -882,6 +922,18 @@ fn app() -> Element {
             if let Some(info) = update::check(&repo, &url).await {
                 update_info.set(Some(info));
             }
+        });
+    });
+
+    // Auto-scroll the chat to the bottom as content streams in.
+    use_effect(move || {
+        let _ = messages.read(); // subscribe to any transcript change
+        let _ = thinking.read().len();
+        let _ = status.read().len();
+        spawn(async move {
+            let _ = dioxus::document::eval(
+                "requestAnimationFrame(()=>{var s=document.querySelector('.scroll');if(s)s.scrollTop=s.scrollHeight;});",
+            );
         });
     });
 
@@ -1067,17 +1119,27 @@ fn app() -> Element {
                             Event::TurnStarted { turn } => {
                                 thinking.set(String::new());
                                 status.set("Thinking…".to_string());
+                                turn_edits.write().clear();
+                                edits_expanded.set(false);
                                 timeline.write().push(TimelineItem { title: format!("Turn {turn} started"), sub: String::new() });
                             }
                             Event::ApprovalRequested { request_id, tool, summary } => {
                                 approvals.write().push((request_id, tool.clone(), summary.clone()));
                                 timeline.write().push(TimelineItem { title: format!("Approval needed · {tool}"), sub: summary });
                             }
-                            Event::ToolCallBegin { tool, .. } => {
+                            Event::ToolCallBegin { tool, args, .. } => {
                                 timeline.write().push(TimelineItem { title: format!("⚙ {tool}"), sub: "running…".into() });
+                                if tool != "ask_user" {
+                                    messages.write().push(ChatMsg { author: Author::Activity { running: true, ok: true }, text: activity_label(&tool, &args) });
+                                }
                             }
                             Event::ToolCallEnd { tool, ok, .. } => {
                                 timeline.write().push(TimelineItem { title: format!("⚙ {tool}"), sub: if ok { "done".into() } else { "failed".into() } });
+                                // Mark the most recent running activity row as finished.
+                                let mut m = messages.write();
+                                if let Some(c) = m.iter_mut().rev().find(|c| matches!(c.author, Author::Activity { running: true, .. })) {
+                                    c.author = Author::Activity { running: false, ok };
+                                }
                             }
                             Event::PatchApplied { path, .. } => {
                                 timeline.write().push(TimelineItem { title: "✎ patched".into(), sub: path });
@@ -1085,6 +1147,8 @@ fn app() -> Element {
                                 git_refresh.set(v + 1); // trigger git-tab auto-refresh
                             }
                             Event::FileDiff { path, diff, checkpoint, .. } => {
+                                let (adds, dels) = diff_counts(&diff);
+                                turn_edits.write().push((path.clone(), adds, dels, checkpoint));
                                 messages.write().push(ChatMsg { author: Author::Diff(path, checkpoint), text: diff });
                             }
                             Event::HookFired { hook, command, blocked } => {
@@ -1504,26 +1568,80 @@ fn app() -> Element {
                     } else {
                         div { class: "scroll",
                             div { class: "col",
-                                for m in messages.read().iter() {
-                                    {
-                                        match &m.author {
-                                            Author::Diff(path, cp) => {
-                                                let path = path.clone();
-                                                let cp = *cp;
-                                                let diff = m.text.clone();
-                                                rsx! {
-                                                    div { class: "row diffrow",
-                                                        div { class: "diff-card",
-                                                            div { class: "diff-head",
-                                                                span { class: "diff-path", "± {path}" }
-                                                                button { class: "diff-revert", onclick: move |_| { let _ = engine.send(EngineCmd::Rewind { id: cp }); }, "Revert" }
+                                {
+                                    // Group consecutive tool-activity rows so they collapse into one dropdown.
+                                    let groups = {
+                                        let msgs = messages.read();
+                                        let mut g: Vec<(bool, Vec<usize>)> = Vec::new();
+                                        for (i, m) in msgs.iter().enumerate() {
+                                            if matches!(m.author, Author::Activity { .. }) {
+                                                match g.last_mut() {
+                                                    Some(last) if last.0 => last.1.push(i),
+                                                    _ => g.push((true, vec![i])),
+                                                }
+                                            } else {
+                                                g.push((false, vec![i]));
+                                            }
+                                        }
+                                        g
+                                    };
+                                    rsx! {
+                                        for (is_act, idxs) in groups.into_iter() {
+                                            if is_act && idxs.len() > 2 {
+                                                {
+                                                    let rows: Vec<(String, bool, bool)> = idxs.iter().map(|&i| {
+                                                        let m = &messages.read()[i];
+                                                        if let Author::Activity { running, ok } = m.author { (m.text.clone(), running, ok) } else { (m.text.clone(), false, true) }
+                                                    }).collect();
+                                                    let running = rows.iter().any(|r| r.1);
+                                                    let n = rows.len();
+                                                    let done = rows.iter().filter(|r| !r.1).count();
+                                                    let label = if running { format!("⚙ Working… {done}/{n}") } else { format!("⚙ {n} actions") };
+                                                    rsx! {
+                                                        details { class: "act-group", open: running,
+                                                            summary { class: "act-group-head",
+                                                                span { class: "diff-caret", Icon { name: "chevron" } }
+                                                                "{label}"
                                                             }
-                                                            DiffBody { diff }
+                                                            for (t, r, o) in rows { ActivityRow { text: t, running: r, ok: o } }
+                                                        }
+                                                    }
+                                                }
+                                            } else {
+                                                for i in idxs {
+                                                    {
+                                                        let m = messages.read()[i].clone();
+                                                        match &m.author {
+                                                            Author::Diff(path, cp) => {
+                                                                let path = path.clone();
+                                                                let cp = *cp;
+                                                                let diff = m.text.clone();
+                                                                let (adds, dels) = diff_counts(&diff);
+                                                                let is_reverted = reverted.read().contains(&cp);
+                                                                rsx! {
+                                                                    div { class: "row diffrow",
+                                                                        details { class: "diff-card",
+                                                                            summary { class: "diff-head",
+                                                                                span { class: "diff-caret", Icon { name: "chevron" } }
+                                                                                span { class: "diff-path", "{path}" }
+                                                                                span { class: "diff-adds", "+{adds}" }
+                                                                                span { class: "diff-dels", "−{dels}" }
+                                                                                if is_reverted {
+                                                                                    span { class: "diff-reverted", "✓ Reverted" }
+                                                                                } else {
+                                                                                    button { class: "diff-revert", onclick: move |e| { e.prevent_default(); let _ = engine.send(EngineCmd::Rewind { id: cp }); reverted.write().insert(cp); }, "Revert" }
+                                                                                }
+                                                                            }
+                                                                            DiffBody { diff }
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                            _ => rsx! { Message { author: m.author.clone(), text: m.text.clone() } }
                                                         }
                                                     }
                                                 }
                                             }
-                                            _ => rsx! { Message { author: m.author.clone(), text: m.text.clone() } }
                                         }
                                     }
                                 }
@@ -1593,6 +1711,44 @@ fn app() -> Element {
                                             button { class: "approval-yes", onclick: move |_| { let _ = engine.send(EngineCmd::Approve { id, decision: ApprovalDecision::Approve }); }, "Approve" }
                                             button { class: "approval-always", onclick: move |_| { let _ = engine.send(EngineCmd::Approve { id, decision: ApprovalDecision::ApproveForSession }); }, "Always" }
                                             button { class: "approval-no", onclick: move |_| { let _ = engine.send(EngineCmd::Approve { id, decision: ApprovalDecision::Reject }); }, "Reject" }
+                                        }
+                                    }
+                                }
+                                if !turn_edits.read().is_empty() {
+                                    {
+                                        let edits = turn_edits.read().clone();
+                                        let n = edits.len();
+                                        let total_add: u32 = edits.iter().map(|e| e.1).sum();
+                                        let total_del: u32 = edits.iter().map(|e| e.2).sum();
+                                        let expanded = *edits_expanded.read();
+                                        let shown = if expanded { n } else { n.min(3) };
+                                        let plural = if n == 1 { "" } else { "s" };
+                                        let more_txt = if expanded { "Show less".to_string() } else { format!("Show {} more files", n - 3) };
+                                        rsx! {
+                                            div { class: "edits-card",
+                                                div { class: "edits-head",
+                                                    span { class: "edits-ic", Icon { name: "list" } }
+                                                    div { class: "edits-title-col",
+                                                        span { class: "edits-title", "Edited {n} file{plural}" }
+                                                        span { class: "edits-counts", span { class: "diff-adds", "+{total_add}" } " " span { class: "diff-dels", "−{total_del}" } }
+                                                    }
+                                                    button { class: "edits-undo", onclick: move |_| {
+                                                        for (_, _, _, cp) in turn_edits.read().iter() { let _ = engine.send(EngineCmd::Rewind { id: *cp }); reverted.write().insert(*cp); }
+                                                    }, "Undo ↺" }
+                                                }
+                                                for (path, a, d, _cp) in edits.iter().take(shown).cloned() {
+                                                    div { class: "edits-row",
+                                                        span { class: "edits-path", "{path}" }
+                                                        span { class: "edits-rowcounts", span { class: "diff-adds", "+{a}" } " " span { class: "diff-dels", "−{d}" } }
+                                                    }
+                                                }
+                                                if n > 3 {
+                                                    button { class: "edits-more", onclick: move |_| { let v = *edits_expanded.read(); edits_expanded.set(!v); },
+                                                        "{more_txt}"
+                                                        Icon { name: "chevron" }
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -2111,16 +2267,6 @@ fn provider_title(provider: &str) -> &'static str {
         "anthropic" => "Anthropic",
         _ => "Agent",
     }
-}
-
-/// Launch an agent CLI's real interactive TUI in Terminal.app, in `ws`.
-/// Terminal runs the user's login shell, so `codex`/`claude` resolve via PATH.
-fn launch_cli_tui(ws: &Path, bin: &str) {
-    let ws = ws.display().to_string();
-    let script = format!(
-        "tell application \"Terminal\"\nactivate\ndo script \"cd '{ws}' && {bin}\"\nend tell"
-    );
-    let _ = std::process::Command::new("osascript").arg("-e").arg(script).spawn();
 }
 
 /// Native folder picker → switch workspace.
@@ -3066,6 +3212,7 @@ fn Message(author: Author, text: String) -> Element {
                 }
             }
         },
+        Author::Activity { running, ok } => rsx! { ActivityRow { text, running, ok } },
         Author::Diff(..) => rsx! {},
         Author::Note => {
             let is_cmd = text.starts_with('⌘') || text.starts_with('✎') || text.starts_with('🔎') || text.starts_with('⚙');
@@ -3194,6 +3341,25 @@ fn TerminalView(id: u64, bin: String, ws: String) -> Element {
         }
     });
     rsx! { div { id: "{host}", class: "xterm-host" } }
+}
+
+#[component]
+fn ActivityRow(text: String, running: bool, ok: bool) -> Element {
+    let cls = if running { "activity-card running" } else if ok { "activity-card done" } else { "activity-card fail" };
+    rsx! {
+        div { class: "row activity",
+            div { class: "{cls}",
+                if running {
+                    span { class: "activity-spin" }
+                } else if ok {
+                    span { class: "activity-ic ok", "✓" }
+                } else {
+                    span { class: "activity-ic fail", "✕" }
+                }
+                span { class: "activity-text", "{text}" }
+            }
+        }
+    }
 }
 
 #[component]

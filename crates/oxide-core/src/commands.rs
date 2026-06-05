@@ -42,6 +42,7 @@ pub fn expand(workspace: &Path, text: &str) -> Option<String> {
 }
 
 /// `(name, description)` for each available command.
+#[allow(dead_code)]
 pub fn list(workspace: &Path) -> Vec<(String, String)> {
     let mut out = Vec::new();
     if let Ok(rd) = std::fs::read_dir(commands_dir(workspace)) {
