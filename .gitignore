@@ -12,3 +12,4 @@ Cargo.lock.bak
 **/.oxide/sessions/
 **/.oxide/memory/
 **/.oxide/checkpoints/
+oxide-macos-arm64

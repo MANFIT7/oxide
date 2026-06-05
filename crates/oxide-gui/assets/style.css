@@ -845,6 +845,7 @@ svg { width: 17px; height: 17px; flex-shrink: 0; }
 
 /* ── Welcome (no folder chosen) ──────────────────────── */
 .welcome-screen { gap: 14px; }
+.welcome-logo { width: 76px; height: 76px; border-radius: 18px; object-fit: contain; }
 .welcome-sub { color: var(--muted); font-size: 14px; }
 .welcome-btn {
   background: var(--accent); color: #161618; border: none; border-radius: 11px;
@@ -859,3 +860,45 @@ svg { width: 17px; height: 17px; flex-shrink: 0; }
 }
 .welcome-recent-item:hover { background: var(--surface-hi); }
 .welcome-recent-item svg { width: 15px; height: 15px; color: var(--muted); }
+
+/* Sidebar "Open codebase" (no folder yet) */
+.open-codebase {
+  display: flex; align-items: center; gap: 10px; width: 100%; text-align: left;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 9px;
+  color: var(--text); cursor: pointer; padding: 9px 12px; font-size: 13.5px; font-family: inherit;
+}
+.open-codebase:hover { background: var(--surface-hi); border-color: var(--accent); }
+.open-codebase svg { width: 15px; height: 15px; color: var(--muted); }
+
+/* ── Agent tabs ──────────────────────────────────────── */
+.agent-tabs {
+  display: flex; align-items: center; gap: 2px;
+  padding: 6px 16px 0; border-bottom: 1px solid var(--border);
+}
+.agent-tab {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 12px 9px; cursor: pointer; position: relative;
+  border-bottom: 2px solid transparent; color: var(--muted); font-size: 13px; max-width: 240px;
+}
+.agent-tab:hover { color: var(--text); }
+.agent-tab.active { color: var(--text); border-bottom-color: var(--accent); }
+.agent-tab-logo { width: 16px; height: 16px; border-radius: 4px; flex-shrink: 0; }
+.agent-tab-title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.agent-tab-x {
+  background: transparent; border: none; color: var(--faint); cursor: pointer;
+  font-size: 10px; padding: 2px 3px; border-radius: 4px; line-height: 1;
+}
+.agent-tab-x:hover { background: var(--surface-hi); color: var(--text); }
+.newtab-anchor { position: relative; }
+.agent-tab-add {
+  display: flex; align-items: center; gap: 3px; margin-left: 4px;
+  background: transparent; border: none; color: var(--muted); cursor: pointer;
+  padding: 6px 8px; border-radius: 7px; font-family: inherit;
+}
+.agent-tab-add:hover { background: var(--surface); color: var(--text); }
+.agent-tab-add svg { width: 14px; height: 14px; }
+.newtab-menu {
+  position: absolute; top: calc(100% + 4px); left: 0; width: 200px;
+  background: #232327; border: 1px solid #34343a; border-radius: 11px;
+  padding: 6px; z-index: 40; box-shadow: 0 12px 34px rgba(0,0,0,.5);
+}

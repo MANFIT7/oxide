@@ -91,14 +91,16 @@ fn main() -> Result<()> {
         // The GUI owns the platform event loop and must run on the main thread,
         // outside any tokio runtime — so it is dispatched here directly.
         Command::Gui => {
-            // Launched from a real project dir (terminal) → use it. Launched from
-            // Finder (cwd "/") → leave unset so the GUI shows the Open-folder welcome.
-            if config.workspace.is_none() {
-                if let Ok(cwd) = std::env::current_dir() {
-                    if cwd != std::path::Path::new("/") {
+            // Terminal launch in a real project dir → use it. Finder launch
+            // (cwd "/") → always start at the Open-folder welcome, ignoring any
+            // persisted workspace, so the sidebar is empty until a folder is picked.
+            match std::env::current_dir() {
+                Ok(cwd) if cwd != std::path::Path::new("/") => {
+                    if config.workspace.is_none() {
                         config.workspace = Some(cwd);
                     }
                 }
+                _ => config.workspace = None,
             }
             oxide_gui::run(config)
         }

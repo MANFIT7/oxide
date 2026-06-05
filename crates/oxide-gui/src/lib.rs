@@ -212,11 +212,15 @@ fn effort_label(value: &str) -> &'static str {
 }
 
 fn workspace_of(config: &Config) -> PathBuf {
-    config
-        .workspace
-        .clone()
-        .or_else(|| std::env::current_dir().ok())
-        .unwrap_or_else(|| PathBuf::from("."))
+    if let Some(ws) = &config.workspace {
+        return ws.clone();
+    }
+    // No folder chosen yet (welcome state). Avoid root "/" — fall back to HOME
+    // so the file tree isn't the whole filesystem.
+    match std::env::current_dir().ok() {
+        Some(p) if p != PathBuf::from("/") => p,
+        _ => std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(".")),
+    }
 }
 
 fn project_name(ws: &std::path::Path) -> String {
@@ -281,9 +285,22 @@ struct ChatMsg {
 enum EngineCmd {
     Submit(String),
     Reconfigure(Config),
+    /// Switch to another agent tab: reconfigure the engine to `0` and restore
+    /// that tab's transcript `1` (without the message-clearing Reconfigure does).
+    SwitchTab(Config, Vec<ChatMsg>),
     Approve { id: u64, decision: ApprovalDecision },
     Rewind { id: u64 },
     Interrupt,
+}
+
+/// One agent session tab (its own provider + transcript) within a workspace.
+#[derive(Clone, PartialEq)]
+struct AgentTab {
+    id: u64,
+    title: String,
+    provider: String,
+    model: String,
+    messages: Vec<ChatMsg>,
 }
 
 /// One row in the inspector Timeline.
@@ -701,6 +718,21 @@ fn app() -> Element {
     let mut show_terminal = use_signal(|| false);
     let mut show_settings = use_signal(|| false);
     let mut show_skills = use_signal(|| false);
+    // Agent tabs (multiple agent sessions in one workspace).
+    let initial_provider = cfg.read().provider.clone();
+    let initial_model = cfg.read().model.clone();
+    let mut tabs = use_signal(|| {
+        vec![AgentTab {
+            id: 0,
+            title: provider_title(&initial_provider).to_string(),
+            provider: initial_provider,
+            model: initial_model,
+            messages: Vec::new(),
+        }]
+    });
+    let mut active_tab = use_signal(|| 0usize);
+    let next_tab_id = use_signal(|| 1u64);
+    let mut show_newtab = use_signal(|| false);
 
     // Composer modes (shared across both Composer instances).
     let plan_mode = use_signal(|| false);
@@ -837,6 +869,14 @@ fn app() -> Element {
                             timeline.write().clear();
                             streaming.set(false);
                             start_engine!(conf);
+                        }
+                        Some(EngineCmd::SwitchTab(conf, tab_msgs)) => {
+                            approvals.write().clear();
+                            checkpoints.write().clear();
+                            timeline.write().clear();
+                            streaming.set(false);
+                            start_engine!(conf);
+                            *messages.write() = tab_msgs; // restore this tab's transcript
                         }
                         Some(EngineCmd::Approve { id, decision }) => {
                             if let Some(h) = &handle {
@@ -1037,11 +1077,17 @@ fn app() -> Element {
                     }
                 }
                 div { class: "projects",
-                    div { class: "project",
-                        Icon { name: "folder" }
-                        span { class: "project-name", "{project}" }
+                    if cfg.read().workspace.is_some() {
+                        div { class: "project",
+                            Icon { name: "folder" }
+                            span { class: "project-name", "{project}" }
+                        }
+                        div { class: "thread active", "New chat" }
+                    } else {
+                        button { class: "open-codebase", onclick: move |_| open_folder(cfg, ui, engine),
+                            Icon { name: "folder" } span { "Open codebase" }
+                        }
                     }
-                    div { class: "thread active", "New chat" }
                 }
                 button { class: "settings-btn", onclick: move |_| show_settings.set(true),
                     Icon { name: "settings" } span { "Settings" }
@@ -1085,6 +1131,50 @@ fn app() -> Element {
                         }
                         button { class: if *show_terminal.read() { "top-btn on" } else { "top-btn" },
                             onclick: move |_| { let v = *show_terminal.read(); show_terminal.set(!v); }, Icon { name: "terminal" } "Terminal"
+                        }
+                    }
+                }
+
+                if cfg.read().workspace.is_some() {
+                    div { class: "agent-tabs",
+                        for (i, t) in tabs.read().iter().enumerate() {
+                            {
+                                let i = i;
+                                let id = t.id;
+                                let title = t.title.clone();
+                                let logo = provider_logo(&t.provider);
+                                let is_active = i == *active_tab.read();
+                                let many = tabs.read().len() > 1;
+                                rsx! {
+                                    div { key: "{id}", class: if is_active { "agent-tab active" } else { "agent-tab" },
+                                        onclick: move |_| switch_tab(tabs, active_tab, messages, cfg, engine, i),
+                                        if let Some(l) = logo { img { class: "agent-tab-logo", src: "{l}" } }
+                                        span { class: "agent-tab-title", "{title}" }
+                                        if many {
+                                            button { class: "agent-tab-x", onclick: move |e| { e.stop_propagation(); close_tab(tabs, active_tab, messages, cfg, engine, i); }, "✕" }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        div { class: "newtab-anchor",
+                            button { class: "agent-tab-add", onclick: move |_| { let v = *show_newtab.read(); show_newtab.set(!v); },
+                                Icon { name: "plus" } span { class: "chev", Icon { name: "chevron" } }
+                            }
+                            if *show_newtab.read() {
+                                div { class: "menu-backdrop", onclick: move |_| show_newtab.set(false) }
+                                div { class: "newtab-menu",
+                                    div { class: "menu-label", "New agent" }
+                                    button { class: "menu-item", onclick: move |_| { show_newtab.set(false); new_agent_tab(tabs, active_tab, messages, cfg, engine, next_tab_id, "codex", "", "Codex"); },
+                                        if let Some(l) = provider_logo("codex") { img { class: "agent-tab-logo", src: "{l}" } }
+                                        span { class: "menu-name", "Codex" }
+                                    }
+                                    button { class: "menu-item", onclick: move |_| { show_newtab.set(false); new_agent_tab(tabs, active_tab, messages, cfg, engine, next_tab_id, "claude", "", "Claude Code"); },
+                                        if let Some(l) = provider_logo("claude") { img { class: "agent-tab-logo", src: "{l}" } }
+                                        span { class: "menu-name", "Claude Code" }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -1216,7 +1306,7 @@ fn app() -> Element {
             }
 
             // ── Right inspector (tabbed) ───────────────────────────────
-            if *show_files.read() {
+            if *show_files.read() && cfg.read().workspace.is_some() {
                 aside { class: "files-panel",
                     div { class: "insp-tabs",
                         for (key, label) in [("files","Files"),("timeline","Timeline"),("sessions","Sessions"),("git","Git"),("memory","Memory"),("goal","Goal"),("browser","Browser"),("approvals","Approvals"),("checkpoints","Checkpoints"),("usage","Usage")] {
@@ -1547,6 +1637,103 @@ fn apply_workspace(mut cfg: Signal<Config>, mut ui: Ui, engine: Coroutine<Engine
     c.workspace = Some(dir);
     cfg.set(c.clone());
     let _ = engine.send(EngineCmd::Reconfigure(c));
+}
+
+/// Switch the active agent tab: save the current transcript, load the target's.
+fn switch_tab(
+    mut tabs: Signal<Vec<AgentTab>>,
+    mut active_tab: Signal<usize>,
+    mut messages: Signal<Vec<ChatMsg>>,
+    mut cfg: Signal<Config>,
+    engine: Coroutine<EngineCmd>,
+    idx: usize,
+) {
+    let cur = *active_tab.read();
+    if cur == idx {
+        return;
+    }
+    if let Some(t) = tabs.write().get_mut(cur) {
+        t.messages = messages.read().clone();
+    }
+    let t = tabs.read()[idx].clone();
+    active_tab.set(idx);
+    let mut c = cfg.read().clone();
+    c.provider = t.provider.clone();
+    c.model = t.model.clone();
+    cfg.set(c.clone());
+    let _ = engine.send(EngineCmd::SwitchTab(c, t.messages.clone()));
+}
+
+/// Open a fresh agent tab for `provider` and make it active.
+fn new_agent_tab(
+    mut tabs: Signal<Vec<AgentTab>>,
+    mut active_tab: Signal<usize>,
+    mut messages: Signal<Vec<ChatMsg>>,
+    mut cfg: Signal<Config>,
+    engine: Coroutine<EngineCmd>,
+    mut next_id: Signal<u64>,
+    provider: &str,
+    model: &str,
+    title: &str,
+) {
+    let cur = *active_tab.read();
+    if let Some(t) = tabs.write().get_mut(cur) {
+        t.messages = messages.read().clone();
+    }
+    let id = *next_id.read();
+    next_id.set(id + 1);
+    tabs.write().push(AgentTab {
+        id,
+        title: title.to_string(),
+        provider: provider.to_string(),
+        model: model.to_string(),
+        messages: Vec::new(),
+    });
+    let idx = tabs.read().len() - 1;
+    active_tab.set(idx);
+    let mut c = cfg.read().clone();
+    c.provider = provider.to_string();
+    c.model = model.to_string();
+    cfg.set(c.clone());
+    let _ = engine.send(EngineCmd::SwitchTab(c, Vec::new()));
+}
+
+/// Close an agent tab and switch to a neighbor.
+fn close_tab(
+    tabs: Signal<Vec<AgentTab>>,
+    active_tab: Signal<usize>,
+    messages: Signal<Vec<ChatMsg>>,
+    cfg: Signal<Config>,
+    engine: Coroutine<EngineCmd>,
+    idx: usize,
+) {
+    if tabs.read().len() <= 1 {
+        return; // keep at least one tab
+    }
+    let mut tabs_w = tabs;
+    tabs_w.write().remove(idx);
+    let cur = *active_tab.read();
+    let new_idx = if idx < cur || cur >= tabs_w.read().len() {
+        cur.saturating_sub(1)
+    } else {
+        cur
+    };
+    // Force a reload of the now-active tab.
+    let mut active = active_tab;
+    active.set(usize::MAX);
+    switch_tab(tabs_w, active, messages, cfg, engine, new_idx.min(tabs_w.read().len() - 1));
+}
+
+/// Display title for a provider id.
+fn provider_title(provider: &str) -> &'static str {
+    match provider {
+        "claude" => "Claude Code",
+        "codex" => "Codex",
+        "chatgpt" => "ChatGPT",
+        "openai" => "OpenAI",
+        "anthropic" => "Anthropic",
+        _ => "Agent",
+    }
 }
 
 /// Native folder picker → switch workspace.
