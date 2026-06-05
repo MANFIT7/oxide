@@ -58,7 +58,7 @@ pub struct Config {
     #[serde(default)]
     pub update_url: String,
     /// GitHub repo (`owner/name`) to pull the latest release from for updates.
-    #[serde(default)]
+    #[serde(default = "default_github_repo")]
     pub github_repo: String,
     /// Default mode for new agent tabs / next launch: "gui" or "tui".
     #[serde(default = "default_tab_mode")]
@@ -74,6 +74,9 @@ fn default_true() -> bool {
 
 fn default_tab_mode() -> String {
     "gui".to_string()
+}
+fn default_github_repo() -> String {
+    "MANFIT7/oxide".to_string()
 }
 
 fn default_front() -> String {
@@ -118,7 +121,7 @@ impl Default for Config {
             subagents: false,
             recent_workspaces: Vec::new(),
             update_url: String::new(),
-            github_repo: String::new(),
+            github_repo: default_github_repo(),
             default_tab_mode: default_tab_mode(),
             browser_headless: true,
         }

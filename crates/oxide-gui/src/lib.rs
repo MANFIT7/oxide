@@ -2483,6 +2483,7 @@ fn SettingsModal(
         on_close.call(());
     };
 
+    let mut settings_tab = use_signal(|| "model".to_string());
     rsx! {
         div { class: "modal-overlay", onclick: move |_| on_close.call(()),
             div { class: "modal", onclick: move |e| e.stop_propagation(),
@@ -2490,7 +2491,14 @@ fn SettingsModal(
                     h2 { "Settings" }
                     button { class: "term-x", onclick: move |_| on_close.call(()), "✕" }
                 }
+                div { class: "settings-tabs",
+                    for (key, label) in [("model", "Model"), ("access", "Access"), ("agents", "Agents"), ("updates", "Updates")] {
+                        button { class: if settings_tab.read().as_str() == key { "settings-tab active" } else { "settings-tab" },
+                            onclick: move |_| settings_tab.set(key.to_string()), "{label}" }
+                    }
+                }
                 div { class: "modal-body",
+                  if settings_tab.read().as_str() == "model" {
                     div { class: "field cgpt-field",
                         span { class: "field-label", "ChatGPT subscription (no API key)" }
                         div { class: "field-folder",
@@ -2602,6 +2610,8 @@ fn SettingsModal(
                         }
                         span { class: "field-label", "Fast mode (fast model + low effort)" }
                     }
+                  }
+                  if settings_tab.read().as_str() == "access" {
                     label { class: "field",
                         span { class: "field-label", "Permissions" }
                         select {
@@ -2620,6 +2630,8 @@ fn SettingsModal(
                             }, "Browse…" }
                         }
                     }
+                  }
+                  if settings_tab.read().as_str() == "agents" {
                     div { class: "field cgpt-field",
                         label { class: "toggle-field",
                             input { r#type: "checkbox", checked: *orchestrate.read(),
@@ -2660,6 +2672,8 @@ fn SettingsModal(
                             option { value: "tui", selected: tab_mode.read().as_str() == "tui", "TUI (terminal)" }
                         }
                     }
+                  }
+                  if settings_tab.read().as_str() == "updates" {
                     div { class: "field",
                         span { class: "field-label", "Updates · current v{update::CURRENT}" }
                         input { class: "field-input", placeholder: "GitHub repo (owner/name)",
@@ -2668,6 +2682,7 @@ fn SettingsModal(
                             value: "{upd_url}", oninput: move |e| upd_url.set(e.value()) }
                         span { class: "field-hint", "Set a GitHub repo → reads the latest release + picks the macOS asset. Checked on startup; a banner appears when newer." }
                     }
+                  }
                 }
                 div { class: "modal-foot",
                     button { class: "ed-close", onclick: move |_| on_close.call(()), "Cancel" }
