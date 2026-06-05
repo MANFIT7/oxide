@@ -14,6 +14,7 @@
 //!                  Provider (streaming)        ToolRouter ─▶ sandbox (Fase 2)
 //! ```
 
+mod browser;
 mod commands;
 mod context;
 mod hooks;
@@ -121,6 +122,7 @@ pub fn spawn(config: Config) -> anyhow::Result<(EngineHandle, mpsc::Receiver<Eve
         checkpoints: CheckpointStore::default(),
         mcp_clients: Vec::new(),
         mcp_tools: Vec::new(),
+        browser: None,
         event_tx,
     };
 
@@ -157,6 +159,8 @@ struct Engine {
     mcp_clients: Vec<McpClient>,
     /// Namespaced tool specs discovered from all MCP servers.
     mcp_tools: Vec<ToolSpec>,
+    /// Lazily launched browser-automation session.
+    browser: Option<browser::BrowserSession>,
     event_tx: mpsc::Sender<Event>,
 }
 
@@ -200,7 +204,67 @@ impl Engine {
                     "required": ["name", "content"]
                 })),
         );
+        // Browser automation (headless/visible) for background web testing.
+        tools.push(ToolSpec::new("browser_navigate", "Open a URL in the automation browser; returns the page title and visible text.")
+            .mutating(true)
+            .params(serde_json::json!({"type":"object","properties":{"url":{"type":"string"}},"required":["url"]})));
+        tools.push(ToolSpec::new("browser_read", "Read the current page's visible text (innerText).")
+            .params(serde_json::json!({"type":"object","properties":{}})));
+        tools.push(ToolSpec::new("browser_click", "Click the first element matching a CSS selector.")
+            .mutating(true)
+            .params(serde_json::json!({"type":"object","properties":{"selector":{"type":"string"}},"required":["selector"]})));
+        tools.push(ToolSpec::new("browser_type", "Type text into the element matching a CSS selector.")
+            .mutating(true)
+            .params(serde_json::json!({"type":"object","properties":{"selector":{"type":"string"},"text":{"type":"string"}},"required":["selector","text"]})));
+        tools.push(ToolSpec::new("browser_screenshot", "Capture a PNG screenshot of the current page to .oxide/screenshots.")
+            .mutating(true)
+            .params(serde_json::json!({"type":"object","properties":{}})));
+        tools.push(ToolSpec::new("browser_eval", "Run JavaScript in the page and return the JSON result.")
+            .mutating(true)
+            .params(serde_json::json!({"type":"object","properties":{"script":{"type":"string"}},"required":["script"]})));
+        tools.push(ToolSpec::new("ask_user", "Ask the user a question, optionally offering up to 4 short options to pick from. Use only when you genuinely need a decision before continuing.")
+            .params(serde_json::json!({"type":"object","properties":{"question":{"type":"string"},"options":{"type":"array","items":{"type":"string"}}},"required":["question"]})));
         tools
+    }
+
+    /// Ensure the browser session is launched; returns a ref or an error string.
+    async fn ensure_browser(&mut self) -> Result<&browser::BrowserSession, String> {
+        if self.browser.is_none() {
+            match browser::BrowserSession::launch(self.config.browser_headless).await {
+                Ok(s) => self.browser = Some(s),
+                Err(e) => return Err(format!("browser launch failed: {e} (is a Chromium-based browser installed?)")),
+            }
+        }
+        Ok(self.browser.as_ref().unwrap())
+    }
+
+    /// Handle a `browser_*` tool. Returns Some((output, ok)) if it was one.
+    async fn handle_browser_tool(&mut self, name: &str, args: &serde_json::Value) -> Option<(String, bool)> {
+        if !matches!(
+            name,
+            "browser_navigate" | "browser_read" | "browser_click" | "browser_type" | "browser_screenshot" | "browser_eval"
+        ) {
+            return None;
+        }
+        let shots_dir = self.workspace.join(".oxide/screenshots");
+        let sess = match self.ensure_browser().await {
+            Ok(s) => s,
+            Err(e) => return Some((e, false)),
+        };
+        let sa = |k: &str| args[k].as_str().unwrap_or("").to_string();
+        let res = match name {
+            "browser_navigate" => sess.navigate(&sa("url")).await,
+            "browser_read" => sess.read_text().await,
+            "browser_click" => sess.click(&sa("selector")).await,
+            "browser_type" => sess.type_text(&sa("selector"), &sa("text")).await,
+            "browser_screenshot" => sess.screenshot(&shots_dir).await,
+            "browser_eval" => sess.eval(&sa("script")).await,
+            _ => return Some((format!("unknown browser tool {name}"), false)),
+        };
+        Some(match res {
+            Ok(out) => (out, true),
+            Err(e) => (format!("browser error: {e}"), false),
+        })
     }
 
     /// Launch each configured MCP server and merge its tools. Failures are
@@ -333,6 +397,7 @@ impl Engine {
                     .await;
                 }
                 Op::ApprovalResponse { .. } => { /* handled inline during a turn */ }
+                Op::QuestionAnswer { .. } => { /* handled inline during a turn */ }
                 Op::Rewind { checkpoint_id } => {
                     let restored = self.checkpoints.rewind(checkpoint_id);
                     self.emit(Event::RewindDone {
@@ -361,6 +426,53 @@ impl Engine {
 
     /// Drive a single turn: build request from harness + history, stream the
     /// model, forward deltas as events, and remain interruptible.
+    /// Keep the session under budget by *summarizing* the oldest turns into one
+    /// brief (preserving goal/decisions/files/state) instead of dropping them,
+    /// so the agent can continue with relevant context intact.
+    async fn compact_session(&mut self, turn: TurnId) {
+        let budget = self.config.max_context_tokens;
+        if context::estimate_tokens(&self.session) <= budget {
+            return;
+        }
+        const KEEP_RECENT: usize = 8;
+        if self.session.len() <= KEEP_RECENT + 1 {
+            // Too short to summarize usefully — fall back to a hard trim.
+            let dropped = context::compact(&mut self.session, budget, KEEP_RECENT);
+            if dropped > 0 {
+                self.emit(Event::Compacted { dropped, tokens: context::estimate_tokens(&self.session) }).await;
+            }
+            return;
+        }
+        let split = self.session.len() - KEEP_RECENT;
+        let old: Vec<Message> = self.session.drain(0..split).collect();
+        let blob = old
+            .iter()
+            .map(|m| format!("{:?}: {}", m.role, m.content))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let provider = self.config.provider.clone();
+        let effort = self.config.reasoning_effort.clone();
+        let sys = "You compress conversation history. Summarize the earlier conversation below into a concise but COMPLETE brief that lets the assistant continue seamlessly. Preserve: the user's goal/task, decisions made, files created/edited (with paths), commands run and key results, current state, and open TODOs. Terse bullet points. Output only the summary.";
+        let summary = self.stream_collect(&provider, sys, &blob, &effort, turn, false, true).await;
+        let summary = if summary.trim().is_empty() {
+            format!("(summary unavailable; {} earlier messages folded)", old.len())
+        } else {
+            summary
+        };
+        self.session.insert(0, Message {
+            role: Role::Assistant,
+            content: format!("## Summary of earlier conversation\n{summary}"),
+        });
+        if let Some(store) = &self.session_store {
+            let _ = store.append("summary", &summary);
+        }
+        self.emit(Event::Compacted {
+            dropped: old.len() as u64,
+            tokens: context::estimate_tokens(&self.session),
+        })
+        .await;
+    }
+
     /// Run one provider stream to completion, emitting its output (as the answer
     /// or as reasoning) and returning the accumulated text. Used by the
     /// orchestration pipeline (front planner → backend implementer).
@@ -452,21 +564,20 @@ impl Engine {
             let _ = store.append("user", &user_text);
         }
 
-        // Keep the running history under the token budget before sending.
-        let dropped = context::compact(&mut self.session, self.config.max_context_tokens, 6);
-        if dropped > 0 {
-            self.emit(Event::Compacted {
-                dropped,
-                tokens: context::estimate_tokens(&self.session),
-            })
-            .await;
-        }
+        // Keep the running history under budget — summarize, don't just drop.
+        self.compact_session(turn).await;
 
         let tools = self.all_tools();
         let mem_block = memory::Memory::new(&self.workspace).load_block();
         let harness = self.active_harness();
         let policy = harness.loop_policy();
         let mut sys = harness.system_prompt();
+        // Pinned project instructions (AGENTS.md / CLAUDE.md) — always resident,
+        // never compacted away.
+        if let Some(agents) = load_project_instructions(&self.workspace) {
+            sys.push_str("\n\n# Project instructions (AGENTS.md)\n");
+            sys.push_str(&agents);
+        }
         sys.push_str(
             "\n\n# Persistent memory & self-improvement\n\
              You have durable memory at .oxide/memory. Use the `remember` tool to store \
@@ -477,12 +588,6 @@ impl Engine {
             sys.push_str("\n\n");
             sys.push_str(&mem_block);
         }
-        let mut messages = vec![Message {
-            role: Role::System,
-            content: sys,
-        }];
-        messages.extend(self.session.iter().cloned());
-
         let mut assistant = String::new();
         let mut interrupted = false;
 
@@ -612,78 +717,99 @@ impl Engine {
             return;
         }
 
-        let req = TurnRequest {
-            model: policy
-                .model
-                .clone()
-                .unwrap_or_else(|| self.config.effective_model()),
-            reasoning_effort: self.config.reasoning_effort.clone(),
-            temperature: policy.temperature,
-            messages,
-            tools,
-        };
-
-        let (stream_tx, mut stream_rx) = mpsc::channel::<StreamItem>(STREAM_QUEUE);
-        let provider = oxide_providers::build(&self.config.provider);
-        let stream_task = tokio::spawn(async move { provider.stream(req, stream_tx).await });
-
+        // ── Agentic loop: stream → run tool calls → re-request with results,
+        //    until the model answers with no tool calls (or step budget runs out). ──
+        let _ = &mut assistant; // (assistant is used by the orchestrate path above)
+        let model = policy
+            .model
+            .clone()
+            .unwrap_or_else(|| self.config.effective_model());
+        let max_steps = (policy.max_steps as usize).clamp(1, 60);
+        let mut step = 0usize;
         loop {
-            tokio::select! {
-                item = stream_rx.recv() => {
-                    match item {
-                        Some(StreamItem::TextDelta(t)) => {
-                            assistant.push_str(&t);
-                            self.emit(Event::AgentMessageDelta { turn, text: t }).await;
-                        }
-                        Some(StreamItem::ReasoningDelta(t)) => {
-                            self.emit(Event::ReasoningDelta { turn, text: t }).await;
-                        }
-                        Some(StreamItem::ToolCall { name, arguments }) => {
-                            if self.handle_tool_call(turn, name, arguments, op_rx).await {
-                                interrupted = true;
-                                break;
-                            }
-                        }
-                        Some(StreamItem::Notice(text)) => {
-                            self.emit(Event::Info { text }).await;
-                        }
-                        Some(StreamItem::Usage { input, output, context_window }) => {
-                            self.emit(Event::TokensUsed { turn, input, output }).await;
-                            if let Some(limit) = context_window {
-                                self.emit(Event::ContextWindow { limit }).await;
-                            }
-                        }
-                        Some(StreamItem::Done) | None => break,
-                    }
-                }
-                op = op_rx.recv() => {
-                    match op {
-                        Some(Op::Interrupt) => { interrupted = true; break; }
-                        Some(Op::Shutdown) => { interrupted = true; break; }
-                        Some(other) => {
-                            self.emit(Event::Info { text: format!("queued op ignored mid-turn: {other:?}") }).await;
-                        }
-                        None => break,
-                    }
-                }
-            }
-        }
+            let mut msgs = vec![Message { role: Role::System, content: sys.clone() }];
+            msgs.extend(self.session.iter().cloned());
+            let req = TurnRequest {
+                model: model.clone(),
+                reasoning_effort: self.config.reasoning_effort.clone(),
+                temperature: policy.temperature,
+                messages: msgs,
+                tools: tools.clone(),
+            };
 
-        stream_task.abort();
-        if !assistant.is_empty() {
-            if let Some(store) = &self.session_store {
-                let _ = store.append("assistant", &assistant);
+            let (stream_tx, mut stream_rx) = mpsc::channel::<StreamItem>(STREAM_QUEUE);
+            let provider = oxide_providers::build(&self.config.provider);
+            let stream_task = tokio::spawn(async move { provider.stream(req, stream_tx).await });
+
+            let mut round_text = String::new();
+            let mut did_tool = false;
+            let mut steered = false;
+            loop {
+                tokio::select! {
+                    item = stream_rx.recv() => {
+                        match item {
+                            Some(StreamItem::TextDelta(t)) => {
+                                round_text.push_str(&t);
+                                self.emit(Event::AgentMessageDelta { turn, text: t }).await;
+                            }
+                            Some(StreamItem::ReasoningDelta(t)) => {
+                                self.emit(Event::ReasoningDelta { turn, text: t }).await;
+                            }
+                            Some(StreamItem::ToolCall { name, arguments }) => {
+                                did_tool = true;
+                                if self.handle_tool_call(turn, name, arguments, op_rx).await {
+                                    interrupted = true;
+                                    break;
+                                }
+                            }
+                            Some(StreamItem::Notice(text)) => {
+                                self.emit(Event::Info { text }).await;
+                            }
+                            Some(StreamItem::Usage { input, output, context_window }) => {
+                                self.emit(Event::TokensUsed { turn, input, output }).await;
+                                if let Some(limit) = context_window {
+                                    self.emit(Event::ContextWindow { limit }).await;
+                                }
+                            }
+                            Some(StreamItem::Done) | None => break,
+                        }
+                    }
+                    op = op_rx.recv() => {
+                        match op {
+                            Some(Op::Interrupt) => { interrupted = true; break; }
+                            Some(Op::Shutdown) => { interrupted = true; break; }
+                            // Steering: a message sent mid-turn is injected into the
+                            // conversation; the next agentic round picks it up.
+                            Some(Op::UserTurn { text }) => {
+                                if let Some(store) = &self.session_store {
+                                    let _ = store.append("user", &text);
+                                }
+                                self.session.push(Message { role: Role::User, content: text.clone() });
+                                self.emit(Event::Info { text: format!("↪ steering: {text}") }).await;
+                                steered = true;
+                            }
+                            Some(other) => {
+                                self.emit(Event::Info { text: format!("queued op ignored mid-turn: {other:?}") }).await;
+                            }
+                            None => break,
+                        }
+                    }
+                }
             }
-            self.session.push(Message {
-                role: Role::Assistant,
-                content: assistant,
-            });
+            stream_task.abort();
+            if !round_text.is_empty() {
+                if let Some(store) = &self.session_store {
+                    let _ = store.append("assistant", &round_text);
+                }
+                self.session.push(Message { role: Role::Assistant, content: round_text });
+            }
+            step += 1;
+            if interrupted || (!did_tool && !steered) || step >= max_steps {
+                break;
+            }
         }
         if interrupted {
-            self.emit(Event::Info {
-                text: "turn interrupted".into(),
-            })
-            .await;
+            self.emit(Event::Info { text: "turn interrupted".into() }).await;
         }
         self.fire_hooks("stop", serde_json::json!({})).await;
         self.emit(Event::TurnFinished { turn }).await;
@@ -704,6 +830,28 @@ impl Engine {
             args: arguments.clone(),
         })
         .await;
+
+        // ask_user: surface a question (with optional choices) and block for the answer.
+        if name == "ask_user" {
+            let request_id = self.next_approval;
+            self.next_approval += 1;
+            let question = arguments["question"].as_str().unwrap_or("").to_string();
+            let options = arguments["options"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect::<Vec<_>>())
+                .unwrap_or_default();
+            self.emit(Event::QuestionAsked { request_id, question, options }).await;
+            let answer = loop {
+                match op_rx.recv().await {
+                    Some(Op::QuestionAnswer { request_id: rid, answer }) if rid == request_id => break answer,
+                    Some(Op::Interrupt) | Some(Op::Shutdown) | None => return true,
+                    Some(_) => {}
+                }
+            };
+            self.session.push(Message { role: Role::Tool, content: format!("[ask_user answer] {answer}") });
+            self.emit(Event::ToolCallEnd { turn, tool: name, output: answer, ok: true }).await;
+            return false;
+        }
 
         let mut router = ToolRouter::new(
             self.config.approval_policy,
@@ -797,8 +945,10 @@ impl Engine {
             }
         }
 
-        // Memory tools (persistent + self-improvement), then MCP, then native sandbox.
-        let (output, ok) = if name == "remember" {
+        // Browser automation, then memory tools, then MCP, then native sandbox.
+        let (output, ok) = if let Some(r) = self.handle_browser_tool(&name, &arguments).await {
+            r
+        } else if name == "remember" {
             let mem = memory::Memory::new(&self.workspace);
             match mem.remember(arguments["text"].as_str().unwrap_or("")) {
                 Ok(()) => ("remembered".to_string(), true),
@@ -858,6 +1008,11 @@ impl Engine {
             serde_json::json!({ "tool": name.clone(), "ok": ok, "output": output.clone() }),
         )
         .await;
+        // Feed the result back into the conversation so the agentic loop can continue.
+        self.session.push(Message {
+            role: Role::Tool,
+            content: format!("[tool {name}]\n{output}"),
+        });
         self.emit(Event::ToolCallEnd {
             turn,
             tool: name,
@@ -867,6 +1022,20 @@ impl Engine {
         .await;
         false
     }
+}
+
+/// Load pinned project instructions from AGENTS.md / CLAUDE.md (first found).
+fn load_project_instructions(workspace: &std::path::Path) -> Option<String> {
+    for name in ["AGENTS.md", "CLAUDE.md", ".oxide/AGENTS.md"] {
+        if let Ok(text) = std::fs::read_to_string(workspace.join(name)) {
+            let t = text.trim();
+            if !t.is_empty() {
+                let capped: String = t.chars().take(8000).collect();
+                return Some(capped);
+            }
+        }
+    }
+    None
 }
 
 /// Unified diff between two file contents.

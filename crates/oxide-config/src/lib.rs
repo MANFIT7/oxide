@@ -60,6 +60,20 @@ pub struct Config {
     /// GitHub repo (`owner/name`) to pull the latest release from for updates.
     #[serde(default)]
     pub github_repo: String,
+    /// Default mode for new agent tabs / next launch: "gui" or "tui".
+    #[serde(default = "default_tab_mode")]
+    pub default_tab_mode: String,
+    /// Run the automation browser headless (background, no window).
+    #[serde(default = "default_true")]
+    pub browser_headless: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_tab_mode() -> String {
+    "gui".to_string()
 }
 
 fn default_front() -> String {
@@ -105,6 +119,8 @@ impl Default for Config {
             recent_workspaces: Vec::new(),
             update_url: String::new(),
             github_repo: String::new(),
+            default_tab_mode: default_tab_mode(),
+            browser_headless: true,
         }
     }
 }

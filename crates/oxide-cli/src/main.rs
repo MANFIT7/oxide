@@ -65,7 +65,8 @@ enum HarnessAction {
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "warn,chromiumoxide=off,tungstenite=off".into()),
         )
         .with_writer(std::io::stderr)
         .init();
@@ -177,6 +178,12 @@ async fn run_exec(config: Config, prompt: String, yes: bool) -> Result<()> {
             Event::FileDiff { path, .. } => println!("[diff] {path}"),
             Event::HookFired { hook, command, blocked } => {
                 println!("[hook] {hook}: {command}{}", if blocked { " (blocked)" } else { "" })
+            }
+            Event::QuestionAsked { question, options, .. } => {
+                println!("[question] {question}");
+                for (i, o) in options.iter().enumerate() {
+                    println!("  {}. {o}", i + 1);
+                }
             }
             Event::HarnessChanged { id } => println!("[harness] {id}"),
             Event::McpServerStatus {

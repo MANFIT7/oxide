@@ -902,3 +902,85 @@ svg { width: 17px; height: 17px; flex-shrink: 0; }
   background: #232327; border: 1px solid #34343a; border-radius: 11px;
   padding: 6px; z-index: 40; box-shadow: 0 12px 34px rgba(0,0,0,.5);
 }
+
+/* tab-row actions (moved from toolbar-top) */
+.tab-actions { margin-left: auto; display: flex; align-items: center; gap: 8px; padding-bottom: 4px; }
+
+/* embedded terminal (xterm) */
+.xterm-host { width: 100%; height: 100%; min-height: 70vh; padding: 8px 10px; background: #0e0e10; }
+.xterm-host .xterm { height: 100%; }
+.center:has(.xterm-host) { padding: 0; }
+
+/* ── Kanban board ────────────────────────────────────── */
+.board { padding: 22px 26px; height: 100%; overflow: hidden; display: flex; flex-direction: column; }
+.board-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
+.board-head h2 { margin: 0; font-size: 18px; }
+.board-actions { display: flex; gap: 8px; align-items: center; }
+.board-input { background: var(--surface); border: 1px solid var(--border); border-radius: 9px; color: var(--text); padding: 8px 12px; font-size: 13px; width: 240px; font-family: inherit; }
+.board-btn { background: var(--accent); color: #161618; border: none; border-radius: 9px; padding: 8px 14px; font-size: 12.5px; font-weight: 600; cursor: pointer; font-family: inherit; }
+.board-btn.ghost { background: var(--surface); color: var(--text); border: 1px solid var(--border); }
+.board-btn:hover { opacity: .9; }
+.board-cols { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; flex: 1; overflow: hidden; }
+.board-col { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 12px; overflow-y: auto; }
+.board-col-head { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .4px; color: var(--faint); margin-bottom: 12px; }
+.board-card { position: relative; background: #0e0e10; border: 1px solid var(--border); border-radius: 10px; padding: 11px 12px; margin-bottom: 9px; }
+.board-card.doing { border-color: var(--accent); animation: pulseborder 1.6s ease-in-out infinite; }
+@keyframes pulseborder { 50% { border-color: rgba(224,145,58,.4); } }
+.board-card-title { font-size: 13.5px; font-weight: 500; line-height: 1.4; padding-right: 16px; }
+.board-card-result { font-size: 11.5px; color: var(--muted); margin-top: 7px; line-height: 1.5; max-height: 120px; overflow-y: auto; white-space: pre-wrap; }
+.board-card-branch { font-family: ui-monospace, Menlo, monospace; font-size: 10.5px; color: #7c91ff; margin-top: 6px; }
+.board-card-x { position: absolute; top: 7px; right: 8px; background: transparent; border: none; color: var(--faint); cursor: pointer; font-size: 10px; }
+.board-card-x:hover { color: var(--danger); }
+
+.board-cols.four { grid-template-columns: repeat(4, 1fr); }
+.board-merge { display: block; width: 100%; margin-top: 8px; background: rgba(58,210,159,.14); color: #7ee7c0; border: 1px solid rgba(58,210,159,.3); border-radius: 7px; padding: 5px 0; font-size: 11.5px; font-weight: 600; cursor: pointer; font-family: inherit; }
+.board-merge:hover { background: rgba(58,210,159,.24); }
+
+.project { display: flex; align-items: center; gap: 8px; }
+.project .project-name { flex: 1; }
+.project-add { width: 20px; height: 20px; display: flex; align-items: center; justify-content: center; background: transparent; border: none; border-radius: 5px; color: var(--faint); cursor: pointer; opacity: 0; transition: opacity .12s; }
+.project:hover .project-add { opacity: 1; }
+.project-add:hover { background: var(--surface-hi); color: var(--text); }
+.project-add svg { width: 14px; height: 14px; }
+
+/* ── Access (permissions) dropdown ───────────────────── */
+.access-anchor { position: relative; display: inline-flex; }
+.access-menu {
+  position: absolute; bottom: calc(100% + 6px); left: 0; width: 340px;
+  background: #232327; border: 1px solid #34343a; border-radius: 12px;
+  padding: 6px; z-index: 40; box-shadow: 0 12px 34px rgba(0,0,0,.5);
+}
+.hero .access-menu { top: calc(100% + 6px); bottom: auto; }
+.menu-copy { display: flex; flex-direction: column; gap: 2px; flex: 1; text-align: left; }
+.menu-check { color: var(--accent); font-weight: 700; margin-left: auto; }
+
+/* ── Inline approval prompt (agent asking) ───────────── */
+.approval-card { max-width: 720px; margin: 10px auto 14px 40px; background: var(--surface); border: 1px solid rgba(224,145,58,.4); border-radius: 12px; padding: 13px 15px; }
+.approval-q { font-size: 14px; font-weight: 600; }
+.approval-tool { font-family: ui-monospace, Menlo, monospace; color: var(--accent); }
+.approval-sum { font-size: 12.5px; color: var(--muted); margin-top: 6px; white-space: pre-wrap; line-height: 1.5; }
+.approval-actions { display: flex; gap: 8px; margin-top: 11px; }
+.approval-yes, .approval-always, .approval-no { border: none; border-radius: 8px; padding: 7px 16px; font-size: 12.5px; font-weight: 600; cursor: pointer; font-family: inherit; }
+.approval-yes { background: var(--accent); color: #161618; }
+.approval-always { background: var(--surface-hi); color: var(--text); border: 1px solid var(--border); }
+.approval-no { background: transparent; color: var(--muted); border: 1px solid var(--border); }
+.approval-no:hover { color: var(--danger); border-color: rgba(239,93,93,.4); }
+
+/* steer button + queue bar */
+.send.steer { background: var(--surface-hi); color: var(--text); border: 1px solid var(--border); margin-right: 6px; }
+.send.steer:hover { border-color: var(--accent); color: var(--accent); }
+.queue-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; max-width: 720px; margin: 4px auto 12px 40px; }
+.queue-label { font-size: 11.5px; color: var(--faint); font-weight: 600; }
+.queue-chip { display: inline-flex; align-items: center; gap: 6px; background: var(--surface); border: 1px solid var(--border); border-radius: 999px; padding: 4px 6px 4px 11px; font-size: 12px; color: var(--muted); }
+.queue-x { background: transparent; border: none; color: var(--faint); cursor: pointer; font-size: 9px; padding: 2px 4px; border-radius: 4px; }
+.queue-x:hover { color: var(--danger); }
+
+/* ── Agent question (ask_user) ───────────────────────── */
+.question-card { max-width: 720px; margin: 10px auto 14px 40px; background: var(--surface); border: 1px solid rgba(124,145,255,.4); border-radius: 12px; padding: 13px 15px; }
+.question-q { font-size: 14px; font-weight: 600; line-height: 1.45; }
+.question-opts { display: flex; flex-direction: column; gap: 7px; margin-top: 11px; }
+.question-opt { display: flex; align-items: center; gap: 10px; text-align: left; background: #0e0e10; border: 1px solid var(--border); border-radius: 9px; color: var(--text); padding: 9px 12px; font-size: 13px; cursor: pointer; font-family: inherit; }
+.question-opt:hover { border-color: var(--accent); background: rgba(124,145,255,.08); }
+.question-num { display: inline-flex; align-items: center; justify-content: center; width: 19px; height: 19px; border-radius: 5px; background: var(--surface-hi); color: var(--muted); font-size: 11px; font-weight: 700; flex-shrink: 0; }
+.question-free { margin-top: 9px; }
+.question-input { width: 100%; background: #0e0e10; border: 1px solid var(--border); border-radius: 9px; color: var(--text); padding: 9px 12px; font-size: 13px; font-family: inherit; }

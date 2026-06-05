@@ -136,9 +136,15 @@ impl Provider for MockToolProvider {
 
     async fn stream(
         &self,
-        _req: TurnRequest,
+        req: TurnRequest,
         sink: mpsc::Sender<StreamItem>,
     ) -> anyhow::Result<()> {
+        // Terminate the agentic loop once the tool has run.
+        if req.messages.iter().any(|m| matches!(m.role, Role::Tool)) {
+            let _ = sink.send(StreamItem::TextDelta("done.".to_string())).await;
+            let _ = sink.send(StreamItem::Done).await;
+            return Ok(());
+        }
         let _ = sink
             .send(StreamItem::ToolCall {
                 name: "write_file".to_string(),
@@ -148,7 +154,6 @@ impl Provider for MockToolProvider {
                 }),
             })
             .await;
-        let _ = sink.send(StreamItem::TextDelta("done.".to_string())).await;
         let _ = sink.send(StreamItem::Done).await;
         Ok(())
     }
@@ -166,9 +171,13 @@ impl Provider for MockMcpProvider {
 
     async fn stream(
         &self,
-        _req: TurnRequest,
+        req: TurnRequest,
         sink: mpsc::Sender<StreamItem>,
     ) -> anyhow::Result<()> {
+        if req.messages.iter().any(|m| matches!(m.role, Role::Tool)) {
+            let _ = sink.send(StreamItem::Done).await;
+            return Ok(());
+        }
         let _ = sink
             .send(StreamItem::ToolCall {
                 name: "mcp__demo__ping".to_string(),
@@ -191,9 +200,13 @@ impl Provider for MockBrowserProvider {
 
     async fn stream(
         &self,
-        _req: TurnRequest,
+        req: TurnRequest,
         sink: mpsc::Sender<StreamItem>,
     ) -> anyhow::Result<()> {
+        if req.messages.iter().any(|m| matches!(m.role, Role::Tool)) {
+            let _ = sink.send(StreamItem::Done).await;
+            return Ok(());
+        }
         let _ = sink
             .send(StreamItem::ToolCall {
                 name: "browser_open".to_string(),

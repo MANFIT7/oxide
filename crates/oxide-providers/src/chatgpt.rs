@@ -94,14 +94,31 @@ fn build_body(req: &TurnRequest) -> Value {
     }
     let model = if req.model.is_empty() { DEFAULT_MODEL } else { req.model.as_str() };
     let effort = if req.reasoning_effort.is_empty() { "medium" } else { req.reasoning_effort.as_str() };
-    json!({
+    let mut body = json!({
         "model": model,
         "instructions": instructions,
         "input": input,
         "stream": true,
         "store": false,
         "reasoning": { "effort": effort }
-    })
+    });
+    if !req.tools.is_empty() {
+        let tools: Vec<Value> = req
+            .tools
+            .iter()
+            .map(|t| {
+                json!({
+                    "type": "function",
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.parameters,
+                })
+            })
+            .collect();
+        body["tools"] = json!(tools);
+        body["tool_choice"] = json!("auto");
+    }
+    body
 }
 
 #[async_trait]
@@ -157,6 +174,20 @@ impl Provider for ChatGptProvider {
                 Some("response.reasoning_summary_text.delta") | Some("response.reasoning_text.delta") => {
                     if let Some(t) = v["delta"].as_str() {
                         let _ = sink.send(StreamItem::ReasoningDelta(t.to_string())).await;
+                    }
+                }
+                Some("response.output_item.done") => {
+                    let item = &v["item"];
+                    if item["type"].as_str() == Some("function_call") {
+                        if let Some(name) = item["name"].as_str() {
+                            let args: Value = item["arguments"]
+                                .as_str()
+                                .and_then(|s| serde_json::from_str(s).ok())
+                                .unwrap_or_else(|| json!({}));
+                            let _ = sink
+                                .send(StreamItem::ToolCall { name: name.to_string(), arguments: args })
+                                .await;
+                        }
                     }
                 }
                 Some("response.completed") => {

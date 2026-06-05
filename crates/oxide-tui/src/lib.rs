@@ -297,6 +297,12 @@ fn apply_event(event: Event, state: &mut State) {
             format!("hook {hook}: {command}{}", if blocked { " (blocked)" } else { "" }),
             Style::default().fg(Color::DarkGray),
         ))),
+        Event::QuestionAsked { question, options, .. } => {
+            state.push(Line::from(Span::styled(format!("❓ {question}"), Style::default().fg(Color::Yellow))));
+            for (i, o) in options.iter().enumerate() {
+                state.push(Line::from(format!("  {}. {o}", i + 1)));
+            }
+        }
         Event::Shutdown => state.quit = true,
     }
 }

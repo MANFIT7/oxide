@@ -13,3 +13,7 @@ Cargo.lock.bak
 **/.oxide/memory/
 **/.oxide/checkpoints/
 oxide-macos-arm64
+**/.oxide/worktrees/
+**/.oxide/screenshots/
+**/.oxide/board.json
+.oxide/worktrees/

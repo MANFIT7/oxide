@@ -1243,7 +1243,7 @@ impl OxideDesktop {
             Event::Shutdown => {
                 self.streaming = false;
             }
-            Event::FileDiff { .. } | Event::HookFired { .. } => {}
+            Event::FileDiff { .. } | Event::HookFired { .. } | Event::QuestionAsked { .. } => {}
         }
     }
 

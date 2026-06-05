@@ -57,6 +57,8 @@ base64 = "0.22"
 rfd = "0.15"
 similar = "2"
 self-replace = "1"
+portable-pty = "0.8"
+chromiumoxide = { version = "0.7", features = ["tokio-runtime"], default-features = false }
 eframe = "0.29"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 

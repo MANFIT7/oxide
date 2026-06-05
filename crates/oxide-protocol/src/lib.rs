@@ -38,6 +38,8 @@ pub enum Op {
     },
     /// Restore the workspace to a prior checkpoint (see [`Event::CheckpointCreated`]).
     Rewind { checkpoint_id: u64 },
+    /// Answer a question the agent asked (see [`Event::QuestionAsked`]).
+    QuestionAnswer { request_id: u64, answer: String },
     /// Graceful shutdown of the engine task.
     Shutdown,
 }
@@ -88,6 +90,12 @@ pub enum Event {
         hook: String,
         command: String,
         blocked: bool,
+    },
+    /// The agent is asking the user a question, optionally with choices.
+    QuestionAsked {
+        request_id: u64,
+        question: String,
+        options: Vec<String>,
     },
     /// A checkpoint was recorded before a mutating tool ran.
     CheckpointCreated {

@@ -20,3 +20,4 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 similar = { workspace = true }
 toml = { workspace = true }
+chromiumoxide = { workspace = true }

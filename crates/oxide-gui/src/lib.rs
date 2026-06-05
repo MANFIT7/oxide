@@ -6,6 +6,7 @@
 //! picker, and a **Settings** modal that changes provider/model/permissions/
 //! workspace and live-reconfigures the engine (persisted to `oxide.toml`).
 
+mod board;
 mod update;
 
 use dioxus::desktop::{Config as DesktopConfig, WindowBuilder};
@@ -32,6 +33,10 @@ fn logo_uri() -> &'static str {
     })
     .as_str()
 }
+
+const XTERM_CSS: &str = include_str!("../assets/xterm/xterm.css");
+const XTERM_JS: &str = include_str!("../assets/xterm/xterm.js");
+const XTERM_FIT_JS: &str = include_str!("../assets/xterm/addon-fit.js");
 
 // Brand logos for the provider picker (inline SVG).
 const SVG_CLAUDE: &str = include_str!("../assets/providers/claude-icon.svg");
@@ -289,6 +294,7 @@ enum EngineCmd {
     /// that tab's transcript `1` (without the message-clearing Reconfigure does).
     SwitchTab(Config, Vec<ChatMsg>),
     Approve { id: u64, decision: ApprovalDecision },
+    Answer { id: u64, text: String },
     Rewind { id: u64 },
     Interrupt,
 }
@@ -301,6 +307,10 @@ struct AgentTab {
     provider: String,
     model: String,
     messages: Vec<ChatMsg>,
+    /// "gui" = chat, "tui" = embedded terminal running a CLI.
+    mode: String,
+    /// CLI binary for tui mode (e.g. "codex", "claude").
+    bin: String,
 }
 
 /// One row in the inspector Timeline.
@@ -396,6 +406,7 @@ fn chatgpt_status() -> Option<String> {
 
 /// Build the prompt (mode prefixes + mention/skill context) and submit it.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn submit_prompt(
     mut input: Signal<String>,
     streaming: Signal<bool>,
@@ -404,10 +415,12 @@ fn submit_prompt(
     pursue_goal: Signal<bool>,
     goal_text: Signal<String>,
     mut mentions: Signal<Vec<String>>,
+    mut queue: Signal<Vec<String>>,
+    steer: bool,
     ws: &Path,
 ) {
     let raw = input.read().trim().to_string();
-    if raw.is_empty() || *streaming.read() {
+    if raw.is_empty() {
         return;
     }
     let mut text = String::new();
@@ -450,7 +463,13 @@ fn submit_prompt(
     text.push_str(&raw);
     mentions.set(Vec::new());
     input.set(String::new());
-    let _ = engine.send(EngineCmd::Submit(text));
+    if !steer && *streaming.read() {
+        // Default while running: queue — don't disturb the current turn.
+        queue.write().push(text);
+    } else {
+        // Idle → new turn. Steer → inject into the running turn.
+        let _ = engine.send(EngineCmd::Submit(text));
+    }
 }
 
 /// Saved skills matching `query`, returned as `skill:<name>` tokens.
@@ -545,6 +564,80 @@ fn discover_skills(ws: &Path) -> Vec<(&'static str, String, String)> {
             } else if p.file_name().and_then(|n| n.to_str()) == Some("SKILL.md") {
                 if let Some((n, d)) = parse_skill_md(&p) {
                     out.push(("Codex", n, d));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Launch all To-Do cards in parallel, each in its own git worktree.
+fn run_board(mut board: Signal<board::Board>, cfg: Signal<Config>, root: PathBuf) {
+    let todo: Vec<(u64, String, String)> = board
+        .read()
+        .cards
+        .iter()
+        .filter(|c| c.column == board::TODO)
+        .map(|c| (c.id, c.title.clone(), c.desc.clone()))
+        .collect();
+    for (id, title, desc) in todo {
+        {
+            let mut b = board.write();
+            if let Some(c) = b.cards.iter_mut().find(|c| c.id == id) {
+                c.column = board::DOING.to_string();
+            }
+        }
+        let base = cfg.read().clone();
+        let root = root.clone();
+        spawn(async move {
+            let (result, branch) = board::run_card(base, title, desc, id, root.clone()).await;
+            let snapshot = {
+                let mut b = board.write();
+                if let Some(c) = b.cards.iter_mut().find(|c| c.id == id) {
+                    c.column = board::REVIEW.to_string();
+                    c.result = result;
+                    c.branch = branch;
+                }
+                b.clone()
+            };
+            snapshot.save(&root);
+        });
+    }
+}
+
+/// Set the permission mode (approval policy + sandbox) and reconfigure.
+fn set_access_mode(
+    mut cfg: Signal<Config>,
+    engine: Coroutine<EngineCmd>,
+    mut show_access: Signal<bool>,
+    approval: ApprovalPolicy,
+    sandbox: SandboxPolicy,
+) {
+    let mut c = cfg.read().clone();
+    c.approval_policy = approval;
+    c.sandbox = sandbox;
+    cfg.set(c.clone());
+    let _ = engine.send(EngineCmd::Reconfigure(c));
+    show_access.set(false);
+}
+
+/// Available harness ids: builtins + manifests scanned from `dir`.
+fn list_harnesses(dir: &Path) -> Vec<String> {
+    let mut out = vec!["default".to_string(), "hermes".to_string()];
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) == Some("toml") {
+                if let Ok(text) = std::fs::read_to_string(&p) {
+                    if let Some(id) = text
+                        .lines()
+                        .find_map(|l| l.trim().strip_prefix("id ="))
+                        .map(|v| v.trim().trim_matches('"').to_string())
+                    {
+                        if !out.contains(&id) {
+                            out.push(id);
+                        }
+                    }
                 }
             }
         }
@@ -718,6 +811,9 @@ fn app() -> Element {
     let mut show_terminal = use_signal(|| false);
     let mut show_settings = use_signal(|| false);
     let mut show_skills = use_signal(|| false);
+    let mut show_board = use_signal(|| false);
+    let mut board = use_signal(board::Board::default);
+    let mut new_card_title = use_signal(String::new);
     // Agent tabs (multiple agent sessions in one workspace).
     let initial_provider = cfg.read().provider.clone();
     let initial_model = cfg.read().model.clone();
@@ -728,6 +824,8 @@ fn app() -> Element {
             provider: initial_provider,
             model: initial_model,
             messages: Vec::new(),
+            mode: "gui".to_string(),
+            bin: String::new(),
         }]
     });
     let mut active_tab = use_signal(|| 0usize);
@@ -755,6 +853,9 @@ fn app() -> Element {
     let goal_text = use_signal(String::new);
     let mut memory_text = use_signal(String::new);
     let mut thinking = use_signal(String::new);
+    let mut queue = use_signal(Vec::<String>::new);
+    let mut questions = use_signal(Vec::<(u64, String, Vec<String>)>::new);
+    let mut q_answer = use_signal(String::new);
     let mut status = use_signal(String::new);
 
     // File/editor signals, shared with tree/editor via context.
@@ -782,6 +883,32 @@ fn app() -> Element {
                 update_info.set(Some(info));
             }
         });
+    });
+
+    // Load the kanban board for the active workspace.
+    use_effect(move || {
+        let ws = ui.workspace.read().clone();
+        if cfg.read().workspace.is_some() {
+            board.set(board::Board::load(&ws));
+        }
+    });
+
+    // Auto-rename the active tab from its first user message.
+    use_effect(move || {
+        let snippet = messages
+            .read()
+            .iter()
+            .find(|m| m.author == Author::User)
+            .map(|m| m.text.clone());
+        if let Some(text) = snippet {
+            let cur = *active_tab.read();
+            let mut tw = tabs.write();
+            if let Some(t) = tw.get_mut(cur) {
+                if t.title == provider_title(&t.provider) {
+                    t.title = make_title(&text);
+                }
+            }
+        }
     });
 
     // Auto-load git status when the Git tab is open or files change.
@@ -878,6 +1005,13 @@ fn app() -> Element {
                             start_engine!(conf);
                             *messages.write() = tab_msgs; // restore this tab's transcript
                         }
+                        Some(EngineCmd::Answer { id, text }) => {
+                            if let Some(h) = &handle {
+                                let _ = h.submit(Op::QuestionAnswer { request_id: id, answer: text.clone() }).await;
+                            }
+                            questions.write().retain(|(qid, _, _)| *qid != id);
+                            messages.write().push(ChatMsg { author: Author::User, text });
+                        }
                         Some(EngineCmd::Approve { id, decision }) => {
                             if let Some(h) = &handle {
                                 let _ = h.submit(Op::ApprovalResponse { request_id: id, decision }).await;
@@ -959,6 +1093,9 @@ fn app() -> Element {
                                     sub: command,
                                 });
                             }
+                            Event::QuestionAsked { request_id, question, options } => {
+                                questions.write().push((request_id, question, options));
+                            }
                             Event::CheckpointCreated { id, label, .. } => {
                                 checkpoints.write().push((id, label.clone()));
                                 timeline.write().push(TimelineItem { title: format!("⎌ checkpoint #{id}"), sub: label });
@@ -972,7 +1109,20 @@ fn app() -> Element {
                             Event::Compacted { dropped, tokens } => {
                                 timeline.write().push(TimelineItem { title: "∿ context compacted".into(), sub: format!("dropped {dropped} · ~{tokens} tok") });
                             }
-                            Event::TurnFinished { .. } => { streaming.set(false); status.set(String::new()); }
+                            Event::TurnFinished { .. } => {
+                                streaming.set(false);
+                                status.set(String::new());
+                                // Submit the next queued message as a fresh turn.
+                                let next = { let mut q = queue.write(); if q.is_empty() { None } else { Some(q.remove(0)) } };
+                                if let Some(text) = next {
+                                    if let Some(h) = &handle {
+                                        messages.write().push(ChatMsg { author: Author::User, text: text.clone() });
+                                        messages.write().push(ChatMsg { author: Author::Agent, text: String::new() });
+                                        streaming.set(true);
+                                        let _ = h.submit(Op::UserTurn { text }).await;
+                                    }
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -983,6 +1133,14 @@ fn app() -> Element {
 
     let workspace = ui.workspace.read().clone();
     let project = project_name(&workspace);
+    // Active TUI tab (embedded terminal) info.
+    let (active_is_tui, active_bin, active_tab_id) = {
+        let t = tabs.read();
+        match t.get(*active_tab.read()) {
+            Some(tab) if tab.mode == "tui" => (true, tab.bin.clone(), tab.id),
+            _ => (false, String::new(), 0),
+        }
+    };
     let branch = git_branch(&workspace);
     let active_cfg = cfg.read().clone();
     let provider = active_cfg.provider.clone();
@@ -1051,6 +1209,7 @@ fn app() -> Element {
 
     rsx! {
         style { {CSS} }
+        style { {XTERM_CSS} }
         div { class: "app",
             // ── Sidebar ────────────────────────────────────────────────
             aside { class: "sidebar",
@@ -1059,7 +1218,17 @@ fn app() -> Element {
                     span { class: "brand-name", "Oxide" }
                 }
                 nav { class: "nav",
-                    button { class: "nav-item", onclick: move |_| { messages.write().clear(); let mut op = ui.open_path; op.set(None); },
+                    button { class: "nav-item", onclick: move |_| {
+                            // Reset to a fresh chat: clear transcript, close panels, reset the engine session.
+                            show_board.set(false);
+                            let mut op = ui.open_path; op.set(None);
+                            messages.write().clear();
+                            thinking.set(String::new());
+                            status.set(String::new());
+                            let cur = *active_tab.read();
+                            if let Some(t) = tabs.write().get_mut(cur) { t.messages.clear(); t.title = provider_title(&t.provider).to_string(); }
+                            let _ = engine.send(EngineCmd::Reconfigure(cfg.read().clone()));
+                        },
                         Icon { name: "edit" } span { "New chat" }
                     }
                     button { class: "nav-item", Icon { name: "search" } span { "Search" } }
@@ -1068,6 +1237,9 @@ fn app() -> Element {
                     }
                     button { class: "nav-item", onclick: move |_| show_skills.set(true),
                         Icon { name: "target" } span { "Skills" }
+                    }
+                    button { class: if *show_board.read() { "nav-item on" } else { "nav-item" }, onclick: move |_| { let v = *show_board.read(); show_board.set(!v); },
+                        Icon { name: "list" } span { "Board" }
                     }
                 }
                 div { class: "section-row",
@@ -1081,8 +1253,31 @@ fn app() -> Element {
                         div { class: "project",
                             Icon { name: "folder" }
                             span { class: "project-name", "{project}" }
+                            button { class: "project-add", title: "New chat", onclick: move |_| {
+                                    show_board.set(false);
+                                    let mut op = ui.open_path; op.set(None);
+                                    let prov = cfg.read().provider.clone();
+                                    let model = cfg.read().model.clone();
+                                    let title = provider_title(&prov).to_string();
+                                    new_agent_tab(tabs, active_tab, messages, cfg, engine, next_tab_id, &prov, &model, &title);
+                                },
+                                Icon { name: "plus" }
+                            }
                         }
-                        div { class: "thread active", "New chat" }
+                        for (i, t) in tabs.read().iter().enumerate() {
+                            {
+                                let i = i;
+                                let id = t.id;
+                                let title = if t.title.is_empty() { "New chat".to_string() } else { t.title.clone() };
+                                let is_active = i == *active_tab.read();
+                                rsx! {
+                                    div { key: "{id}", class: if is_active { "thread active" } else { "thread" },
+                                        onclick: move |_| { show_board.set(false); switch_tab(tabs, active_tab, messages, cfg, engine, i); },
+                                        "{title}"
+                                    }
+                                }
+                            }
+                        }
                     } else {
                         button { class: "open-codebase", onclick: move |_| open_folder(cfg, ui, engine),
                             Icon { name: "folder" } span { "Open codebase" }
@@ -1120,21 +1315,6 @@ fn app() -> Element {
                         }
                     }
                 }
-                header { class: "toolbar-top",
-                    span { class: "ws-name", "{project}" }
-                    div { class: "top-actions",
-                        button { class: "top-btn", onclick: move |_| open_folder(cfg, ui, engine),
-                            Icon { name: "folder" } "Open folder"
-                        }
-                        button { class: if *show_files.read() { "top-btn on" } else { "top-btn" },
-                            onclick: move |_| { let v = *show_files.read(); show_files.set(!v); }, Icon { name: "plugins" } "Files"
-                        }
-                        button { class: if *show_terminal.read() { "top-btn on" } else { "top-btn" },
-                            onclick: move |_| { let v = *show_terminal.read(); show_terminal.set(!v); }, Icon { name: "terminal" } "Terminal"
-                        }
-                    }
-                }
-
                 if cfg.read().workspace.is_some() {
                     div { class: "agent-tabs",
                         for (i, t) in tabs.read().iter().enumerate() {
@@ -1148,7 +1328,7 @@ fn app() -> Element {
                                 rsx! {
                                     div { key: "{id}", class: if is_active { "agent-tab active" } else { "agent-tab" },
                                         onclick: move |_| switch_tab(tabs, active_tab, messages, cfg, engine, i),
-                                        if let Some(l) = logo { img { class: "agent-tab-logo", src: "{l}" } }
+                                        if let Some(l) = logo { span { class: "agent-tab-logo prov-logo", dangerous_inner_html: l } }
                                         span { class: "agent-tab-title", "{title}" }
                                         if many {
                                             button { class: "agent-tab-x", onclick: move |e| { e.stop_propagation(); close_tab(tabs, active_tab, messages, cfg, engine, i); }, "✕" }
@@ -1164,23 +1344,119 @@ fn app() -> Element {
                             if *show_newtab.read() {
                                 div { class: "menu-backdrop", onclick: move |_| show_newtab.set(false) }
                                 div { class: "newtab-menu",
-                                    div { class: "menu-label", "New agent" }
-                                    button { class: "menu-item", onclick: move |_| { show_newtab.set(false); new_agent_tab(tabs, active_tab, messages, cfg, engine, next_tab_id, "codex", "", "Codex"); },
-                                        if let Some(l) = provider_logo("codex") { img { class: "agent-tab-logo", src: "{l}" } }
+                                    div { class: "menu-label", "New agent · ⌘-click for TUI" }
+                                    button { class: "menu-item", onclick: move |e| {
+                                            show_newtab.set(false);
+                                            let tui = e.modifiers().meta() || cfg.read().default_tab_mode == "tui";
+                                            if tui { new_tui_tab(tabs, active_tab, messages, next_tab_id, "codex", "Codex"); }
+                                            else { new_agent_tab(tabs, active_tab, messages, cfg, engine, next_tab_id, "codex", "", "Codex"); }
+                                        },
+                                        if let Some(l) = provider_logo("codex") { span { class: "agent-tab-logo prov-logo", dangerous_inner_html: l } }
                                         span { class: "menu-name", "Codex" }
                                     }
-                                    button { class: "menu-item", onclick: move |_| { show_newtab.set(false); new_agent_tab(tabs, active_tab, messages, cfg, engine, next_tab_id, "claude", "", "Claude Code"); },
-                                        if let Some(l) = provider_logo("claude") { img { class: "agent-tab-logo", src: "{l}" } }
+                                    button { class: "menu-item", onclick: move |e| {
+                                            show_newtab.set(false);
+                                            let tui = e.modifiers().meta() || cfg.read().default_tab_mode == "tui";
+                                            if tui { new_tui_tab(tabs, active_tab, messages, next_tab_id, "claude", "Claude Code"); }
+                                            else { new_agent_tab(tabs, active_tab, messages, cfg, engine, next_tab_id, "claude", "", "Claude Code"); }
+                                        },
+                                        if let Some(l) = provider_logo("claude") { span { class: "agent-tab-logo prov-logo", dangerous_inner_html: l } }
                                         span { class: "menu-name", "Claude Code" }
                                     }
                                 }
+                            }
+                        }
+                        div { class: "tab-actions",
+                            button { class: "top-btn", onclick: move |_| open_folder(cfg, ui, engine),
+                                Icon { name: "folder" } "Open folder"
+                            }
+                            button { class: if *show_files.read() { "top-btn on" } else { "top-btn" },
+                                onclick: move |_| { let v = *show_files.read(); show_files.set(!v); }, Icon { name: "plugins" } "Files"
+                            }
+                            button { class: if *show_terminal.read() { "top-btn on" } else { "top-btn" },
+                                onclick: move |_| { let v = *show_terminal.read(); show_terminal.set(!v); }, Icon { name: "terminal" } "Terminal"
                             }
                         }
                     }
                 }
 
                 div { class: "center",
-                    if cfg.read().workspace.is_none() {
+                    if *show_board.read() && cfg.read().workspace.is_some() {
+                        div { class: "board",
+                            div { class: "board-head",
+                                h2 { "Board" }
+                                div { class: "board-actions",
+                                    input { class: "board-input", placeholder: "New task…", value: "{new_card_title}",
+                                        oninput: move |e| new_card_title.set(e.value()),
+                                        onkeydown: move |e| {
+                                            if e.key() == Key::Enter {
+                                                let t = new_card_title.read().trim().to_string();
+                                                if !t.is_empty() {
+                                                    board.write().add(t, String::new());
+                                                    new_card_title.set(String::new());
+                                                    let snap = board.read().clone(); snap.save(&workspace_of(&cfg.read()));
+                                                }
+                                            }
+                                        }
+                                    }
+                                    button { class: "board-btn", onclick: move |_| { let _ = workspace_of(&cfg.read()); run_board(board, cfg, workspace_of(&cfg.read())); }, "▶ Run To-Do" }
+                                    button { class: "board-btn ghost", onclick: move |_| {
+                                            let root = workspace_of(&cfg.read());
+                                            spawn(async move {
+                                                let issues = board::import_github_issues(&root).await;
+                                                let mut b = board.write();
+                                                for (t, d) in issues { b.add(t, d); }
+                                                let snap = b.clone(); drop(b); snap.save(&root);
+                                            });
+                                        }, "↓ GitHub issues" }
+                                }
+                            }
+                            div { class: "board-cols four",
+                                for (col, label) in [(board::TODO, "To Do"), (board::DOING, "In Progress"), (board::REVIEW, "Review"), (board::DONE, "Done")] {
+                                    div { class: "board-col",
+                                        div { class: "board-col-head", "{label}" }
+                                        for card in board.read().cards.iter().filter(|c| c.column == col).cloned() {
+                                            {
+                                                let cid = card.id;
+                                                let cbranch = card.branch.clone();
+                                                rsx! {
+                                                    div { class: if col == board::DOING { "board-card doing" } else { "board-card" },
+                                                        div { class: "board-card-title", "{card.title}" }
+                                                        if !card.result.is_empty() { div { class: "board-card-result", "{card.result}" } }
+                                                        if !card.branch.is_empty() { div { class: "board-card-branch", "{card.branch}" } }
+                                                        if col == board::REVIEW && !cbranch.is_empty() {
+                                                            button { class: "board-merge", onclick: move |_| {
+                                                                let root = workspace_of(&cfg.read());
+                                                                let branch = cbranch.clone();
+                                                                spawn(async move {
+                                                                    let (ok, msg) = board::merge_branch(&root, &branch).await;
+                                                                    let snap = {
+                                                                        let mut b = board.write();
+                                                                        if let Some(c) = b.cards.iter_mut().find(|c| c.id == cid) {
+                                                                            if ok { c.column = board::DONE.to_string(); }
+                                                                            c.result = format!("{}\n\n[merge] {msg}", c.result);
+                                                                        }
+                                                                        b.clone()
+                                                                    };
+                                                                    snap.save(&root);
+                                                                });
+                                                            }, "✓ Merge" }
+                                                        }
+                                                        button { class: "board-card-x", onclick: move |_| {
+                                                            board.write().cards.retain(|c| c.id != cid);
+                                                            let snap = board.read().clone(); snap.save(&workspace_of(&cfg.read()));
+                                                        }, "✕" }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else if active_is_tui {
+                        TerminalView { key: "{active_tab_id}", id: active_tab_id, bin: active_bin.clone(), ws: workspace.display().to_string() }
+                    } else if cfg.read().workspace.is_none() {
                         div { class: "hero welcome-screen",
                             img { class: "welcome-logo", src: logo_uri() }
                             h1 { class: "hero-title", "Welcome to Oxide" }
@@ -1210,7 +1486,7 @@ fn app() -> Element {
                             Composer { input, streaming, engine, cfg, model_label: model_label.clone(),
                                        bypass, project: project.clone(), branch: branch.clone(),
                                        context_used: ctx_used, context_limit: ctx_limit,
-                                       workspace: workspace.clone(), plan_mode, pursue_goal, goal_text, mentions,
+                                       workspace: workspace.clone(), plan_mode, pursue_goal, goal_text, mentions, queue,
                                        on_settings: move |_| show_settings.set(true),
                                        on_open_folder: move |_| open_folder(cfg, ui, engine), on_pick_workspace: move |dir| apply_workspace(cfg, ui, engine, dir) }
                             div { class: "suggestions",
@@ -1263,13 +1539,70 @@ fn app() -> Element {
                                         span { class: "status-shimmer", "{status}" }
                                     }
                                 }
+                                if !queue.read().is_empty() {
+                                    div { class: "queue-bar",
+                                        span { class: "queue-label", "⧖ Queued ({queue.read().len()})" }
+                                        for (qi, q) in queue.read().iter().enumerate() {
+                                            {
+                                                let qi = qi;
+                                                let preview: String = q.lines().last().unwrap_or("").chars().take(48).collect();
+                                                rsx! {
+                                                    span { class: "queue-chip",
+                                                        "{preview}"
+                                                        button { class: "queue-x", onclick: move |_| { queue.write().remove(qi); }, "✕" }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                for (qid, question, options) in questions.read().iter().cloned() {
+                                    div { class: "question-card",
+                                        div { class: "question-q", "❓ {question}" }
+                                        div { class: "question-opts",
+                                            for (oi, opt) in options.iter().enumerate() {
+                                                {
+                                                    let qid = qid;
+                                                    let opt = opt.clone();
+                                                    rsx! {
+                                                        button { class: "question-opt", onclick: move |_| { let _ = engine.send(EngineCmd::Answer { id: qid, text: opt.clone() }); q_answer.set(String::new()); },
+                                                            span { class: "question-num", "{oi + 1}" } "{opt}"
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        div { class: "question-free",
+                                            input { class: "question-input", placeholder: "Or type your answer…", value: "{q_answer}",
+                                                oninput: move |e| q_answer.set(e.value()),
+                                                onkeydown: move |e| {
+                                                    if e.key() == Key::Enter {
+                                                        let a = q_answer.read().trim().to_string();
+                                                        if !a.is_empty() { let _ = engine.send(EngineCmd::Answer { id: qid, text: a }); q_answer.set(String::new()); }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                for (id, tool, summary) in approvals.read().iter().cloned() {
+                                    div { class: "approval-card",
+                                        div { class: "approval-q", "Allow " span { class: "approval-tool", "{tool}" } "?" }
+                                        if !summary.is_empty() { div { class: "approval-sum", "{summary}" } }
+                                        div { class: "approval-actions",
+                                            button { class: "approval-yes", onclick: move |_| { let _ = engine.send(EngineCmd::Approve { id, decision: ApprovalDecision::Approve }); }, "Approve" }
+                                            button { class: "approval-always", onclick: move |_| { let _ = engine.send(EngineCmd::Approve { id, decision: ApprovalDecision::ApproveForSession }); }, "Always" }
+                                            button { class: "approval-no", onclick: move |_| { let _ = engine.send(EngineCmd::Approve { id, decision: ApprovalDecision::Reject }); }, "Reject" }
+                                        }
+                                    }
+                                }
                             }
                         }
                         div { class: "composer-dock",
                             Composer { input, streaming, engine, cfg, model_label, bypass,
                                        project: project.clone(), branch: branch.clone(),
                                        context_used: ctx_used, context_limit: ctx_limit,
-                                       workspace: workspace.clone(), plan_mode, pursue_goal, goal_text, mentions,
+                                       workspace: workspace.clone(), plan_mode, pursue_goal, goal_text, mentions, queue,
                                        on_settings: move |_| show_settings.set(true),
                                        on_open_folder: move |_| open_folder(cfg, ui, engine), on_pick_workspace: move |dir| apply_workspace(cfg, ui, engine, dir) }
                         }
@@ -1688,6 +2021,8 @@ fn new_agent_tab(
         provider: provider.to_string(),
         model: model.to_string(),
         messages: Vec::new(),
+        mode: "gui".to_string(),
+        bin: String::new(),
     });
     let idx = tabs.read().len() - 1;
     active_tab.set(idx);
@@ -1696,6 +2031,34 @@ fn new_agent_tab(
     c.model = model.to_string();
     cfg.set(c.clone());
     let _ = engine.send(EngineCmd::SwitchTab(c, Vec::new()));
+}
+
+/// Open an embedded-TUI tab running `bin` (codex/claude) in a PTY.
+fn new_tui_tab(
+    mut tabs: Signal<Vec<AgentTab>>,
+    mut active_tab: Signal<usize>,
+    mut messages: Signal<Vec<ChatMsg>>,
+    mut next_id: Signal<u64>,
+    bin: &str,
+    title: &str,
+) {
+    let cur = *active_tab.read();
+    if let Some(t) = tabs.write().get_mut(cur) {
+        t.messages = messages.read().clone();
+    }
+    let id = *next_id.read();
+    next_id.set(id + 1);
+    tabs.write().push(AgentTab {
+        id,
+        title: format!("{title} (TUI)"),
+        provider: bin.to_string(),
+        model: String::new(),
+        messages: Vec::new(),
+        mode: "tui".to_string(),
+        bin: bin.to_string(),
+    });
+    let idx = tabs.read().len() - 1;
+    active_tab.set(idx);
 }
 
 /// Close an agent tab and switch to a neighbor.
@@ -1707,21 +2070,35 @@ fn close_tab(
     engine: Coroutine<EngineCmd>,
     idx: usize,
 ) {
-    if tabs.read().len() <= 1 {
+    let mut tabs_w = tabs;
+    let len_before = tabs_w.read().len();
+    if len_before <= 1 {
         return; // keep at least one tab
     }
-    let mut tabs_w = tabs;
     tabs_w.write().remove(idx);
+    let len_after = tabs_w.read().len();
     let cur = *active_tab.read();
-    let new_idx = if idx < cur || cur >= tabs_w.read().len() {
+    let new_idx = if idx < cur || cur >= len_after {
         cur.saturating_sub(1)
     } else {
         cur
-    };
-    // Force a reload of the now-active tab.
+    }
+    .min(len_after - 1);
+    // Force a reload of the now-active tab (read borrows above are dropped here).
     let mut active = active_tab;
     active.set(usize::MAX);
-    switch_tab(tabs_w, active, messages, cfg, engine, new_idx.min(tabs_w.read().len() - 1));
+    switch_tab(tabs_w, active, messages, cfg, engine, new_idx);
+}
+
+/// Short tab title from the first user message.
+fn make_title(text: &str) -> String {
+    let line = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+    let short: String = line.chars().take(32).collect();
+    if line.chars().count() > 32 {
+        format!("{}…", short.trim_end())
+    } else {
+        short
+    }
 }
 
 /// Display title for a provider id.
@@ -1734,6 +2111,16 @@ fn provider_title(provider: &str) -> &'static str {
         "anthropic" => "Anthropic",
         _ => "Agent",
     }
+}
+
+/// Launch an agent CLI's real interactive TUI in Terminal.app, in `ws`.
+/// Terminal runs the user's login shell, so `codex`/`claude` resolve via PATH.
+fn launch_cli_tui(ws: &Path, bin: &str) {
+    let ws = ws.display().to_string();
+    let script = format!(
+        "tell application \"Terminal\"\nactivate\ndo script \"cd '{ws}' && {bin}\"\nend tell"
+    );
+    let _ = std::process::Command::new("osascript").arg("-e").arg(script).spawn();
 }
 
 /// Native folder picker → switch workspace.
@@ -1891,6 +2278,12 @@ fn SettingsModal(
 ) -> Element {
     let base = cfg.read().clone();
     let mut provider = use_signal(|| base.provider.clone());
+    let mut harness = use_signal(|| base.harness.clone());
+    let harness_opts = {
+        let dir = base.harness_dir.clone().unwrap_or_else(|| PathBuf::from("harnesses"));
+        let dir = if dir.is_absolute() { dir } else { workspace_of(&base).join(dir) };
+        list_harnesses(&dir)
+    };
     let mut model = use_signal(|| base.model.clone());
     let mut effort = use_signal(|| base.reasoning_effort.clone());
     let mut fast = use_signal(|| base.fast_mode);
@@ -1902,12 +2295,15 @@ fn SettingsModal(
     let mut subagents = use_signal(|| base.subagents);
     let mut upd_url = use_signal(|| base.update_url.clone());
     let mut gh_repo = use_signal(|| base.github_repo.clone());
+    let mut tab_mode = use_signal(|| base.default_tab_mode.clone());
+    let mut browser_headless = use_signal(|| base.browser_headless);
 
     let providers = ["chatgpt", "codex", "claude", "openai", "anthropic", "echo", "mock"];
 
     let mut save = move |_| {
         let mut c = cfg.read().clone();
         c.provider = provider.read().clone();
+        c.harness = harness.read().clone();
         c.model = model.read().clone();
         c.reasoning_effort = effort.read().clone();
         c.fast_mode = *fast.read();
@@ -1917,6 +2313,8 @@ fn SettingsModal(
         c.subagents = *subagents.read();
         c.update_url = upd_url.read().clone();
         c.github_repo = gh_repo.read().clone();
+        c.default_tab_mode = tab_mode.read().clone();
+        c.browser_headless = *browser_headless.read();
         c.approval_policy = if *bypass.read() {
             ApprovalPolicy::Never
         } else {
@@ -1965,6 +2363,14 @@ fn SettingsModal(
                             model.set("gpt-5.5".to_string());
                             fast.set(false);
                         }, "Use ChatGPT subscription" }
+                    }
+                    label { class: "field",
+                        span { class: "field-label", "Harness (coding behavior)" }
+                        select { class: "field-input", value: "{harness}", onchange: move |e| harness.set(e.value()),
+                            for h in harness_opts.iter() {
+                                option { value: "{h}", selected: harness.read().as_str() == h.as_str(), "{h}" }
+                            }
+                        }
                     }
                     label { class: "field",
                         span { class: "field-label", "Provider" }
@@ -2096,6 +2502,18 @@ fn SettingsModal(
                             }
                         }
                     }
+                    label { class: "field toggle-field",
+                        input { r#type: "checkbox", checked: *browser_headless.read(),
+                            onchange: move |e| browser_headless.set(e.checked()) }
+                        span { class: "field-label", "Browser automation runs headless (background)" }
+                    }
+                    label { class: "field",
+                        span { class: "field-label", "Default mode (new tabs / next launch)" }
+                        select { class: "field-input", onchange: move |e| tab_mode.set(e.value()),
+                            option { value: "gui", selected: tab_mode.read().as_str() == "gui", "GUI (chat)" }
+                            option { value: "tui", selected: tab_mode.read().as_str() == "tui", "TUI (terminal)" }
+                        }
+                    }
                     div { class: "field",
                         span { class: "field-label", "Updates · current v{update::CURRENT}" }
                         input { class: "field-input", placeholder: "GitHub repo (owner/name)",
@@ -2131,6 +2549,7 @@ fn Composer(
     pursue_goal: Signal<bool>,
     goal_text: Signal<String>,
     mentions: Signal<Vec<String>>,
+    queue: Signal<Vec<String>>,
     on_settings: EventHandler<()>,
     on_open_folder: EventHandler<()>,
     on_pick_workspace: EventHandler<PathBuf>,
@@ -2143,6 +2562,7 @@ fn Composer(
     let mut pursue_goal = pursue_goal;
     let mut mentions = mentions;
     let mut show_plus = use_signal(|| false);
+    let mut show_access = use_signal(|| false);
     let mut mention_sel = use_signal(|| 0usize);
     // `@mention` codebase picker.
     let mention = active_mention(&input.read());
@@ -2206,6 +2626,7 @@ fn Composer(
 
     let ws_kd2 = workspace.clone();
     let ws_btn = workspace.clone();
+    let ws_steer = workspace.clone();
 
     rsx! {
         div { class: "composer",
@@ -2277,7 +2698,7 @@ fn Composer(
             }
             textarea {
                 class: "input",
-                placeholder: "Do anything",
+                placeholder: if *streaming.read() { "Steer the agent (sent mid-run)…" } else { "Do anything" },
                 value: "{input}",
                 oninput: move |e| input.set(e.value()),
                 onkeydown: move |e| {
@@ -2295,7 +2716,7 @@ fn Composer(
                     }
                     if e.key() == Key::Enter && !e.modifiers().shift() {
                         e.prevent_default();
-                        submit_prompt(input, streaming, engine, plan_mode, pursue_goal, goal_text, mentions, &ws_kd2);
+                        submit_prompt(input, streaming, engine, plan_mode, pursue_goal, goal_text, mentions, queue, false, &ws_kd2);
                     } else if e.key() == Key::Tab && e.modifiers().shift() {
                         e.prevent_default();
                         let v = *plan_mode.read();
@@ -2344,14 +2765,59 @@ fn Composer(
                                     span { class: "plus-name", "Pursue goal" }
                                     span { class: if *pursue_goal.read() { "switch on" } else { "switch" }, span { class: "knob" } }
                                 }
+                                button { class: "plus-item",
+                                    onclick: move |_| {
+                                        let mut c = cfg.read().clone();
+                                        c.orchestrate = !c.orchestrate;
+                                        cfg.set(c.clone());
+                                        let _ = engine.send(EngineCmd::Reconfigure(c));
+                                    },
+                                    Icon { name: "spark" }
+                                    span { class: "plus-name", "Orchestrate" }
+                                    span { class: "plus-hint", "plan→do→review" }
+                                    span { class: if cfg.read().orchestrate { "switch on" } else { "switch" }, span { class: "knob" } }
+                                }
                             }
                         }
                     }
                     if *plan_mode.read() {
                         span { class: "pill plan", Icon { name: "list" } "Plan" }
                     }
-                    button { class: "{access_cls}", onclick: move |_| on_settings.call(()),
-                        Icon { name: "shield" } "{access_label}"
+                    div { class: "access-anchor",
+                        button { class: "{access_cls}", onclick: move |_| { let v = *show_access.read(); show_access.set(!v); },
+                            Icon { name: "shield" } "{access_label}"
+                        }
+                        if *show_access.read() {
+                            div { class: "menu-backdrop", onclick: move |_| show_access.set(false) }
+                            {
+                                let ap = cfg.read().approval_policy;
+                                rsx! {
+                                    div { class: "access-menu",
+                                        div { class: "menu-label", "How should actions be approved?" }
+                                        button { class: "menu-item", onclick: move |_| set_access_mode(cfg, engine, show_access, ApprovalPolicy::Always, SandboxPolicy::WorkspaceWrite),
+                                            Icon { name: "shield" }
+                                            span { class: "menu-copy", span { class: "menu-name", "Ask for approval" } span { class: "menu-meta", "Always ask before edits and network" } }
+                                            if matches!(ap, ApprovalPolicy::Always) { span { class: "menu-check", "✓" } }
+                                        }
+                                        button { class: "menu-item", onclick: move |_| set_access_mode(cfg, engine, show_access, ApprovalPolicy::OnRequest, SandboxPolicy::WorkspaceWrite),
+                                            Icon { name: "terminal" }
+                                            span { class: "menu-copy", span { class: "menu-name", "Approve for me" } span { class: "menu-meta", "Auto-run safe; ask for risky actions" } }
+                                            if matches!(ap, ApprovalPolicy::OnRequest) { span { class: "menu-check", "✓" } }
+                                        }
+                                        button { class: "menu-item", onclick: move |_| set_access_mode(cfg, engine, show_access, ApprovalPolicy::Never, SandboxPolicy::DangerFullAccess),
+                                            Icon { name: "zap" }
+                                            span { class: "menu-copy", span { class: "menu-name", "Full access" } span { class: "menu-meta", "Unrestricted files + network (yolo)" } }
+                                            if matches!(ap, ApprovalPolicy::Never) { span { class: "menu-check", "✓" } }
+                                        }
+                                        div { class: "plus-divider" }
+                                        button { class: "menu-item", onclick: move |_| { show_access.set(false); on_settings.call(()); },
+                                            Icon { name: "settings" }
+                                            span { class: "menu-copy", span { class: "menu-name", "Settings…" } span { class: "menu-meta", "Workspace, model, harness, more" } }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                     button {
                         class: if fast_enabled { "pill fast on" } else { "pill fast" },
@@ -2496,9 +2962,10 @@ fn Composer(
                         }
                     }
                     if *streaming.read() {
+                        button { class: "send steer", title: "Steer (inject into the running turn)", onclick: move |_| submit_prompt(input, streaming, engine, plan_mode, pursue_goal, goal_text, mentions, queue, true, &ws_steer), "↪" }
                         button { class: "send stop", title: "Stop", onclick: move |_| { let _ = engine.send(EngineCmd::Interrupt); }, "■" }
                     } else {
-                        button { class: "send", onclick: move |_| submit_prompt(input, streaming, engine, plan_mode, pursue_goal, goal_text, mentions, &ws_btn), "↑" }
+                        button { class: "send", onclick: move |_| submit_prompt(input, streaming, engine, plan_mode, pursue_goal, goal_text, mentions, queue, false, &ws_btn), "↑" }
                     }
                 }
             }
@@ -2609,6 +3076,124 @@ fn Message(author: Author, text: String) -> Element {
             }
         }
     }
+}
+
+/// Embedded interactive terminal: runs `bin` in a PTY and bridges it to an
+/// xterm.js instance in the webview via Dioxus eval.
+#[component]
+fn TerminalView(id: u64, bin: String, ws: String) -> Element {
+    let host = format!("term-{id}");
+    let host_js = host.clone();
+    use_future(move || {
+        let host = host_js.clone();
+        let bin = bin.clone();
+        let ws = ws.clone();
+        async move {
+            let setup = format!(
+                r##"
+                for (let i = 0; i < 300 && !window.Terminal; i++) {{ await new Promise(r => setTimeout(r, 20)); }}
+                const el = document.getElementById("{host}");
+                if (!el || !window.Terminal) return;
+                el.innerHTML = "";
+                const term = new window.Terminal({{ fontSize: 12.5, fontFamily: "'MesloLGS NF', 'JetBrainsMono Nerd Font', 'JetBrainsMono Nerd Font Mono', 'Hack Nerd Font', 'FiraCode Nerd Font', 'CaskaydiaCove Nerd Font', 'Symbols Nerd Font Mono', 'Symbols Nerd Font', ui-monospace, Menlo, monospace", cursorBlink: true, theme: {{ background: "#0e0e10", foreground: "#cdd0d6" }} }});
+                let fit = null;
+                try {{ fit = new window.FitAddon.FitAddon(); term.loadAddon(fit); }} catch (e) {{}}
+                try {{ if (document.fonts && document.fonts.ready) await document.fonts.ready; }} catch (e) {{}}
+                term.open(el);
+                try {{ if (fit) fit.fit(); }} catch (e) {{}}
+                term.focus();
+                term.onData(d => dioxus.send(JSON.stringify({{ inp: d }})));
+                const ro = new ResizeObserver(() => {{ try {{ if (fit) fit.fit(); dioxus.send(JSON.stringify({{ resize: [term.rows, term.cols] }})); }} catch (e) {{}} }});
+                ro.observe(el);
+                dioxus.send(JSON.stringify({{ resize: [term.rows, term.cols] }}));
+                (async () => {{ while (true) {{ const m = await dioxus.recv(); if (typeof m === "string" && m.length) {{ term.write(Uint8Array.from(atob(m), c => c.charCodeAt(0))); }} }} }})();
+            "##
+            );
+            // Inject the xterm runtime inline (asset!() isn't served under plain `cargo run`).
+            let setup = format!("{XTERM_JS}\n;\n{XTERM_FIT_JS}\n;\n{setup}");
+            let mut eval = dioxus::document::eval(&setup);
+
+            let pty = portable_pty::native_pty_system();
+            let pair = match pty.openpty(portable_pty::PtySize { rows: 32, cols: 110, pixel_width: 0, pixel_height: 0 }) {
+                Ok(p) => p,
+                Err(_) => return,
+            };
+            let mut cmd = portable_pty::CommandBuilder::new(&bin);
+            // Launch the agent CLIs with permissions bypassed (yolo), like the rest of Oxide.
+            match bin.as_str() {
+                "codex" => cmd.arg("--dangerously-bypass-approvals-and-sandbox"),
+                "claude" => cmd.arg("--dangerously-skip-permissions"),
+                _ => {}
+            }
+            cmd.cwd(&ws);
+            cmd.env("TERM", "xterm-256color");
+            if let Ok(home) = std::env::var("HOME") {
+                let path = std::env::var("PATH").unwrap_or_default();
+                cmd.env("PATH", format!("{home}/.superconductor/bin:{home}/.local/bin:{home}/.bun/bin:/opt/homebrew/bin:/usr/local/bin:{path}"));
+            }
+            let mut child = match pair.slave.spawn_command(cmd) {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            drop(pair.slave);
+            let mut reader = match pair.master.try_clone_reader() {
+                Ok(r) => r,
+                Err(_) => return,
+            };
+            let mut writer = match pair.master.take_writer() {
+                Ok(w) => w,
+                Err(_) => return,
+            };
+            let master = pair.master;
+
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+            std::thread::spawn(move || {
+                use std::io::Read;
+                let mut buf = [0u8; 8192];
+                loop {
+                    match reader.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if tx.send(buf[..n].to_vec()).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+
+            use base64::Engine;
+            use std::io::Write;
+            loop {
+                tokio::select! {
+                    bytes = rx.recv() => match bytes {
+                        Some(bytes) => {
+                            let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                            if eval.send(serde_json::Value::String(b64)).is_err() { break; }
+                        }
+                        None => break,
+                    },
+                    msg = eval.recv::<String>() => match msg {
+                        Ok(s) => {
+                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+                                if let Some(inp) = v.get("inp").and_then(|x| x.as_str()) {
+                                    let _ = writer.write_all(inp.as_bytes());
+                                    let _ = writer.flush();
+                                } else if let Some(rc) = v.get("resize").and_then(|x| x.as_array()) {
+                                    let rows = rc.first().and_then(|x| x.as_u64()).unwrap_or(32) as u16;
+                                    let cols = rc.get(1).and_then(|x| x.as_u64()).unwrap_or(110) as u16;
+                                    let _ = master.resize(portable_pty::PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
+                                }
+                            }
+                        }
+                        Err(_) => break,
+                    },
+                }
+            }
+            let _ = child.kill();
+        }
+    });
+    rsx! { div { id: "{host}", class: "xterm-host" } }
 }
 
 #[component]
