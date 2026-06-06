@@ -2473,12 +2473,13 @@ fn app() -> Element {
             if *show_files.read() && cfg.read().workspace.is_some() {
                 aside { class: "files-panel",
                     div { class: "insp-tabs",
-                        for (key, label) in [("files","Files"),("timeline","Timeline"),("sessions","Sessions"),("git","Git"),("memory","Memory"),("goal","Goal"),("browser","Browser"),("approvals","Approvals"),("checkpoints","Checkpoints"),("usage","Usage")] {
+                        for (key, label) in [("review","Review"),("files","Files"),("timeline","Timeline"),("sessions","Sessions"),("git","Git"),("memory","Memory"),("goal","Goal"),("browser","Browser"),("approvals","Approvals"),("checkpoints","Checkpoints"),("usage","Usage")] {
                             {
                                 let active = *inspector_tab.read() == key;
                                 let badge = match key {
                                     "approvals" => approvals.read().len(),
                                     "checkpoints" => checkpoints.read().len(),
+                                    "review" => turn_edits.read().len(),
                                     _ => 0,
                                 };
                                 let k = key.to_string();
@@ -2496,6 +2497,39 @@ fn app() -> Element {
                     }
                     div { class: "insp-body",
                         match inspector_tab.read().as_str() {
+                            "review" => rsx! {
+                                if turn_edits.read().is_empty() {
+                                    div { class: "insp-empty", "No changes to review. Edits the agent makes appear here — accept to keep, reject to revert." }
+                                } else {
+                                    div { class: "review-head",
+                                        span { class: "review-count", "{turn_edits.read().len()} changed file(s)" }
+                                        button { class: "ed-close", onclick: move |_| {
+                                            let edits = turn_edits.read().clone();
+                                            for (_, _, _, cp) in edits.iter().rev() { let _ = engine.send(EngineCmd::Rewind { id: *cp }); }
+                                            turn_edits.write().clear();
+                                        }, "Reject all" }
+                                    }
+                                    for (idx, (path, adds, dels, cp)) in turn_edits.read().clone().into_iter().enumerate() {
+                                        div { class: "review-item",
+                                            div { class: "review-file",
+                                                Icon { name: "file" }
+                                                span { class: "review-path", "{path}" }
+                                                span { class: "diff-adds", "+{adds}" }
+                                                span { class: "diff-dels", "−{dels}" }
+                                            }
+                                            div { class: "review-actions",
+                                                button { class: "review-accept", title: "Keep this change", onclick: move |_| {
+                                                    let mut v = turn_edits.write(); if idx < v.len() { v.remove(idx); }
+                                                }, "Accept" }
+                                                button { class: "review-reject", title: "Revert this change", onclick: move |_| {
+                                                    let _ = engine.send(EngineCmd::Rewind { id: cp });
+                                                    let mut v = turn_edits.write(); if idx < v.len() { v.remove(idx); }
+                                                }, "Reject" }
+                                            }
+                                        }
+                                    }
+                                }
+                            },
                             "files" => rsx! {
                                 div { class: "tree",
                                     FileNode { path: workspace.clone(), depth: 0, is_root: true }

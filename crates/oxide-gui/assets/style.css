@@ -1310,3 +1310,17 @@ details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
 .app[data-density="compact"] .messages, .app[data-density="compact"] .chat { gap: 8px; }
 .app[data-density="compact"] .project { margin-top: 6px; }
 .app[data-density="compact"] .composer { padding: 10px 13px 8px; }
+
+/* ── Review pane (per-file accept/reject) ────────────── */
+.review-head { display: flex; align-items: center; justify-content: space-between; padding: 4px 4px 10px; border-bottom: 1px solid var(--border); margin-bottom: 8px; }
+.review-count { font-size: 12px; color: var(--muted); font-weight: 600; }
+.review-item { padding: 9px 4px; border-bottom: 1px solid var(--border); }
+.review-file { display: flex; align-items: center; gap: 7px; font-size: 12.5px; }
+.review-file svg { width: 14px; height: 14px; color: var(--faint); flex-shrink: 0; }
+.review-path { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, Menlo, monospace; }
+.review-actions { display: flex; gap: 6px; margin-top: 7px; }
+.review-accept, .review-reject { flex: 1; border-radius: 7px; padding: 5px 0; font-size: 12px; cursor: pointer; font-family: inherit; border: 1px solid var(--border); background: transparent; }
+.review-accept { color: #3ad29f; border-color: rgba(58,210,159,.35); }
+.review-accept:hover { background: rgba(58,210,159,.12); }
+.review-reject { color: var(--danger); border-color: rgba(224,145,58,.35); }
+.review-reject:hover { background: rgba(224,145,58,.12); }
