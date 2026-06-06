@@ -1324,3 +1324,8 @@ details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
 .review-accept:hover { background: rgba(58,210,159,.12); }
 .review-reject { color: var(--danger); border-color: rgba(224,145,58,.35); }
 .review-reject:hover { background: rgba(224,145,58,.12); }
+
+/* active-tab streaming dot */
+.tab-dot.busy { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--danger); margin-right: 7px; animation: ox-pulse 1.1s ease-in-out infinite; }
+@keyframes ox-pulse { 0%,100% { opacity: 1; } 50% { opacity: .3; } }
+.thread .thread-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

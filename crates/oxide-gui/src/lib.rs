@@ -1366,6 +1366,7 @@ fn app() -> Element {
               window.__oxkeys = 1;
               document.addEventListener('keydown', function(e){
                 if ((e.metaKey || e.ctrlKey) && (e.key === 'k' || e.key === 'K')) { e.preventDefault(); dioxus.send('palette'); }
+                else if ((e.metaKey || e.ctrlKey) && (e.key === 'b' || e.key === 'B')) { e.preventDefault(); dioxus.send('files'); }
                 else if (e.key === 'Escape') { dioxus.send('esc'); }
               }, true);
             }
@@ -1375,6 +1376,7 @@ fn app() -> Element {
         loop {
             match eval.recv::<String>().await {
                 Ok(k) if k == "palette" => { let v = !*show_palette.read(); show_palette.set(v); palette_query.set(String::new()); palette_sel.set(0); }
+                Ok(k) if k == "files" => { let v = !*show_files.read(); show_files.set(v); }
                 Ok(k) if k == "esc" => { show_palette.set(false); }
                 Ok(_) => {}
                 Err(_) => break,
@@ -1922,10 +1924,12 @@ fn app() -> Element {
                                                 let id = t.id;
                                                 let ttl = if t.title.is_empty() { "New chat".to_string() } else { t.title.clone() };
                                                 let is_active = i == *active_tab.read();
+                                                let busy = is_active && *streaming.read();
                                                 rsx! {
                                                     div { key: "tab{id}", class: if is_active { "thread active" } else { "thread" },
                                                         onclick: move |_| { show_board.set(false); switch_tab(tabs, active_tab, messages, cfg, engine, i); },
-                                                        "{ttl}"
+                                                        if busy { span { class: "tab-dot busy" } }
+                                                        span { class: "thread-title", "{ttl}" }
                                                     }
                                                 }
                                             }
