@@ -309,6 +309,7 @@ fn status_verb(tool: &str) -> &'static str {
         "read_file" => "Reading files",
         "write_file" => "Making edits",
         "remember" | "save_skill" => "Saving to memory",
+        "web_search" | "fetch_url" => "Searching the web",
         "ask_user" => "Asking you",
         t if t.starts_with("browser_") => "Browsing",
         t if t.starts_with("mcp__") => "Using tools",
@@ -325,6 +326,8 @@ fn activity_label(tool: &str, args: &serde_json::Value) -> String {
         "write_file" => ("edit", "Edit", s("path").to_string()),
         "read_file" => ("file", "Read", s("path").to_string()),
         "search" => ("search", "Search", s("pattern").to_string()),
+        "web_search" => ("globe", "Search web", short(s("query"))),
+        "fetch_url" => ("globe", "Fetch", s("url").to_string()),
         "browser_navigate" => ("globe", "Open", s("url").to_string()),
         t if t.starts_with("browser_") => ("globe", "Browser", t.trim_start_matches("browser_").to_string()),
         "remember" => ("brain", "Remember", String::new()),
@@ -1259,7 +1262,7 @@ fn app() -> Element {
     let win = dioxus::desktop::use_window();
     let mut mcp_status = use_signal(std::collections::HashMap::<String, String>::new);
     // ChatGPT subscription usage: (plan, 5h %, weekly %, 5h reset s, weekly reset s).
-    let mut usage_info = use_signal(|| None::<(String, u8, u8, u64, u64)>);
+    let mut usage_info = use_signal(|| None::<(String, u8, u8, String, String)>);
     // Tiling split-view (each pane its own live engine).
     let mut show_split = use_signal(|| false);
     let split_panes = use_signal(|| vec![(0u64, "gui".to_string(), cfg.read().provider.clone(), cfg.read().model.clone())]);
@@ -1613,7 +1616,17 @@ fn app() -> Element {
                                 questions.write().push((request_id, question, options));
                             }
                             Event::RateLimit { plan, primary_pct, secondary_pct, primary_reset_s, secondary_reset_s } => {
-                                usage_info.set(Some((plan, primary_pct, secondary_pct, primary_reset_s, secondary_reset_s)));
+                                let p_rem = 100u8.saturating_sub(primary_pct);
+                                let s_rem = 100u8.saturating_sub(secondary_pct);
+                                // Format reset times as a local clock (5h) / date (weekly), like Codex.
+                                let js = format!(
+                                    "const P={primary_reset_s},S={secondary_reset_s};const p=new Date(Date.now()+P*1000),s=new Date(Date.now()+S*1000);const t=d=>d.toLocaleTimeString([],{{hour:'numeric',minute:'2-digit'}});const dd=d=>d.toLocaleDateString([],{{month:'short',day:'numeric'}});return JSON.stringify({{p:t(p),s:dd(s)}});"
+                                );
+                                let labels = dioxus::document::eval(&js).join::<String>().await.unwrap_or_default();
+                                let lv: serde_json::Value = serde_json::from_str(&labels).unwrap_or(serde_json::Value::Null);
+                                let pl = lv["p"].as_str().unwrap_or("").to_string();
+                                let sl = lv["s"].as_str().unwrap_or("").to_string();
+                                usage_info.set(Some((plan, p_rem, s_rem, pl, sl)));
                             }
                             Event::CheckpointCreated { id, label, .. } => {
                                 checkpoints.write().push((id, label.clone()));
@@ -1942,16 +1955,17 @@ fn app() -> Element {
                     }
                 }
                 if let Some((plan, p, s, p_reset, s_reset)) = usage_info.read().clone() {
-                    div { class: "usage-chip", title: "ChatGPT subscription usage",
+                    div { class: "usage-chip", title: "ChatGPT subscription — shared with Codex",
+                        div { class: "usage-head", "Usage remaining" }
                         div { class: "usage-row",
                             span { class: "usage-k", "5h" }
                             span { class: "usage-bar", span { class: "usage-fill", style: "width:{p}%" } }
-                            span { class: "usage-v", "{p}% · {fmt_reset(p_reset)}" }
+                            span { class: "usage-v", "{p}% · {p_reset}" }
                         }
                         div { class: "usage-row",
                             span { class: "usage-k", "wk" }
                             span { class: "usage-bar", span { class: "usage-fill", style: "width:{s}%" } }
-                            span { class: "usage-v", "{s}% · {fmt_reset(s_reset)}" }
+                            span { class: "usage-v", "{s}% · {s_reset}" }
                         }
                         div { class: "usage-plan", "ChatGPT {plan}" }
                     }

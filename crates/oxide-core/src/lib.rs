@@ -27,6 +27,160 @@ pub use tools::{Routed, ToolRouter};
 use oxide_config::Config;
 use oxide_config::McpServerConfig;
 
+/// A browser-like HTTP client for web tools.
+fn web_client() -> Option<reqwest::Client> {
+    reqwest::Client::builder()
+        .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+        .build()
+        .ok()
+}
+
+/// Decode `%XX` percent-escapes (UTF-8).
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(if b[i] == b'+' { b' ' } else { b[i] });
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+/// Decode the few HTML entities that matter for plain-text output.
+fn html_decode(s: &str) -> String {
+    s.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+        .replace("&quot;", "\"").replace("&#x27;", "'").replace("&#39;", "'").replace("&nbsp;", " ")
+}
+
+/// Strip HTML tags from a fragment, leaving text.
+fn strip_tags(s: &str) -> String {
+    let mut out = String::new();
+    let mut depth = 0i32;
+    for c in s.chars() {
+        match c {
+            '<' => depth += 1,
+            '>' => depth = (depth - 1).max(0),
+            _ if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// A DuckDuckGo redirect href (`...uddg=<enc>`) → the real URL.
+fn decode_ddg(href: &str) -> String {
+    if let Some(i) = href.find("uddg=") {
+        let v = &href[i + 5..];
+        let end = v.find('&').unwrap_or(v.len());
+        return percent_decode(&v[..end]);
+    }
+    href.trim_start_matches("//").to_string()
+}
+
+/// Extract text inside `marker … > BODY <end>` from `hay`, tags stripped.
+fn extract_between(hay: &str, marker: &str, end: &str) -> Option<String> {
+    let i = hay.find(marker)?;
+    let after = &hay[i + marker.len()..];
+    let gt = after.find('>')?;
+    let body = &after[gt + 1..];
+    let e = body.find(end)?;
+    let t = html_decode(&strip_tags(&body[..e]));
+    if t.is_empty() { None } else { Some(t) }
+}
+
+/// Web search via Brave (reliable HTML, no captcha for plain GET).
+/// Returns ranked `title / url / snippet`.
+async fn web_search(query: &str) -> (String, bool) {
+    let q = query.trim();
+    if q.is_empty() {
+        return ("web_search: missing 'query'".into(), false);
+    }
+    let Some(client) = web_client() else { return ("web_search: client error".into(), false) };
+    let url = format!("https://search.brave.com/search?q={}&source=web", q.replace(' ', "+"));
+    let html = match client.get(&url).send().await {
+        Ok(r) => match r.text().await { Ok(t) => t, Err(e) => return (format!("web_search: {e}"), false) },
+        Err(e) => return (format!("web_search: {e}"), false),
+    };
+    let mut out = String::new();
+    let mut n = 0;
+    let mut rest = html.as_str();
+    // Each organic web result carries `data-type="web"`.
+    while let Some(i) = rest.find("data-type=\"web\"") {
+        rest = &rest[i + 15..];
+        let block_end = rest.find("data-type=\"").unwrap_or(rest.len().min(6000)).min(6000);
+        let block = &rest[..block_end];
+        let url = block
+            .find("href=\"https")
+            .and_then(|h| { let a = &block[h + 6..]; a.find('"').map(|e| a[..e].to_string()) });
+        let Some(url) = url else { continue };
+        if url.contains("search.brave.com") {
+            continue;
+        }
+        let title = extract_between(block, "snippet-title", "</")
+            .or_else(|| extract_between(block, "title=\"", "\""))
+            .unwrap_or_else(|| url.clone());
+        n += 1;
+        out.push_str(&format!("{n}. {title}\n   {url}\n"));
+        if let Some(desc) = extract_between(block, "snippet-description", "</") {
+            out.push_str(&format!("   {}\n", desc.chars().take(240).collect::<String>()));
+        }
+        if n >= 8 {
+            break;
+        }
+    }
+    if out.is_empty() {
+        return (format!("No results for '{q}'."), true);
+    }
+    (out, true)
+}
+
+/// Fetch a URL and return its readable text (scripts/styles/tags stripped).
+async fn fetch_url(url: &str) -> (String, bool) {
+    let u = url.trim();
+    if !u.starts_with("http") {
+        return ("fetch_url: url must start with http(s)".into(), false);
+    }
+    let Some(client) = web_client() else { return ("fetch_url: client error".into(), false) };
+    let html = match client.get(u).send().await {
+        Ok(r) => match r.text().await { Ok(t) => t, Err(e) => return (format!("fetch_url: {e}"), false) },
+        Err(e) => return (format!("fetch_url: {e}"), false),
+    };
+    // Drop <script>/<style> blocks, then strip tags.
+    let mut cleaned = String::with_capacity(html.len());
+    let lower = html.to_ascii_lowercase();
+    let mut i = 0;
+    while i < html.len() {
+        let drop = ["<script", "<style"].iter().find_map(|tag| {
+            if lower[i..].starts_with(tag) {
+                let close = if *tag == "<script" { "</script>" } else { "</style>" };
+                lower[i..].find(close).map(|e| i + e + close.len())
+            } else {
+                None
+            }
+        });
+        if let Some(end) = drop {
+            i = end;
+        } else {
+            cleaned.push(html[i..].chars().next().unwrap());
+            i += html[i..].chars().next().unwrap().len_utf8();
+        }
+    }
+    let text = html_decode(&strip_tags(&cleaned));
+    let capped: String = text.chars().take(15_000).collect();
+    if capped.trim().is_empty() {
+        return (format!("(no readable text at {u})"), true);
+    }
+    (capped, true)
+}
+
 /// Discover MCP servers configured in Codex (`~/.codex/config.toml`) and Claude
 /// desktop / Claude Code (`mcpServers` JSON), so Oxide can reuse them.
 pub fn discover_external_mcp() -> Vec<McpServerConfig> {
@@ -280,6 +434,10 @@ impl Engine {
             .params(serde_json::json!({"type":"object","properties":{"script":{"type":"string"}},"required":["script"]})));
         tools.push(ToolSpec::new("ask_user", "Ask the user a question, optionally offering up to 4 short options to pick from. Use only when you genuinely need a decision before continuing.")
             .params(serde_json::json!({"type":"object","properties":{"question":{"type":"string"},"options":{"type":"array","items":{"type":"string"}}},"required":["question"]})));
+        tools.push(ToolSpec::new("web_search", "Search the web (DuckDuckGo). Returns ranked results with title, URL, and snippet.")
+            .params(serde_json::json!({"type":"object","properties":{"query":{"type":"string"}},"required":["query"]})));
+        tools.push(ToolSpec::new("fetch_url", "Fetch a web page and return its readable text content (HTML stripped).")
+            .params(serde_json::json!({"type":"object","properties":{"url":{"type":"string"}},"required":["url"]})));
         tools
     }
 
@@ -1040,6 +1198,10 @@ impl Engine {
                 Ok(()) => (format!("saved skill '{n}'"), true),
                 Err(e) => (format!("memory error: {e}"), false),
             }
+        } else if name == "web_search" {
+            web_search(arguments["query"].as_str().unwrap_or("")).await
+        } else if name == "fetch_url" {
+            fetch_url(arguments["url"].as_str().unwrap_or("")).await
         } else if is_mcp_tool(&name) {
             self.mcp_call(&name, &arguments).await
         } else {

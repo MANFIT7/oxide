@@ -1286,3 +1286,6 @@ details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
 /* OTA download progress */
 .update-progress { flex: 1; height: 4px; background: rgba(255,255,255,.14); border-radius: 3px; overflow: hidden; margin: 0 12px; }
 .update-bar { height: 100%; background: var(--accent); border-radius: 3px; transition: width .15s ease; }
+
+/* usage chip header (remaining) */
+.usage-head { font-size: 10.5px; text-transform: uppercase; letter-spacing: .4px; color: var(--faint); font-weight: 600; margin-bottom: 7px; }
