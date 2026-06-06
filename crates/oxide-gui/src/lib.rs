@@ -305,7 +305,7 @@ fn diff_counts(diff: &str) -> (u32, u32) {
 fn status_verb(tool: &str) -> &'static str {
     match tool {
         "shell" => "Running commands",
-        "search" => "Searching the codebase",
+        "search" | "codebase_search" => "Searching the codebase",
         "read_file" => "Reading files",
         "write_file" => "Making edits",
         "remember" | "save_skill" => "Saving to memory",
@@ -326,6 +326,7 @@ fn activity_label(tool: &str, args: &serde_json::Value) -> String {
         "write_file" => ("edit", "Edit", s("path").to_string()),
         "read_file" => ("file", "Read", s("path").to_string()),
         "search" => ("search", "Search", s("pattern").to_string()),
+        "codebase_search" => ("search", "Find code", short(s("query"))),
         "web_search" => ("globe", "Search web", short(s("query"))),
         "fetch_url" => ("globe", "Fetch", s("url").to_string()),
         "browser_navigate" => ("globe", "Open", s("url").to_string()),

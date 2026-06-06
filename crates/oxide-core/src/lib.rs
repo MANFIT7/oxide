@@ -27,6 +27,94 @@ pub use tools::{Routed, ToolRouter};
 use oxide_config::Config;
 use oxide_config::McpServerConfig;
 
+/// Recursively collect candidate source files (skips vendor/build dirs).
+fn collect_code_files(root: &Path, out: &mut Vec<PathBuf>) {
+    if out.len() > 1200 {
+        return;
+    }
+    let skip = [".git", "target", "node_modules", ".oxide", "dist", "build", ".next", "vendor", ".venv", "__pycache__"];
+    let Ok(rd) = std::fs::read_dir(root) else { return };
+    for e in rd.flatten() {
+        let p = e.path();
+        let name = e.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') && name != ".cursorrules" {
+            continue;
+        }
+        if p.is_dir() {
+            if !skip.contains(&name.as_str()) {
+                collect_code_files(&p, out);
+            }
+        } else {
+            let ext_ok = p.extension().and_then(|x| x.to_str()).map(|x| {
+                matches!(x, "rs" | "ts" | "tsx" | "js" | "jsx" | "py" | "go" | "java" | "c" | "h" | "cpp" | "hpp" | "rb" | "php" | "swift" | "kt" | "cs" | "scala" | "sh" | "toml" | "md" | "css" | "html" | "vue" | "svelte" | "json" | "sql")
+            }).unwrap_or(false);
+            if ext_ok {
+                out.push(p);
+            }
+        }
+    }
+}
+
+/// Ranked codebase retrieval (no embeddings): scores ~50-line chunks by how
+/// many query terms they contain, returns the top snippets with `path:line`.
+fn codebase_search(ws: &Path, query: &str) -> (String, bool) {
+    let terms: Vec<String> = query
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|w| w.len() > 2)
+        .map(String::from)
+        .collect();
+    if terms.is_empty() {
+        return ("codebase_search: provide a query of 1+ words".into(), false);
+    }
+    let mut files = Vec::new();
+    collect_code_files(ws, &mut files);
+    let mut hits: Vec<(i64, String, usize, String)> = Vec::new();
+    for f in files {
+        let Ok(text) = std::fs::read_to_string(&f) else { continue };
+        if text.len() > 400_000 {
+            continue;
+        }
+        let lines: Vec<&str> = text.lines().collect();
+        let rel = f.strip_prefix(ws).unwrap_or(&f).display().to_string();
+        let (win, step) = (50usize, 40usize);
+        let mut start = 0;
+        while start < lines.len() {
+            let end = (start + win).min(lines.len());
+            let chunk = lines[start..end].join("\n");
+            let cl = chunk.to_lowercase();
+            let mut distinct = 0i64;
+            let mut total = 0i64;
+            for t in &terms {
+                let c = cl.matches(t.as_str()).count() as i64;
+                if c > 0 {
+                    distinct += 1;
+                    total += c;
+                }
+            }
+            if distinct > 0 {
+                let score = distinct * 1000 + total;
+                hits.push((score, rel.clone(), start + 1, chunk));
+            }
+            if end == lines.len() {
+                break;
+            }
+            start += step;
+        }
+    }
+    if hits.is_empty() {
+        return (format!("No code found for: {}", terms.join(" ")), true);
+    }
+    hits.sort_by(|a, b| b.0.cmp(&a.0));
+    hits.dedup_by(|a, b| a.1 == b.1 && a.2.abs_diff(b.2) < 20);
+    let mut out = String::new();
+    for (_, path, line, chunk) in hits.into_iter().take(8) {
+        let snippet: String = chunk.lines().take(16).collect::<Vec<_>>().join("\n");
+        out.push_str(&format!("── {path}:{line}\n{snippet}\n\n"));
+    }
+    (out.chars().take(9000).collect(), true)
+}
+
 /// A browser-like HTTP client for web tools.
 fn web_client() -> Option<reqwest::Client> {
     reqwest::Client::builder()
@@ -268,7 +356,7 @@ use oxide_mcp::{is_mcp_tool, server_of, McpClient};
 use oxide_protocol::{ApprovalDecision, Event, Op, ToolSpec, TurnId};
 use oxide_providers::{Message, Provider, Role, StreamItem, TurnRequest};
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use store::{CheckpointStore, SessionStore};
 use tokio::sync::mpsc;
 
@@ -466,6 +554,8 @@ impl Engine {
             .params(serde_json::json!({"type":"object","properties":{"query":{"type":"string"}},"required":["query"]})));
         tools.push(ToolSpec::new("fetch_url", "Fetch a web page and return its readable text content (HTML stripped).")
             .params(serde_json::json!({"type":"object","properties":{"url":{"type":"string"}},"required":["url"]})));
+        tools.push(ToolSpec::new("codebase_search", "Find code relevant to a natural-language query (ranked retrieval across the workspace). Use to locate where something is implemented.")
+            .params(serde_json::json!({"type":"object","properties":{"query":{"type":"string"}},"required":["query"]})));
         tools
     }
 
@@ -1230,6 +1320,8 @@ impl Engine {
             web_search(arguments["query"].as_str().unwrap_or("")).await
         } else if name == "fetch_url" {
             fetch_url(arguments["url"].as_str().unwrap_or("")).await
+        } else if name == "codebase_search" {
+            codebase_search(&self.workspace, arguments["query"].as_str().unwrap_or(""))
         } else if is_mcp_tool(&name) {
             self.mcp_call(&name, &arguments).await
         } else {
