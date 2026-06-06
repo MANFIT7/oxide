@@ -1534,8 +1534,8 @@ fn app() -> Element {
                                 thinking.write().push_str(&text);
                             }
                             Event::Info { text } => {
-                                if text.starts_with("session") {
-                                    // internal noise — ignore
+                                if text.starts_with("session") || text.starts_with("mcp ") || text.starts_with("mcp '") {
+                                    // internal/MCP noise — status shown in the MCP manager, not chat
                                 } else if text.starts_with(['🧭','⚙','🔍','🤖','🧩','🔁','✓','⚠']) {
                                     // pipeline stage → live animated status, not a chat note
                                     status.set(text);
@@ -1543,7 +1543,12 @@ fn app() -> Element {
                                     messages.write().push(ChatMsg { author: Author::Note, text });
                                 }
                             }
-                            Event::Error { message } => messages.write().push(ChatMsg { author: Author::Note, text: format!("error: {message}") }),
+                            Event::Error { message } => {
+                                // MCP connect errors surface on the manager dots, not the chat.
+                                if !message.starts_with("mcp '") {
+                                    messages.write().push(ChatMsg { author: Author::Note, text: format!("error: {message}") });
+                                }
+                            }
                             Event::ContextWindow { limit } => context_limit.set(Some(limit)),
                             Event::McpServerStatus { name, status, tool_count, detail, .. } => {
                                 mcp_status.write().insert(name.clone(), format!("{status} · {tool_count} tool(s) · {detail}"));
