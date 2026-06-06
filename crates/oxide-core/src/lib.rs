@@ -777,6 +777,21 @@ impl Engine {
     /// Keep the session under budget by *summarizing* the oldest turns into one
     /// brief (preserving goal/decisions/files/state) instead of dropping them,
     /// so the agent can continue with relevant context intact.
+    /// Aggressively trim history after a context-overflow error (drop-based,
+    /// keep only the last few messages, half the normal budget).
+    async fn force_compact(&mut self, turn: TurnId) {
+        let _ = turn;
+        const KEEP_RECENT: usize = 4;
+        if self.session.len() <= KEEP_RECENT + 1 {
+            return;
+        }
+        let budget = (self.config.max_context_tokens / 2).max(20_000);
+        let dropped = context::compact(&mut self.session, budget, KEEP_RECENT);
+        if dropped > 0 {
+            self.emit(Event::Compacted { dropped, tokens: context::estimate_tokens(&self.session) }).await;
+        }
+    }
+
     async fn compact_session(&mut self, turn: TurnId) {
         let budget = self.config.max_context_tokens;
         if context::estimate_tokens(&self.session) <= budget {
@@ -1077,7 +1092,11 @@ impl Engine {
             .unwrap_or_else(|| self.config.effective_model());
         let max_steps = (policy.max_steps as usize).clamp(1, 60);
         let mut step = 0usize;
+        let mut overflow_retries = 0u8;
         loop {
+            // Keep the running history under budget on EVERY request — long
+            // agentic turns accumulate tool output and would otherwise overflow.
+            self.compact_session(turn).await;
             let mut msgs = vec![Message { role: Role::System, content: sys.clone() }];
             msgs.extend(self.session.iter().cloned());
             let req = TurnRequest {
@@ -1150,7 +1169,27 @@ impl Engine {
                     }
                 }
             }
-            stream_task.abort();
+            // Surface a provider error; on context-overflow, hard-compact + retry.
+            let stream_err = if interrupted {
+                stream_task.abort();
+                None
+            } else {
+                stream_task.await.ok().and_then(|r| r.err()).map(|e| e.to_string())
+            };
+            if let Some(err) = &stream_err {
+                let low = err.to_lowercase();
+                let overflow = low.contains("context") || low.contains("exceeds") || low.contains("too long")
+                    || low.contains("maximum") || (low.contains("token") && low.contains("limit"));
+                if overflow && round_text.is_empty() && overflow_retries < 3 {
+                    overflow_retries += 1;
+                    self.force_compact(turn).await;
+                    self.emit(Event::Info { text: "⚠ context full — compacted, retrying".into() }).await;
+                    continue;
+                }
+                if round_text.is_empty() {
+                    self.emit(Event::Error { message: err.clone() }).await;
+                }
+            }
             if !round_text.is_empty() {
                 if let Some(store) = &self.session_store {
                     let _ = store.append("assistant", &round_text);
@@ -1368,10 +1407,17 @@ impl Engine {
             serde_json::json!({ "tool": name.clone(), "ok": ok, "output": output.clone() }),
         )
         .await;
-        // Feed the result back into the conversation so the agentic loop can continue.
+        // Feed the result back into the conversation so the agentic loop can
+        // continue — cap huge outputs so one tool can't blow the context budget.
+        let stored = if output.chars().count() > 16_000 {
+            let head: String = output.chars().take(16_000).collect();
+            format!("{head}\n… [output truncated]")
+        } else {
+            output.clone()
+        };
         self.session.push(Message {
             role: Role::Tool,
-            content: format!("[tool {name}]\n{output}"),
+            content: format!("[tool {name}]\n{stored}"),
         });
         self.emit(Event::ToolCallEnd {
             turn,
