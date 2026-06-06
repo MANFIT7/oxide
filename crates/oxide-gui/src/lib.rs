@@ -680,6 +680,11 @@ async fn submit_ce(
     if body.is_empty() && tokens.is_empty() && n_imgs == 0 {
         return;
     }
+    // Clear the editor immediately so a rapid second Enter can't double-submit
+    // (the next serialize reads an empty body and returns).
+    let _ = dioxus::document::eval("const e=document.getElementById('ce-input'); if(e) e.innerHTML='';")
+        .join::<bool>()
+        .await;
     let mut text = String::new();
     if *plan_mode.read() {
         text.push_str("[Plan mode] Produce a clear, numbered plan first and do NOT modify anything yet — wait for approval.\n\n");
@@ -734,9 +739,6 @@ async fn submit_ce(
         body
     };
     attachments.write().clear();
-    let _ = dioxus::document::eval("const e=document.getElementById('ce-input'); if(e) e.innerHTML='';")
-        .join::<bool>()
-        .await;
     if !steer && *streaming.read() {
         queue.write().push(text);
     } else {
@@ -1891,7 +1893,9 @@ fn app() -> Element {
                         },
                         Icon { name: "edit" } span { "New chat" }
                     }
-                    button { class: "nav-item", Icon { name: "search" } span { "Search" } }
+                    button { class: "nav-item", onclick: move |_| { show_palette.set(true); palette_query.set(String::new()); palette_sel.set(0); },
+                        Icon { name: "search" } span { "Search" }
+                    }
                     button { class: "nav-item", onclick: move |_| show_mcp.set(true),
                         if let Some(l) = provider_logo("mcp") { span { class: "nav-logo", dangerous_inner_html: l } } else { Icon { name: "plugins" } }
                         span { "MCP" }
@@ -1948,7 +1952,7 @@ fn app() -> Element {
                                                     div { key: "tab{id}", class: if is_active { "thread active" } else { "thread" },
                                                         onclick: move |_| { show_board.set(false); switch_tab(tabs, active_tab, messages, cfg, engine, i); },
                                                         if busy { span { class: "tab-dot busy" } }
-                                                        span { class: "thread-title", "{ttl}" }
+                                                        span { class: "thread-title", title: "{ttl}", "{ttl}" }
                                                     }
                                                 }
                                             }
@@ -1960,19 +1964,20 @@ fn app() -> Element {
                                             let p_dbl = path.clone();
                                             let p_del = path.clone();
                                             let p_arch = path.clone();
+                                            let t_open = title.clone();
                                             let menu_open = session_menu.read().as_ref() == Some(&path);
                                             let ws_d = ws_rebuild.clone();
                                             let ws_ar = ws_rebuild.clone();
                                             rsx! {
                                                 div { class: "thread-anchor",
                                                     div { class: "thread recent", title: "right-click / double-click for options",
-                                                        onclick: move |_| { show_board.set(false); open_session_tab(tabs, active_tab, messages, next_tab_id, cfg, p_open.clone(), title.clone()); },
+                                                        onclick: move |_| { show_board.set(false); open_session_tab(tabs, active_tab, messages, next_tab_id, cfg, p_open.clone(), t_open.clone()); },
                                                         oncontextmenu: {
                                                             let p = p_dbl.clone();
                                                             move |e: dioxus::prelude::MouseEvent| { e.prevent_default(); e.stop_propagation(); show_theme_menu.set(false); session_menu.set(Some(p.clone())); }
                                                         },
                                                         ondoubleclick: move |_| { let cur = session_menu.read().clone(); session_menu.set(if cur.as_ref() == Some(&p_dbl) { None } else { Some(p_dbl.clone()) }); },
-                                                        span { class: "thread-title", "{title}" }
+                                                        span { class: "thread-title", title: "{title}", "{title}" }
                                                         span { class: "thread-time", "{reltime}" }
                                                     }
                                                     if menu_open {
@@ -4508,6 +4513,17 @@ fn ActivityRow(text: String, running: bool, ok: bool) -> Element {
                         span { class: "activity-verb", "{verb}" }
                         if !detail.is_empty() { span { class: "activity-text", "{detail}" } }
                         span { class: "activity-out-n", "{lines} lines" }
+                        button { class: "copy-btn", title: "Copy output",
+                            onclick: {
+                                let out = output.clone();
+                                move |e: dioxus::prelude::MouseEvent| {
+                                    e.stop_propagation();
+                                    let js = format!("navigator.clipboard.writeText({});", serde_json::to_string(&out).unwrap_or_default());
+                                    let _ = dioxus::document::eval(&js);
+                                }
+                            },
+                            "⧉"
+                        }
                     }
                     pre { class: "activity-out", "{output}" }
                 }

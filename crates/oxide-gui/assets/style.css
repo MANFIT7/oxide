@@ -1329,3 +1329,7 @@ details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
 .tab-dot.busy { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--danger); margin-right: 7px; animation: ox-pulse 1.1s ease-in-out infinite; }
 @keyframes ox-pulse { 0%,100% { opacity: 1; } 50% { opacity: .3; } }
 .thread .thread-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* copy button on tool output */
+.copy-btn { background: transparent; border: none; color: var(--faint); cursor: pointer; font-size: 13px; padding: 0 4px; margin-left: 4px; border-radius: 5px; }
+.copy-btn:hover { color: var(--text); background: var(--surface-hi); }
