@@ -1258,6 +1258,10 @@ fn app() -> Element {
     let mut show_mcp = use_signal(|| false);
     let mut show_theme_menu = use_signal(|| false);
     let mut theme_menu_pos = use_signal(|| (12.0f64, 44.0f64));
+    // ⌘K command palette.
+    let mut show_palette = use_signal(|| false);
+    let mut palette_query = use_signal(String::new);
+    let mut palette_sel = use_signal(|| 0usize);
     let mut pinned = use_signal(|| false);
     let win = dioxus::desktop::use_window();
     let mut mcp_status = use_signal(std::collections::HashMap::<String, String>::new);
@@ -1352,6 +1356,30 @@ fn app() -> Element {
                 update_info.set(Some(info));
             }
         });
+    });
+
+    // Global keyboard shortcuts (⌘K command palette, Esc to close).
+    use_future(move || async move {
+        let mut eval = dioxus::document::eval(
+            r#"
+            if (!window.__oxkeys) {
+              window.__oxkeys = 1;
+              document.addEventListener('keydown', function(e){
+                if ((e.metaKey || e.ctrlKey) && (e.key === 'k' || e.key === 'K')) { e.preventDefault(); dioxus.send('palette'); }
+                else if (e.key === 'Escape') { dioxus.send('esc'); }
+              }, true);
+            }
+            while (true) { await new Promise(r => setTimeout(r, 3600000)); }
+            "#,
+        );
+        loop {
+            match eval.recv::<String>().await {
+                Ok(k) if k == "palette" => { let v = !*show_palette.read(); show_palette.set(v); palette_query.set(String::new()); palette_sel.set(0); }
+                Ok(k) if k == "esc" => { show_palette.set(false); }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
     });
 
     // Disable the WebView's native right-click menu (Reload / Inspect Element).
@@ -1751,7 +1779,7 @@ fn app() -> Element {
     rsx! {
         style { {CSS} }
         style { {XTERM_CSS} }
-        div { class: "app", "data-theme": "{cfg.read().theme}", style: "{accent_style}",
+        div { class: "app", "data-theme": "{cfg.read().theme}", "data-density": "{cfg.read().density}", style: "{accent_style}",
             // ── Sidebar ────────────────────────────────────────────────
             aside { class: "sidebar",
                 oncontextmenu: move |e: dioxus::prelude::MouseEvent| { e.prevent_default(); let c = e.client_coordinates(); theme_menu_pos.set((c.x, c.y)); session_menu.set(None); show_theme_menu.set(true); },
@@ -2704,6 +2732,74 @@ fn app() -> Element {
             if *show_mcp.read() {
                 McpModal { cfg, engine, status: mcp_status, on_close: move |_| show_mcp.set(false) }
             }
+            if *show_palette.read() {
+                {
+                    let run = move |label: &str| {
+                        show_palette.set(false);
+                        match label {
+                            "New chat" => {
+                                show_board.set(false);
+                                let prov = cfg.read().provider.clone();
+                                let model = cfg.read().model.clone();
+                                let title = provider_title(&prov).to_string();
+                                new_agent_tab(tabs, active_tab, messages, cfg, engine, next_tab_id, &prov, &model, &title);
+                            }
+                            "Open folder…" => open_folder(cfg, ui, engine),
+                            "Split view" => { let v = !*show_split.read(); show_split.set(v); }
+                            "MCP servers" => show_mcp.set(true),
+                            "Skills" => show_skills.set(true),
+                            "Board" => { show_board.set(true); }
+                            "Files panel" => { let v = !*show_files.read(); show_files.set(v); }
+                            "Terminal" => { let v = !*show_terminal.read(); show_terminal.set(v); }
+                            "Settings…" => show_settings.set(true),
+                            "Theme: Light" => set_theme(cfg, "light"),
+                            "Theme: Dark" => set_theme(cfg, "dark"),
+                            "Theme: System" => set_theme(cfg, "system"),
+                            "Toggle density" => toggle_density(cfg),
+                            _ => {}
+                        }
+                    };
+                    let actions: Vec<(&str, &str)> = vec![
+                        ("plus", "New chat"), ("folder", "Open folder…"), ("plugins", "Split view"),
+                        ("plugins", "MCP servers"), ("target", "Skills"), ("list", "Board"),
+                        ("plugins", "Files panel"), ("terminal", "Terminal"), ("settings", "Settings…"),
+                        ("spark", "Theme: Light"), ("target", "Theme: Dark"), ("settings", "Theme: System"),
+                        ("list", "Toggle density"),
+                    ];
+                    let q = palette_query.read().to_lowercase();
+                    let filtered: Vec<(&str, &str)> = actions.into_iter().filter(|(_, l)| q.is_empty() || l.to_lowercase().contains(&q)).collect();
+                    let sel = if filtered.is_empty() { 0 } else { (*palette_sel.read()).min(filtered.len() - 1) };
+                    let f2 = filtered.clone();
+                    rsx! {
+                        div { class: "modal-overlay palette-overlay", onclick: move |_| show_palette.set(false),
+                            div { class: "palette", onclick: move |e| e.stop_propagation(),
+                                input { class: "palette-input", autofocus: true, placeholder: "Type a command…", value: "{palette_query}",
+                                    oninput: move |e| { palette_query.set(e.value()); palette_sel.set(0); },
+                                    onkeydown: move |e| {
+                                        let n = f2.len();
+                                        if n == 0 { return; }
+                                        match e.key() {
+                                            Key::ArrowDown => { e.prevent_default(); palette_sel.set((sel + 1) % n); }
+                                            Key::ArrowUp => { e.prevent_default(); palette_sel.set((sel + n - 1) % n); }
+                                            Key::Enter => { e.prevent_default(); let mut run = run; run(f2[sel].1); }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                                div { class: "palette-list",
+                                    for (i, (icon, label)) in filtered.into_iter().enumerate() {
+                                        button { class: if i == sel { "palette-item sel" } else { "palette-item" },
+                                            onmouseenter: move |_| palette_sel.set(i),
+                                            onclick: move |_| { let mut run = run; run(label); },
+                                            Icon { name: icon } span { class: "palette-label", "{label}" }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -3006,6 +3102,22 @@ fn provider_title(provider: &str) -> &'static str {
         "openai" => "OpenAI",
         "anthropic" => "Anthropic",
         _ => "Agent",
+    }
+}
+
+/// Toggle UI density (comfortable ↔ compact) and persist.
+fn toggle_density(mut cfg: Signal<Config>) {
+    let mut c = cfg.read().clone();
+    c.density = if c.density == "compact" { "comfortable".to_string() } else { "compact".to_string() };
+    cfg.set(c.clone());
+    if let Ok(s) = toml::to_string(&c) {
+        let ws = workspace_of(&c);
+        let _ = std::fs::write(ws.join("oxide.toml"), &s);
+        if let Some(home) = std::env::var_os("HOME") {
+            let d = std::path::PathBuf::from(home).join(".config/oxide");
+            let _ = std::fs::create_dir_all(&d);
+            let _ = std::fs::write(d.join("config.toml"), &s);
+        }
     }
 }
 

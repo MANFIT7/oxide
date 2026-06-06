@@ -72,6 +72,9 @@ pub struct Config {
     /// Optional custom accent color (hex, e.g. "#e0913a"); empty = theme default.
     #[serde(default)]
     pub accent_color: String,
+    /// UI density: "comfortable" or "compact".
+    #[serde(default = "default_density")]
+    pub density: String,
 }
 
 fn default_true() -> bool {
@@ -83,6 +86,9 @@ fn default_tab_mode() -> String {
 }
 fn default_github_repo() -> String {
     "MANFIT7/oxide".to_string()
+}
+fn default_density() -> String {
+    "comfortable".to_string()
 }
 fn default_theme() -> String {
     "dark".to_string()
@@ -142,6 +148,7 @@ impl Default for Config {
             browser_headless: true,
             theme: default_theme(),
             accent_color: String::new(),
+            density: default_density(),
         }
     }
 }

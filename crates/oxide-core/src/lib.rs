@@ -1294,13 +1294,31 @@ impl Engine {
 
 /// Load pinned project instructions from AGENTS.md / CLAUDE.md (first found).
 fn load_project_instructions(workspace: &std::path::Path) -> Option<String> {
-    for name in ["AGENTS.md", "CLAUDE.md", ".oxide/AGENTS.md"] {
+    // Single-file instructions (first found): AGENTS.md / CLAUDE.md / Cursor rules.
+    for name in ["AGENTS.md", "CLAUDE.md", ".oxide/AGENTS.md", ".cursorrules"] {
         if let Ok(text) = std::fs::read_to_string(workspace.join(name)) {
             let t = text.trim();
             if !t.is_empty() {
                 let capped: String = t.chars().take(8000).collect();
                 return Some(capped);
             }
+        }
+    }
+    // Cursor's `.cursor/rules/*.mdc` rule files (concatenated).
+    if let Ok(rd) = std::fs::read_dir(workspace.join(".cursor/rules")) {
+        let mut combined = String::new();
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) == Some("mdc") {
+                if let Ok(text) = std::fs::read_to_string(&p) {
+                    combined.push_str(text.trim());
+                    combined.push_str("\n\n");
+                }
+            }
+        }
+        let t = combined.trim();
+        if !t.is_empty() {
+            return Some(t.chars().take(8000).collect());
         }
     }
     None
