@@ -449,6 +449,7 @@ pub fn spawn(config: Config) -> anyhow::Result<(EngineHandle, mpsc::Receiver<Eve
         mcp_clients: Vec::new(),
         mcp_tools: Vec::new(),
         browser: None,
+        ctx_window: None,
         event_tx,
     };
 
@@ -487,6 +488,9 @@ struct Engine {
     mcp_tools: Vec<ToolSpec>,
     /// Lazily launched browser-automation session.
     browser: Option<browser::BrowserSession>,
+    /// Model context window (tokens), reported by the provider; drives the
+    /// compaction budget at 75% (opencode-style).
+    ctx_window: Option<u64>,
     event_tx: mpsc::Sender<Event>,
 }
 
@@ -785,16 +789,55 @@ impl Engine {
         if self.session.len() <= KEEP_RECENT + 1 {
             return;
         }
-        let budget = (self.config.max_context_tokens / 2).max(20_000);
+        self.prune_tool_outputs();
+        let budget = (self.budget() / 2).max(20_000);
         let dropped = context::compact(&mut self.session, budget, KEEP_RECENT);
         if dropped > 0 {
             self.emit(Event::Compacted { dropped, tokens: context::estimate_tokens(&self.session) }).await;
         }
     }
 
+    /// Compaction budget: 75% of the model's reported context window
+    /// (opencode-style), falling back to the configured token cap.
+    fn budget(&self) -> u64 {
+        match self.ctx_window {
+            Some(w) if w > 0 => ((w as f64 * 0.75) as u64).max(20_000),
+            _ => self.config.max_context_tokens,
+        }
+    }
+
+    /// Replace the oldest tool outputs with placeholders once recent tool output
+    /// exceeds a protected window — preserves the conversation flow (opencode's
+    /// `prune`). Returns true if anything was pruned.
+    fn prune_tool_outputs(&mut self) -> bool {
+        const PRUNE_PROTECT_TOKENS: u64 = 40_000;
+        let mut acc = 0u64;
+        let mut pruned = false;
+        for m in self.session.iter_mut().rev() {
+            if !matches!(m.role, Role::Tool) {
+                continue;
+            }
+            let tok = (m.content.len() / 4) as u64;
+            if acc >= PRUNE_PROTECT_TOKENS {
+                if m.content != "[tool output pruned to save context]" {
+                    m.content = "[tool output pruned to save context]".to_string();
+                    pruned = true;
+                }
+            } else {
+                acc += tok;
+            }
+        }
+        pruned
+    }
+
     async fn compact_session(&mut self, turn: TurnId) {
-        let budget = self.config.max_context_tokens;
+        let budget = self.budget();
         if context::estimate_tokens(&self.session) <= budget {
+            return;
+        }
+        // 1. Prune old tool outputs first (cheap, preserves the dialogue).
+        if self.prune_tool_outputs() && context::estimate_tokens(&self.session) <= budget {
+            self.emit(Event::Compacted { dropped: 0, tokens: context::estimate_tokens(&self.session) }).await;
             return;
         }
         const KEEP_RECENT: usize = 8;
@@ -1138,6 +1181,7 @@ impl Engine {
                             Some(StreamItem::Usage { input, output, context_window }) => {
                                 self.emit(Event::TokensUsed { turn, input, output }).await;
                                 if let Some(limit) = context_window {
+                                    self.ctx_window = Some(limit);
                                     self.emit(Event::ContextWindow { limit }).await;
                                 }
                             }
@@ -1409,8 +1453,8 @@ impl Engine {
         .await;
         // Feed the result back into the conversation so the agentic loop can
         // continue — cap huge outputs so one tool can't blow the context budget.
-        let stored = if output.chars().count() > 16_000 {
-            let head: String = output.chars().take(16_000).collect();
+        let stored = if output.chars().count() > 40_000 {
+            let head: String = output.chars().take(40_000).collect();
             format!("{head}\n… [output truncated]")
         } else {
             output.clone()
