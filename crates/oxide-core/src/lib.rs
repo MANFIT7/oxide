@@ -119,6 +119,7 @@ fn codebase_search(ws: &Path, query: &str) -> (String, bool) {
 fn web_client() -> Option<reqwest::Client> {
     reqwest::Client::builder()
         .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+        .timeout(std::time::Duration::from_secs(30))
         .build()
         .ok()
 }

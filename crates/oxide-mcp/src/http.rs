@@ -20,7 +20,10 @@ pub struct HttpTransport {
 impl HttpTransport {
     pub fn new(url: impl Into<String>) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap_or_default(),
             url: url.into(),
             next_id: AtomicU64::new(1),
             session: Mutex::new(None),

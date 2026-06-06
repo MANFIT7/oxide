@@ -201,15 +201,26 @@ impl ToolRouter {
         (output, true)
     }
 
-    /// Run a shell command, sandboxed via Seatbelt on macOS.
+    /// Run a shell command, sandboxed via Seatbelt on macOS. Times out (and kills
+    /// the process) after 120s and uses a null stdin, so a hung/interactive
+    /// command can never freeze the agent.
     async fn exec_shell(&self, args: &serde_json::Value) -> (String, bool) {
         let Some(command) = args["command"].as_str() else {
             return ("shell: missing 'command'".into(), false);
         };
         let mut cmd = self.build_shell_command(command);
         cmd.current_dir(&self.workspace);
-        match cmd.output().await {
-            Ok(out) => {
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+        cmd.kill_on_drop(true);
+        let child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => return (format!("shell spawn error: {e}"), false),
+        };
+        let dur = std::time::Duration::from_secs(120);
+        match tokio::time::timeout(dur, child.wait_with_output()).await {
+            Ok(Ok(out)) => {
                 let mut s = String::new();
                 s.push_str(&String::from_utf8_lossy(&out.stdout));
                 let err = String::from_utf8_lossy(&out.stderr);
@@ -221,7 +232,11 @@ impl ToolRouter {
                 let capped: String = s.chars().take(20_000).collect();
                 (capped, ok)
             }
-            Err(e) => (format!("shell spawn error: {e}"), false),
+            Ok(Err(e)) => (format!("shell error: {e}"), false),
+            Err(_) => (
+                "shell: timed out after 120s and was killed. For long-running processes (dev servers, watchers) run them in the background (append ' &' or use nohup) and poll, instead of blocking.".into(),
+                false,
+            ),
         }
     }
 

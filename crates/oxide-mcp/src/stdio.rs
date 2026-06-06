@@ -70,24 +70,30 @@ impl Transport for StdioTransport {
         StdioTransport::send(&mut io, &req).await?;
 
         // Read lines until we get the response with our id (skipping any
-        // notifications the server emits in between).
+        // notifications the server emits in between) — bounded so a silent
+        // server can't hang the agent.
         let mut line = String::new();
-        loop {
-            line.clear();
-            let n = io.stdout.read_line(&mut line).await?;
-            if n == 0 {
-                anyhow::bail!("mcp server closed the connection");
-            }
-            let Ok(msg) = serde_json::from_str::<Value>(line.trim()) else {
-                continue;
-            };
-            if msg.get("id").and_then(|v| v.as_u64()) == Some(id) {
-                if let Some(err) = msg.get("error") {
-                    anyhow::bail!("mcp error: {err}");
+        let read = async {
+            loop {
+                line.clear();
+                let n = io.stdout.read_line(&mut line).await?;
+                if n == 0 {
+                    anyhow::bail!("mcp server closed the connection");
                 }
-                return Ok(msg.get("result").cloned().unwrap_or(Value::Null));
+                let Ok(msg) = serde_json::from_str::<Value>(line.trim()) else {
+                    continue;
+                };
+                if msg.get("id").and_then(|v| v.as_u64()) == Some(id) {
+                    if let Some(err) = msg.get("error") {
+                        anyhow::bail!("mcp error: {err}");
+                    }
+                    return Ok(msg.get("result").cloned().unwrap_or(Value::Null));
+                }
             }
-            // else: a notification or another id — keep reading.
+        };
+        match tokio::time::timeout(std::time::Duration::from_secs(60), read).await {
+            Ok(r) => r,
+            Err(_) => anyhow::bail!("mcp request timed out"),
         }
     }
 
