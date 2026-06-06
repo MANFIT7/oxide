@@ -70,8 +70,12 @@ fn pick_asset(assets: &[serde_json::Value]) -> Option<String> {
     let dl = |a: &serde_json::Value| a["browser_download_url"].as_str().map(String::from);
     let os_match = |n: &str| n.contains(os) || (os == "macos" && n.contains("darwin"));
     let arch_match = |n: &str| n.contains(arch) || (arch == "aarch64" && n.contains("arm64"));
-    // best: os + arch
-    if let Some(a) = assets.iter().find(|a| { let n = name_of(a); os_match(&n) && arch_match(&n) }) {
+    // best: os + arch + gzip (smallest download)
+    if let Some(a) = assets.iter().find(|a| { let n = name_of(a); os_match(&n) && arch_match(&n) && n.ends_with(".gz") }) {
+        return dl(a);
+    }
+    // os + arch (raw binary)
+    if let Some(a) = assets.iter().find(|a| { let n = name_of(a); os_match(&n) && arch_match(&n) && !n.ends_with(".dmg") }) {
         return dl(a);
     }
     // os only
@@ -94,11 +98,36 @@ async fn check_manifest(manifest_url: &str) -> Option<UpdateInfo> {
     })
 }
 
-/// Download the new binary and replace the running executable.
-pub async fn apply(info: &UpdateInfo) -> anyhow::Result<()> {
-    let bytes = reqwest::get(&info.url).await?.bytes().await?;
+/// Download the new binary (streamed, with progress 0.0–1.0) and replace the
+/// running executable. A `.gz` asset is decompressed on the fly.
+pub async fn apply<F: Fn(f32)>(info: &UpdateInfo, on_progress: F) -> anyhow::Result<()> {
+    use futures::StreamExt;
+    let client = reqwest::Client::builder().user_agent("oxide-updater").build()?;
+    let resp = client.get(&info.url).send().await?;
+    let total = resp.content_length().unwrap_or(0);
+    let mut stream = resp.bytes_stream();
+    let mut buf: Vec<u8> = Vec::with_capacity(total as usize);
+    let mut got: u64 = 0;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        got += chunk.len() as u64;
+        buf.extend_from_slice(&chunk);
+        if total > 0 {
+            on_progress((got as f32 / total as f32).min(0.98));
+        }
+    }
+    // Decompress gzip assets in memory.
+    let data = if info.url.ends_with(".gz") {
+        use std::io::Read;
+        let mut d = flate2::read::GzDecoder::new(&buf[..]);
+        let mut out = Vec::new();
+        d.read_to_end(&mut out)?;
+        out
+    } else {
+        buf
+    };
     let tmp = std::env::temp_dir().join("oxide-update-bin");
-    std::fs::write(&tmp, &bytes)?;
+    std::fs::write(&tmp, &data)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -106,6 +135,7 @@ pub async fn apply(info: &UpdateInfo) -> anyhow::Result<()> {
     }
     self_replace::self_replace(&tmp)?;
     let _ = std::fs::remove_file(&tmp);
+    on_progress(1.0);
     Ok(())
 }
 

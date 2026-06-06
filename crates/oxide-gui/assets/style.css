@@ -1282,3 +1282,7 @@ details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
 .nav-logo { display: inline-flex; width: 18px; height: 18px; align-items: center; justify-content: center; flex-shrink: 0; }
 .nav-logo svg { width: 18px; height: 18px; }
 .mention-menu .mcp-logo, .mention-menu .mcp-logo svg { width: 15px; height: 15px; }
+
+/* OTA download progress */
+.update-progress { flex: 1; height: 4px; background: rgba(255,255,255,.14); border-radius: 3px; overflow: hidden; margin: 0 12px; }
+.update-bar { height: 100%; background: var(--accent); border-radius: 3px; transition: width .15s ease; }

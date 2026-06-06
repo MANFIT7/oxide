@@ -1340,6 +1340,7 @@ fn app() -> Element {
     // OTA self-update.
     let mut update_info = use_signal(|| None::<update::UpdateInfo>);
     let mut updating = use_signal(|| false);
+    let mut update_pct = use_signal(|| 0.0f32);
     use_effect(move || {
         let repo = { let r = cfg.read().github_repo.clone(); if r.trim().is_empty() { "MANFIT7/oxide".to_string() } else { r } };
         let url = cfg.read().update_url.clone();
@@ -1958,26 +1959,37 @@ fn app() -> Element {
             // ── Center column ──────────────────────────────────────────
             main { class: "main",
                 if let Some(info) = update_info.read().clone() {
+                    {
+                    let pct = (*update_pct.read() * 100.0) as u32;
+                    rsx! {
                     div { class: "update-banner",
                         span { class: "update-text",
                             "⬆ Update available · v{info.version}"
+                        }
+                        if *updating.read() {
+                            div { class: "update-progress",
+                                div { class: "update-bar", style: "width: {pct}%" }
+                            }
                         }
                         div { class: "update-actions",
                             button { class: "update-btn", disabled: *updating.read(),
                                 onclick: move |_| {
                                     updating.set(true);
+                                    update_pct.set(0.0);
                                     let info = info.clone();
                                     spawn(async move {
-                                        match update::apply(&info).await {
+                                        match update::apply(&info, move |p| { let mut up = update_pct; up.set(p); }).await {
                                             Ok(()) => update::restart(),
                                             Err(_) => updating.set(false),
                                         }
                                     });
                                 },
-                                if *updating.read() { "Updating…" } else { "Update & restart" }
+                                if *updating.read() { "Updating… {pct}%" } else { "Update & restart" }
                             }
                             button { class: "update-x", onclick: move |_| update_info.set(None), "✕" }
                         }
+                    }
+                    }
                     }
                 }
                 if cfg.read().workspace.is_some() {
