@@ -42,6 +42,7 @@ const XTERM_FIT_JS: &str = include_str!("../assets/xterm/addon-fit.js");
 const SVG_CLAUDE: &str = include_str!("../assets/providers/claude-icon.svg");
 const SVG_OPENAI: &str = include_str!("../assets/providers/openai-icon.svg");
 const SVG_CURSOR: &str = include_str!("../assets/providers/cursor.svg");
+const SVG_MCP: &str = include_str!("../assets/providers/mcp-icon.svg");
 
 /// SVG markup from `<svg` onward (drops the `<?xml?>` prolog) for inline use.
 fn svg_inner(s: &str) -> String {
@@ -58,6 +59,7 @@ fn provider_logo(provider: &str) -> Option<String> {
         "chatgpt" | "codex" | "openai" => Some(svg_inner(SVG_OPENAI).replace("#000000", "currentColor")),
         "claude" | "anthropic" => Some(svg_inner(SVG_CLAUDE)),
         "cursor" => Some(svg_inner(SVG_CURSOR)),
+        "mcp" => Some(svg_inner(SVG_MCP).replace("#000000", "currentColor")),
         _ => None,
     }
 }
@@ -299,6 +301,21 @@ fn diff_counts(diff: &str) -> (u32, u32) {
     (adds, dels)
 }
 
+/// Coarse, human status verb for the live pill (opencode-style).
+fn status_verb(tool: &str) -> &'static str {
+    match tool {
+        "shell" => "Running commands",
+        "search" => "Searching the codebase",
+        "read_file" => "Reading files",
+        "write_file" => "Making edits",
+        "remember" | "save_skill" => "Saving to memory",
+        "ask_user" => "Asking you",
+        t if t.starts_with("browser_") => "Browsing",
+        t if t.starts_with("mcp__") => "Using tools",
+        _ => "Working",
+    }
+}
+
 /// `(icon, verb, detail)` for a tool activity row, joined as "icon\tverb\tdetail".
 fn activity_label(tool: &str, args: &serde_json::Value) -> String {
     let s = |k: &str| args.get(k).and_then(|v| v.as_str()).unwrap_or("");
@@ -446,6 +463,114 @@ fn chatgpt_status() -> Option<String> {
 /// Build the prompt (mode prefixes + mention/skill context) and submit it.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
+/// JS: report the in-progress `@query` at the caret + whether the editor is empty.
+const CE_QUERY_JS: &str = r#"
+const el=document.getElementById('ce-input');
+let q=null;
+const sel=window.getSelection();
+if(sel && sel.rangeCount){
+  const r=sel.getRangeAt(0); const n=r.startContainer;
+  if(n.nodeType===3){
+    const t=n.textContent.slice(0,r.startOffset);
+    const m=t.match(/(?:^|\s)@([^\s@]*)$/);
+    if(m) q=m[1];
+  }
+}
+const empty = !el || (el.textContent.replace(/ /g,'').trim()==='' && el.querySelectorAll('.ce-chip').length===0);
+return JSON.stringify({q, empty});
+"#;
+
+/// JS: serialize the editor into `{body, tokens}` for submission.
+const CE_SERIALIZE_JS: &str = r#"
+const el=document.getElementById('ce-input'); if(!el) return '{}';
+let body=''; const tokens=[];
+el.childNodes.forEach(n=>{
+  if(n.nodeType===3) body+=n.textContent;
+  else if(n.classList && n.classList.contains('ce-chip')){ tokens.push(n.dataset.token); body+='@'+(n.textContent||''); }
+  else body+=(n.textContent||'');
+});
+return JSON.stringify({body: body.replace(/ /g,' ').trim(), tokens});
+"#;
+
+/// JS to replace the caret's `@query` with an inline chip span.
+fn ce_insert_js(token: &str, label: &str) -> String {
+    let token = serde_json::to_string(token).unwrap_or_else(|_| "\"\"".into());
+    let label = serde_json::to_string(label).unwrap_or_else(|_| "\"\"".into());
+    format!(
+        r#"
+const sel=window.getSelection(); if(!sel||!sel.rangeCount) return false;
+const r=sel.getRangeAt(0); const n=r.startContainer;
+if(n.nodeType!==3) return false;
+const t=n.textContent; const off=r.startOffset;
+const m=t.slice(0,off).match(/(?:^|\s)@([^\s@]*)$/);
+if(!m) return false;
+const start=off - m[1].length - 1;
+const after=n.splitText(start);
+after.textContent=after.textContent.slice(m[1].length+1);
+const chip=document.createElement('span');
+chip.className='ce-chip'; chip.setAttribute('contenteditable','false');
+chip.dataset.token={token}; chip.textContent={label};
+const sp=document.createTextNode(' ');
+n.parentNode.insertBefore(chip, after);
+n.parentNode.insertBefore(sp, after);
+const nr=document.createRange(); nr.setStartAfter(sp); nr.collapse(true);
+sel.removeAllRanges(); sel.addRange(nr);
+const ed=document.getElementById('ce-input'); if(ed) ed.focus();
+return true;
+"#,
+        token = token,
+        label = label
+    )
+}
+
+/// Split user text into `(is_mention, text)` segments — `@word` at a word
+/// boundary becomes a mention pill.
+fn user_segments(text: &str) -> Vec<(bool, String)> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out: Vec<(bool, String)> = Vec::new();
+    let mut buf = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let at_word_start = i == 0 || chars[i - 1].is_whitespace();
+        if chars[i] == '@' && at_word_start {
+            let mut j = i + 1;
+            let mut name = String::new();
+            while j < chars.len() && !chars[j].is_whitespace() {
+                name.push(chars[j]);
+                j += 1;
+            }
+            if !name.is_empty() {
+                if !buf.is_empty() {
+                    out.push((false, std::mem::take(&mut buf)));
+                }
+                out.push((true, name));
+                i = j;
+                continue;
+            }
+        }
+        buf.push(chars[i]);
+        i += 1;
+    }
+    if !buf.is_empty() {
+        out.push((false, buf));
+    }
+    out
+}
+
+/// Strip the `mcp:`/`skill:` prefix from a mention token for its chip label.
+fn mention_label(token: &str) -> String {
+    token
+        .strip_prefix("mcp:")
+        .or_else(|| token.strip_prefix("skill:"))
+        .unwrap_or(token)
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or(token)
+        .to_string()
+}
+
+#[allow(clippy::too_many_arguments)]
 fn submit_prompt(
     mut input: Signal<String>,
     streaming: Signal<bool>,
@@ -522,6 +647,94 @@ fn submit_prompt(
         queue.write().push(text);
     } else {
         // Idle → new turn. Steer → inject into the running turn.
+        let _ = engine.send(EngineCmd::Submit { engine: text, display });
+    }
+}
+
+/// Serialize the contenteditable composer, build the prompt, and submit it.
+#[allow(clippy::too_many_arguments)]
+async fn submit_ce(
+    streaming: Signal<bool>,
+    engine: Coroutine<EngineCmd>,
+    plan_mode: Signal<bool>,
+    pursue_goal: Signal<bool>,
+    goal_text: Signal<String>,
+    mut queue: Signal<Vec<String>>,
+    mut attachments: Signal<Vec<String>>,
+    steer: bool,
+    ws: PathBuf,
+) {
+    let json = dioxus::document::eval(CE_SERIALIZE_JS).join::<String>().await.unwrap_or_default();
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap_or(serde_json::Value::Null);
+    let body = v["body"].as_str().unwrap_or("").trim().to_string();
+    let tokens: Vec<String> = v["tokens"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let n_imgs = attachments.read().len();
+    if body.is_empty() && tokens.is_empty() && n_imgs == 0 {
+        return;
+    }
+    let mut text = String::new();
+    if *plan_mode.read() {
+        text.push_str("[Plan mode] Produce a clear, numbered plan first and do NOT modify anything yet — wait for approval.\n\n");
+    }
+    if *pursue_goal.read() {
+        let g = goal_text.read().clone();
+        if g.trim().is_empty() {
+            text.push_str("[Pursue goal] Keep working autonomously until this is fully done.\n\n");
+        } else {
+            text.push_str(&format!("[Pursue goal] Keep working autonomously until this goal is fully done: {}\n\n", g.trim()));
+        }
+    }
+    let mut files = Vec::new();
+    let mut skills_block = String::new();
+    let mut mcp_block = String::new();
+    for tkn in &tokens {
+        if let Some(name) = tkn.strip_prefix("mcp:") {
+            mcp_block.push_str(&format!("\n- `{name}` — call its tools via `mcp__{name}__*`"));
+        } else if let Some(name) = tkn.strip_prefix("skill:") {
+            let p = ws.join(".oxide/memory/skills").join(format!("{name}.md"));
+            match std::fs::read_to_string(&p) {
+                Ok(c) => skills_block.push_str(&format!("\n## Skill: {name}\n{}\n", c.trim())),
+                Err(_) => skills_block.push_str(&format!("\n## Skill: {name} (not found)\n")),
+            }
+        } else {
+            files.push(format!("@{tkn}"));
+        }
+    }
+    if !mcp_block.is_empty() {
+        text.push_str("Use these MCP servers for this task:");
+        text.push_str(&mcp_block);
+        text.push('\n');
+    }
+    if !files.is_empty() {
+        text.push_str("Context files: ");
+        text.push_str(&files.join(" "));
+        text.push('\n');
+    }
+    if !skills_block.is_empty() {
+        text.push_str(&skills_block);
+    }
+    if !tokens.is_empty() {
+        text.push('\n');
+    }
+    if n_imgs > 0 {
+        text.push_str(&format!("\n(user attached {n_imgs} image{})", if n_imgs == 1 { "" } else { "s" }));
+    }
+    text.push_str(&body);
+    let display = if n_imgs > 0 {
+        format!("{body} [{n_imgs} image{}]", if n_imgs == 1 { "" } else { "s" })
+    } else {
+        body
+    };
+    attachments.write().clear();
+    let _ = dioxus::document::eval("const e=document.getElementById('ce-input'); if(e) e.innerHTML='';")
+        .join::<bool>()
+        .await;
+    if !steer && *streaming.read() {
+        queue.write().push(text);
+    } else {
         let _ = engine.send(EngineCmd::Submit { engine: text, display });
     }
 }
@@ -1108,6 +1321,7 @@ fn app() -> Element {
     let mut turn_edits = use_signal(Vec::<(String, u32, u32, u64)>::new);
     let mut edits_expanded = use_signal(|| false);
     let mut status = use_signal(String::new);
+    let mut turn_start = use_signal(|| None::<std::time::Instant>);
 
     // File/editor signals, shared with tree/editor via context.
     let ws_sig = use_signal(|| ws0.clone());
@@ -1340,6 +1554,7 @@ fn app() -> Element {
                             Event::TurnStarted { turn } => {
                                 thinking.set(String::new());
                                 status.set("Working…".to_string());
+                                turn_start.set(Some(std::time::Instant::now()));
                                 turn_edits.write().clear();
                                 edits_expanded.set(false);
                                 timeline.write().push(TimelineItem { title: format!("Turn {turn} started"), sub: String::new() });
@@ -1350,6 +1565,7 @@ fn app() -> Element {
                             }
                             Event::ToolCallBegin { tool, args, .. } => {
                                 timeline.write().push(TimelineItem { title: format!("⚙ {tool}"), sub: "running…".into() });
+                                status.set(status_verb(&tool).to_string());
                                 if tool != "ask_user" {
                                     messages.write().push(ChatMsg { author: Author::Activity { running: true, ok: true }, text: activity_label(&tool, &args) });
                                 }
@@ -1409,6 +1625,11 @@ fn app() -> Element {
                             Event::TurnFinished { .. } => {
                                 streaming.set(false);
                                 status.set(String::new());
+                                if let Some(start) = turn_start.write().take() {
+                                    let secs = start.elapsed().as_secs();
+                                    let dur = if secs >= 60 { format!("{}m {}s", secs / 60, secs % 60) } else { format!("{secs}s") };
+                                    messages.write().push(ChatMsg { author: Author::Note, text: format!("✓ Done · {dur}") });
+                                }
                                 // Submit the next queued message as a fresh turn.
                                 let next = { let mut q = queue.write(); if q.is_empty() { None } else { Some(q.remove(0)) } };
                                 if let Some(text) = next {
@@ -1604,7 +1825,8 @@ fn app() -> Element {
                     }
                     button { class: "nav-item", Icon { name: "search" } span { "Search" } }
                     button { class: "nav-item", onclick: move |_| show_mcp.set(true),
-                        Icon { name: "plugins" } span { "MCP" }
+                        if let Some(l) = provider_logo("mcp") { span { class: "nav-logo", dangerous_inner_html: l } } else { Icon { name: "plugins" } }
+                        span { "MCP" }
                     }
                     button { class: "nav-item", onclick: move |_| show_skills.set(true),
                         Icon { name: "target" } span { "Skills" }
@@ -3255,13 +3477,48 @@ fn Composer(
     let mut show_plus = use_signal(|| false);
     let mut show_access = use_signal(|| false);
     let mut mention_sel = use_signal(|| 0usize);
-    // `@mention` codebase picker.
-    let mention = active_mention(&input.read());
-    let mention_items: Vec<String> = match &mention {
-        Some((_, q)) => all_mention_items(&workspace, q),
+    // `@mention` picker driven by the contenteditable caret query.
+    let mut mention_q = use_signal(|| None::<String>);
+    let mut ce_empty = use_signal(|| true);
+    // Pasted image attachments (data URLs), shown as preview cards.
+    let mut attachments = use_signal(Vec::<String>::new);
+    // Full-screen image preview (lightbox) when a thumbnail is clicked.
+    let mut preview_img = use_signal(|| None::<String>);
+    // Intercept image paste into the composer → attachment card (not inline).
+    use_future(move || async move {
+        let mut eval = dioxus::document::eval(
+            r#"
+            const el = document.getElementById('ce-input');
+            if (el && !el.__oxpaste) {
+              el.__oxpaste = true;
+              el.addEventListener('paste', function(ev){
+                const items = (ev.clipboardData || {}).items || [];
+                for (const it of items) {
+                  if (it.type && it.type.indexOf('image') === 0) {
+                    ev.preventDefault();
+                    const f = it.getAsFile();
+                    const r = new FileReader();
+                    r.onload = function(){ dioxus.send(r.result); };
+                    r.readAsDataURL(f);
+                  }
+                }
+              });
+            }
+            while (true) { await new Promise(r => setTimeout(r, 3600000)); }
+            "#,
+        );
+        loop {
+            match eval.recv::<String>().await {
+                Ok(durl) => attachments.write().push(durl),
+                Err(_) => break,
+            }
+        }
+    });
+    let mention_items: Vec<String> = match mention_q.read().as_ref() {
+        Some(q) => all_mention_items(&workspace, q),
         None => Vec::new(),
     };
-    let mention_at = mention.as_ref().map(|(a, _)| *a);
+    let mention_at = if mention_q.read().is_some() { Some(0usize) } else { None };
     let msel = if mention_items.is_empty() {
         0
     } else {
@@ -3364,8 +3621,16 @@ fn Composer(
                                     button {
                                         class: if sel { "menu-item sel" } else { "menu-item" },
                                         onmouseenter: move |_| mention_sel.set(i),
-                                        onclick: move |_| { pick_mention(input, mentions, at, p_sel.clone()); mention_sel.set(0); },
-                                        Icon { name: icon_name }
+                                        onclick: move |_| {
+                                            let tok = p_sel.clone();
+                                            let label = mention_label(&tok);
+                                            spawn(async move { let _ = dioxus::document::eval(&ce_insert_js(&tok, &label)).join::<bool>().await; });
+                                            mention_q.set(None);
+                                            mention_sel.set(0);
+                                            ce_empty.set(false);
+                                        },
+                                        if is_mcp { span { class: "nav-logo mcp-logo", dangerous_inner_html: provider_logo("mcp").unwrap_or_default() } }
+                                        else { Icon { name: icon_name } }
                                         span { class: "menu-name", "{disp}" }
                                         if is_mcp { span { class: "menu-tag", "mcp" } }
                                         else if is_skill { span { class: "menu-tag", "skill" } }
@@ -3376,51 +3641,69 @@ fn Composer(
                     }
                 }
             }
-            if !mentions.read().is_empty() {
-                div { class: "chips",
-                    for (i, m) in mentions.read().iter().cloned().enumerate() {
-                        {
-                            let is_mcp = m.starts_with("mcp:");
-                            let is_skill = m.starts_with("skill:");
-                            let disp = m.strip_prefix("mcp:").or_else(|| m.strip_prefix("skill:")).unwrap_or(&m).to_string();
-                            let icon_name = if is_mcp { "plugins" } else if is_skill { "target" } else if !m.contains('.') || m.ends_with('/') { "folder" } else { "file" };
-                            let chip_class = if is_mcp { "chip mcp" } else if is_skill { "chip skill" } else { "chip" };
-                            rsx! {
-                                span { class: "{chip_class}",
-                                    Icon { name: icon_name }
-                                    span { class: "chip-name", "{disp}" }
-                                    button { class: "chip-x", onclick: move |_| {
-                                        let mut v = mentions.read().clone();
-                                        if i < v.len() { v.remove(i); }
-                                        mentions.set(v);
-                                    }, "✕" }
-                                }
-                            }
+            if let Some(src) = preview_img.read().clone() {
+                div { class: "img-lightbox", onclick: move |_| preview_img.set(None),
+                    button { class: "img-lightbox-x", onclick: move |_| preview_img.set(None), "✕" }
+                    img { class: "img-lightbox-img", src: "{src}", onclick: move |e| e.stop_propagation() }
+                }
+            }
+            if !attachments.read().is_empty() {
+                div { class: "attach-row",
+                    for (i, src) in attachments.read().iter().cloned().enumerate() {
+                        div { class: "attach-card",
+                            img { src: "{src}", onclick: { let s = src.clone(); move |_| preview_img.set(Some(s.clone())) } }
+                            button { class: "attach-x", onclick: move |_| { let mut v = attachments.write(); if i < v.len() { v.remove(i); } }, "✕" }
                         }
                     }
                 }
             }
-            textarea {
-                class: "input",
-                placeholder: if *streaming.read() { "Steer the agent (sent mid-run)…" } else { "Do anything" },
-                value: "{input}",
-                oninput: move |e| input.set(e.value()),
+            div {
+                class: "input ce-input",
+                id: "ce-input",
+                contenteditable: "true",
+                "data-empty": "{ce_empty}",
+                "data-ph": if *streaming.read() { "Steer the agent (sent mid-run)…" } else { "Do anything" },
+                oninput: move |_| {
+                    spawn(async move {
+                        let j = dioxus::document::eval(CE_QUERY_JS).join::<String>().await.unwrap_or_default();
+                        let v: serde_json::Value = serde_json::from_str(&j).unwrap_or(serde_json::Value::Null);
+                        match v["q"].as_str() {
+                            Some(q) => mention_q.set(Some(q.to_string())),
+                            None => mention_q.set(None),
+                        }
+                        ce_empty.set(v["empty"].as_bool().unwrap_or(true));
+                        mention_sel.set(0);
+                    });
+                },
                 onkeydown: move |e| {
                     // When the @mention popup is open, the keyboard drives it.
-                    if let Some(at) = mention_at {
-                        let items = all_mention_items(&ws_kd, &active_mention(&input.read()).map(|(_, q)| q).unwrap_or_default());
+                    let q = mention_q.read().clone();
+                    if let Some(q) = q {
+                        let items = all_mention_items(&ws_kd, &q);
                         if !items.is_empty() {
                             match e.key() {
                                 Key::ArrowDown => { e.prevent_default(); let n = items.len(); let s = (*mention_sel.read() + 1) % n; mention_sel.set(s); return; }
                                 Key::ArrowUp => { e.prevent_default(); let n = items.len(); let c = *mention_sel.read(); mention_sel.set((c + n - 1) % n); return; }
-                                Key::Enter => { e.prevent_default(); let s = (*mention_sel.read()).min(items.len() - 1); pick_mention(input, mentions, at, items[s].clone()); mention_sel.set(0); return; }
+                                Key::Enter => {
+                                    e.prevent_default();
+                                    let s = (*mention_sel.read()).min(items.len() - 1);
+                                    let tok = items[s].clone();
+                                    let label = mention_label(&tok);
+                                    spawn(async move { let _ = dioxus::document::eval(&ce_insert_js(&tok, &label)).join::<bool>().await; });
+                                    mention_q.set(None);
+                                    mention_sel.set(0);
+                                    ce_empty.set(false);
+                                    return;
+                                }
+                                Key::Escape => { e.prevent_default(); mention_q.set(None); return; }
                                 _ => {}
                             }
                         }
                     }
                     if e.key() == Key::Enter && !e.modifiers().shift() {
                         e.prevent_default();
-                        submit_prompt(input, streaming, engine, plan_mode, pursue_goal, goal_text, mentions, queue, false, &ws_kd2);
+                        let ws = ws_kd2.clone();
+                        spawn(async move { submit_ce(streaming, engine, plan_mode, pursue_goal, goal_text, queue, attachments, false, ws).await; });
                     } else if e.key() == Key::Tab && e.modifiers().shift() {
                         e.prevent_default();
                         let v = *plan_mode.read();
@@ -3444,12 +3727,14 @@ fn Composer(
                                     onclick: move |_| {
                                         show_plus.set(false);
                                         if let Some(file) = rfd::FileDialog::new().pick_file() {
-                                            let mut cur = input.read().clone();
-                                            if !cur.is_empty() && !cur.ends_with(' ') { cur.push(' '); }
-                                            cur.push('@');
-                                            cur.push_str(&file.display().to_string());
-                                            cur.push(' ');
-                                            input.set(cur);
+                                            let tok = file.display().to_string();
+                                            let label = mention_label(&tok);
+                                            let js = format!(
+                                                "const ed=document.getElementById('ce-input'); if(ed){{ed.focus(); const c=document.createElement('span'); c.className='ce-chip'; c.setAttribute('contenteditable','false'); c.dataset.token={}; c.textContent={}; ed.appendChild(c); ed.appendChild(document.createTextNode(' '));}} return true;",
+                                                serde_json::to_string(&tok).unwrap(), serde_json::to_string(&label).unwrap()
+                                            );
+                                            spawn(async move { let _ = dioxus::document::eval(&js).join::<bool>().await; });
+                                            ce_empty.set(false);
                                         }
                                     },
                                     Icon { name: "paperclip" }
@@ -3666,10 +3951,10 @@ fn Composer(
                         }
                     }
                     if *streaming.read() {
-                        button { class: "send steer", title: "Steer (inject into the running turn)", onclick: move |_| submit_prompt(input, streaming, engine, plan_mode, pursue_goal, goal_text, mentions, queue, true, &ws_steer), "↪" }
+                        button { class: "send steer", title: "Steer (inject into the running turn)", onclick: move |_| { let ws = ws_steer.clone(); spawn(async move { submit_ce(streaming, engine, plan_mode, pursue_goal, goal_text, queue, attachments, true, ws).await; }); }, "↪" }
                         button { class: "send stop", title: "Stop", onclick: move |_| { let _ = engine.send(EngineCmd::Interrupt); }, "■" }
                     } else {
-                        button { class: "send", onclick: move |_| submit_prompt(input, streaming, engine, plan_mode, pursue_goal, goal_text, mentions, queue, false, &ws_btn), "↑" }
+                        button { class: "send", onclick: move |_| { let ws = ws_btn.clone(); spawn(async move { submit_ce(streaming, engine, plan_mode, pursue_goal, goal_text, queue, attachments, false, ws).await; }); }, "↑" }
                     }
                 }
             }
@@ -3760,29 +4045,13 @@ fn Composer(
 fn Message(author: Author, text: String) -> Element {
     match author {
         Author::User => {
-            // "<mentions>\u{1}<body>" → render mentions as chips above the bubble.
-            let (chips, body) = match text.split_once('\u{1}') {
-                Some((m, b)) => (m.split_whitespace().map(String::from).collect::<Vec<_>>(), b.to_string()),
-                None => (Vec::new(), text.clone()),
-            };
+            let segs = user_segments(&text);
             rsx! {
                 div { class: "row user",
-                    div { class: "user-col",
-                        if !chips.is_empty() {
-                            div { class: "msg-chips",
-                                for m in chips.iter() {
-                                    {
-                                        let is_mcp = m.starts_with("mcp:");
-                                        let is_skill = m.starts_with("skill:");
-                                        let disp = m.strip_prefix("mcp:").or_else(|| m.strip_prefix("skill:")).unwrap_or(m).to_string();
-                                        let icon_name = if is_mcp { "plugins" } else if is_skill { "target" } else { "file" };
-                                        let cls = if is_mcp { "chip mcp" } else if is_skill { "chip skill" } else { "chip" };
-                                        rsx! { span { class: "{cls}", Icon { name: icon_name } span { class: "chip-name", "{disp}" } } }
-                                    }
-                                }
-                            }
+                    div { class: "bubble",
+                        for (is_m, s) in segs {
+                            if is_m { span { class: "inline-chip", "{s}" } } else { "{s}" }
                         }
-                        div { class: "bubble", "{body}" }
                     }
                 }
             }
