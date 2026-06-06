@@ -96,13 +96,41 @@ fn extract_between(hay: &str, marker: &str, end: &str) -> Option<String> {
     if t.is_empty() { None } else { Some(t) }
 }
 
-/// Web search via Brave (reliable HTML, no captcha for plain GET).
-/// Returns ranked `title / url / snippet`.
+/// Web search: prefer Exa (hosted MCP, keyless, returns page content), fall
+/// back to Brave HTML scraping.
 async fn web_search(query: &str) -> (String, bool) {
     let q = query.trim();
     if q.is_empty() {
         return ("web_search: missing 'query'".into(), false);
     }
+    match exa_search(q).await {
+        Ok(text) if !text.trim().is_empty() => (text, true),
+        _ => brave_search(q).await,
+    }
+}
+
+/// Web search via Exa's public MCP endpoint (no API key).
+async fn exa_search(query: &str) -> anyhow::Result<String> {
+    let client = McpClient::connect_http("exa", "https://mcp.exa.ai/mcp").await?;
+    let tool = client
+        .list_tools()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|t| t.name)
+        .find(|n| n.contains("web_search") || n.contains("search"))
+        .unwrap_or_else(|| "web_search_exa".to_string());
+    let (text, ok) = client
+        .call_tool(&tool, &serde_json::json!({ "query": query, "numResults": 6 }))
+        .await?;
+    if !ok {
+        anyhow::bail!("exa error");
+    }
+    Ok(text.chars().take(9000).collect())
+}
+
+/// Web search via Brave HTML (fallback). Returns ranked `title / url / snippet`.
+async fn brave_search(q: &str) -> (String, bool) {
     let Some(client) = web_client() else { return ("web_search: client error".into(), false) };
     let url = format!("https://search.brave.com/search?q={}&source=web", q.replace(' ', "+"));
     let html = match client.get(&url).send().await {
