@@ -66,6 +66,12 @@ pub struct Config {
     /// Run the automation browser headless (background, no window).
     #[serde(default = "default_true")]
     pub browser_headless: bool,
+    /// UI theme: "dark", "light", or "system".
+    #[serde(default = "default_theme")]
+    pub theme: String,
+    /// Optional custom accent color (hex, e.g. "#e0913a"); empty = theme default.
+    #[serde(default)]
+    pub accent_color: String,
 }
 
 fn default_true() -> bool {
@@ -78,6 +84,9 @@ fn default_tab_mode() -> String {
 fn default_github_repo() -> String {
     "MANFIT7/oxide".to_string()
 }
+fn default_theme() -> String {
+    "dark".to_string()
+}
 
 fn default_front() -> String {
     "claude".to_string()
@@ -86,16 +95,23 @@ fn default_backend() -> String {
     "codex".to_string()
 }
 
-/// One MCP server launcher.
+/// One MCP server launcher (stdio command, or a remote HTTP/SSE `url`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpServerConfig {
     /// Short name used to namespace its tools (`mcp__<name>__<tool>`).
     pub name: String,
-    /// Executable to spawn.
+    /// Executable to spawn (stdio transport). Empty when `url` is set.
+    #[serde(default)]
     pub command: String,
     /// Arguments passed to the executable.
     #[serde(default)]
     pub args: Vec<String>,
+    /// Remote MCP endpoint (Streamable HTTP/SSE). Used instead of `command`.
+    #[serde(default)]
+    pub url: String,
+    /// Whether this server is active.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
 }
 
 impl Default for Config {
@@ -124,6 +140,8 @@ impl Default for Config {
             github_repo: default_github_repo(),
             default_tab_mode: default_tab_mode(),
             browser_headless: true,
+            theme: default_theme(),
+            accent_color: String::new(),
         }
     }
 }

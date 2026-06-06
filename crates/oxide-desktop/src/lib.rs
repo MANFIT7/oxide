@@ -1880,7 +1880,7 @@ impl OxideDesktop {
                 return;
             }
         };
-        let server = McpServerConfig {
+        let server = McpServerConfig { url: String::new(), enabled: true,
             name: self.mcp_name.trim().to_string(),
             command: self.mcp_command.trim().to_string(),
             args,
@@ -9168,7 +9168,7 @@ mod tests {
             review_prompt: "Review risks".to_string(),
             created_ms: 12,
         }];
-        let mcp = vec![McpServerConfig {
+        let mcp = vec![McpServerConfig { url: String::new(), enabled: true,
             name: "fs".to_string(),
             command: "npx".to_string(),
             args: vec!["server".to_string()],
@@ -9357,7 +9357,7 @@ mod tests {
         let mut cfg = Config::default();
         upsert_mcp_server(
             &mut cfg,
-            McpServerConfig {
+            McpServerConfig { url: String::new(), enabled: true,
                 name: "fs".to_string(),
                 command: "npx".to_string(),
                 args: vec!["old".to_string()],
@@ -9365,7 +9365,7 @@ mod tests {
         );
         upsert_mcp_server(
             &mut cfg,
-            McpServerConfig {
+            McpServerConfig { url: String::new(), enabled: true,
                 name: "fs".to_string(),
                 command: "bunx".to_string(),
                 args: vec!["new".to_string()],
@@ -9381,12 +9381,12 @@ mod tests {
     fn mcp_server_remove_deletes_matching_name_only() {
         let mut cfg = Config::default();
         cfg.mcp_servers = vec![
-            McpServerConfig {
+            McpServerConfig { url: String::new(), enabled: true,
                 name: "fs".to_string(),
                 command: "npx".to_string(),
                 args: Vec::new(),
             },
-            McpServerConfig {
+            McpServerConfig { url: String::new(), enabled: true,
                 name: "linear".to_string(),
                 command: "bunx".to_string(),
                 args: Vec::new(),
@@ -9436,7 +9436,7 @@ mod tests {
     #[test]
     fn configured_mcp_health_falls_back_before_runtime_status() {
         let mut health = BTreeMap::new();
-        let server = McpServerConfig {
+        let server = McpServerConfig { url: String::new(), enabled: true,
             name: "fs".to_string(),
             command: "npx".to_string(),
             args: vec!["server".to_string()],
@@ -10677,7 +10677,7 @@ mod tests {
             review_prompt: "Review risks".to_string(),
             created_ms: 4,
         }];
-        let mcp = vec![McpServerConfig {
+        let mcp = vec![McpServerConfig { url: String::new(), enabled: true,
             name: "filesystem".to_string(),
             command: "npx".to_string(),
             args: vec!["server".to_string()],

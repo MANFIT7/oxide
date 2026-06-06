@@ -25,6 +25,62 @@ mod tools;
 pub use tools::{Routed, ToolRouter};
 
 use oxide_config::Config;
+use oxide_config::McpServerConfig;
+
+/// Discover MCP servers configured in Codex (`~/.codex/config.toml`) and Claude
+/// desktop / Claude Code (`mcpServers` JSON), so Oxide can reuse them.
+pub fn discover_external_mcp() -> Vec<McpServerConfig> {
+    let mut out: Vec<McpServerConfig> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+        return out;
+    };
+    let mut push = |name: String, command: String, args: Vec<String>, url: String, enabled: bool| {
+        if (command.is_empty() && url.is_empty()) || !seen.insert(name.clone()) {
+            return;
+        }
+        out.push(McpServerConfig { name, command, args, url, enabled });
+    };
+    // Codex: ~/.codex/config.toml -> [mcp_servers.NAME]
+    if let Ok(text) = std::fs::read_to_string(home.join(".codex/config.toml")) {
+        if let Ok(v) = toml::from_str::<toml::Value>(&text) {
+            if let Some(tbl) = v.get("mcp_servers").and_then(|x| x.as_table()) {
+                for (name, e) in tbl {
+                    let s = |k: &str| e.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+                    let args = e
+                        .get("args")
+                        .and_then(|x| x.as_array())
+                        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                        .unwrap_or_default();
+                    let enabled = e.get("enabled").and_then(|x| x.as_bool()).unwrap_or(true);
+                    push(name.clone(), s("command"), args, s("url"), enabled);
+                }
+            }
+        }
+    }
+    // Claude desktop + Claude Code: mcpServers { NAME: { command, args, url } }
+    for p in [
+        home.join("Library/Application Support/Claude/claude_desktop_config.json"),
+        home.join(".claude.json"),
+    ] {
+        if let Ok(text) = std::fs::read_to_string(&p) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                if let Some(obj) = v.get("mcpServers").and_then(|x| x.as_object()) {
+                    for (name, e) in obj {
+                        let s = |k: &str| e.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+                        let args = e
+                            .get("args")
+                            .and_then(|x| x.as_array())
+                            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                            .unwrap_or_default();
+                        push(name.clone(), s("command"), args, s("url"), true);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
 use oxide_harness::{Harness, Registry};
 use oxide_mcp::{is_mcp_tool, server_of, McpClient};
 use oxide_protocol::{ApprovalDecision, Event, Op, ToolSpec, TurnId};
@@ -270,8 +326,24 @@ impl Engine {
     /// Launch each configured MCP server and merge its tools. Failures are
     /// reported but never fatal — a missing server just means fewer tools.
     async fn connect_mcp_servers(&mut self) {
-        for srv in self.config.mcp_servers.clone() {
-            match McpClient::connect_stdio(&srv.name, &srv.command, &srv.args).await {
+        let mut servers = self.config.mcp_servers.clone();
+        // Auto-import MCP servers configured in Codex / Claude desktop so they
+        // are available in Oxide without re-declaring them.
+        for ext in discover_external_mcp() {
+            if !servers.iter().any(|s| s.name == ext.name) {
+                servers.push(ext);
+            }
+        }
+        for srv in servers {
+            if !srv.enabled {
+                continue;
+            }
+            let connect = if !srv.url.is_empty() {
+                McpClient::connect_http(&srv.name, &srv.url).await
+            } else {
+                McpClient::connect_stdio(&srv.name, &srv.command, &srv.args).await
+            };
+            match connect {
                 Ok(client) => match client.list_tools().await {
                     Ok(tools) => {
                         let tool_names = tools.iter().map(|tool| tool.name.clone()).collect();

@@ -14,7 +14,9 @@ use oxide_protocol::ToolSpec;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+mod http;
 mod stdio;
+pub use http::HttpTransport;
 pub use stdio::StdioTransport;
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
@@ -61,6 +63,14 @@ impl McpClient {
     ) -> anyhow::Result<Self> {
         let transport = StdioTransport::spawn(command, args)?;
         Self::connect(server, Box::new(transport)).await
+    }
+
+    /// Connect to a remote MCP server over Streamable HTTP/SSE.
+    pub async fn connect_http(
+        server: impl Into<String>,
+        url: &str,
+    ) -> anyhow::Result<Self> {
+        Self::connect(server, Box::new(HttpTransport::new(url))).await
     }
 
     pub fn server(&self) -> &str {

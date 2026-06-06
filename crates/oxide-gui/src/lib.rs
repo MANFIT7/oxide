@@ -55,7 +55,7 @@ fn svg_inner(s: &str) -> String {
 /// so it is recolored for the dark UI.
 fn provider_logo(provider: &str) -> Option<String> {
     match provider {
-        "chatgpt" | "codex" | "openai" => Some(svg_inner(SVG_OPENAI).replace("#000000", "#ececf0")),
+        "chatgpt" | "codex" | "openai" => Some(svg_inner(SVG_OPENAI).replace("#000000", "currentColor")),
         "claude" | "anthropic" => Some(svg_inner(SVG_CLAUDE)),
         "cursor" => Some(svg_inner(SVG_CURSOR)),
         _ => None,
@@ -325,7 +325,9 @@ struct ChatMsg {
 
 /// Commands sent into the engine coroutine.
 enum EngineCmd {
-    Submit(String),
+    /// `engine` is the full prompt (with mention/skill/MCP context); `display`
+    /// is the clean bubble text, optionally `"<space-joined mentions>\u{1}<body>"`.
+    Submit { engine: String, display: String },
     Reconfigure(Config),
     /// Switch to another agent tab: reconfigure the engine to `0` and restore
     /// that tab's transcript `1` (without the message-clearing Reconfigure does).
@@ -476,8 +478,11 @@ fn submit_prompt(
     if !ms.is_empty() {
         let mut files = Vec::new();
         let mut skills_block = String::new();
+        let mut mcp_block = String::new();
         for m in &ms {
-            if let Some(name) = m.strip_prefix("skill:") {
+            if let Some(name) = m.strip_prefix("mcp:") {
+                mcp_block.push_str(&format!("\n- `{name}` — call its tools via `mcp__{name}__*`"));
+            } else if let Some(name) = m.strip_prefix("skill:") {
                 let p = ws.join(".oxide/memory/skills").join(format!("{name}.md"));
                 match std::fs::read_to_string(&p) {
                     Ok(c) => skills_block.push_str(&format!("\n## Skill: {name}\n{}\n", c.trim())),
@@ -486,6 +491,11 @@ fn submit_prompt(
             } else {
                 files.push(format!("@{m}"));
             }
+        }
+        if !mcp_block.is_empty() {
+            text.push_str("Use these MCP servers for this task:");
+            text.push_str(&mcp_block);
+            text.push('\n');
         }
         if !files.is_empty() {
             text.push_str("Context files: ");
@@ -498,6 +508,13 @@ fn submit_prompt(
         text.push('\n');
     }
     text.push_str(&raw);
+    // Clean bubble text: just what the user typed, with the picked mentions
+    // shown as chips (encoded before a \u{1} marker) instead of inline context.
+    let display = if ms.is_empty() {
+        raw.clone()
+    } else {
+        format!("{}\u{1}{}", ms.join(" "), raw)
+    };
     mentions.set(Vec::new());
     input.set(String::new());
     if !steer && *streaming.read() {
@@ -505,7 +522,7 @@ fn submit_prompt(
         queue.write().push(text);
     } else {
         // Idle → new turn. Steer → inject into the running turn.
-        let _ = engine.send(EngineCmd::Submit(text));
+        let _ = engine.send(EngineCmd::Submit { engine: text, display });
     }
 }
 
@@ -727,8 +744,35 @@ fn slash_commands(ws: &Path, query: &str) -> Vec<(String, String)> {
 }
 
 /// Combined `@` menu: skills first, then files/folders.
+/// MCP servers (own + auto-imported) matching `query`, as `mcp:<server>` tokens.
+fn mcp_candidates(query: &str) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    if let Ok(cfg) = Config::load() {
+        for s in cfg.mcp_servers {
+            if s.enabled {
+                names.push(s.name);
+            }
+        }
+    }
+    for s in oxide_core::discover_external_mcp() {
+        if s.enabled {
+            names.push(s.name);
+        }
+    }
+    names.sort();
+    names.dedup();
+    let q = query.to_lowercase();
+    names
+        .into_iter()
+        .filter(|n| q.is_empty() || n.to_lowercase().contains(&q))
+        .take(8)
+        .map(|n| format!("mcp:{n}"))
+        .collect()
+}
+
 fn all_mention_items(ws: &Path, query: &str) -> Vec<String> {
-    let mut v = skill_candidates(ws, query);
+    let mut v = mcp_candidates(query);
+    v.extend(skill_candidates(ws, query));
     v.extend(mention_candidates(ws, query));
     v
 }
@@ -996,6 +1040,10 @@ fn app() -> Element {
     let mut show_settings = use_signal(|| false);
     let mut show_skills = use_signal(|| false);
     let mut show_mcp = use_signal(|| false);
+    let mut show_theme_menu = use_signal(|| false);
+    let mut theme_menu_pos = use_signal(|| (12.0f64, 44.0f64));
+    let mut pinned = use_signal(|| false);
+    let win = dioxus::desktop::use_window();
     let mut mcp_status = use_signal(std::collections::HashMap::<String, String>::new);
     // ChatGPT subscription usage: (plan, 5h %, weekly %, 5h reset s, weekly reset s).
     let mut usage_info = use_signal(|| None::<(String, u8, u8, u64, u64)>);
@@ -1195,12 +1243,12 @@ fn app() -> Element {
             loop {
                 tokio::select! {
                     cmd = rx.next() => match cmd {
-                        Some(EngineCmd::Submit(text)) => {
+                        Some(EngineCmd::Submit { engine: eng, display }) => {
                             if let Some(h) = &handle {
-                                messages.write().push(ChatMsg { author: Author::User, text: text.clone() });
+                                messages.write().push(ChatMsg { author: Author::User, text: display });
                                 messages.write().push(ChatMsg { author: Author::Agent, text: String::new() });
                                 streaming.set(true);
-                                let _ = h.submit(Op::UserTurn { text }).await;
+                                let _ = h.submit(Op::UserTurn { text: eng }).await;
                             }
                         }
                         Some(EngineCmd::Reconfigure(conf)) => {
@@ -1306,12 +1354,21 @@ fn app() -> Element {
                                     messages.write().push(ChatMsg { author: Author::Activity { running: true, ok: true }, text: activity_label(&tool, &args) });
                                 }
                             }
-                            Event::ToolCallEnd { tool, ok, .. } => {
+                            Event::ToolCallEnd { tool, output, ok, .. } => {
                                 timeline.write().push(TimelineItem { title: format!("⚙ {tool}"), sub: if ok { "done".into() } else { "failed".into() } });
-                                // Mark the most recent running activity row as finished.
+                                // Mark the most recent running activity row as finished and
+                                // attach its output (truncated) so the row can expand it.
+                                let mut out = output.trim().to_string();
+                                if out.chars().count() > 4000 {
+                                    out = out.chars().take(4000).collect::<String>() + "\n… (truncated)";
+                                }
                                 let mut m = messages.write();
                                 if let Some(c) = m.iter_mut().rev().find(|c| matches!(c.author, Author::Activity { running: true, .. })) {
                                     c.author = Author::Activity { running: false, ok };
+                                    if !out.is_empty() {
+                                        c.text.push('\t');
+                                        c.text.push_str(&out);
+                                    }
                                 }
                             }
                             Event::PatchApplied { path, .. } => {
@@ -1373,6 +1430,10 @@ fn app() -> Element {
 
     let workspace = ui.workspace.read().clone();
     let project = project_name(&workspace);
+    let accent_style = {
+        let a = cfg.read().accent_color.clone();
+        if a.trim().is_empty() { String::new() } else { format!("--accent: {a}; --on-accent: #ffffff;") }
+    };
     // Active TUI tab (embedded terminal) info.
     let (active_is_tui, active_bin, active_tab_id) = {
         let t = tabs.read();
@@ -1450,9 +1511,79 @@ fn app() -> Element {
     rsx! {
         style { {CSS} }
         style { {XTERM_CSS} }
-        div { class: "app",
+        div { class: "app", "data-theme": "{cfg.read().theme}", style: "{accent_style}",
             // ── Sidebar ────────────────────────────────────────────────
             aside { class: "sidebar",
+                oncontextmenu: move |e: dioxus::prelude::MouseEvent| { e.prevent_default(); let c = e.client_coordinates(); theme_menu_pos.set((c.x, c.y)); session_menu.set(None); show_theme_menu.set(true); },
+                if *show_theme_menu.read() {
+                    div { class: "menu-backdrop", onclick: move |_| show_theme_menu.set(false) }
+                    div { class: "theme-menu", style: "left: {theme_menu_pos.read().0}px; top: {theme_menu_pos.read().1}px;",
+                        button { class: "menu-item", onclick: {
+                            let win = win.clone();
+                            move |_| { let v = !*pinned.read(); pinned.set(v); win.set_always_on_top(v); show_theme_menu.set(false); }
+                        },
+                            Icon { name: "target" } span { class: "menu-name", "Pin window" }
+                            if *pinned.read() { span { class: "menu-check", "✓" } }
+                        }
+                        button { class: "menu-item", onclick: {
+                            let win = win.clone();
+                            let ws = workspace.clone();
+                            move |_| {
+                                show_theme_menu.set(false);
+                                let theme = cfg.read().theme.clone();
+                                let (mode, bin, provider, model) = {
+                                    let t = tabs.read();
+                                    match t.get(*active_tab.read()) {
+                                        Some(tab) => (tab.mode.clone(), tab.bin.clone(), tab.provider.clone(), tab.model.clone()),
+                                        None => ("gui".to_string(), String::new(), cfg.read().provider.clone(), cfg.read().model.clone()),
+                                    }
+                                };
+                                let initial = messages.read().clone();
+                                let dom = VirtualDom::new_with_props(PipWindow, PipWindowProps { workspace: ws.clone(), mode, provider, model, bin, theme, initial });
+                                use dioxus::desktop::tao::dpi::LogicalSize;
+                                let w = WindowBuilder::new()
+                                    .with_title("Oxide — chat")
+                                    .with_inner_size(LogicalSize::new(410.0, 620.0))
+                                    .with_always_on_top(true);
+                                win.new_window(dom, DesktopConfig::new().with_window(w));
+                            }
+                        },
+                            Icon { name: "plugins" } span { class: "menu-name", "Picture in Picture" }
+                        }
+                        div { class: "plus-divider" }
+                        div { class: "menu-label", "Theme" }
+                        button { class: "menu-item", onclick: move |_| { set_theme(cfg, "light"); show_theme_menu.set(false); },
+                            Icon { name: "spark" } span { class: "menu-name", "Light" }
+                            if cfg.read().theme == "light" { span { class: "menu-check", "✓" } }
+                        }
+                        button { class: "menu-item", onclick: move |_| { set_theme(cfg, "dark"); show_theme_menu.set(false); },
+                            Icon { name: "target" } span { class: "menu-name", "Dark" }
+                            if cfg.read().theme == "dark" { span { class: "menu-check", "✓" } }
+                        }
+                        button { class: "menu-item", onclick: move |_| { set_theme(cfg, "system"); show_theme_menu.set(false); },
+                            Icon { name: "settings" } span { class: "menu-name", "System" }
+                            if cfg.read().theme == "system" { span { class: "menu-check", "✓" } }
+                        }
+                        div { class: "plus-divider" }
+                        div { class: "menu-label", "Accent" }
+                        div { class: "accent-swatches",
+                            for c in ["", "#e0913a", "#7c91ff", "#3ad29f", "#e05d5d", "#c678dd", "#56b6c2"] {
+                                {
+                                    let c = c.to_string();
+                                    let active = cfg.read().accent_color == c;
+                                    rsx! {
+                                        button {
+                                            class: if active { "swatch active" } else { "swatch" },
+                                            style: if c.is_empty() { "background: var(--surface-hi)".to_string() } else { format!("background: {c}") },
+                                            title: if c.is_empty() { "Default" } else { "{c}" },
+                                            onclick: move |_| { set_accent(cfg, &c); show_theme_menu.set(false); },
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 div { class: "brand",
                     img { class: "logo", src: logo_uri() }
                     span { class: "brand-name", "Oxide" }
@@ -1546,7 +1677,7 @@ fn app() -> Element {
                                                         onclick: move |_| { show_board.set(false); open_session_tab(tabs, active_tab, messages, next_tab_id, cfg, p_open.clone(), title.clone()); },
                                                         oncontextmenu: {
                                                             let p = p_dbl.clone();
-                                                            move |e: dioxus::prelude::MouseEvent| { e.prevent_default(); session_menu.set(Some(p.clone())); }
+                                                            move |e: dioxus::prelude::MouseEvent| { e.prevent_default(); e.stop_propagation(); show_theme_menu.set(false); session_menu.set(Some(p.clone())); }
                                                         },
                                                         ondoubleclick: move |_| { let cur = session_menu.read().clone(); session_menu.set(if cur.as_ref() == Some(&p_dbl) { None } else { Some(p_dbl.clone()) }); },
                                                         span { class: "thread-title", "{title}" }
@@ -1821,7 +1952,7 @@ fn app() -> Element {
                                     button { class: "suggestion",
                                         onclick: {
                                             let p = s.to_string();
-                                            move |_| { let _ = engine.send(EngineCmd::Submit(p.clone())); }
+                                            move |_| { let _ = engine.send(EngineCmd::Submit { engine: p.clone(), display: p.clone() }); }
                                         },
                                         Icon { name: "spark" } span { "{s}" }
                                     }
@@ -2330,6 +2461,10 @@ fn McpModal(cfg: Signal<Config>, engine: Coroutine<EngineCmd>, status: Signal<st
     let mut command = use_signal(String::new);
     let mut args = use_signal(String::new);
     let servers = cfg.read().mcp_servers.clone();
+    let imported: Vec<oxide_config::McpServerConfig> = oxide_core::discover_external_mcp()
+        .into_iter()
+        .filter(|e| !servers.iter().any(|s| s.name == e.name))
+        .collect();
     rsx! {
         div { class: "modal-overlay", onclick: move |_| on_close.call(()),
             div { class: "modal skills-modal", onclick: move |e| e.stop_propagation(),
@@ -2365,6 +2500,29 @@ fn McpModal(cfg: Signal<Config>, engine: Coroutine<EngineCmd>, status: Signal<st
                             }
                         }
                     }
+                    if !imported.is_empty() {
+                        div { class: "mcp-section", "Imported from Codex / Claude" }
+                        for s in imported.iter() {
+                            {
+                                let st = status.read().get(&s.name).cloned();
+                                let connected = st.as_deref().map(|x| x.starts_with("connected")).unwrap_or(false);
+                                let line = if s.url.is_empty() { format!("{} {}", s.command, s.args.join(" ")) } else { s.url.clone() };
+                                let disabled = !s.enabled;
+                                rsx! {
+                                    div { class: "mcp-item",
+                                        div { class: "mcp-top",
+                                            span { class: if connected { "mcp-dot on" } else { "mcp-dot" } }
+                                            span { class: "skill-name", "{s.name}" }
+                                            span { class: "mcp-tag", if disabled { "disabled" } else if s.url.is_empty() { "imported" } else { "http" } }
+                                        }
+                                        div { class: "mcp-cmd", "{line}" }
+                                        if let Some(st) = st { div { class: "mcp-st", "{st}" } }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    div { class: "mcp-section", "Add server" }
                     div { class: "mcp-add",
                         input { class: "field-input", placeholder: "name (e.g. fs)", value: "{name}", oninput: move |e| name.set(e.value()) }
                         input { class: "field-input", style: "margin-top:6px", placeholder: "command (e.g. npx)", value: "{command}", oninput: move |e| command.set(e.value()) }
@@ -2375,7 +2533,7 @@ fn McpModal(cfg: Signal<Config>, engine: Coroutine<EngineCmd>, status: Signal<st
                             if n.is_empty() || cmd.is_empty() { return; }
                             let a: Vec<String> = args.read().split_whitespace().map(String::from).collect();
                             let mut list = cfg.read().mcp_servers.clone();
-                            list.push(oxide_config::McpServerConfig { name: n, command: cmd, args: a });
+                            list.push(oxide_config::McpServerConfig { name: n, command: cmd, args: a, url: String::new(), enabled: true });
                             let mut c = cfg.read().clone(); c.mcp_servers = list; cfg.set(c.clone());
                             let _ = engine.send(EngineCmd::Reconfigure(c));
                             name.set(String::new()); command.set(String::new()); args.set(String::new());
@@ -2595,6 +2753,38 @@ fn provider_title(provider: &str) -> &'static str {
         "openai" => "OpenAI",
         "anthropic" => "Anthropic",
         _ => "Agent",
+    }
+}
+
+/// Set the UI theme and persist (no engine reconfigure, so chat stays).
+fn set_theme(mut cfg: Signal<Config>, theme: &str) {
+    let mut c = cfg.read().clone();
+    c.theme = theme.to_string();
+    cfg.set(c.clone());
+    if let Ok(s) = toml::to_string(&c) {
+        let ws = workspace_of(&c);
+        let _ = std::fs::write(ws.join("oxide.toml"), &s);
+        if let Some(home) = std::env::var_os("HOME") {
+            let d = std::path::PathBuf::from(home).join(".config/oxide");
+            let _ = std::fs::create_dir_all(&d);
+            let _ = std::fs::write(d.join("config.toml"), &s);
+        }
+    }
+}
+
+/// Set a custom accent color (empty = theme default) and persist.
+fn set_accent(mut cfg: Signal<Config>, accent: &str) {
+    let mut c = cfg.read().clone();
+    c.accent_color = accent.to_string();
+    cfg.set(c.clone());
+    if let Ok(s) = toml::to_string(&c) {
+        let ws = workspace_of(&c);
+        let _ = std::fs::write(ws.join("oxide.toml"), &s);
+        if let Some(home) = std::env::var_os("HOME") {
+            let d = std::path::PathBuf::from(home).join(".config/oxide");
+            let _ = std::fs::create_dir_all(&d);
+            let _ = std::fs::write(d.join("config.toml"), &s);
+        }
     }
 }
 
@@ -3152,22 +3342,33 @@ fn Composer(
             if let Some(at) = mention_at {
                 if !mention_items.is_empty() {
                     div { class: "mention-menu",
-                        div { class: "menu-label", "Skills & files · ↑↓ Enter" }
                         for (i, path) in mention_items.iter().cloned().enumerate() {
                             {
                                 let p_sel = path.clone();
+                                let is_mcp = path.starts_with("mcp:");
                                 let is_skill = path.starts_with("skill:");
-                                let disp = path.strip_prefix("skill:").unwrap_or(&path).to_string();
-                                let icon_name = if is_skill { "target" } else if path.ends_with('/') { "folder" } else { "file" };
+                                let disp = path.strip_prefix("mcp:").or_else(|| path.strip_prefix("skill:")).unwrap_or(&path).to_string();
+                                let icon_name = if is_mcp { "plugins" } else if is_skill { "target" } else if path.ends_with('/') { "folder" } else { "file" };
+                                // Section header when the group changes.
+                                let group = if is_mcp { 0 } else if is_skill { 1 } else { 2 };
+                                let prev_group = if i == 0 { -1 } else {
+                                    let p = &mention_items[i - 1];
+                                    if p.starts_with("mcp:") { 0 } else if p.starts_with("skill:") { 1 } else { 2 }
+                                };
+                                let header = if group != prev_group {
+                                    Some(match group { 0 => "MCP servers", 1 => "Skills", _ => "Files" })
+                                } else { None };
                                 let sel = i == msel;
                                 rsx! {
+                                    if let Some(h) = header { div { class: "menu-label", "{h}" } }
                                     button {
                                         class: if sel { "menu-item sel" } else { "menu-item" },
                                         onmouseenter: move |_| mention_sel.set(i),
                                         onclick: move |_| { pick_mention(input, mentions, at, p_sel.clone()); mention_sel.set(0); },
                                         Icon { name: icon_name }
                                         span { class: "menu-name", "{disp}" }
-                                        if is_skill { span { class: "menu-tag", "skill" } }
+                                        if is_mcp { span { class: "menu-tag", "mcp" } }
+                                        else if is_skill { span { class: "menu-tag", "skill" } }
                                     }
                                 }
                             }
@@ -3179,11 +3380,13 @@ fn Composer(
                 div { class: "chips",
                     for (i, m) in mentions.read().iter().cloned().enumerate() {
                         {
+                            let is_mcp = m.starts_with("mcp:");
                             let is_skill = m.starts_with("skill:");
-                            let disp = m.strip_prefix("skill:").unwrap_or(&m).to_string();
-                            let icon_name = if is_skill { "target" } else if !m.contains('.') || m.ends_with('/') { "folder" } else { "file" };
+                            let disp = m.strip_prefix("mcp:").or_else(|| m.strip_prefix("skill:")).unwrap_or(&m).to_string();
+                            let icon_name = if is_mcp { "plugins" } else if is_skill { "target" } else if !m.contains('.') || m.ends_with('/') { "folder" } else { "file" };
+                            let chip_class = if is_mcp { "chip mcp" } else if is_skill { "chip skill" } else { "chip" };
                             rsx! {
-                                span { class: if is_skill { "chip skill" } else { "chip" },
+                                span { class: "{chip_class}",
                                     Icon { name: icon_name }
                                     span { class: "chip-name", "{disp}" }
                                     button { class: "chip-x", onclick: move |_| {
@@ -3556,7 +3759,34 @@ fn Composer(
 #[component]
 fn Message(author: Author, text: String) -> Element {
     match author {
-        Author::User => rsx! { div { class: "row user", div { class: "bubble", "{text}" } } },
+        Author::User => {
+            // "<mentions>\u{1}<body>" → render mentions as chips above the bubble.
+            let (chips, body) = match text.split_once('\u{1}') {
+                Some((m, b)) => (m.split_whitespace().map(String::from).collect::<Vec<_>>(), b.to_string()),
+                None => (Vec::new(), text.clone()),
+            };
+            rsx! {
+                div { class: "row user",
+                    div { class: "user-col",
+                        if !chips.is_empty() {
+                            div { class: "msg-chips",
+                                for m in chips.iter() {
+                                    {
+                                        let is_mcp = m.starts_with("mcp:");
+                                        let is_skill = m.starts_with("skill:");
+                                        let disp = m.strip_prefix("mcp:").or_else(|| m.strip_prefix("skill:")).unwrap_or(m).to_string();
+                                        let icon_name = if is_mcp { "plugins" } else if is_skill { "target" } else { "file" };
+                                        let cls = if is_mcp { "chip mcp" } else if is_skill { "chip skill" } else { "chip" };
+                                        rsx! { span { class: "{cls}", Icon { name: icon_name } span { class: "chip-name", "{disp}" } } }
+                                    }
+                                }
+                            }
+                        }
+                        div { class: "bubble", "{body}" }
+                    }
+                }
+            }
+        }
         Author::Agent => rsx! {
             div { class: "row agent",
                 img { class: "avatar", src: logo_uri() }
@@ -3778,24 +4008,35 @@ fn tile_leaves(node: &Tile, out: &mut Vec<u64>) {
 #[component]
 fn ActivityRow(text: String, running: bool, ok: bool) -> Element {
     let cls = if running { "activity-card running" } else if ok { "activity-card done" } else { "activity-card fail" };
-    // text is "icon\tverb\tdetail"
-    let mut parts = text.splitn(3, '\t');
+    // text is "icon\tverb\tdetail[\toutput]"
+    let mut parts = text.splitn(4, '\t');
     let icon = parts.next().unwrap_or("spark").to_string();
     let verb = parts.next().unwrap_or("").to_string();
     let detail = parts.next().unwrap_or("").to_string();
+    let output = parts.next().unwrap_or("").to_string();
+    let lines = if output.is_empty() { 0 } else { output.lines().count() };
     rsx! {
         div { class: "row activity",
-            div { class: "{cls}",
-                span { class: "activity-tic", Icon { name: icon_static(&icon) } }
-                if running {
-                    span { class: "activity-spin" }
-                } else if ok {
-                    span { class: "activity-ic ok", "✓" }
-                } else {
-                    span { class: "activity-ic fail", "✕" }
+            if output.is_empty() {
+                div { class: "{cls}",
+                    span { class: "activity-tic", Icon { name: icon_static(&icon) } }
+                    if running { span { class: "activity-spin" } }
+                    else if ok { span { class: "activity-ic ok", "✓" } }
+                    else { span { class: "activity-ic fail", "✕" } }
+                    span { class: "activity-verb", "{verb}" }
+                    if !detail.is_empty() { span { class: "activity-text", "{detail}" } }
                 }
-                span { class: "activity-verb", "{verb}" }
-                if !detail.is_empty() { span { class: "activity-text", "{detail}" } }
+            } else {
+                details { class: "{cls} has-out",
+                    summary { class: "activity-sum",
+                        span { class: "activity-tic", Icon { name: icon_static(&icon) } }
+                        if ok { span { class: "activity-ic ok", "✓" } } else { span { class: "activity-ic fail", "✕" } }
+                        span { class: "activity-verb", "{verb}" }
+                        if !detail.is_empty() { span { class: "activity-text", "{detail}" } }
+                        span { class: "activity-out-n", "{lines} lines" }
+                    }
+                    pre { class: "activity-out", "{output}" }
+                }
             }
         }
     }
@@ -3973,6 +4214,31 @@ fn SplitLeaf(
     }
 }
 
+/// Picture-in-Picture: a separate always-on-top mini window holding one live
+/// chat (its own engine). The main app stays open and full-size.
+#[component]
+fn PipWindow(
+    workspace: PathBuf,
+    mode: String,
+    provider: String,
+    model: String,
+    bin: String,
+    theme: String,
+    initial: Vec<ChatMsg>,
+) -> Element {
+    rsx! {
+        style { {CSS} }
+        style { {XTERM_CSS} }
+        div { class: "app pip-win", "data-theme": "{theme}",
+            if mode == "tui" {
+                TerminalView { id: 990_001, bin: bin.clone(), ws: workspace.display().to_string() }
+            } else {
+                ChatPane { pane_id: 990_001, workspace, provider, model, initial }
+            }
+        }
+    }
+}
+
 /// A self-contained live chat pane: its own engine, transcript, and composer.
 /// The surrounding header (split/close/mode) is provided by `SplitLeaf`.
 #[component]
@@ -3981,8 +4247,9 @@ fn ChatPane(
     workspace: PathBuf,
     provider: String,
     model: String,
+    #[props(default)] initial: Vec<ChatMsg>,
 ) -> Element {
-    let mut messages = use_signal(Vec::<ChatMsg>::new);
+    let mut messages = use_signal(move || initial.clone());
     let mut input = use_signal(String::new);
     let mut streaming = use_signal(|| false);
     let mut thinking = use_signal(String::new);
@@ -4044,10 +4311,13 @@ fn ChatPane(
                                 messages.write().push(ChatMsg { author: Author::Activity { running: true, ok: true }, text: activity_label(&tool, &args) });
                             }
                         }
-                        Some(Event::ToolCallEnd { ok, .. }) => {
+                        Some(Event::ToolCallEnd { output, ok, .. }) => {
+                            let mut out = output.trim().to_string();
+                            if out.chars().count() > 4000 { out = out.chars().take(4000).collect::<String>() + "\n… (truncated)"; }
                             let mut mm = messages.write();
                             if let Some(c) = mm.iter_mut().rev().find(|c| matches!(c.author, Author::Activity { running: true, .. })) {
                                 c.author = Author::Activity { running: false, ok };
+                                if !out.is_empty() { c.text.push('\t'); c.text.push_str(&out); }
                             }
                         }
                         Some(Event::FileDiff { path, diff, checkpoint, .. }) => { messages.write().push(ChatMsg { author: Author::Diff(path, checkpoint), text: diff }); }
