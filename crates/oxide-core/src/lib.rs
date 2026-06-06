@@ -981,6 +981,13 @@ impl Engine {
         let harness = self.active_harness();
         let policy = harness.loop_policy();
         let mut sys = harness.system_prompt();
+        // Tell the agent exactly where it is working so it never wanders to $HOME.
+        sys.push_str(&format!(
+            "\n\n# Working directory\nYou are operating in this project: `{}`. \
+             All shell commands run here (cwd) and relative paths resolve here. \
+             Search, read, and edit only inside this directory unless the user explicitly asks otherwise — do NOT scan $HOME or the whole filesystem.",
+            self.workspace.display()
+        ));
         // Pinned project instructions (AGENTS.md / CLAUDE.md) — always resident,
         // never compacted away.
         if let Some(agents) = load_project_instructions(&self.workspace) {

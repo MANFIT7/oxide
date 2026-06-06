@@ -54,8 +54,10 @@ impl SessionStore {
             ts_ms: now_ms(),
         };
         let line = serde_json::to_string(&rec).unwrap_or_default();
+        // Do NOT recreate the file: if the user deleted this session, stop
+        // persisting instead of resurrecting it. The file is created in `open`.
         let mut f = std::fs::OpenOptions::new()
-            .create(true)
+            .create(false)
             .append(true)
             .open(&self.path)?;
         writeln!(f, "{line}")

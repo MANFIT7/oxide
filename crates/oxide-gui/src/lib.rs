@@ -1050,14 +1050,26 @@ fn recent_sessions(ws: &Path) -> Vec<(PathBuf, std::time::SystemTime, String)> {
                 continue;
             }
             let meta = e.metadata().ok();
+            // Don't delete a brand-new empty file — it's likely the active
+            // session still being written (otherwise we'd resurrect the bug).
+            let fresh = meta
+                .as_ref()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.elapsed().ok())
+                .map(|d| d.as_secs() < 90)
+                .unwrap_or(false);
             if meta.as_ref().map(|m| m.len()).unwrap_or(0) == 0 {
-                let _ = std::fs::remove_file(&p);
+                if !fresh {
+                    let _ = std::fs::remove_file(&p);
+                }
                 continue;
             }
             let text = std::fs::read_to_string(&p).unwrap_or_default();
             let count = text.lines().filter(|l| !l.trim().is_empty()).count();
             if count == 0 {
-                let _ = std::fs::remove_file(&p);
+                if !fresh {
+                    let _ = std::fs::remove_file(&p);
+                }
                 continue;
             }
             let title = text
