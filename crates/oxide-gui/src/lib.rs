@@ -1411,6 +1411,11 @@ fn app() -> Element {
         if cfg.read().workspace.is_some() {
             board.set(board::Board::load(&ws));
             projects_list.set(build_projects(&ws, &cfg.read().recent_workspaces));
+            // Clean up orphaned pane worktrees from a previous run.
+            let ws2 = ws.clone();
+            spawn(async move {
+                let _ = tokio::process::Command::new("git").arg("-C").arg(&ws2).args(["worktree", "prune"]).output().await;
+            });
         }
     });
 
@@ -4535,6 +4540,7 @@ fn SplitView(
             // New panes inherit the current pane's mode/target so a Claude tile
             // splits into more Claude tiles.
             let (im, it, imod) = (mode.clone(), target.clone(), model.clone());
+            let ws_close = workspace.clone();
             rsx! {
                 SplitLeaf {
                     pane_id: pid,
@@ -4556,6 +4562,9 @@ fn SplitView(
                             layout.set(t);
                         }
                         panes.write().retain(|p| p.0 != pid);
+                        if pid != 0 {
+                            remove_pane_worktree(&ws_close, pid);
+                        }
                     },
                     on_set_mode: move |(m, t): (String, String)| {
                         let mut ps = panes.write();
@@ -4658,10 +4667,49 @@ fn SplitLeaf(
             if is_tui {
                 TerminalView { id: pane_id, bin: target.clone(), ws: workspace.display().to_string() }
             } else {
-                ChatPane { pane_id, workspace: workspace.clone(), provider: target.clone(), model: model.clone() }
+                ChatPane { pane_id, workspace: workspace.clone(), provider: target.clone(), model: model.clone(), isolate: pane_id != 0 }
             }
         }
     }
+}
+
+/// Create (or reuse) an isolated git worktree for a split pane. Returns None if
+/// `ws` isn't a git repo (caller then shares the main workspace).
+async fn pane_worktree(ws: &Path, id: u64) -> Option<PathBuf> {
+    let is_git = tokio::process::Command::new("git")
+        .arg("-C").arg(ws).args(["rev-parse", "--is-inside-work-tree"])
+        .output().await.ok().map(|o| o.status.success()).unwrap_or(false);
+    if !is_git {
+        return None;
+    }
+    let wt = ws.join(".oxide/worktrees").join(format!("pane-{id}"));
+    if wt.exists() {
+        return Some(wt);
+    }
+    let _ = std::fs::create_dir_all(ws.join(".oxide/worktrees"));
+    let branch = format!("oxide/pane-{id}");
+    let _ = tokio::process::Command::new("git")
+        .arg("-C").arg(ws).args(["worktree", "add", "-B", &branch])
+        .arg(&wt).arg("HEAD")
+        .output().await;
+    wt.exists().then_some(wt)
+}
+
+/// Remove a pane's worktree (best-effort) when the pane closes.
+fn remove_pane_worktree(ws: &Path, id: u64) {
+    let wt = ws.join(".oxide/worktrees").join(format!("pane-{id}"));
+    if !wt.exists() {
+        return;
+    }
+    let ws = ws.to_path_buf();
+    spawn(async move {
+        let _ = tokio::process::Command::new("git")
+            .arg("-C").arg(&ws).args(["worktree", "remove", "--force"]).arg(&wt)
+            .output().await;
+        let _ = tokio::process::Command::new("git")
+            .arg("-C").arg(&ws).args(["branch", "-D", &format!("oxide/pane-{id}")])
+            .output().await;
+    });
 }
 
 /// Picture-in-Picture: a separate always-on-top mini window holding one live
@@ -4698,6 +4746,7 @@ fn ChatPane(
     provider: String,
     model: String,
     #[props(default)] initial: Vec<ChatMsg>,
+    #[props(default)] isolate: bool,
 ) -> Element {
     let mut messages = use_signal(move || initial.clone());
     let mut input = use_signal(String::new);
@@ -4713,7 +4762,14 @@ fn ChatPane(
         async move {
             let (ev_tx, mut ev_rx) = tokio::sync::mpsc::channel::<Event>(256);
             let mut cfg = Config::load().unwrap_or_default();
-            cfg.workspace = Some(w);
+            // Isolate non-primary panes in their own git worktree so parallel
+            // agents never clobber each other's working tree.
+            let ws_eff = if isolate {
+                pane_worktree(&w, pane_id).await.unwrap_or_else(|| w.clone())
+            } else {
+                w.clone()
+            };
+            cfg.workspace = Some(ws_eff);
             cfg.provider = p;
             cfg.model = m;
             cfg.approval_policy = oxide_protocol::ApprovalPolicy::Never;
