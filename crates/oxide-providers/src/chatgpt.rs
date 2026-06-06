@@ -20,6 +20,21 @@ const ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
 const DEFAULT_MODEL: &str = "gpt-5.5";
 const CONTEXT_WINDOW: u64 = 272_000;
 
+/// Best-known context window (tokens) for a ChatGPT-backend model, so
+/// compaction adapts automatically per model instead of a fixed number.
+fn model_context_window(model: &str) -> u64 {
+    let m = model.to_ascii_lowercase();
+    if m.contains("gpt-5") || m.contains("gpt5") {
+        400_000
+    } else if m.contains("gpt-4.1") || m.contains("o3") || m.contains("o4") {
+        1_000_000
+    } else if m.contains("gpt-4") {
+        128_000
+    } else {
+        CONTEXT_WINDOW
+    }
+}
+
 pub struct ChatGptProvider {
     client: reqwest::Client,
     auth_path: String,
@@ -216,7 +231,7 @@ impl Provider for ChatGptProvider {
                         .send(StreamItem::Usage {
                             input: u["input_tokens"].as_u64().unwrap_or(0),
                             output: u["output_tokens"].as_u64().unwrap_or(0),
-                            context_window: Some(CONTEXT_WINDOW),
+                            context_window: Some(model_context_window(if req.model.is_empty() { DEFAULT_MODEL } else { &req.model })),
                         })
                         .await;
                 }
