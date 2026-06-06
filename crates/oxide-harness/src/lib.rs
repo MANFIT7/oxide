@@ -223,12 +223,24 @@ mod builtin {
                     "required": ["path"]
                 }),
             ),
-            ToolSpec::new("write_file", "Create or overwrite a file.")
+            ToolSpec::new("write_file", "Create a NEW file or fully overwrite one. For changing part of an existing file, prefer `edit`.")
                 .mutating(true)
                 .params(serde_json::json!({
                     "type": "object",
                     "properties": { "path": { "type": "string" }, "content": { "type": "string" } },
                     "required": ["path", "content"]
+                })),
+            ToolSpec::new("edit", "Make a surgical change to an existing file: replace `old_string` with `new_string`. You MUST read_file the file first. `old_string` must match exactly (incl. whitespace) and be unique unless `replace_all` is set.")
+                .mutating(true)
+                .params(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "old_string": { "type": "string", "description": "Exact text to find (with surrounding context to be unique)." },
+                        "new_string": { "type": "string", "description": "Replacement text." },
+                        "replace_all": { "type": "boolean", "description": "Replace every occurrence (default false)." }
+                    },
+                    "required": ["path", "old_string", "new_string"]
                 })),
             ToolSpec::new("shell", "Run a shell command inside the sandbox.")
                 .mutating(true)
@@ -289,6 +301,8 @@ mod builtin {
              - For multi-step work, state a short plan (the files/functions you'll change) first. Skip planning for trivial tasks.\n\
              - Send a one-line note before tool calls describing the next step.\n\n\
              Editing discipline:\n\
+             - DEFAULT TO ACTING. Reading and searching are means to an edit, not the goal — apply changes with the `edit`/`write_file` tools. Apply edits and run reversible commands without asking permission.\n\
+             - Do not announce an action and then stop. If you say 'I'll update X', actually call the tool in the SAME turn before yielding. Never end your turn having only described, planned, or read when the task asks for a change — make the change, then verify.\n\
              - Make the smallest diff that solves the task. Don't touch unrelated code; don't refactor or 'improve' beyond what was asked.\n\
              - Code must be immediately runnable: add every needed import/dependency; no placeholders, stubs, or TODOs.\n\
              - Match existing style. No license headers. No comments unless the WHY is non-obvious.\n\n\

@@ -307,7 +307,7 @@ fn status_verb(tool: &str) -> &'static str {
         "shell" => "Running commands",
         "search" | "codebase_search" => "Searching the codebase",
         "read_file" => "Reading files",
-        "write_file" => "Making edits",
+        "write_file" | "edit" => "Making edits",
         "remember" | "save_skill" => "Saving to memory",
         "web_search" | "fetch_url" => "Searching the web",
         "ask_user" => "Asking you",
@@ -323,7 +323,8 @@ fn activity_label(tool: &str, args: &serde_json::Value) -> String {
     let short = |t: &str| t.chars().take(90).collect::<String>();
     let (icon, verb, detail) = match tool {
         "shell" => ("terminal", "Run", short(s("command"))),
-        "write_file" => ("edit", "Edit", s("path").to_string()),
+        "write_file" => ("edit", "Write", s("path").to_string()),
+        "edit" => ("edit", "Edit", s("path").to_string()),
         "read_file" => ("file", "Read", s("path").to_string()),
         "search" => ("search", "Search", s("pattern").to_string()),
         "codebase_search" => ("search", "Find code", short(s("query"))),
@@ -3866,12 +3867,17 @@ fn Composer(
                     spawn(async move {
                         let j = dioxus::document::eval(CE_QUERY_JS).join::<String>().await.unwrap_or_default();
                         let v: serde_json::Value = serde_json::from_str(&j).unwrap_or(serde_json::Value::Null);
-                        match v["q"].as_str() {
-                            Some(q) => mention_q.set(Some(q.to_string())),
-                            None => mention_q.set(None),
+                        // Only write signals when the value actually changed —
+                        // otherwise every keystroke re-renders and the caret jitters.
+                        let new_q = v["q"].as_str().map(|s| s.to_string());
+                        if *mention_q.read() != new_q {
+                            mention_q.set(new_q);
+                            mention_sel.set(0);
                         }
-                        ce_empty.set(v["empty"].as_bool().unwrap_or(true));
-                        mention_sel.set(0);
+                        let new_empty = v["empty"].as_bool().unwrap_or(true);
+                        if *ce_empty.read() != new_empty {
+                            ce_empty.set(new_empty);
+                        }
                     });
                 },
                 onkeydown: move |e| {

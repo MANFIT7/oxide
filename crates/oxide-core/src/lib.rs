@@ -450,6 +450,7 @@ pub fn spawn(config: Config) -> anyhow::Result<(EngineHandle, mpsc::Receiver<Eve
         mcp_tools: Vec::new(),
         browser: None,
         ctx_window: None,
+        read_files: std::collections::HashSet::new(),
         event_tx,
     };
 
@@ -491,6 +492,8 @@ struct Engine {
     /// Model context window (tokens), reported by the provider; drives the
     /// compaction budget at 75% (opencode-style).
     ctx_window: Option<u64>,
+    /// Files the model has read this session — `edit` requires a prior read.
+    read_files: std::collections::HashSet<String>,
     event_tx: mpsc::Sender<Event>,
 }
 
@@ -1143,6 +1146,7 @@ impl Engine {
         let max_steps = (policy.max_steps as usize).clamp(1, 60);
         let mut step = 0usize;
         let mut overflow_retries = 0u8;
+        let mut nudges = 0u8;
         loop {
             // Keep the running history under budget on EVERY request — long
             // agentic turns accumulate tool output and would otherwise overflow.
@@ -1248,7 +1252,33 @@ impl Engine {
                 self.session.push(Message { role: Role::Assistant, content: round_text });
             }
             step += 1;
-            if interrupted || (!did_tool && !steered) || step >= max_steps {
+            if interrupted {
+                break;
+            }
+            if step >= max_steps {
+                // Force a text-only wrap-up instead of silently stopping (opencode-style).
+                self.session.push(Message {
+                    role: Role::User,
+                    content: "<system-reminder>\nMaximum tool steps reached. Do NOT call any more tools. \
+Reply with text only: summarize what you changed (with file paths and how you verified), and list \
+any remaining tasks and the recommended next step.\n</system-reminder>".into(),
+                });
+                break;
+            }
+            if !did_tool && !steered {
+                // The model produced prose but took no action. If it likely owes
+                // an edit, nudge it once to actually do the work before ending.
+                if nudges < 1 {
+                    nudges += 1;
+                    self.session.push(Message {
+                        role: Role::User,
+                        content: "<system-reminder>\nYou stopped without calling a tool. If the task requires \
+changes, APPLY them now with the edit/write_file tools (then verify with shell). Do not just describe \
+an edit — make it. Only end without acting if the task is genuinely complete and verified, or you are \
+truly blocked and need a decision (then call ask_user).\n</system-reminder>".into(),
+                    });
+                    continue;
+                }
                 break;
             }
         }
@@ -1261,11 +1291,36 @@ impl Engine {
 
     /// Route one tool call through approval + sandbox and emit its result.
     /// Returns `true` if the turn was interrupted/shut down while waiting.
+    /// Validate an `edit` and compute the resulting full file content.
+    fn compute_edit(&self, args: &serde_json::Value) -> Result<(String, String), String> {
+        let path = args["path"].as_str().ok_or("edit: missing 'path'")?.to_string();
+        let old = args["old_string"].as_str().ok_or("edit: missing 'old_string'")?;
+        let new = args["new_string"].as_str().unwrap_or("");
+        let replace_all = args["replace_all"].as_bool().unwrap_or(false);
+        if old.is_empty() {
+            return Err("edit: 'old_string' is empty — use write_file to create a whole file.".into());
+        }
+        let abs = self.workspace.join(&path);
+        if abs.exists() && !self.read_files.contains(&path) {
+            return Err(format!("edit: you must read_file '{path}' before editing it."));
+        }
+        let content = std::fs::read_to_string(&abs).unwrap_or_default();
+        let count = content.matches(old).count();
+        if count == 0 {
+            return Err(format!("edit: old_string not found in '{path}'. Read the file and copy the exact text (with whitespace)."));
+        }
+        if count > 1 && !replace_all {
+            return Err(format!("edit: old_string appears {count} times in '{path}' — add surrounding lines to make it unique, or set replace_all=true."));
+        }
+        let new_content = if replace_all { content.replace(old, new) } else { content.replacen(old, new, 1) };
+        Ok((path, new_content))
+    }
+
     async fn handle_tool_call(
         &mut self,
         turn: TurnId,
         name: String,
-        arguments: serde_json::Value,
+        mut arguments: serde_json::Value,
         op_rx: &mut mpsc::Receiver<Op>,
     ) -> bool {
         self.emit(Event::ToolCallBegin {
@@ -1372,9 +1427,21 @@ impl Engine {
             return false;
         }
 
+        // `edit` = surgical string replace; validate then handle it like a write.
+        let mut edit_error: Option<String> = None;
+        if name == "edit" {
+            match self.compute_edit(&arguments) {
+                Ok((path, new_content)) => {
+                    arguments = serde_json::json!({ "path": path, "content": new_content });
+                }
+                Err(e) => edit_error = Some(e),
+            }
+        }
+        let is_write = (name == "write_file" || name == "edit") && edit_error.is_none();
+
         // Snapshot the target before a write so the change can be rewound + diffed.
         let mut write_ctx: Option<(String, String, u64)> = None; // (path, prior, checkpoint)
-        if name == "write_file" {
+        if is_write {
             if let Some(path) = arguments["path"].as_str() {
                 let abs = self.workspace.join(path);
                 let prior = std::fs::read_to_string(&abs).unwrap_or_default();
@@ -1412,11 +1479,22 @@ impl Engine {
             fetch_url(arguments["url"].as_str().unwrap_or("")).await
         } else if name == "codebase_search" {
             codebase_search(&self.workspace, arguments["query"].as_str().unwrap_or(""))
+        } else if name == "edit" {
+            match &edit_error {
+                Some(e) => (e.clone(), false),
+                None => router.execute("write_file", &arguments).await,
+            }
         } else if is_mcp_tool(&name) {
             self.mcp_call(&name, &arguments).await
         } else {
             router.execute(&name, &arguments).await
         };
+        // Remember reads so `edit` can require a prior read of the file.
+        if ok && name == "read_file" {
+            if let Some(p) = arguments.get("path").and_then(|v| v.as_str()) {
+                self.read_files.insert(p.to_string());
+            }
+        }
         if ok {
             match name.as_str() {
                 "browser_open" => {
@@ -1438,7 +1516,7 @@ impl Engine {
                 _ => {}
             }
         }
-        if ok && name == "write_file" {
+        if ok && is_write {
             if let Some((path, prior, id)) = &write_ctx {
                 self.emit(Event::PatchApplied { turn, path: path.clone() }).await;
                 let new = arguments["content"].as_str().unwrap_or("");

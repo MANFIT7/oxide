@@ -104,9 +104,14 @@ impl ToolRouter {
             PathCheck::Denied(why) => (why, false),
             PathCheck::Ok(abs) => match std::fs::read_to_string(&abs) {
                 Ok(content) => {
-                    // Cap very large reads to keep transcripts sane.
-                    let capped: String = content.chars().take(20_000).collect();
-                    (capped, true)
+                    // Cap very large reads, but TELL the model it was truncated so
+                    // it edits with what it has instead of re-reading blindly.
+                    if content.chars().count() > 20_000 {
+                        let capped: String = content.chars().take(20_000).collect();
+                        (format!("{capped}\n\n… [truncated at 20000 chars — this file is larger; use `search` to locate the exact region instead of re-reading the whole file]"), true)
+                    } else {
+                        (content, true)
+                    }
                 }
                 Err(e) => (format!("read_file error: {e}"), false),
             },
