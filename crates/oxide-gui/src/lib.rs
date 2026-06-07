@@ -1128,26 +1128,23 @@ fn build_projects(current: &Path, recents: &[PathBuf]) -> Vec<(PathBuf, String, 
     let mut seen = HashSet::new();
     let mut wss: Vec<PathBuf> = Vec::new();
     for w in std::iter::once(current.to_path_buf()).chain(recents.iter().cloned()) {
-        // Skip recents on removable volumes (except the active one) to avoid
-        // macOS re-prompting for "access files on a removable volume".
-        let is_current = w == current;
-        if !is_current && w.starts_with("/Volumes/") {
-            continue;
-        }
-        if seen.insert(w.clone()) {
+        if w.exists() && seen.insert(w.clone()) {
             wss.push(w);
         }
     }
     let mut out = Vec::new();
     for ws in wss {
-        let sessions = recent_sessions(&ws);
-        if sessions.is_empty() {
-            continue;
-        }
-        let name = project_name(&ws);
-        let items: Vec<(PathBuf, String, String)> =
-            sessions.into_iter().map(|(p, m, t)| (p, t, relative_time(m))).collect();
-        out.push((ws, name, items));
+        let is_current = ws == current;
+        // Only scan the ACTIVE project's sessions; recents show a clickable
+        // header and load their chats when switched to. This avoids eagerly
+        // touching every folder's `.oxide/sessions` (which on external/removable
+        // volumes re-triggers the macOS "allow access" prompt every build).
+        let items: Vec<(PathBuf, String, String)> = if is_current {
+            recent_sessions(&ws).into_iter().map(|(p, m, t)| (p, t, relative_time(m))).collect()
+        } else {
+            Vec::new()
+        };
+        out.push((ws, project_name(&ws), items));
     }
     out
 }
@@ -1923,21 +1920,24 @@ fn app() -> Element {
                                 let shown = if expanded { sessions.len() } else { sessions.len().min(5) };
                                 let total = sessions.len();
                                 let ws_rebuild = workspace.clone();
+                                let pws_switch = pws.clone();
                                 rsx! {
-                                    div { class: "project",
+                                    div { class: if is_current { "project current" } else { "project" },
+                                        title: if is_current { "" } else { "Switch to this project" },
+                                        onclick: move |_| { if !is_current { apply_workspace(cfg, ui, engine, pws_switch.clone()); } },
                                         Icon { name: "folder" }
                                         span { class: "project-name", "{pname}" }
-                                        if is_current {
-                                            button { class: "project-add", title: "New chat", onclick: move |_| {
-                                                    show_board.set(false);
-                                                    let mut op = ui.open_path; op.set(None);
-                                                    let prov = cfg.read().provider.clone();
-                                                    let model = cfg.read().model.clone();
-                                                    let title = provider_title(&prov).to_string();
-                                                    new_agent_tab(tabs, active_tab, messages, cfg, engine, next_tab_id, &prov, &model, &title);
-                                                },
-                                                Icon { name: "plus" }
-                                            }
+                                        button { class: "project-add", title: "New chat here", onclick: move |e: dioxus::prelude::MouseEvent| {
+                                                e.stop_propagation();
+                                                show_board.set(false);
+                                                if !is_current { apply_workspace(cfg, ui, engine, pws.clone()); }
+                                                let mut op = ui.open_path; op.set(None);
+                                                let prov = cfg.read().provider.clone();
+                                                let model = cfg.read().model.clone();
+                                                let title = provider_title(&prov).to_string();
+                                                new_agent_tab(tabs, active_tab, messages, cfg, engine, next_tab_id, &prov, &model, &title);
+                                            },
+                                            Icon { name: "plus" }
                                         }
                                     }
                                     if is_current {

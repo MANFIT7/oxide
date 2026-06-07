@@ -1333,3 +1333,10 @@ details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
 /* copy button on tool output */
 .copy-btn { background: transparent; border: none; color: var(--faint); cursor: pointer; font-size: 13px; padding: 0 4px; margin-left: 4px; border-radius: 5px; }
 .copy-btn:hover { color: var(--text); background: var(--surface-hi); }
+
+/* clickable project headers — switch between opened folders */
+.project { cursor: pointer; border-radius: 8px; padding: 6px 8px; }
+.project:not(.current):hover { background: var(--surface); }
+.project.current .project-name { font-weight: 650; }
+.project .project-add { opacity: 0; transition: opacity .12s; margin-left: auto; }
+.project:hover .project-add, .project.current .project-add { opacity: 1; }
