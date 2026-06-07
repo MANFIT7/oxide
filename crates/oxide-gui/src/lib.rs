@@ -1144,7 +1144,8 @@ fn build_projects(current: &Path, recents: &[PathBuf]) -> Vec<(PathBuf, String, 
         } else {
             Vec::new()
         };
-        out.push((ws, project_name(&ws), items));
+        let name = project_name(&ws);
+        out.push((ws, name, items));
     }
     out
 }
