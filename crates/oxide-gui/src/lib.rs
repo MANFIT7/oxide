@@ -482,6 +482,7 @@ if(sel && sel.rangeCount){
   }
 }
 const empty = !el || (el.textContent.replace(/ /g,'').trim()==='' && el.querySelectorAll('.ce-chip').length===0);
+if (empty && el && el.innerHTML !== '') el.innerHTML = '';
 return JSON.stringify({q, empty});
 "#;
 
