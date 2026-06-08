@@ -1548,3 +1548,14 @@ details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
 .row:hover .msg-actions { opacity: 1; }
 .msg-act { background: var(--surface-hi); border: 1px solid var(--border); color: var(--muted); border-radius: 6px; min-width: 24px; height: 22px; font-size: 11px; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; padding: 0 5px; }
 .msg-act:hover { color: var(--text); border-color: var(--syn-accent); }
+
+/* agent task checklist (todo_write) */
+.todo-card { width: 100%; max-width: 760px; margin: 0 auto 8px; background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 10px 14px; }
+.todo-head { display: flex; align-items: center; gap: 7px; font-size: 12.5px; font-weight: 600; color: var(--text); margin-bottom: 6px; }
+.todo-head .todo-ic svg { width: 14px; height: 14px; color: var(--muted); }
+.todo-row { display: flex; align-items: center; gap: 9px; padding: 3px 0; font-size: 13px; }
+.todo-box { width: 16px; height: 16px; display: inline-flex; align-items: center; justify-content: center; border: 1px solid var(--border); border-radius: 5px; font-size: 11px; color: #40c977; flex-shrink: 0; }
+.todo-row.completed .todo-text { color: var(--muted); text-decoration: line-through; }
+.todo-row.in_progress .todo-text { color: var(--text); }
+.todo-row.pending .todo-text { color: var(--muted); }
+.todo-row .syn-spinner { width: 11px; height: 11px; }

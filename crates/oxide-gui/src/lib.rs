@@ -1536,6 +1536,7 @@ fn app() -> Element {
     let mut reverted = use_signal(HashSet::<u64>::new);
     // Edits made this turn: (path, adds, dels, checkpoint).
     let mut turn_edits = use_signal(Vec::<(String, u32, u32, u64, String)>::new);
+    let mut todos = use_signal(Vec::<(String, String)>::new);
     let mut edits_expanded = use_signal(|| false);
     // Per activity-group open state (keyed by first row index). Defaults to the
     // running state but, once the user toggles, their choice sticks across the
@@ -1816,6 +1817,7 @@ fn app() -> Element {
                                 status.set("Working…".to_string());
                                 turn_start.set(Some(std::time::Instant::now()));
                                 turn_edits.write().clear();
+                                todos.write().clear();
                                 edits_expanded.set(false);
                                 timeline.write().push(TimelineItem { title: format!("Turn {turn} started"), sub: String::new() });
                             }
@@ -1846,6 +1848,9 @@ fn app() -> Element {
                                         c.text.push_str(&out);
                                     }
                                 }
+                            }
+                            Event::Todos { items } => {
+                                todos.set(items);
                             }
                             Event::PatchApplied { path, .. } => {
                                 timeline.write().push(TimelineItem { title: "✎ patched".into(), sub: path });
@@ -2869,6 +2874,26 @@ fn app() -> Element {
                                                         Icon { name: "chevron" }
                                                     }
                                                 }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if !todos.read().is_empty() {
+                            {
+                                let items = todos.read().clone();
+                                let done = items.iter().filter(|(_, s)| s == "completed").count();
+                                let n = items.len();
+                                rsx! {
+                                    div { class: "todo-card",
+                                        div { class: "todo-head", span { class: "todo-ic", Icon { name: "list" } } "Tasks {done}/{n}" }
+                                        for (content, st) in items {
+                                            div { class: "todo-row {st}",
+                                                span { class: "todo-box",
+                                                    if st == "completed" { "✓" } else if st == "in_progress" { span { class: "syn-spinner" } } else { "" }
+                                                }
+                                                span { class: "todo-text", "{content}" }
                                             }
                                         }
                                     }

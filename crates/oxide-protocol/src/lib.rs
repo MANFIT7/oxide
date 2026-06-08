@@ -77,6 +77,9 @@ pub enum Event {
     },
     /// A file patch was applied to disk.
     PatchApplied { turn: TurnId, path: String },
+    /// The agent's current task checklist `(content, status)` where status is
+    /// "pending" | "in_progress" | "completed".
+    Todos { items: Vec<(String, String)> },
     /// A reviewable unified diff for a file the agent changed.
     FileDiff {
         turn: TurnId,

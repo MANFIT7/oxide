@@ -17,6 +17,8 @@
 mod browser;
 mod commands;
 mod context;
+mod embed;
+mod index;
 mod hooks;
 mod memory;
 mod sandbox;
@@ -26,99 +28,6 @@ pub use tools::{Routed, ToolRouter};
 
 use oxide_config::Config;
 use oxide_config::McpServerConfig;
-
-/// Recursively collect candidate source files (skips vendor/build dirs).
-fn collect_code_files(root: &Path, out: &mut Vec<PathBuf>) {
-    if out.len() > 1200 {
-        return;
-    }
-    let skip = [".git", "target", "node_modules", ".oxide", "dist", "build", ".next", "vendor", ".venv", "__pycache__"];
-    let Ok(rd) = std::fs::read_dir(root) else { return };
-    for e in rd.flatten() {
-        let p = e.path();
-        let name = e.file_name().to_string_lossy().to_string();
-        if name.starts_with('.') && name != ".cursorrules" {
-            continue;
-        }
-        if p.is_dir() {
-            if !skip.contains(&name.as_str()) {
-                collect_code_files(&p, out);
-            }
-        } else {
-            let ext_ok = p.extension().and_then(|x| x.to_str()).map(|x| {
-                matches!(x, "rs" | "ts" | "tsx" | "js" | "jsx" | "py" | "go" | "java" | "c" | "h" | "cpp" | "hpp" | "rb" | "php" | "swift" | "kt" | "cs" | "scala" | "sh" | "toml" | "md" | "css" | "html" | "vue" | "svelte" | "json" | "sql")
-            }).unwrap_or(false);
-            if ext_ok {
-                out.push(p);
-            }
-        }
-    }
-}
-
-/// Ranked codebase retrieval (no embeddings): scores ~50-line chunks by how
-/// many query terms they contain, returns the top snippets with `path:line`.
-fn codebase_search(ws: &Path, query: &str) -> (String, bool) {
-    let terms: Vec<String> = query
-        .to_lowercase()
-        .split(|c: char| !c.is_alphanumeric() && c != '_')
-        .filter(|w| w.len() > 2)
-        .map(String::from)
-        .collect();
-    if terms.is_empty() {
-        return ("codebase_search: provide a query of 1+ words".into(), false);
-    }
-    let mut files = Vec::new();
-    collect_code_files(ws, &mut files);
-    let mut hits: Vec<(i64, String, usize, String)> = Vec::new();
-    let mut chunks_scored = 0usize;
-    for f in files {
-        if chunks_scored > 40_000 {
-            break; // hard bound so a pathological repo can't run forever
-        }
-        let Ok(text) = std::fs::read_to_string(&f) else { continue };
-        if text.len() > 400_000 {
-            continue;
-        }
-        let lines: Vec<&str> = text.lines().collect();
-        let rel = f.strip_prefix(ws).unwrap_or(&f).display().to_string();
-        let (win, step) = (50usize, 40usize);
-        let mut start = 0;
-        while start < lines.len() {
-            let end = (start + win).min(lines.len());
-            let chunk = lines[start..end].join("\n");
-            let cl = chunk.to_lowercase();
-            let mut distinct = 0i64;
-            let mut total = 0i64;
-            for t in &terms {
-                let c = cl.matches(t.as_str()).count() as i64;
-                if c > 0 {
-                    distinct += 1;
-                    total += c;
-                }
-            }
-            chunks_scored += 1;
-            if distinct > 0 {
-                let score = distinct * 1000 + total;
-                hits.push((score, rel.clone(), start + 1, chunk));
-            }
-            if end == lines.len() {
-                break;
-            }
-            start += step;
-        }
-    }
-    if hits.is_empty() {
-        return (format!("No code found for: {}", terms.join(" ")), true);
-    }
-    hits.sort_by(|a, b| b.0.cmp(&a.0));
-    hits.dedup_by(|a, b| a.1 == b.1 && a.2.abs_diff(b.2) < 20);
-    let mut out = String::new();
-    for (_, path, line, chunk) in hits.into_iter().take(8) {
-        let snippet: String = chunk.lines().take(16).collect::<Vec<_>>().join("\n");
-        out.push_str(&format!("── {path}:{line}\n{snippet}\n\n"));
-    }
-    (out.chars().take(9000).collect(), true)
-}
 
 /// A browser-like HTTP client for web tools.
 fn web_client() -> Option<reqwest::Client> {
@@ -576,8 +485,17 @@ impl Engine {
             .params(serde_json::json!({"type":"object","properties":{"query":{"type":"string"}},"required":["query"]})));
         tools.push(ToolSpec::new("fetch_url", "Fetch a web page and return its readable text content (HTML stripped).")
             .params(serde_json::json!({"type":"object","properties":{"url":{"type":"string"}},"required":["url"]})));
-        tools.push(ToolSpec::new("codebase_search", "Find code relevant to a natural-language query (ranked retrieval across the workspace). Use to locate where something is implemented.")
+        tools.push(ToolSpec::new("codebase_search", "Find code relevant to a natural-language query — fast indexed retrieval (TF-IDF + symbol-aware) across the workspace. Use this FIRST to locate where something is implemented when you don't know the file; prefer it over a broad `search`. Then read only the top file(s).")
             .params(serde_json::json!({"type":"object","properties":{"query":{"type":"string"}},"required":["query"]})));
+        tools.push(ToolSpec::new("todo_write", "Maintain a short task checklist for non-trivial multi-step work (>2 edits or multiple files/subsystems). Skip it for simple tasks. Call with the FULL list each time; keep exactly one task 'in_progress' and mark tasks 'completed' as you finish.")
+            .params(serde_json::json!({
+                "type":"object",
+                "properties":{"todos":{"type":"array","items":{"type":"object","properties":{
+                    "content":{"type":"string"},
+                    "status":{"type":"string","enum":["pending","in_progress","completed"]}
+                },"required":["content","status"]}}},
+                "required":["todos"]
+            })));
         tools
     }
 
@@ -1595,6 +1513,17 @@ Do NOT read it again. Proceed now: make the edits with the edit/write_file tools
                 Ok(()) => (format!("saved skill '{n}'"), true),
                 Err(e) => (format!("memory error: {e}"), false),
             }
+        } else if name == "todo_write" {
+            let items: Vec<(String, String)> = arguments["todos"].as_array()
+                .map(|a| a.iter().filter_map(|t| {
+                    let c = t["content"].as_str()?.to_string();
+                    let s = t["status"].as_str().unwrap_or("pending").to_string();
+                    Some((c, s))
+                }).collect())
+                .unwrap_or_default();
+            self.emit(Event::Todos { items: items.clone() }).await;
+            let done = items.iter().filter(|(_, s)| s == "completed").count();
+            (format!("todo list updated ({done}/{} done)", items.len()), true)
         } else if name == "web_search" {
             web_search(arguments["query"].as_str().unwrap_or("")).await
         } else if name == "fetch_url" {
@@ -1605,7 +1534,9 @@ Do NOT read it again. Proceed now: make the edits with the edit/write_file tools
             // bound it so a huge repo can't hang the turn.
             let ws = self.workspace.clone();
             let q = arguments["query"].as_str().unwrap_or("").to_string();
-            let job = tokio::task::spawn_blocking(move || codebase_search(&ws, &q));
+            // Persistent incremental index (Augment-style): instant after the first
+            // build, refreshes only changed files.
+            let job = tokio::task::spawn_blocking(move || (index::search(&ws, &q), true));
             match tokio::time::timeout(std::time::Duration::from_secs(20), job).await {
                 Ok(Ok(r)) => r,
                 Ok(Err(_)) => ("codebase_search: internal error".into(), false),

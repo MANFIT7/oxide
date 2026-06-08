@@ -222,6 +222,7 @@ fn apply_event(event: Event, state: &mut State) {
                 Style::default().fg(color),
             )));
         }
+        Event::Todos { .. } => {}
         Event::PatchApplied { path, .. } => state.push(Line::from(Span::styled(
             format!("✎ patched {path}"),
             Style::default().fg(Color::Magenta),

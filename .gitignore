@@ -17,3 +17,5 @@ oxide-macos-arm64
 **/.oxide/screenshots/
 **/.oxide/board.json
 .oxide/worktrees/
+.oxide/index/
+**/.oxide/index/

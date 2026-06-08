@@ -1045,6 +1045,7 @@ impl OxideDesktop {
                     });
                 }
             }
+            Event::Todos { .. } => {}
             Event::PatchApplied { path, .. } => {
                 self.inspector = InspectorTab::Diff;
                 self.refresh_repo_index();

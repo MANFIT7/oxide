@@ -161,6 +161,7 @@ async fn run_exec(config: Config, prompt: String, yes: bool) -> Result<()> {
             } => {
                 println!("[tool] {tool} ok={ok}: {output}")
             }
+            Event::Todos { items } => println!("[todos] {}/{} done", items.iter().filter(|(_, s)| s == "completed").count(), items.len()),
             Event::PatchApplied { path, .. } => println!("[patch] {path}"),
             Event::CheckpointCreated { id, label, .. } => {
                 println!("[checkpoint] #{id}: {label}")

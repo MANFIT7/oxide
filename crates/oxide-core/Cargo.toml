@@ -22,3 +22,4 @@ tracing = { workspace = true }
 similar = { workspace = true }
 toml = { workspace = true }
 chromiumoxide = { workspace = true }
+model2vec-rs = "0.2.1"
