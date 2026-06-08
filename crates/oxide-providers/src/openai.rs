@@ -119,6 +119,7 @@ impl Provider for OpenAiProvider {
         // Accumulate streamed tool calls by index until the stream ends.
         let mut tool_names: BTreeMap<u64, String> = BTreeMap::new();
         let mut tool_args: BTreeMap<u64, String> = BTreeMap::new();
+        let mut tool_ids: BTreeMap<u64, String> = BTreeMap::new();
 
         let mut stream = resp.bytes_stream().eventsource();
         while let Some(ev) = stream.next().await {
@@ -160,6 +161,9 @@ impl Provider for OpenAiProvider {
             if let Some(calls) = delta["tool_calls"].as_array() {
                 for c in calls {
                     let idx = c["index"].as_u64().unwrap_or(0);
+                    if let Some(id) = c["id"].as_str() {
+                        tool_ids.entry(idx).or_default().push_str(id);
+                    }
                     if let Some(name) = c["function"]["name"].as_str() {
                         tool_names.entry(idx).or_default().push_str(name);
                     }
@@ -173,7 +177,8 @@ impl Provider for OpenAiProvider {
         for (idx, name) in tool_names {
             let raw = tool_args.remove(&idx).unwrap_or_default();
             let arguments = serde_json::from_str(&raw).unwrap_or(Value::Object(Default::default()));
-            let _ = sink.send(StreamItem::ToolCall { name, arguments }).await;
+            let id = tool_ids.remove(&idx).unwrap_or_default();
+            let _ = sink.send(StreamItem::ToolCall { id, name, arguments }).await;
         }
         let _ = sink.send(StreamItem::Done).await;
         Ok(())
@@ -190,14 +195,8 @@ mod tests {
             reasoning_effort: "high".into(),
             temperature: 0.2,
             messages: vec![
-                Message {
-                    role: Role::System,
-                    content: "sys".into(),
-                },
-                Message {
-                    role: Role::User,
-                    content: "hi".into(),
-                },
+                Message::new(Role::System, "sys"),
+                Message::new(Role::User, "hi"),
             ],
             tools: vec![ToolSpec::new("shell", "run a command").mutating(true)],
         }

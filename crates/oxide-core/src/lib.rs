@@ -70,7 +70,11 @@ fn codebase_search(ws: &Path, query: &str) -> (String, bool) {
     let mut files = Vec::new();
     collect_code_files(ws, &mut files);
     let mut hits: Vec<(i64, String, usize, String)> = Vec::new();
+    let mut chunks_scored = 0usize;
     for f in files {
+        if chunks_scored > 40_000 {
+            break; // hard bound so a pathological repo can't run forever
+        }
         let Ok(text) = std::fs::read_to_string(&f) else { continue };
         if text.len() > 400_000 {
             continue;
@@ -92,6 +96,7 @@ fn codebase_search(ws: &Path, query: &str) -> (String, bool) {
                     total += c;
                 }
             }
+            chunks_scored += 1;
             if distinct > 0 {
                 let score = distinct * 1000 + total;
                 hits.push((score, rel.clone(), start + 1, chunk));
@@ -414,10 +419,7 @@ pub fn spawn(config: Config) -> anyhow::Result<(EngineHandle, mpsc::Receiver<Eve
             if let Ok(msgs) = SessionStore::load(&prev) {
                 history = msgs
                     .into_iter()
-                    .map(|m| Message {
-                        role: role_from_str(&m.role),
-                        content: m.content,
-                    })
+                    .map(|m| Message::new(role_from_str(&m.role), m.content))
                     .collect();
                 tracing::info!(count = history.len(), "resumed prior session");
             }
@@ -452,6 +454,9 @@ pub fn spawn(config: Config) -> anyhow::Result<(EngineHandle, mpsc::Receiver<Eve
         browser: None,
         ctx_window: None,
         read_files: std::collections::HashSet::new(),
+        turn_edited: false,
+        turn_edit_paths: Vec::new(),
+        turn_reads: std::collections::HashSet::new(),
         event_tx,
     };
 
@@ -495,6 +500,15 @@ struct Engine {
     ctx_window: Option<u64>,
     /// Files the model has read this session — `edit` requires a prior read.
     read_files: std::collections::HashSet<String>,
+    /// Set when a write/edit succeeds this turn — drives the auto-verify pass.
+    turn_edited: bool,
+    /// Paths edited this turn — auto-verify only runs when a *relevant* code file
+    /// was touched, so a README-only edit can't drag the agent into unrelated
+    /// typecheck errors.
+    turn_edit_paths: Vec<String>,
+    /// Files already read THIS turn — re-reading the same file is intercepted to
+    /// break the "read README → re-plan → read README again" loop.
+    turn_reads: std::collections::HashSet<String>,
     event_tx: mpsc::Sender<Event>,
 }
 
@@ -869,10 +883,7 @@ impl Engine {
         } else {
             summary
         };
-        self.session.insert(0, Message {
-            role: Role::Assistant,
-            content: format!("## Summary of earlier conversation\n{summary}"),
-        });
+        self.session.insert(0, Message::new(Role::Assistant, format!("## Summary of earlier conversation\n{summary}")));
         if let Some(store) = &self.session_store {
             let _ = store.append("summary", &summary);
         }
@@ -902,8 +913,8 @@ impl Engine {
             reasoning_effort: effort.to_string(),
             temperature: 0.2,
             messages: vec![
-                Message { role: Role::System, content: system.to_string() },
-                Message { role: Role::User, content: user.to_string() },
+                Message::new(Role::System, system.to_string()),
+                Message::new(Role::User, user.to_string()),
             ],
             tools: vec![],
         };
@@ -969,10 +980,7 @@ impl Engine {
             user_text
         };
 
-        self.session.push(Message {
-            role: Role::User,
-            content: user_text.clone(),
-        });
+        self.session.push(Message::new(Role::User, user_text.clone()));
         if let Some(store) = &self.session_store {
             let _ = store.append("user", &user_text);
         }
@@ -1130,7 +1138,7 @@ impl Engine {
                 if let Some(store) = &self.session_store {
                     let _ = store.append("assistant", &assistant);
                 }
-                self.session.push(Message { role: Role::Assistant, content: assistant });
+                self.session.push(Message::new(Role::Assistant, assistant));
             }
             self.fire_hooks("stop", serde_json::json!({})).await;
             self.emit(Event::TurnFinished { turn }).await;
@@ -1148,11 +1156,15 @@ impl Engine {
         let mut step = 0usize;
         let mut overflow_retries = 0u8;
         let mut nudges = 0u8;
+        let mut verifies = 0u8;
+        self.turn_edited = false;
+        self.turn_reads.clear();
+        self.turn_edit_paths.clear();
         loop {
             // Keep the running history under budget on EVERY request — long
             // agentic turns accumulate tool output and would otherwise overflow.
             self.compact_session(turn).await;
-            let mut msgs = vec![Message { role: Role::System, content: sys.clone() }];
+            let mut msgs = vec![Message::new(Role::System, sys.clone())];
             msgs.extend(self.session.iter().cloned());
             let req = TurnRequest {
                 model: model.clone(),
@@ -1171,7 +1183,18 @@ impl Engine {
             let mut steered = false;
             loop {
                 tokio::select! {
-                    item = stream_rx.recv() => {
+                    res = tokio::time::timeout(std::time::Duration::from_secs(180), stream_rx.recv()) => {
+                        // Idle-timeout: if the provider stalls mid-stream (HTTP
+                        // open but no data), don't hang the turn forever — end the
+                        // round so the user isn't stuck on a spinner.
+                        let item = match res {
+                            Ok(it) => it,
+                            Err(_) => {
+                                self.emit(Event::Info { text: "provider stream stalled (no data for 180s) — ending round".into() }).await;
+                                stream_task.abort();
+                                break;
+                            }
+                        };
                         match item {
                             Some(StreamItem::TextDelta(t)) => {
                                 round_text.push_str(&t);
@@ -1180,9 +1203,17 @@ impl Engine {
                             Some(StreamItem::ReasoningDelta(t)) => {
                                 self.emit(Event::ReasoningDelta { turn, text: t }).await;
                             }
-                            Some(StreamItem::ToolCall { name, arguments }) => {
+                            Some(StreamItem::ToolCall { id, name, arguments }) => {
                                 did_tool = true;
-                                if self.handle_tool_call(turn, name, arguments, op_rx).await {
+                                // Record the assistant's tool call structurally so the model
+                                // sees a real function_call/tool_use (with id) on replay — not
+                                // flattened text. This is what stops the re-plan/re-read loop.
+                                let prose = std::mem::take(&mut round_text);
+                                self.session.push(Message::with_tool_call(
+                                    prose,
+                                    oxide_providers::ToolCall { id: id.clone(), name: name.clone(), arguments: arguments.clone() },
+                                ));
+                                if self.handle_tool_call(turn, name, arguments, id, op_rx).await {
                                     interrupted = true;
                                     break;
                                 }
@@ -1213,7 +1244,7 @@ impl Engine {
                                 if let Some(store) = &self.session_store {
                                     let _ = store.append("user", &text);
                                 }
-                                self.session.push(Message { role: Role::User, content: text.clone() });
+                                self.session.push(Message::new(Role::User, text.clone()));
                                 self.emit(Event::Info { text: format!("↪ steering: {text}") }).await;
                                 steered = true;
                             }
@@ -1250,7 +1281,7 @@ impl Engine {
                 if let Some(store) = &self.session_store {
                     let _ = store.append("assistant", &round_text);
                 }
-                self.session.push(Message { role: Role::Assistant, content: round_text });
+                self.session.push(Message::new(Role::Assistant, round_text));
             }
             step += 1;
             if interrupted {
@@ -1258,12 +1289,10 @@ impl Engine {
             }
             if step >= max_steps {
                 // Force a text-only wrap-up instead of silently stopping (opencode-style).
-                self.session.push(Message {
-                    role: Role::User,
-                    content: "<system-reminder>\nMaximum tool steps reached. Do NOT call any more tools. \
+                self.session.push(Message::new(Role::User,
+                    "<system-reminder>\nMaximum tool steps reached. Do NOT call any more tools. \
 Reply with text only: summarize what you changed (with file paths and how you verified), and list \
-any remaining tasks and the recommended next step.\n</system-reminder>".into(),
-                });
+any remaining tasks and the recommended next step.\n</system-reminder>"));
                 break;
             }
             if !did_tool && !steered {
@@ -1271,14 +1300,25 @@ any remaining tasks and the recommended next step.\n</system-reminder>".into(),
                 // an edit, nudge it once to actually do the work before ending.
                 if nudges < 1 {
                     nudges += 1;
-                    self.session.push(Message {
-                        role: Role::User,
-                        content: "<system-reminder>\nYou stopped without calling a tool. If the task requires \
+                    self.session.push(Message::new(Role::User,
+                        "<system-reminder>\nYou stopped without calling a tool. If the task requires \
 changes, APPLY them now with the edit/write_file tools (then verify with shell). Do not just describe \
 an edit — make it. Only end without acting if the task is genuinely complete and verified, or you are \
-truly blocked and need a decision (then call ask_user).\n</system-reminder>".into(),
-                    });
+truly blocked and need a decision (then call ask_user).\n</system-reminder>"));
                     continue;
+                }
+                // Auto-verify: build/typecheck the edits and feed failures back
+                // so the agent fixes them before finishing (Cursor-style).
+                if self.config.auto_verify && self.turn_edited && verifies < 2 {
+                    if let Some(report) = self.run_verify().await {
+                        verifies += 1;
+                        self.turn_edited = false;
+                        self.session.push(Message::new(Role::User, format!(
+                            "<system-reminder>\nA build/typecheck failed after your edits. Fix the errors below, \
+then stop. Apply fixes with edit/write_file — do not just explain.\n\n{report}\n</system-reminder>"
+                        )));
+                        continue;
+                    }
                 }
                 break;
             }
@@ -1292,6 +1332,70 @@ truly blocked and need a decision (then call ask_user).\n</system-reminder>".int
 
     /// Route one tool call through approval + sandbox and emit its result.
     /// Returns `true` if the turn was interrupted/shut down while waiting.
+    /// Run the project's build/typecheck after edits. Returns `Some(report)`
+    /// when it fails (so the agent can auto-fix), `None` when it passes, can't
+    /// be detected, errors out, or times out (never blocks the turn).
+    async fn run_verify(&self) -> Option<String> {
+        let ws = &self.workspace;
+        // Only verify when a relevant source file was edited. A docs/config-only
+        // edit (e.g. README.md) must NOT trigger a project-wide typecheck that
+        // surfaces pre-existing errors in unrelated files and drags the agent
+        // off-task. Extension of any edited path drives the language choice.
+        let ext = |p: &str| std::path::Path::new(p).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+        let edited: Vec<String> = self.turn_edit_paths.iter().map(|p| ext(p)).collect();
+        let has = |exts: &[&str]| edited.iter().any(|e| exts.contains(&e.as_str()));
+        let (prog, args): (String, Vec<String>) = if !self.config.verify_command.trim().is_empty() {
+            ("sh".into(), vec!["-c".into(), self.config.verify_command.clone()])
+        } else if ws.join("Cargo.toml").exists() && has(&["rs"]) {
+            ("cargo".into(), vec!["check".into(), "--message-format".into(), "short".into()])
+        } else if ws.join("tsconfig.json").exists() && has(&["ts", "tsx"]) {
+            ("npx".into(), vec!["tsc".into(), "--noEmit".into()])
+        } else if ws.join("package.json").exists() && has(&["ts", "tsx", "js", "jsx", "mjs", "cjs", "vue", "svelte"]) {
+            ("npm".into(), vec!["run".into(), "build".into(), "--if-present".into()])
+        } else if (ws.join("pyproject.toml").exists() || ws.join("requirements.txt").exists()) && has(&["py"]) {
+            ("ruff".into(), vec!["check".into(), ".".into()])
+        } else {
+            return None;
+        };
+        self.emit(Event::Info { text: format!("auto-verify: {prog} {}", args.join(" ")) }).await;
+        let fut = tokio::process::Command::new(&prog)
+            .args(&args)
+            .current_dir(ws)
+            .output();
+        let out = match tokio::time::timeout(std::time::Duration::from_secs(180), fut).await {
+            Ok(Ok(o)) => o,
+            _ => return None, // spawn error / timeout → don't block
+        };
+        if out.status.success() {
+            return None;
+        }
+        let mut s = String::from_utf8_lossy(&out.stdout).to_string();
+        s.push_str(&String::from_utf8_lossy(&out.stderr));
+        let s = s.trim();
+        if s.is_empty() {
+            return None;
+        }
+        // Surface ONLY diagnostics that reference a file edited this turn — a
+        // build failing on pre-existing errors elsewhere isn't this turn's job
+        // (opencode does per-edited-file diagnostics, not project-wide chasing).
+        let names: Vec<String> = self.turn_edit_paths.iter()
+            .filter_map(|p| std::path::Path::new(p).file_name().map(|n| n.to_string_lossy().to_string()))
+            .collect();
+        if !names.is_empty() && self.config.verify_command.trim().is_empty() {
+            let relevant: String = s.lines()
+                .filter(|l| names.iter().any(|n| l.contains(n.as_str())))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if relevant.trim().is_empty() {
+                return None; // failures are all in files we didn't touch
+            }
+            let capped: String = relevant.chars().take(6000).collect();
+            return Some(format!("$ {} {}\n{capped}", prog, args.join(" ")));
+        }
+        let capped: String = s.chars().take(6000).collect();
+        Some(format!("$ {} {}\n{capped}", prog, args.join(" ")))
+    }
+
     /// Validate an `edit` and compute the resulting full file content.
     fn compute_edit(&self, args: &serde_json::Value) -> Result<(String, String), String> {
         let path = args["path"].as_str().ok_or("edit: missing 'path'")?.to_string();
@@ -1322,6 +1426,7 @@ truly blocked and need a decision (then call ask_user).\n</system-reminder>".int
         turn: TurnId,
         name: String,
         mut arguments: serde_json::Value,
+        call_id: String,
         op_rx: &mut mpsc::Receiver<Op>,
     ) -> bool {
         self.emit(Event::ToolCallBegin {
@@ -1348,7 +1453,7 @@ truly blocked and need a decision (then call ask_user).\n</system-reminder>".int
                     Some(_) => {}
                 }
             };
-            self.session.push(Message { role: Role::Tool, content: format!("[ask_user answer] {answer}") });
+            self.session.push(Message::tool_result(format!("[ask_user answer] {answer}"), call_id));
             self.emit(Event::ToolCallEnd { turn, tool: name, output: answer, ok: true }).await;
             return false;
         }
@@ -1428,6 +1533,22 @@ truly blocked and need a decision (then call ask_user).\n</system-reminder>".int
             return false;
         }
 
+        // Break the re-read loop: if the model reads a file it already read this
+        // turn, don't re-read — its content is already in context. Push it to act.
+        if name == "read_file" {
+            if let Some(p) = arguments["path"].as_str() {
+                if !self.turn_reads.insert(p.to_string()) {
+                    let msg = format!(
+                        "You already read `{p}` earlier this turn — its full content is in the conversation above. \
+Do NOT read it again. Proceed now: make the edits with the edit/write_file tools."
+                    );
+                    self.session.push(Message::tool_result(format!("[tool read_file]\n{msg}"), call_id));
+                    self.emit(Event::ToolCallEnd { turn, tool: name, output: msg, ok: true }).await;
+                    return false;
+                }
+            }
+        }
+
         // `edit` = surgical string replace; validate then handle it like a write.
         let mut edit_error: Option<String> = None;
         if name == "edit" {
@@ -1479,7 +1600,20 @@ truly blocked and need a decision (then call ask_user).\n</system-reminder>".int
         } else if name == "fetch_url" {
             fetch_url(arguments["url"].as_str().unwrap_or("")).await
         } else if name == "codebase_search" {
-            codebase_search(&self.workspace, arguments["query"].as_str().unwrap_or(""))
+            // Heavy synchronous walk + scoring — run off the async runtime so it
+            // can never block the engine event loop (the "stuck" symptom), and
+            // bound it so a huge repo can't hang the turn.
+            let ws = self.workspace.clone();
+            let q = arguments["query"].as_str().unwrap_or("").to_string();
+            let job = tokio::task::spawn_blocking(move || codebase_search(&ws, &q));
+            match tokio::time::timeout(std::time::Duration::from_secs(20), job).await {
+                Ok(Ok(r)) => r,
+                Ok(Err(_)) => ("codebase_search: internal error".into(), false),
+                Err(_) => (
+                    "codebase_search: timed out (repository too large). Narrow the query or use `search`/`read_file` on a specific path.".into(),
+                    false,
+                ),
+            }
         } else if name == "edit" {
             match &edit_error {
                 Some(e) => (e.clone(), false),
@@ -1518,6 +1652,10 @@ truly blocked and need a decision (then call ask_user).\n</system-reminder>".int
             }
         }
         if ok && is_write {
+            self.turn_edited = true;
+            if let Some(p) = arguments["path"].as_str() {
+                self.turn_edit_paths.push(p.to_string());
+            }
             if let Some((path, prior, id)) = &write_ctx {
                 self.emit(Event::PatchApplied { turn, path: path.clone() }).await;
                 let new = arguments["content"].as_str().unwrap_or("");
@@ -1545,10 +1683,7 @@ truly blocked and need a decision (then call ask_user).\n</system-reminder>".int
         } else {
             output.clone()
         };
-        self.session.push(Message {
-            role: Role::Tool,
-            content: format!("[tool {name}]\n{stored}"),
-        });
+        self.session.push(Message::tool_result(format!("[tool {name}]\n{stored}"), call_id));
         self.emit(Event::ToolCallEnd {
             turn,
             tool: name,
@@ -1562,34 +1697,40 @@ truly blocked and need a decision (then call ask_user).\n</system-reminder>".int
 
 /// Load pinned project instructions from AGENTS.md / CLAUDE.md (first found).
 fn load_project_instructions(workspace: &std::path::Path) -> Option<String> {
-    // Single-file instructions (first found): AGENTS.md / CLAUDE.md / Cursor rules.
-    for name in ["AGENTS.md", "CLAUDE.md", ".oxide/AGENTS.md", ".cursorrules"] {
+    let mut combined = String::new();
+    // Single-file instructions — first match among the conventional names wins
+    // (they're usually the same doc under different ecosystems' names).
+    for name in ["AGENTS.md", "CLAUDE.md", ".oxide/AGENTS.md", ".cursorrules", ".windsurfrules"] {
         if let Ok(text) = std::fs::read_to_string(workspace.join(name)) {
             let t = text.trim();
             if !t.is_empty() {
-                let capped: String = t.chars().take(8000).collect();
-                return Some(capped);
+                combined.push_str(t);
+                combined.push_str("\n\n");
+                break;
             }
         }
     }
-    // Cursor's `.cursor/rules/*.mdc` rule files (concatenated).
-    if let Ok(rd) = std::fs::read_dir(workspace.join(".cursor/rules")) {
-        let mut combined = String::new();
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.extension().and_then(|x| x.to_str()) == Some("mdc") {
+    // Rule directories (all files concatenated): Cursor `.cursor/rules/*.mdc`
+    // and Oxide's own `.oxide/rules/*.md`.
+    for (dir, ext) in [(".cursor/rules", "mdc"), (".oxide/rules", "md")] {
+        if let Ok(rd) = std::fs::read_dir(workspace.join(dir)) {
+            let mut paths: Vec<_> = rd.flatten().map(|e| e.path())
+                .filter(|p| p.extension().and_then(|x| x.to_str()) == Some(ext))
+                .collect();
+            paths.sort();
+            for p in paths {
                 if let Ok(text) = std::fs::read_to_string(&p) {
-                    combined.push_str(text.trim());
-                    combined.push_str("\n\n");
+                    let t = text.trim();
+                    if !t.is_empty() {
+                        combined.push_str(t);
+                        combined.push_str("\n\n");
+                    }
                 }
             }
         }
-        let t = combined.trim();
-        if !t.is_empty() {
-            return Some(t.chars().take(8000).collect());
-        }
     }
-    None
+    let t = combined.trim();
+    if t.is_empty() { None } else { Some(t.chars().take(12000).collect()) }
 }
 
 /// Unified diff between two file contents.

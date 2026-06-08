@@ -102,7 +102,20 @@ impl ToolRouter {
         };
         match sandbox::check_read(self.sandbox, &self.workspace, std::path::Path::new(path)) {
             PathCheck::Denied(why) => (why, false),
-            PathCheck::Ok(abs) => match std::fs::read_to_string(&abs) {
+            PathCheck::Ok(abs) => {
+                // Guard before reading: a non-regular file (fifo/device/socket)
+                // would block read_to_string forever, and a multi-GB file would
+                // stall the engine. Both showed up as a "stuck" turn.
+                match std::fs::metadata(&abs) {
+                    Ok(m) if !m.is_file() => {
+                        return (format!("read_file: '{path}' is not a regular file (skipped)"), false);
+                    }
+                    Ok(m) if m.len() > 10_000_000 => {
+                        return (format!("read_file: '{path}' is {} MB — too large to read whole. Use `search` to locate the region.", m.len() / 1_000_000), false);
+                    }
+                    _ => {}
+                }
+                match std::fs::read_to_string(&abs) {
                 Ok(content) => {
                     // Cap very large reads, but TELL the model it was truncated so
                     // it edits with what it has instead of re-reading blindly.
@@ -114,7 +127,8 @@ impl ToolRouter {
                     }
                 }
                 Err(e) => (format!("read_file error: {e}"), false),
-            },
+                }
+            }
         }
     }
 
@@ -147,22 +161,38 @@ impl ToolRouter {
         let Some(query) = args["query"].as_str() else {
             return ("search: missing 'query'".into(), false);
         };
+        const SKIP: &[&str] = &[
+            ".git", "target", ".oxide", "node_modules", "dist", "build",
+            ".next", "vendor", ".venv", "__pycache__", ".cache", "out", ".turbo",
+        ];
         let mut hits = Vec::new();
         let mut stack = vec![self.workspace.clone()];
+        let mut visited = 0usize;
         while let Some(dir) = stack.pop() {
             let Ok(entries) = std::fs::read_dir(&dir) else {
                 continue;
             };
             for entry in entries.flatten() {
+                visited += 1;
+                if visited > 50_000 {
+                    hits.push("… (search stopped: too many files — narrow the path)".into());
+                    return (hits.join("\n"), true);
+                }
                 let p = entry.path();
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
-                if name == ".git" || name == "target" || name == ".oxide" {
+                if SKIP.contains(&name.as_ref()) {
                     continue;
                 }
                 if p.is_dir() {
                     stack.push(p);
-                } else if let Ok(text) = std::fs::read_to_string(&p) {
+                    continue;
+                }
+                // Skip big/binary files: never slurp a >2MB file into a String.
+                if std::fs::metadata(&p).map(|m| m.len() > 2_000_000).unwrap_or(true) {
+                    continue;
+                }
+                if let Ok(text) = std::fs::read_to_string(&p) {
                     for (i, line) in text.lines().enumerate() {
                         if line.contains(query) {
                             hits.push(format!("{}:{}: {}", p.display(), i + 1, line.trim()));

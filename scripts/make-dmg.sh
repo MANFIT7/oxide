@@ -68,11 +68,55 @@ codesign --force --deep --sign - "$APPDIR" 2>/dev/null || true
 
 echo "▶ building $APP.dmg…"
 STAGE="$DIST/stage"
-mkdir -p "$STAGE"
+mkdir -p "$STAGE/.background"
 cp -R "$APPDIR" "$STAGE/"
 ln -s /Applications "$STAGE/Applications"
-rm -f "$DIST/$APP.dmg"
-hdiutil create -volname "$APP" -srcfolder "$STAGE" -ov -format UDZO "$DIST/$APP.dmg" >/dev/null
+
+# Synara-style install window: dark background + arrow + positioned icons.
+python3 scripts/dmg-bg.py "$STAGE/.background/bg.png" || true
+
+RW="$DIST/rw.dmg"
+rm -f "$RW" "$DIST/$APP.dmg"
+
+# Detach any stale "Oxide" volume (a previously-opened dmg) so our RW mounts
+# under the expected name instead of "Oxide 1" — otherwise the Finder styling
+# targets the wrong disk and the window comes out unstyled (huge, no bg).
+for v in /Volumes/"$APP"*; do
+  [ -d "$v" ] && hdiutil detach "$v" -force >/dev/null 2>&1 || true
+done
+
+hdiutil create -volname "$APP" -srcfolder "$STAGE" -ov -format UDRW "$RW" >/dev/null
+MOUNT="$(hdiutil attach -readwrite -noverify -noautoopen "$RW" | egrep '/Volumes/' | sed 's/.*\(\/Volumes\/.*\)/\1/' | head -1)"
+# Use the ACTUAL mounted volume name (basename), not the hardcoded title.
+VOL="$(basename "$MOUNT")"
+
+if [ -n "${MOUNT:-}" ] && [ -f "$MOUNT/.background/bg.png" ]; then
+osascript <<APPLESCRIPT || true
+tell application "Finder"
+  tell disk "$VOL"
+    open
+    set current view of container window to icon view
+    set toolbar visible of container window to false
+    set statusbar visible of container window to false
+    set the bounds of container window to {200, 140, 740, 520}
+    set vo to the icon view options of container window
+    set arrangement of vo to not arranged
+    set icon size of vo to 80
+    set background picture of vo to file ".background:bg.png"
+    set position of item "$APP.app" of container window to {140, 205}
+    set position of item "Applications" of container window to {400, 205}
+    update without registering applications
+    delay 1
+    close
+  end tell
+end tell
+APPLESCRIPT
+sync
+fi
+
+[ -n "${MOUNT:-}" ] && hdiutil detach "$MOUNT" >/dev/null || true
+hdiutil convert "$RW" -format UDZO -ov -o "$DIST/$APP.dmg" >/dev/null
+rm -f "$RW"
 rm -rf "$STAGE"
 
 echo "✓ done → $DIST/$APP.dmg"

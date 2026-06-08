@@ -15,11 +15,41 @@ use async_trait::async_trait;
 use oxide_protocol::ToolSpec;
 use tokio::sync::mpsc;
 
+/// A tool call the assistant made, carried structurally so providers can emit a
+/// proper `function_call`/`tool_use` item (with a stable id) on replay instead
+/// of flattening it to text — which is what makes the model re-plan/re-call.
+#[derive(Debug, Clone)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: serde_json::Value,
+}
+
 /// One message in the conversation sent to the model.
 #[derive(Debug, Clone)]
 pub struct Message {
     pub role: Role,
     pub content: String,
+    /// For an assistant message: the tool call it issued (paired with a later
+    /// `Tool` message whose `tool_call_id` matches `tool_call.id`).
+    pub tool_call: Option<ToolCall>,
+    /// For a `Tool` message: which assistant tool call this is the result of.
+    pub tool_call_id: Option<String>,
+}
+
+impl Message {
+    /// A plain text message (no tool call).
+    pub fn new(role: Role, content: impl Into<String>) -> Self {
+        Self { role, content: content.into(), tool_call: None, tool_call_id: None }
+    }
+    /// An assistant message that issued a tool call.
+    pub fn with_tool_call(content: impl Into<String>, call: ToolCall) -> Self {
+        Self { role: Role::Assistant, content: content.into(), tool_call: Some(call), tool_call_id: None }
+    }
+    /// A tool result paired to the assistant call `id`.
+    pub fn tool_result(content: impl Into<String>, id: impl Into<String>) -> Self {
+        Self { role: Role::Tool, content: content.into(), tool_call: None, tool_call_id: Some(id.into()) }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,8 +77,10 @@ pub enum StreamItem {
     TextDelta(String),
     /// A chunk of reasoning/thinking text.
     ReasoningDelta(String),
-    /// The model wants to call a tool.
+    /// The model wants to call a tool. `id` is the provider's call id (used to
+    /// pair the result back); empty for backends that don't supply one.
     ToolCall {
+        id: String,
         name: String,
         arguments: serde_json::Value,
     },
@@ -155,6 +187,7 @@ impl Provider for MockToolProvider {
         }
         let _ = sink
             .send(StreamItem::ToolCall {
+                id: "m1".into(),
                 name: "write_file".to_string(),
                 arguments: serde_json::json!({
                     "path": "oxide_mock.txt",
@@ -188,6 +221,7 @@ impl Provider for MockMcpProvider {
         }
         let _ = sink
             .send(StreamItem::ToolCall {
+                id: "m2".into(),
                 name: "mcp__demo__ping".to_string(),
                 arguments: serde_json::json!({}),
             })
@@ -217,6 +251,7 @@ impl Provider for MockBrowserProvider {
         }
         let _ = sink
             .send(StreamItem::ToolCall {
+                id: "m3".into(),
                 name: "browser_open".to_string(),
                 arguments: serde_json::json!({
                     "url": "http://localhost:3000",
@@ -226,6 +261,7 @@ impl Provider for MockBrowserProvider {
             .await;
         let _ = sink
             .send(StreamItem::ToolCall {
+                id: "m4".into(),
                 name: "browser_snapshot".to_string(),
                 arguments: serde_json::json!({
                     "url": "http://localhost:3000",

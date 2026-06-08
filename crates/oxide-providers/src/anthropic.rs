@@ -117,6 +117,7 @@ impl Provider for AnthropicProvider {
 
         // Tool-use accumulation for the currently open content block.
         let mut cur_tool: Option<String> = None;
+        let mut cur_tool_id = String::new();
         let mut cur_args = String::new();
         let mut input_tokens = 0u64;
 
@@ -137,6 +138,7 @@ impl Provider for AnthropicProvider {
                     let block = &data["content_block"];
                     if block["type"] == "tool_use" {
                         cur_tool = block["name"].as_str().map(|s| s.to_string());
+                        cur_tool_id = block["id"].as_str().unwrap_or("").to_string();
                         cur_args.clear();
                     }
                 }
@@ -171,7 +173,8 @@ impl Provider for AnthropicProvider {
                     if let Some(name) = cur_tool.take() {
                         let arguments = serde_json::from_str(&cur_args)
                             .unwrap_or(Value::Object(Default::default()));
-                        let _ = sink.send(StreamItem::ToolCall { name, arguments }).await;
+                        let id = std::mem::take(&mut cur_tool_id);
+                        let _ = sink.send(StreamItem::ToolCall { id, name, arguments }).await;
                         cur_args.clear();
                     }
                 }
@@ -206,14 +209,8 @@ mod tests {
             reasoning_effort: "medium".into(),
             temperature: 0.2,
             messages: vec![
-                Message {
-                    role: Role::System,
-                    content: "be terse".into(),
-                },
-                Message {
-                    role: Role::User,
-                    content: "hi".into(),
-                },
+                Message::new(Role::System, "be terse"),
+                Message::new(Role::User, "hi"),
             ],
             tools: vec![ToolSpec::new("read_file", "read a file")],
         }

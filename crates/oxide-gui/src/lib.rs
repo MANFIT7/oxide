@@ -8,6 +8,7 @@
 
 mod board;
 mod update;
+mod preview_proxy;
 
 use dioxus::desktop::{Config as DesktopConfig, WindowBuilder};
 use dioxus::prelude::*;
@@ -531,7 +532,40 @@ return true;
 
 /// Split user text into `(is_mention, text)` segments — `@word` at a word
 /// boundary becomes a mention pill.
+/// Strip the prompt scaffolding the composer injects (context files, MCP/skill
+/// blocks, plan/pursue tags, git context, picked-element, image notes) so a
+/// persisted/resumed user message renders as just the human text + chips.
+fn strip_scaffold(text: &str) -> String {
+    const DROP_PREFIX: &[&str] = &[
+        "Context files:", "Use these MCP servers", "- `", "## Skill:",
+        "## Git context", "## Working git diff", "### status", "### recent commits",
+        "### working diff", "(Use the `", "[Preview selection", "[Plan mode]",
+        "[Pursue goal]", "(user attached", "- selector:", "- component:",
+        "- source:", "- text:", "- html:", "Selected UI element",
+    ];
+    let mut keep = Vec::new();
+    let mut in_diff_fence = false;
+    for line in text.lines() {
+        let l = line.trim_start();
+        if in_diff_fence {
+            if l.starts_with("```") { in_diff_fence = false; }
+            continue; // drop the whole injected ```diff block
+        }
+        if l.starts_with("```diff") {
+            in_diff_fence = true;
+            continue;
+        }
+        if DROP_PREFIX.iter().any(|p| l.starts_with(p)) {
+            continue;
+        }
+        keep.push(line);
+    }
+    keep.join("\n").trim().to_string()
+}
+
 fn user_segments(text: &str) -> Vec<(bool, String)> {
+    let text = strip_scaffold(text);
+    let text = text.as_str();
     let chars: Vec<char> = text.chars().collect();
     let mut out: Vec<(bool, String)> = Vec::new();
     let mut buf = String::new();
@@ -568,6 +602,7 @@ fn mention_label(token: &str) -> String {
     token
         .strip_prefix("mcp:")
         .or_else(|| token.strip_prefix("skill:"))
+        .or_else(|| token.strip_prefix("ctx:"))
         .unwrap_or(token)
         .trim_end_matches('/')
         .rsplit('/')
@@ -667,6 +702,7 @@ async fn submit_ce(
     goal_text: Signal<String>,
     mut queue: Signal<Vec<String>>,
     mut attachments: Signal<Vec<String>>,
+    mut picked_element: Signal<Option<String>>,
     steer: bool,
     ws: PathBuf,
 ) {
@@ -678,7 +714,24 @@ async fn submit_ce(
         .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
         .unwrap_or_default();
     let n_imgs = attachments.read().len();
-    if body.is_empty() && tokens.is_empty() && n_imgs == 0 {
+    let picked = picked_element.read().clone();
+    if body.is_empty() && tokens.is_empty() && n_imgs == 0 && picked.is_none() {
+        return;
+    }
+    // Built-in /review (Bugbot): review the working diff for bugs.
+    if body.trim_start().starts_with("/review") {
+        let _ = dioxus::document::eval("const e=document.getElementById('ce-input'); if(e) e.innerHTML='';").join::<bool>().await;
+        let extra = body.trim_start().trim_start_matches("/review").trim();
+        let diff = run_cmd(&ws, "git", &["diff"]).await;
+        let diff: String = diff.chars().take(12000).collect();
+        let prompt = format!(
+            "Act as Bugbot. Review the current working changes for bugs, security issues, \
+logic errors, and regressions. For each finding give: file:line, severity (high/med/low), \
+why it's wrong, and the concrete fix. If the diff is clean, say so plainly.{}\n\n```diff\n{}\n```",
+            if extra.is_empty() { String::new() } else { format!(" Extra focus: {extra}.") },
+            diff
+        );
+        let _ = engine.send(EngineCmd::Submit { engine: prompt, display: "/review (Bugbot)".into() });
         return;
     }
     // Clear the editor immediately so a rapid second Enter can't double-submit
@@ -701,6 +754,7 @@ async fn submit_ce(
     let mut files = Vec::new();
     let mut skills_block = String::new();
     let mut mcp_block = String::new();
+    let mut ctx_block = String::new();
     for tkn in &tokens {
         if let Some(name) = tkn.strip_prefix("mcp:") {
             mcp_block.push_str(&format!("\n- `{name}` — call its tools via `mcp__{name}__*`"));
@@ -710,9 +764,31 @@ async fn submit_ce(
                 Ok(c) => skills_block.push_str(&format!("\n## Skill: {name}\n{}\n", c.trim())),
                 Err(_) => skills_block.push_str(&format!("\n## Skill: {name} (not found)\n")),
             }
+        } else if let Some(kind) = tkn.strip_prefix("ctx:") {
+            match kind {
+                "git" => {
+                    let st = run_cmd(&ws, "git", &["status", "--short", "--branch"]).await;
+                    let df = run_cmd(&ws, "git", &["diff"]).await;
+                    let lg = run_cmd(&ws, "git", &["log", "--oneline", "-10"]).await;
+                    let df: String = df.chars().take(6000).collect();
+                    ctx_block.push_str(&format!("\n## Git context\n### status\n{st}\n### recent commits\n{lg}\n### working diff\n```diff\n{df}\n```\n"));
+                }
+                "diff" => {
+                    let df = run_cmd(&ws, "git", &["diff"]).await;
+                    let df: String = df.chars().take(8000).collect();
+                    ctx_block.push_str(&format!("\n## Working git diff\n```diff\n{df}\n```\n"));
+                }
+                "codebase" => ctx_block.push_str("\n(Use the `codebase_search` tool to find relevant code semantically before acting.)\n"),
+                "web" => ctx_block.push_str("\n(Use the `web_search` tool to research this on the web.)\n"),
+                _ => {}
+            }
         } else {
             files.push(format!("@{tkn}"));
         }
+    }
+    if !ctx_block.is_empty() {
+        text.push_str(&ctx_block);
+        text.push('\n');
     }
     if !mcp_block.is_empty() {
         text.push_str("Use these MCP servers for this task:");
@@ -732,6 +808,10 @@ async fn submit_ce(
     }
     if n_imgs > 0 {
         text.push_str(&format!("\n(user attached {n_imgs} image{})", if n_imgs == 1 { "" } else { "s" }));
+    }
+    if let Some(p) = &picked {
+        text.push_str(&format!("\n[Preview selection — change this element]\n{p}\n"));
+        picked_element.set(None);
     }
     text.push_str(&body);
     let display = if n_imgs > 0 {
@@ -933,8 +1013,17 @@ fn active_slash(text: &str) -> Option<String> {
 /// Available slash commands `(name, description)` matching `query`.
 fn slash_commands(ws: &Path, query: &str) -> Vec<(String, String)> {
     let q = query.to_ascii_lowercase();
+    // Built-in commands handled by the composer itself.
+    let builtins = [
+        ("review", "Bugbot — review the working git diff for bugs"),
+    ];
+    let mut v: Vec<(String, String)> = builtins
+        .iter()
+        .filter(|(n, _)| q.is_empty() || n.contains(&q))
+        .map(|(n, d)| (n.to_string(), d.to_string()))
+        .collect();
     let dir = ws.join(".oxide/commands");
-    let mut v: Vec<(String, String)> = std::fs::read_dir(&dir)
+    v.extend(std::fs::read_dir(&dir)
         .into_iter()
         .flatten()
         .flatten()
@@ -958,9 +1047,9 @@ fn slash_commands(ws: &Path, query: &str) -> Vec<(String, String)> {
                 })
                 .unwrap_or_default();
             Some((name, desc))
-        })
-        .collect();
+        }));
     v.sort();
+    v.dedup();
     v
 }
 
@@ -992,7 +1081,14 @@ fn mcp_candidates(query: &str) -> Vec<String> {
 }
 
 fn all_mention_items(ws: &Path, query: &str) -> Vec<String> {
-    let mut v = mcp_candidates(query);
+    let q = query.to_ascii_lowercase();
+    // Special context providers (Cursor-style @git / @web / @codebase).
+    let mut v: Vec<String> = ["ctx:git", "ctx:diff", "ctx:codebase", "ctx:web"]
+        .iter()
+        .filter(|t| q.is_empty() || t.contains(&q))
+        .map(|t| t.to_string())
+        .collect();
+    v.extend(mcp_candidates(query));
     v.extend(skill_candidates(ws, query));
     v.extend(mention_candidates(ws, query));
     v
@@ -1040,6 +1136,24 @@ fn archive_session(path: &Path) {
             let _ = std::fs::rename(path, arch.join(name));
         }
     }
+}
+
+/// First user line of a session as its title.
+fn session_title(path: &Path) -> String {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|t| {
+            t.lines().find_map(|l| {
+                let v: serde_json::Value = serde_json::from_str(l).ok()?;
+                if v["role"].as_str()? == "user" {
+                    Some(v["content"].as_str()?.lines().next().unwrap_or("").chars().take(38).collect::<String>())
+                } else {
+                    None
+                }
+            })
+        })
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "Chat".to_string())
 }
 
 /// Recent non-empty sessions `(path, title, msg_count)`, newest first. Deletes
@@ -1163,6 +1277,21 @@ fn open_session_tab(
 ) {
     let loaded = load_session(&path);
     let cur = *active_tab.read();
+    // If the current tab is an empty GUI chat, open the history IN PLACE instead
+    // of spawning a new tab (user picked a chat from history with nothing typed).
+    let cur_empty = {
+        let t = tabs.read();
+        messages.read().is_empty()
+            && t.get(cur).map(|tab| tab.mode == "gui" && tab.messages.is_empty()).unwrap_or(false)
+    };
+    if cur_empty {
+        if let Some(t) = tabs.write().get_mut(cur) {
+            t.title = title;
+            t.messages = loaded.clone();
+        }
+        messages.set(loaded);
+        return;
+    }
     if let Some(t) = tabs.write().get_mut(cur) {
         t.messages = messages.read().clone();
     }
@@ -1204,6 +1333,64 @@ fn load_session(path: &Path) -> Vec<ChatMsg> {
 }
 
 /// Run a git subcommand in the workspace, returning stdout (stderr appended).
+/// Detect localhost servers: listening TCP ports + the owning process name.
+/// macOS/Linux via `lsof`. Returns `(port, "pid/command")` sorted, deduped.
+async fn scan_ports() -> Vec<(u16, String)> {
+    let out = match tokio::process::Command::new("lsof")
+        .args(["-nP", "-iTCP", "-sTCP:LISTEN"])
+        .output().await {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
+        Err(_) => return Vec::new(),
+    };
+    // macOS/media daemons that squat on localhost ports — never a dev server.
+    const DENY: &[&str] = &[
+        "spotify", "rapportd", "controlce", "sharingd", "identityser", "rapport",
+        "cloudd", "apsd", "trustd", "nsurlsess", "airplay", "wifiagent", "music",
+        "podcasts", "supercond", "remoted", "launchd", "deleted", "syncdefa",
+    ];
+    // Runtimes that *are* dev servers — these we always surface.
+    const DEV: &[&str] = &[
+        "node", "vite", "next", "bun", "deno", "python", "ruby", "php", "cargo",
+        "rustc", "webpack", "esbuild", "turbo", "npm", "pnpm", "yarn", "rails",
+        "flask", "uvicorn", "gunicorn", "caddy", "dotnet", "java", "air", "gin",
+        "hugo", "jekyll", "astro", "remix", "nuxt", "ng", "serve", "http-ser",
+    ];
+    let mut found: std::collections::BTreeMap<u16, String> = std::collections::BTreeMap::new();
+    for line in out.lines().skip(1) {
+        let mut cols = line.split_whitespace();
+        let cmd = cols.next().unwrap_or("").to_string();
+        let lc = cmd.to_ascii_lowercase();
+        if DENY.iter().any(|d| lc.starts_with(d)) { continue; }
+        // NAME column holds e.g. "127.0.0.1:5173" or "*:3000".
+        if let Some(addr) = line.split_whitespace().find(|c| c.contains(':') && (c.contains("127.0.0.1") || c.starts_with("*:") || c.contains("[::1]") || c.contains("localhost"))) {
+            if let Some(p) = addr.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()) {
+                if matches!(p, 22 | 53 | 88 | 445 | 631 | 5353 | 7000) { continue; }
+                let is_dev = DEV.iter().any(|d| lc.starts_with(d));
+                let common = matches!(p, 3000..=3009 | 4000 | 4200 | 4321 | 5000..=5005 | 5173..=5180 | 8000..=8090 | 8788 | 9000 | 1234 | 5500);
+                // Keep only plausible dev servers: a known runtime, or a common
+                // dev port. Drops random ephemeral daemons.
+                if is_dev || common {
+                    found.entry(p).or_insert(cmd.clone());
+                }
+            }
+        }
+    }
+    found.into_iter().collect()
+}
+
+/// Run an arbitrary command in the workspace, returning stdout+stderr.
+async fn run_cmd(ws: &Path, cmd: &str, args: &[&str]) -> String {
+    match tokio::process::Command::new(cmd).args(args).current_dir(ws).output().await {
+        Ok(o) => {
+            let mut s = String::from_utf8_lossy(&o.stdout).to_string();
+            let err = String::from_utf8_lossy(&o.stderr);
+            if !err.trim().is_empty() { s.push('\n'); s.push_str(&err); }
+            if s.trim().is_empty() { "(done)".to_string() } else { s }
+        }
+        Err(e) => format!("{cmd} error: {e} — is it installed?"),
+    }
+}
+
 async fn git_run(ws: PathBuf, args: Vec<String>) -> String {
     match tokio::process::Command::new("git")
         .args(&args)
@@ -1275,6 +1462,7 @@ fn app() -> Element {
     let mut theme_menu_pos = use_signal(|| (12.0f64, 44.0f64));
     // ⌘K command palette.
     let mut show_palette = use_signal(|| false);
+    let mut show_shortcuts = use_signal(|| false);
     let mut palette_query = use_signal(String::new);
     let mut palette_sel = use_signal(|| 0usize);
     let mut pinned = use_signal(|| false);
@@ -1284,6 +1472,10 @@ fn app() -> Element {
     let mut usage_info = use_signal(|| None::<(String, u8, u8, String, String)>);
     // Tiling split-view (each pane its own live engine).
     let mut show_split = use_signal(|| false);
+    let mut show_preview = use_signal(|| false);
+    let mut preview_url = use_signal(String::new);
+    let mut preview_ports = use_signal(Vec::<(u16, String)>::new);
+    let mut picked_element = use_signal(|| Option::<String>::None);
     let split_panes = use_signal(|| vec![(0u64, "gui".to_string(), cfg.read().provider.clone(), cfg.read().model.clone())]);
     let split_layout = use_signal(|| Tile::Leaf(0));
     let split_next_id = use_signal(|| 1u64);
@@ -1311,6 +1503,8 @@ fn app() -> Element {
         }]
     });
     let mut active_tab = use_signal(|| 0usize);
+    let mut renaming_tab = use_signal(|| None::<u64>);
+    let mut rename_text = use_signal(String::new);
     let next_tab_id = use_signal(|| 1u64);
     let mut show_newtab = use_signal(|| false);
 
@@ -1327,6 +1521,7 @@ fn app() -> Element {
     let mut usage = use_signal(|| (0u64, 0u64));
     // Git / Browser / Goal tab state.
     let mut git_status = use_signal(Vec::<String>::new);
+    let mut git_busy = use_signal(String::new);
     let mut git_refresh = use_signal(|| 0u32);
     let mut git_diff = use_signal(String::new);
     let mut commit_msg = use_signal(String::new);
@@ -1340,8 +1535,12 @@ fn app() -> Element {
     let mut q_answer = use_signal(String::new);
     let mut reverted = use_signal(HashSet::<u64>::new);
     // Edits made this turn: (path, adds, dels, checkpoint).
-    let mut turn_edits = use_signal(Vec::<(String, u32, u32, u64)>::new);
+    let mut turn_edits = use_signal(Vec::<(String, u32, u32, u64, String)>::new);
     let mut edits_expanded = use_signal(|| false);
+    // Per activity-group open state (keyed by first row index). Defaults to the
+    // running state but, once the user toggles, their choice sticks across the
+    // streaming re-renders that would otherwise force it back open.
+    let mut act_open = use_signal(std::collections::HashMap::<usize, bool>::new);
     let mut status = use_signal(String::new);
     let mut turn_start = use_signal(|| None::<std::time::Instant>);
 
@@ -1381,6 +1580,7 @@ fn app() -> Element {
               window.__oxkeys = 1;
               document.addEventListener('keydown', function(e){
                 if ((e.metaKey || e.ctrlKey) && (e.key === 'k' || e.key === 'K')) { e.preventDefault(); dioxus.send('palette'); }
+                else if ((e.metaKey || e.ctrlKey) && e.key === '/') { e.preventDefault(); dioxus.send('shortcuts'); }
                 else if ((e.metaKey || e.ctrlKey) && (e.key === 'b' || e.key === 'B')) { e.preventDefault(); dioxus.send('files'); }
                 else if (e.key === 'Escape') { dioxus.send('esc'); }
               }, true);
@@ -1392,7 +1592,8 @@ fn app() -> Element {
             match eval.recv::<String>().await {
                 Ok(k) if k == "palette" => { let v = !*show_palette.read(); show_palette.set(v); palette_query.set(String::new()); palette_sel.set(0); }
                 Ok(k) if k == "files" => { let v = !*show_files.read(); show_files.set(v); }
-                Ok(k) if k == "esc" => { show_palette.set(false); }
+                Ok(k) if k == "shortcuts" => { let v = !*show_shortcuts.read(); show_shortcuts.set(v); }
+                Ok(k) if k == "esc" => { show_palette.set(false); show_shortcuts.set(false); }
                 Ok(_) => {}
                 Err(_) => break,
             }
@@ -1653,7 +1854,7 @@ fn app() -> Element {
                             }
                             Event::FileDiff { path, diff, checkpoint, .. } => {
                                 let (adds, dels) = diff_counts(&diff);
-                                turn_edits.write().push((path.clone(), adds, dels, checkpoint));
+                                turn_edits.write().push((path.clone(), adds, dels, checkpoint, diff.clone()));
                                 messages.write().push(ChatMsg { author: Author::Diff(path, checkpoint), text: diff });
                             }
                             Event::HookFired { hook, command, blocked } => {
@@ -1694,6 +1895,14 @@ fn app() -> Element {
                             Event::TurnFinished { .. } => {
                                 streaming.set(false);
                                 status.set(String::new());
+                                // Settle any activity still showing a spinner so none stays
+                                // "running" stuck at the bottom after the turn ends.
+                                {
+                                    let mut m = messages.write();
+                                    for c in m.iter_mut() {
+                                        if let Author::Activity { running, .. } = &mut c.author { *running = false; }
+                                    }
+                                }
                                 if let Some(start) = turn_start.write().take() {
                                     let secs = start.elapsed().as_secs();
                                     let dur = if secs >= 60 { format!("{}m {}s", secs / 60, secs % 60) } else { format!("{secs}s") };
@@ -1724,6 +1933,67 @@ fn app() -> Element {
         let a = cfg.read().accent_color.clone();
         if a.trim().is_empty() { String::new() } else { format!("--accent: {a}; --on-accent: #ffffff;") }
     };
+
+    // Keyboard: ⌘1–9 jump to tab N, ⌘⇧] / ⌘⇧[ cycle tabs.
+    use_future(move || async move {
+        let mut eval = dioxus::document::eval(
+            r#"
+            if (!window.__oxtabkeys) {
+              window.__oxtabkeys = 1;
+              document.addEventListener('keydown', function(e){
+                if (!(e.metaKey || e.ctrlKey)) return;
+                if (e.shiftKey && (e.key === ']' || e.code === 'BracketRight')) { e.preventDefault(); dioxus.send('next'); }
+                else if (e.shiftKey && (e.key === '[' || e.code === 'BracketLeft')) { e.preventDefault(); dioxus.send('prev'); }
+                else if (!e.shiftKey && e.key >= '1' && e.key <= '9') { e.preventDefault(); dioxus.send('jump:' + e.key); }
+              }, true);
+            }
+            while (true) { await new Promise(r => setTimeout(r, 3600000)); }
+            "#,
+        );
+        loop {
+            let msg = match eval.recv::<String>().await { Ok(m) => m, Err(_) => break };
+            let n = tabs.read().len();
+            if n == 0 { continue; }
+            let cur = *active_tab.read();
+            let target = if msg == "next" { (cur + 1) % n }
+                else if msg == "prev" { (cur + n - 1) % n }
+                else if let Some(d) = msg.strip_prefix("jump:") { d.parse::<usize>().ok().map(|x| x.saturating_sub(1)).filter(|&x| x < n).unwrap_or(cur) }
+                else { cur };
+            if target != cur {
+                switch_tab(tabs, active_tab, messages, cfg, engine, target);
+            }
+        }
+    });
+    // Element picker: previewed page posts the selected element up to here.
+    use_future(move || async move {
+        let mut eval = dioxus::document::eval(
+            r#"
+            if (!window.__oxpick) {
+              window.__oxpick = 1;
+              window.addEventListener('message', function(e){
+                if (e.data && e.data.type === 'oxide-element') { try { dioxus.send(JSON.stringify(e.data)); } catch(_){} }
+              });
+            }
+            while (true) { await new Promise(r => setTimeout(r, 3600000)); }
+            "#,
+        );
+        loop {
+            let raw = match eval.recv::<String>().await { Ok(m) => m, Err(_) => break };
+            let v: serde_json::Value = match serde_json::from_str(&raw) { Ok(v) => v, Err(_) => continue };
+            let sel = v["selector"].as_str().unwrap_or("");
+            let src = v["source"].as_str().unwrap_or("");
+            let comp = v["component"].as_str().unwrap_or("");
+            let text = v["text"].as_str().unwrap_or("");
+            let html = v["html"].as_str().unwrap_or("");
+            let mut ctx = String::from("Selected UI element to change:\n");
+            ctx.push_str(&format!("- selector: {sel}\n"));
+            if !comp.is_empty() { ctx.push_str(&format!("- component: <{comp}>\n")); }
+            if !src.is_empty() { ctx.push_str(&format!("- source: {src}\n")); }
+            if !text.is_empty() { ctx.push_str(&format!("- text: {text}\n")); }
+            if !html.is_empty() { ctx.push_str(&format!("- html: {html}\n")); }
+            picked_element.set(Some(ctx));
+        }
+    });
     // Active TUI tab (embedded terminal) info.
     let (active_is_tui, active_bin, active_tab_id) = {
         let t = tabs.read();
@@ -1914,6 +2184,37 @@ fn app() -> Element {
                 }
                 div { class: "projects",
                     if cfg.read().workspace.is_some() {
+                        {
+                            let pins: Vec<(PathBuf, String)> = cfg.read().pinned_sessions.iter()
+                                .map(PathBuf::from)
+                                .filter(|p| p.exists())
+                                .map(|p| { let title = session_title(&p); (p, title) })
+                                .collect();
+                            if pins.is_empty() { rsx!{} } else {
+                                rsx! {
+                                    div { class: "section-label", "Pinned" }
+                                    for (p, title) in pins {
+                                        {
+                                            let p_open = p.clone();
+                                            let t_open = title.clone();
+                                            let p_str = p.display().to_string();
+                                            rsx! {
+                                                div { class: "thread-anchor",
+                                                    div { class: "row-actions",
+                                                        button { class: "row-act-btn pinned", title: "Unpin", onclick: move |e: dioxus::prelude::MouseEvent| { e.stop_propagation(); toggle_pin(cfg, &p_str); }, "📌" }
+                                                    }
+                                                    div { class: "thread recent",
+                                                        onclick: move |_| { show_board.set(false); open_session_tab(tabs, active_tab, messages, next_tab_id, cfg, p_open.clone(), t_open.clone()); },
+                                                        span { class: "thread-title", title: "{title}", "{title}" }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    div { class: "section-label", "Projects" }
+                                }
+                            }
+                        }
                         for (pws, pname, sessions) in projects_list.read().clone() {
                             {
                                 let is_current = pws == workspace;
@@ -1929,6 +2230,7 @@ fn app() -> Element {
                                         onclick: move |_| { if !is_current { apply_workspace(cfg, ui, engine, pws_switch.clone()); } },
                                         Icon { name: "folder" }
                                         span { class: "project-name", "{pname}" }
+                                        if is_current && *streaming.read() { span { class: "syn-spinner", style: "margin-left:6px" } }
                                         button { class: "project-add", title: "New chat here", onclick: move |e: dioxus::prelude::MouseEvent| {
                                                 e.stop_propagation();
                                                 show_board.set(false);
@@ -1950,11 +2252,29 @@ fn app() -> Element {
                                                 let ttl = if t.title.is_empty() { "New chat".to_string() } else { t.title.clone() };
                                                 let is_active = i == *active_tab.read();
                                                 let busy = is_active && *streaming.read();
+                                                let prov = t.provider.clone();
+                                                let logo = provider_logo(&prov);
+                                                let editing = *renaming_tab.read() == Some(id);
+                                                let ttl_dc = ttl.clone();
                                                 rsx! {
                                                     div { key: "tab{id}", class: if is_active { "thread active" } else { "thread" },
                                                         onclick: move |_| { show_board.set(false); switch_tab(tabs, active_tab, messages, cfg, engine, i); },
-                                                        if busy { span { class: "tab-dot busy" } }
-                                                        span { class: "thread-title", title: "{ttl}", "{ttl}" }
+                                                        ondoubleclick: move |_| { rename_text.set(ttl_dc.clone()); renaming_tab.set(Some(id)); },
+                                                        if busy { span { class: "syn-spinner" } }
+                                                        else if let Some(l) = logo { span { class: "tab-prov", dangerous_inner_html: l } }
+                                                        if editing {
+                                                            input { class: "rename-input", value: "{rename_text}", autofocus: true,
+                                                                oninput: move |e| rename_text.set(e.value()),
+                                                                onkeydown: move |e| {
+                                                                    if e.key() == Key::Enter { e.prevent_default(); let n = rename_text.read().trim().to_string(); if !n.is_empty() { if let Some(t) = tabs.write().get_mut(i) { t.title = n; } } renaming_tab.set(None); }
+                                                                    else if e.key() == Key::Escape { renaming_tab.set(None); }
+                                                                },
+                                                                onblur: move |_| { let n = rename_text.read().trim().to_string(); if !n.is_empty() { if let Some(t) = tabs.write().get_mut(i) { t.title = n; } } renaming_tab.set(None); },
+                                                                onclick: move |e| e.stop_propagation(),
+                                                            }
+                                                        } else {
+                                                            span { class: "thread-title", title: "{ttl}", "{ttl}" }
+                                                        }
                                                     }
                                                 }
                                             }
@@ -1966,12 +2286,24 @@ fn app() -> Element {
                                             let p_dbl = path.clone();
                                             let p_del = path.clone();
                                             let p_arch = path.clone();
+                                            let p_del2 = path.clone();
+                                            let p_arch2 = path.clone();
                                             let t_open = title.clone();
                                             let menu_open = session_menu.read().as_ref() == Some(&path);
                                             let ws_d = ws_rebuild.clone();
                                             let ws_ar = ws_rebuild.clone();
+                                            let ws_d2 = ws_rebuild.clone();
+                                            let ws_ar2 = ws_rebuild.clone();
+                                            let path_str = path.display().to_string();
+                                            let is_pinned = cfg.read().pinned_sessions.iter().any(|p| p == &path_str);
                                             rsx! {
                                                 div { class: "thread-anchor",
+                                                    div { class: "row-actions",
+                                                        button { class: if is_pinned { "row-act-btn pinned" } else { "row-act-btn" }, title: if is_pinned { "Unpin" } else { "Pin" },
+                                                            onclick: move |e: dioxus::prelude::MouseEvent| { e.stop_propagation(); toggle_pin(cfg, &path_str); }, "📌" }
+                                                        button { class: "row-act-btn", title: "Archive", onclick: move |e: dioxus::prelude::MouseEvent| { e.stop_propagation(); archive_session(&p_arch2); projects_list.set(build_projects(&ws_ar2, &cfg.read().recent_workspaces)); }, "⊟" }
+                                                        button { class: "row-act-btn danger", title: "Delete", onclick: move |e: dioxus::prelude::MouseEvent| { e.stop_propagation(); delete_session(&p_del2); projects_list.set(build_projects(&ws_d2, &cfg.read().recent_workspaces)); }, "✕" }
+                                                    }
                                                     div { class: "thread recent", title: "right-click / double-click for options",
                                                         onclick: move |_| { show_board.set(false); open_session_tab(tabs, active_tab, messages, next_tab_id, cfg, p_open.clone(), t_open.clone()); },
                                                         oncontextmenu: {
@@ -2133,11 +2465,59 @@ fn app() -> Element {
                             button { class: if *show_split.read() { "top-btn on" } else { "top-btn" },
                                 onclick: move |_| { let v = *show_split.read(); show_split.set(!v); }, Icon { name: "plugins" } "Split"
                             }
+                            button { class: if *show_preview.read() { "top-btn on" } else { "top-btn" },
+                                onclick: move |_| {
+                                    let v = *show_preview.read(); show_preview.set(!v);
+                                    if !v { spawn(async move { preview_ports.set(scan_ports().await); }); }
+                                }, Icon { name: "browser" } "Preview"
+                            }
                         }
                     }
                 }
 
-                div { class: "center",
+                div { class: if *show_preview.read() { "center with-preview" } else { "center" },
+                    if *show_preview.read() {
+                        div { class: "preview-panel",
+                            div { class: "preview-bar",
+                                input { class: "preview-addr", placeholder: "http://localhost:3000", value: "{preview_url}",
+                                    oninput: move |e| preview_url.set(e.value()),
+                                    onkeydown: move |e| if e.key() == Key::Enter {
+                                        let mut u = preview_url.read().clone();
+                                        if !u.is_empty() && !u.contains("://") { u = format!("http://{u}"); preview_url.set(u); }
+                                    }
+                                }
+                                button { class: "preview-btn", title: "Rescan localhost ports", onclick: move |_| { spawn(async move { preview_ports.set(scan_ports().await); }); }, "⟳ Scan" }
+                                button { class: "preview-btn pick", title: "Select an element to send to the composer", onclick: move |_| {
+                                    spawn(async move { let _ = document::eval("document.querySelector('.preview-frame')?.contentWindow?.postMessage('oxide-pick-on','*')").await; });
+                                }, "📍 Pick" }
+                                button { class: "preview-btn", title: "Reload", onclick: move |_| { let u = preview_url.read().clone(); preview_url.set(String::new()); preview_url.set(u); }, "Reload" }
+                                button { class: "preview-btn", title: "Open in system browser", onclick: move |_| { let u = preview_url.read().clone(); if !u.is_empty() { let _ = std::process::Command::new("open").arg(u).spawn(); } }, "↗" }
+                                button { class: "term-x", onclick: move |_| show_preview.set(false), "✕" }
+                            }
+                            div { class: "preview-ports",
+                                if preview_ports.read().is_empty() {
+                                    span { class: "preview-hint", "No localhost servers detected. Start a dev server, then ⟳ Scan." }
+                                }
+                                for (port, cmd) in preview_ports.read().iter().cloned() {
+                                    button { class: "port-chip", title: "{cmd}", onclick: move |_| {
+                                        spawn(async move {
+                                            preview_proxy::set_target(port);
+                                            let pp = preview_proxy::ensure_proxy().await;
+                                            if pp != 0 { preview_url.set(format!("http://127.0.0.1:{pp}/")); }
+                                            else { preview_url.set(format!("http://localhost:{port}")); }
+                                        });
+                                    },
+                                        span { class: "port-dot" } "localhost:{port}" span { class: "port-cmd", "{cmd}" }
+                                    }
+                                }
+                            }
+                            if preview_url.read().is_empty() {
+                                div { class: "preview-empty", "Pick a detected server above, or type a URL. Build + run + see it without leaving Oxide." }
+                            } else {
+                                iframe { class: "preview-frame", src: "{preview_url}" }
+                            }
+                        }
+                    }
                     if *show_split.read() && cfg.read().workspace.is_some() {
                         SplitView {
                             node: split_layout.read().clone(),
@@ -2255,7 +2635,7 @@ fn app() -> Element {
                             Composer { input, streaming, engine, cfg, model_label: model_label.clone(),
                                        bypass, project: project.clone(), branch: branch.clone(),
                                        context_used: ctx_used, context_limit: ctx_limit,
-                                       workspace: workspace.clone(), plan_mode, pursue_goal, goal_text, mentions, queue,
+                                       workspace: workspace.clone(), plan_mode, pursue_goal, goal_text, mentions, queue, picked_element,
                                        on_settings: move |_| show_settings.set(true),
                                        on_open_folder: move |_| open_folder(cfg, ui, engine), on_pick_workspace: move |dir| apply_workspace(cfg, ui, engine, dir) }
                             div { class: "suggestions",
@@ -2302,9 +2682,16 @@ fn app() -> Element {
                                                     let n = rows.len();
                                                     let done = rows.iter().filter(|r| !r.1).count();
                                                     let label = if running { format!("⚙ Working… {done}/{n}") } else { format!("⚙ {n} actions") };
+                                                    let key = idxs[0];
+                                                    let is_open = act_open.read().get(&key).copied().unwrap_or(running);
                                                     rsx! {
-                                                        details { class: "act-group", open: running,
+                                                        details { class: "act-group", open: is_open,
                                                             summary { class: "act-group-head",
+                                                                onclick: move |e: dioxus::prelude::MouseEvent| {
+                                                                    e.prevent_default();
+                                                                    let cur = act_open.read().get(&key).copied().unwrap_or(running);
+                                                                    act_open.write().insert(key, !cur);
+                                                                },
                                                                 span { class: "diff-caret", Icon { name: "chevron" } }
                                                                 "{label}"
                                                             }
@@ -2337,7 +2724,32 @@ fn app() -> Element {
                                                                                     button { class: "diff-revert", onclick: move |e| { e.prevent_default(); let _ = engine.send(EngineCmd::Rewind { id: cp }); reverted.write().insert(cp); }, "Revert" }
                                                                                 }
                                                                             }
-                                                                            DiffBody { diff }
+                                                                            HunkedDiff { ws: workspace.clone(), path: path.clone(), diff }
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                            Author::User => {
+                                                                let segs = user_segments(&m.text);
+                                                                let copy = serde_json::to_string(&strip_scaffold(&m.text)).unwrap_or_default();
+                                                                let idx = i;
+                                                                rsx! {
+                                                                    div { class: "row user",
+                                                                        div { class: "bubble",
+                                                                            for (is_m, s) in segs {
+                                                                                if is_m { span { class: "inline-chip", "{s}" } } else { "{s}" }
+                                                                            }
+                                                                        }
+                                                                        div { class: "msg-actions",
+                                                                            button { class: "msg-act", title: "Copy message", onclick: move |_| { let c = copy.clone(); spawn(async move { let _ = document::eval(&format!("navigator.clipboard.writeText({c})")).await; }); }, "⧉" }
+                                                                            button { class: "msg-act", title: "Restore checkpoint — revert files and chat back to here", onclick: move |_| {
+                                                                                let floor = { let ms = messages.read(); ms.iter().skip(idx + 1).find_map(|mm| if let Author::Diff(_, cp) = mm.author { Some(cp) } else { None }) };
+                                                                                if let Some(fl) = floor {
+                                                                                    let ids: Vec<u64> = checkpoints.read().iter().map(|(id, _)| *id).filter(|id| *id >= fl).collect();
+                                                                                    for id in ids.into_iter().rev() { let _ = engine.send(EngineCmd::Rewind { id }); reverted.write().insert(id); }
+                                                                                }
+                                                                                messages.write().truncate(idx + 1);
+                                                                            }, "↩" }
                                                                         }
                                                                     }
                                                                 }
@@ -2428,7 +2840,7 @@ fn app() -> Element {
                                         let expanded = *edits_expanded.read();
                                         let shown = if expanded { n } else { n.min(3) };
                                         let plural = if n == 1 { "" } else { "s" };
-                                        let more_txt = if expanded { "Show less".to_string() } else { format!("Show {} more files", n - 3) };
+                                        let more_txt = if expanded { "Show less".to_string() } else { format!("Show {} more files", n.saturating_sub(3)) };
                                         rsx! {
                                             div { class: "edits-card",
                                                 div { class: "edits-head",
@@ -2438,13 +2850,17 @@ fn app() -> Element {
                                                         span { class: "edits-counts", span { class: "diff-adds", "+{total_add}" } " " span { class: "diff-dels", "−{total_del}" } }
                                                     }
                                                     button { class: "edits-undo", onclick: move |_| {
-                                                        for (_, _, _, cp) in turn_edits.read().iter() { let _ = engine.send(EngineCmd::Rewind { id: *cp }); reverted.write().insert(*cp); }
+                                                        for (_, _, _, cp, _) in turn_edits.read().iter() { let _ = engine.send(EngineCmd::Rewind { id: *cp }); reverted.write().insert(*cp); }
                                                     }, "Undo ↺" }
                                                 }
-                                                for (path, a, d, _cp) in edits.iter().take(shown).cloned() {
-                                                    div { class: "edits-row",
-                                                        span { class: "edits-path", "{path}" }
-                                                        span { class: "edits-rowcounts", span { class: "diff-adds", "+{a}" } " " span { class: "diff-dels", "−{d}" } }
+                                                for (path, a, d, _cp, diff) in edits.iter().take(shown).cloned() {
+                                                    details { class: "edits-row-d",
+                                                        summary { class: "edits-row",
+                                                            span { class: "edits-caret", Icon { name: "chevron" } }
+                                                            span { class: "edits-path", "{path}" }
+                                                            span { class: "edits-rowcounts", span { class: "diff-adds", "+{a}" } " " span { class: "diff-dels", "−{d}" } }
+                                                        }
+                                                        HunkedDiff { ws: workspace.clone(), path: path.clone(), diff }
                                                     }
                                                 }
                                                 if n > 3 {
@@ -2463,7 +2879,7 @@ fn app() -> Element {
                             Composer { input, streaming, engine, cfg, model_label, bypass,
                                        project: project.clone(), branch: branch.clone(),
                                        context_used: ctx_used, context_limit: ctx_limit,
-                                       workspace: workspace.clone(), plan_mode, pursue_goal, goal_text, mentions, queue,
+                                       workspace: workspace.clone(), plan_mode, pursue_goal, goal_text, mentions, queue, picked_element,
                                        on_settings: move |_| show_settings.set(true),
                                        on_open_folder: move |_| open_folder(cfg, ui, engine), on_pick_workspace: move |dir| apply_workspace(cfg, ui, engine, dir) }
                         }
@@ -2500,7 +2916,7 @@ fn app() -> Element {
             }
 
             // ── Right inspector (tabbed) ───────────────────────────────
-            if *show_files.read() && cfg.read().workspace.is_some() {
+            if *show_files.read() && !*show_preview.read() && cfg.read().workspace.is_some() {
                 aside { class: "files-panel",
                     div { class: "insp-tabs",
                         for (key, label) in [("review","Review"),("files","Files"),("timeline","Timeline"),("sessions","Sessions"),("git","Git"),("memory","Memory"),("goal","Goal"),("browser","Browser"),("approvals","Approvals"),("checkpoints","Checkpoints"),("usage","Usage")] {
@@ -2535,17 +2951,20 @@ fn app() -> Element {
                                         span { class: "review-count", "{turn_edits.read().len()} changed file(s)" }
                                         button { class: "ed-close", onclick: move |_| {
                                             let edits = turn_edits.read().clone();
-                                            for (_, _, _, cp) in edits.iter().rev() { let _ = engine.send(EngineCmd::Rewind { id: *cp }); }
+                                            for (_, _, _, cp, _) in edits.iter().rev() { let _ = engine.send(EngineCmd::Rewind { id: *cp }); }
                                             turn_edits.write().clear();
                                         }, "Reject all" }
                                     }
-                                    for (idx, (path, adds, dels, cp)) in turn_edits.read().clone().into_iter().enumerate() {
+                                    for (idx, (path, adds, dels, cp, diff)) in turn_edits.read().clone().into_iter().enumerate() {
                                         div { class: "review-item",
-                                            div { class: "review-file",
-                                                Icon { name: "file" }
-                                                span { class: "review-path", "{path}" }
-                                                span { class: "diff-adds", "+{adds}" }
-                                                span { class: "diff-dels", "−{dels}" }
+                                            details { class: "review-diff-d",
+                                                summary { class: "review-file",
+                                                    span { class: "edits-caret", Icon { name: "chevron" } }
+                                                    span { class: "review-path", "{path}" }
+                                                    span { class: "diff-adds", "+{adds}" }
+                                                    span { class: "diff-dels", "−{dels}" }
+                                                }
+                                                HunkedDiff { ws: workspace.clone(), path: path.clone(), diff }
                                             }
                                             div { class: "review-actions",
                                                 button { class: "review-accept", title: "Keep this change", onclick: move |_| {
@@ -2619,6 +3038,8 @@ fn app() -> Element {
                                 let ws_refresh = workspace.clone();
                                 let ws_commit = workspace.clone();
                                 let ws_files = workspace.clone();
+                                let ws_refresh2 = workspace.clone();
+                                let ws_pr = workspace.clone();
                                 rsx! {
                                     div { class: "git-bar",
                                         button { class: "ed-close", onclick: move |_| {
@@ -2678,6 +3099,40 @@ fn app() -> Element {
                                                 });
                                             }
                                         }, "Commit" }
+                                    }
+                                    div { class: "git-actions",
+                                        span { class: "git-branch-label", Icon { name: "git" } "{branch}" }
+                                        button { class: "git-act", title: "Push to origin", onclick: {
+                                            let ws = ws_refresh2.clone();
+                                            move |_| {
+                                                let ws = ws.clone();
+                                                git_busy.set("Pushing…".into());
+                                                spawn(async move {
+                                                    let out = git_run(ws.clone(), vec!["push".into()]).await;
+                                                    let out = if out.to_lowercase().contains("no upstream") || out.to_lowercase().contains("set-upstream") {
+                                                        let b = git_branch(&ws);
+                                                        git_run(ws.clone(), vec!["push".into(),"-u".into(),"origin".into(), b]).await
+                                                    } else { out };
+                                                    git_busy.set(String::new());
+                                                    git_diff.set(format!("$ git push\n{out}"));
+                                                });
+                                            }
+                                        }, "Push ↑" }
+                                        button { class: "git-act", title: "Create a pull request (gh)", onclick: {
+                                            let ws = ws_pr.clone();
+                                            move |_| {
+                                                let ws = ws.clone();
+                                                git_busy.set("Creating PR…".into());
+                                                spawn(async move {
+                                                    let b = git_branch(&ws);
+                                                    let _ = git_run(ws.clone(), vec!["push".into(),"-u".into(),"origin".into(), b]).await;
+                                                    let out = run_cmd(&ws, "gh", &["pr","create","--fill"]).await;
+                                                    git_busy.set(String::new());
+                                                    git_diff.set(format!("$ gh pr create --fill\n{out}"));
+                                                });
+                                            }
+                                        }, "Create PR" }
+                                        if !git_busy.read().is_empty() { span { class: "git-busy", span { class: "syn-spinner" } "{git_busy}" } }
                                     }
                                 }
                             },
@@ -2796,6 +3251,36 @@ fn app() -> Element {
             if *show_mcp.read() {
                 McpModal { cfg, engine, status: mcp_status, on_close: move |_| show_mcp.set(false) }
             }
+            if *show_shortcuts.read() {
+                div { class: "modal-overlay", onclick: move |_| show_shortcuts.set(false),
+                    div { class: "modal shortcuts-modal", onclick: move |e| e.stop_propagation(),
+                        div { class: "modal-head", h2 { "Keyboard shortcuts" } button { class: "term-x", onclick: move |_| show_shortcuts.set(false), "✕" } }
+                        div { class: "modal-body shortcuts-body",
+                            for (k, d) in [
+                                ("⌘K", "Command palette + chat search"),
+                                ("⌘/", "This shortcuts sheet"),
+                                ("⌘B", "Toggle Files inspector"),
+                                ("⌘1–9", "Jump to agent tab N"),
+                                ("⌘⇧]", "Next tab"),
+                                ("⌘⇧[", "Previous tab"),
+                                ("⌘↵", "Send message"),
+                                ("⇧↵", "New line in composer"),
+                                ("⇧⇥", "Toggle plan mode (in composer)"),
+                                ("@", "Mention MCP / skill / file"),
+                                ("Esc", "Close menus / overlays"),
+                                ("Double-click tab", "Rename"),
+                                ("Right-click chat", "Archive / Delete"),
+                                ("Right-click sidebar", "Theme / Pin window / PiP"),
+                            ] {
+                                div { class: "shortcut-row",
+                                    kbd { class: "shortcut-key", "{k}" }
+                                    span { class: "shortcut-desc", "{d}" }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             if *show_palette.read() {
                 {
                     let run = move |label: &str| {
@@ -2856,6 +3341,31 @@ fn app() -> Element {
                                             onmouseenter: move |_| palette_sel.set(i),
                                             onclick: move |_| { let mut run = run; run(label); },
                                             Icon { name: icon } span { class: "palette-label", "{label}" }
+                                        }
+                                    }
+                                    if !q.is_empty() {
+                                        {
+                                            let chats: Vec<(PathBuf, String)> = recent_sessions(&workspace).into_iter()
+                                                .map(|(p, _, t)| (p, t))
+                                                .filter(|(_, t)| t.to_lowercase().contains(&q))
+                                                .take(8).collect();
+                                            if chats.is_empty() { rsx!{} } else {
+                                                rsx! {
+                                                    div { class: "menu-label", style: "padding:8px 12px 4px", "Chats" }
+                                                    for (p, title) in chats {
+                                                        {
+                                                            let p2 = p.clone();
+                                                            let t2 = title.clone();
+                                                            rsx! {
+                                                                button { class: "palette-item",
+                                                                    onclick: move |_| { show_palette.set(false); show_board.set(false); open_session_tab(tabs, active_tab, messages, next_tab_id, cfg, p2.clone(), t2.clone()); },
+                                                                    Icon { name: "file" } span { class: "palette-label", "{title}" }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -3169,6 +3679,26 @@ fn provider_title(provider: &str) -> &'static str {
     }
 }
 
+/// Pin / unpin a session path and persist.
+fn toggle_pin(mut cfg: Signal<Config>, path: &str) {
+    let mut c = cfg.read().clone();
+    if let Some(i) = c.pinned_sessions.iter().position(|p| p == path) {
+        c.pinned_sessions.remove(i);
+    } else {
+        c.pinned_sessions.insert(0, path.to_string());
+    }
+    cfg.set(c.clone());
+    if let Ok(s) = toml::to_string(&c) {
+        let ws = workspace_of(&c);
+        let _ = std::fs::write(ws.join("oxide.toml"), &s);
+        if let Some(home) = std::env::var_os("HOME") {
+            let d = std::path::PathBuf::from(home).join(".config/oxide");
+            let _ = std::fs::create_dir_all(&d);
+            let _ = std::fs::write(d.join("config.toml"), &s);
+        }
+    }
+}
+
 /// Toggle UI density (comfortable ↔ compact) and persist.
 fn toggle_density(mut cfg: Signal<Config>) {
     let mut c = cfg.read().clone();
@@ -3219,9 +3749,14 @@ fn set_accent(mut cfg: Signal<Config>, accent: &str) {
 
 /// Native folder picker → switch workspace.
 fn open_folder(cfg: Signal<Config>, ui: Ui, engine: Coroutine<EngineCmd>) {
-    if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-        apply_workspace(cfg, ui, engine, dir);
-    }
+    // MUST use the async dialog: the blocking `FileDialog::pick_folder()` runs
+    // an NSOpenPanel modal loop on the main thread, which deadlocks the webview
+    // when invoked from inside a synchronous JS→native event dispatch.
+    spawn(async move {
+        if let Some(h) = rfd::AsyncFileDialog::new().pick_folder().await {
+            apply_workspace(cfg, ui, engine, h.path().to_path_buf());
+        }
+    });
 }
 
 /// Local git branches (short names).
@@ -3575,7 +4110,9 @@ fn SettingsModal(
                         div { class: "field-folder",
                             span { class: "folder-path", "{ws.read().display()}" }
                             button { class: "ed-close", onclick: move |_| {
-                                if let Some(d) = rfd::FileDialog::new().pick_folder() { ws.set(d); }
+                                spawn(async move {
+                                    if let Some(h) = rfd::AsyncFileDialog::new().pick_folder().await { ws.set(h.path().to_path_buf()); }
+                                });
                             }, "Browse…" }
                         }
                     }
@@ -3670,6 +4207,7 @@ fn Composer(
     goal_text: Signal<String>,
     mentions: Signal<Vec<String>>,
     queue: Signal<Vec<String>>,
+    mut picked_element: Signal<Option<String>>,
     on_settings: EventHandler<()>,
     on_open_folder: EventHandler<()>,
     on_pick_workspace: EventHandler<PathBuf>,
@@ -3784,7 +4322,7 @@ fn Composer(
     let ws_steer = workspace.clone();
 
     rsx! {
-        div { class: "composer",
+        div { class: if *streaming.read() { if cur_effort == "xhigh" { "composer working ultra" } else { "composer working" } } else { "composer" },
             if !slash_items.is_empty() {
                 div { class: "mention-menu",
                     div { class: "menu-label", "Commands" }
@@ -3811,16 +4349,15 @@ fn Composer(
                                 let p_sel = path.clone();
                                 let is_mcp = path.starts_with("mcp:");
                                 let is_skill = path.starts_with("skill:");
-                                let disp = path.strip_prefix("mcp:").or_else(|| path.strip_prefix("skill:")).unwrap_or(&path).to_string();
-                                let icon_name = if is_mcp { "plugins" } else if is_skill { "target" } else if path.ends_with('/') { "folder" } else { "file" };
+                                let is_ctx = path.starts_with("ctx:");
+                                let disp = path.strip_prefix("mcp:").or_else(|| path.strip_prefix("skill:")).or_else(|| path.strip_prefix("ctx:")).unwrap_or(&path).to_string();
+                                let icon_name = if is_ctx { "branch" } else if is_mcp { "plugins" } else if is_skill { "target" } else if path.ends_with('/') { "folder" } else { "file" };
+                                let grp = |p: &str| if p.starts_with("ctx:") { 0 } else if p.starts_with("mcp:") { 1 } else if p.starts_with("skill:") { 2 } else { 3 };
                                 // Section header when the group changes.
-                                let group = if is_mcp { 0 } else if is_skill { 1 } else { 2 };
-                                let prev_group = if i == 0 { -1 } else {
-                                    let p = &mention_items[i - 1];
-                                    if p.starts_with("mcp:") { 0 } else if p.starts_with("skill:") { 1 } else { 2 }
-                                };
+                                let group = grp(&path);
+                                let prev_group = if i == 0 { -1 } else { grp(&mention_items[i - 1]) };
                                 let header = if group != prev_group {
-                                    Some(match group { 0 => "MCP servers", 1 => "Skills", _ => "Files" })
+                                    Some(match group { 0 => "Context", 1 => "MCP servers", 2 => "Skills", _ => "Files" })
                                 } else { None };
                                 let sel = i == msel;
                                 rsx! {
@@ -3860,6 +4397,19 @@ fn Composer(
                         div { class: "attach-card",
                             img { src: "{src}", onclick: { let s = src.clone(); move |_| preview_img.set(Some(s.clone())) } }
                             button { class: "attach-x", onclick: move |_| { let mut v = attachments.write(); if i < v.len() { v.remove(i); } }, "✕" }
+                        }
+                    }
+                }
+            }
+            if let Some(p) = picked_element.read().clone() {
+                {
+                    let label = p.lines().find_map(|l| l.strip_prefix("- selector: ")).unwrap_or("element").to_string();
+                    rsx! {
+                        div { class: "elem-chip", title: "{p}",
+                            span { class: "elem-pin", "📍" }
+                            span { class: "elem-sel", "{label}" }
+                            span { class: "elem-note", "→ will be sent to change" }
+                            button { class: "elem-x", onclick: move |_| picked_element.set(None), "✕" }
                         }
                     }
                 }
@@ -3915,7 +4465,7 @@ fn Composer(
                     if e.key() == Key::Enter && !e.modifiers().shift() {
                         e.prevent_default();
                         let ws = ws_kd2.clone();
-                        spawn(async move { submit_ce(streaming, engine, plan_mode, pursue_goal, goal_text, queue, attachments, false, ws).await; });
+                        spawn(async move { submit_ce(streaming, engine, plan_mode, pursue_goal, goal_text, queue, attachments, picked_element, false, ws).await; });
                     } else if e.key() == Key::Tab && e.modifiers().shift() {
                         e.prevent_default();
                         let v = *plan_mode.read();
@@ -3938,16 +4488,18 @@ fn Composer(
                                 button { class: "plus-item",
                                     onclick: move |_| {
                                         show_plus.set(false);
-                                        if let Some(file) = rfd::FileDialog::new().pick_file() {
-                                            let tok = file.display().to_string();
-                                            let label = mention_label(&tok);
-                                            let js = format!(
-                                                "const ed=document.getElementById('ce-input'); if(ed){{ed.focus(); const c=document.createElement('span'); c.className='ce-chip'; c.setAttribute('contenteditable','false'); c.dataset.token={}; c.textContent={}; ed.appendChild(c); ed.appendChild(document.createTextNode(' '));}} return true;",
-                                                serde_json::to_string(&tok).unwrap(), serde_json::to_string(&label).unwrap()
-                                            );
-                                            spawn(async move { let _ = dioxus::document::eval(&js).join::<bool>().await; });
-                                            ce_empty.set(false);
-                                        }
+                                        spawn(async move {
+                                            if let Some(file) = rfd::AsyncFileDialog::new().pick_file().await {
+                                                let tok = file.path().display().to_string();
+                                                let label = mention_label(&tok);
+                                                let js = format!(
+                                                    "const ed=document.getElementById('ce-input'); if(ed){{ed.focus(); const c=document.createElement('span'); c.className='ce-chip'; c.setAttribute('contenteditable','false'); c.dataset.token={}; c.textContent={}; ed.appendChild(c); ed.appendChild(document.createTextNode(' '));}} return true;",
+                                                    serde_json::to_string(&tok).unwrap(), serde_json::to_string(&label).unwrap()
+                                                );
+                                                let _ = dioxus::document::eval(&js).join::<bool>().await;
+                                                ce_empty.set(false);
+                                            }
+                                        });
                                     },
                                     Icon { name: "paperclip" }
                                     span { class: "plus-name", "Add files & folders" }
@@ -4023,16 +4575,14 @@ fn Composer(
                     button {
                         class: if fast_enabled { "pill fast on" } else { "pill fast" },
                         onclick: move |_| {
+                            // Fast (speed) is independent of reasoning effort — you can
+                            // run Fast + High together, like Codex/ChatGPT.
                             let mut c = cfg.read().clone();
-                            let next = !c.fast_mode;
-                            c.fast_mode = next;
-                            if next {
+                            c.fast_mode = !c.fast_mode;
+                            if c.fast_mode {
                                 if let Some(preset) = fast_model_for(&c.provider) {
                                     c.model = preset.model.to_string();
                                 }
-                                c.reasoning_effort = "low".to_string();
-                            } else if c.reasoning_effort == "low" {
-                                c.reasoning_effort = "medium".to_string();
                             }
                             cfg.set(c.clone());
                             let _ = engine.send(EngineCmd::Reconfigure(c));
@@ -4135,11 +4685,9 @@ fn Composer(
                                             button {
                                                 class: if selected { "menu-item sel" } else { "menu-item" },
                                                 onclick: move |_| {
+                                                    // Effort is independent of Fast — don't disable Fast here.
                                                     let mut c = cfg.read().clone();
                                                     c.reasoning_effort = value.clone();
-                                                    if value != "low" {
-                                                        c.fast_mode = false;
-                                                    }
                                                     cfg.set(c.clone());
                                                     let _ = engine.send(EngineCmd::Reconfigure(c));
                                                     show_effort.set(false);
@@ -4163,10 +4711,10 @@ fn Composer(
                         }
                     }
                     if *streaming.read() {
-                        button { class: "send steer", title: "Steer (inject into the running turn)", onclick: move |_| { let ws = ws_steer.clone(); spawn(async move { submit_ce(streaming, engine, plan_mode, pursue_goal, goal_text, queue, attachments, true, ws).await; }); }, "↪" }
+                        button { class: "send steer", title: "Steer (inject into the running turn)", onclick: move |_| { let ws = ws_steer.clone(); spawn(async move { submit_ce(streaming, engine, plan_mode, pursue_goal, goal_text, queue, attachments, picked_element, true, ws).await; }); }, "↪" }
                         button { class: "send stop", title: "Stop", onclick: move |_| { let _ = engine.send(EngineCmd::Interrupt); }, "■" }
                     } else {
-                        button { class: "send", onclick: move |_| { let ws = ws_btn.clone(); spawn(async move { submit_ce(streaming, engine, plan_mode, pursue_goal, goal_text, queue, attachments, false, ws).await; }); }, "↑" }
+                        button { class: "send", onclick: move |_| { let ws = ws_btn.clone(); spawn(async move { submit_ce(streaming, engine, plan_mode, pursue_goal, goal_text, queue, attachments, picked_element, false, ws).await; }); }, "↑" }
                     }
                 }
             }
@@ -4258,6 +4806,7 @@ fn Message(author: Author, text: String) -> Element {
     match author {
         Author::User => {
             let segs = user_segments(&text);
+            let copy = serde_json::to_string(&text).unwrap_or_default();
             rsx! {
                 div { class: "row user",
                     div { class: "bubble",
@@ -4265,16 +4814,21 @@ fn Message(author: Author, text: String) -> Element {
                             if is_m { span { class: "inline-chip", "{s}" } } else { "{s}" }
                         }
                     }
+                    button { class: "msg-copy", title: "Copy message", onclick: move |_| { let c = copy.clone(); spawn(async move { let _ = document::eval(&format!("navigator.clipboard.writeText({c})")).await; }); }, "⧉" }
                 }
             }
         }
-        Author::Agent => rsx! {
-            div { class: "row agent",
-                img { class: "avatar", src: logo_uri() }
-                if text.is_empty() {
-                    div { class: "typing", span {} span {} span {} }
-                } else {
-                    div { class: "agent-text", "{text}" }
+        Author::Agent => {
+            let copy = serde_json::to_string(&text).unwrap_or_default();
+            rsx! {
+                div { class: "row agent",
+                    img { class: "avatar", src: logo_uri() }
+                    if text.is_empty() {
+                        div { class: "typing", span {} span {} span {} }
+                    } else {
+                        div { class: "agent-text", "{text}" }
+                        button { class: "msg-copy", title: "Copy message", onclick: move |_| { let c = copy.clone(); spawn(async move { let _ = document::eval(&format!("navigator.clipboard.writeText({c})")).await; }); }, "⧉" }
+                    }
                 }
             }
         },
@@ -4865,7 +5419,7 @@ fn ChatPane(
                         }
                         Some(Event::FileDiff { path, diff, checkpoint, .. }) => { messages.write().push(ChatMsg { author: Author::Diff(path, checkpoint), text: diff }); }
                         Some(Event::TurnStarted { .. }) => { thinking.set(String::new()); status.set("Working…".to_string()); }
-                        Some(Event::TurnFinished { .. }) => { streaming.set(false); status.set(String::new()); }
+                        Some(Event::TurnFinished { .. }) => { streaming.set(false); status.set(String::new()); { let mut mm = messages.write(); for c in mm.iter_mut() { if let Author::Activity { running, .. } = &mut c.author { *running = false; } } } }
                         Some(Event::Info { text }) => { if text.starts_with(['🧭','⚙','🔍','🤖','🧩','🔁','✓','⚠']) { status.set(text); } }
                         Some(Event::Error { message }) => { messages.write().push(ChatMsg { author: Author::Note, text: format!("error: {message}") }); }
                         Some(Event::Shutdown) | None => break,
@@ -4895,7 +5449,7 @@ fn ChatPane(
                                                 span { class: "diff-adds", "+{adds}" }
                                                 span { class: "diff-dels", "−{dels}" }
                                             }
-                                            DiffBody { diff }
+                                            HunkedDiff { ws: workspace.clone(), path: path.clone(), diff }
                                         }
                                     }
                                 }
@@ -4936,25 +5490,81 @@ fn ChatPane(
     }
 }
 
+/// Split a unified diff into `(hunk_header, lines)` groups (drops the file
+/// `---`/`+++` preamble; each group starts at an `@@` line).
+fn split_hunks(diff: &str) -> Vec<(String, Vec<String>)> {
+    let mut hunks: Vec<(String, Vec<String>)> = Vec::new();
+    for line in diff.lines() {
+        if line.starts_with("@@") {
+            hunks.push((line.to_string(), Vec::new()));
+        } else if line.starts_with("+++") || line.starts_with("---") {
+            continue;
+        } else if let Some(h) = hunks.last_mut() {
+            h.1.push(line.to_string());
+        }
+    }
+    hunks
+}
+
+/// Revert a single hunk by replacing its "new" block with its "old" block in
+/// the current file. Best-effort: no-op if the block can't be located.
+fn revert_hunk(ws: &Path, path: &str, lines: &[String]) -> bool {
+    let mut old_block = String::new();
+    let mut new_block = String::new();
+    for l in lines {
+        let (tag, rest) = l.split_at(l.char_indices().next().map(|(_, c)| c.len_utf8()).unwrap_or(0).min(l.len()));
+        match tag {
+            " " => { old_block.push_str(rest); old_block.push('\n'); new_block.push_str(rest); new_block.push('\n'); }
+            "-" => { old_block.push_str(rest); old_block.push('\n'); }
+            "+" => { new_block.push_str(rest); new_block.push('\n'); }
+            _ => {}
+        }
+    }
+    let file = ws.join(path);
+    let Ok(content) = std::fs::read_to_string(&file) else { return false };
+    // Match without forcing the trailing newline so end-of-file hunks work.
+    let nb = new_block.trim_end_matches('\n');
+    let ob = old_block.trim_end_matches('\n');
+    if nb.is_empty() || !content.contains(nb) {
+        return false;
+    }
+    let updated = content.replacen(nb, ob, 1);
+    std::fs::write(&file, updated).is_ok()
+}
+
 #[component]
-fn DiffBody(diff: String) -> Element {
+fn HunkedDiff(ws: PathBuf, path: String, diff: String) -> Element {
+    let hunks = split_hunks(&diff);
+    let mut reverted = use_signal(std::collections::HashSet::<usize>::new);
     rsx! {
-        pre { class: "diff-body",
-            for line in diff.lines() {
+        div { class: "hunked",
+            for (hi, (header, lines)) in hunks.into_iter().enumerate() {
                 {
-                    let cls = if line.starts_with("+++") || line.starts_with("---") {
-                        "dl meta"
-                    } else if line.starts_with("@@") {
-                        "dl hunk"
-                    } else if line.starts_with('+') {
-                        "dl add"
-                    } else if line.starts_with('-') {
-                        "dl del"
-                    } else {
-                        "dl ctx"
-                    };
-                    let line = line.to_string();
-                    rsx! { div { class: "{cls}", "{line}" } }
+                    let done = reverted.read().contains(&hi);
+                    let ws2 = ws.clone();
+                    let path2 = path.clone();
+                    let lines2 = lines.clone();
+                    rsx! {
+                        div { class: if done { "hunk reverted" } else { "hunk" },
+                            div { class: "hunk-head",
+                                span { class: "hunk-hdr", "{header}" }
+                                if done {
+                                    span { class: "hunk-done", "reverted ↩" }
+                                } else {
+                                    button { class: "hunk-revert", title: "Undo just this hunk in the file",
+                                        onclick: move |_| { if revert_hunk(&ws2, &path2, &lines2) { reverted.write().insert(hi); } }, "Revert hunk" }
+                                }
+                            }
+                            pre { class: "diff-body",
+                                for line in lines {
+                                    {
+                                        let cls = if line.starts_with('+') { "dl add" } else if line.starts_with('-') { "dl del" } else { "dl ctx" };
+                                        rsx! { div { class: "{cls}", "{line}" } }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }

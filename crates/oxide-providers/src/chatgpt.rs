@@ -97,14 +97,34 @@ fn build_body(req: &TurnRequest) -> Value {
                 }
                 instructions.push_str(&m.content);
             }
+            // A tool result → a `function_call_output` paired by call_id, so the
+            // model sees its call was satisfied (instead of an orphan user text).
+            Role::Tool if m.tool_call_id.is_some() => input.push(json!({
+                "type": "function_call_output",
+                "call_id": m.tool_call_id.clone().unwrap_or_default(),
+                "output": m.content,
+            })),
             Role::User | Role::Tool => input.push(json!({
                 "type": "message", "role": "user",
                 "content": [{ "type": "input_text", "text": m.content }]
             })),
-            Role::Assistant => input.push(json!({
-                "type": "message", "role": "assistant",
-                "content": [{ "type": "output_text", "text": m.content }]
-            })),
+            Role::Assistant => {
+                // Any assistant prose first, then a structured function_call item.
+                if !m.content.is_empty() {
+                    input.push(json!({
+                        "type": "message", "role": "assistant",
+                        "content": [{ "type": "output_text", "text": m.content }]
+                    }));
+                }
+                if let Some(tc) = &m.tool_call {
+                    input.push(json!({
+                        "type": "function_call",
+                        "call_id": tc.id,
+                        "name": tc.name,
+                        "arguments": serde_json::to_string(&tc.arguments).unwrap_or_else(|_| "{}".into()),
+                    }));
+                }
+            }
         }
     }
     let model = if req.model.is_empty() { DEFAULT_MODEL } else { req.model.as_str() };
@@ -219,8 +239,9 @@ impl Provider for ChatGptProvider {
                                 .as_str()
                                 .and_then(|s| serde_json::from_str(s).ok())
                                 .unwrap_or_else(|| json!({}));
+                            let id = item["call_id"].as_str().or_else(|| item["id"].as_str()).unwrap_or("").to_string();
                             let _ = sink
-                                .send(StreamItem::ToolCall { name: name.to_string(), arguments: args })
+                                .send(StreamItem::ToolCall { id, name: name.to_string(), arguments: args })
                                 .await;
                         }
                     }

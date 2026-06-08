@@ -75,6 +75,16 @@ pub struct Config {
     /// UI density: "comfortable" or "compact".
     #[serde(default = "default_density")]
     pub density: String,
+    /// Pinned session file paths (shown in a top "Pinned" section).
+    #[serde(default)]
+    pub pinned_sessions: Vec<String>,
+    /// After the agent edits files, run a build/typecheck and feed errors back
+    /// so it auto-fixes before finishing (Cursor-style).
+    #[serde(default = "default_true")]
+    pub auto_verify: bool,
+    /// Override the verify command (empty = auto-detect from project files).
+    #[serde(default)]
+    pub verify_command: String,
 }
 
 fn default_true() -> bool {
@@ -149,6 +159,9 @@ impl Default for Config {
             theme: default_theme(),
             accent_color: String::new(),
             density: default_density(),
+            pinned_sessions: Vec::new(),
+            auto_verify: true,
+            verify_command: String::new(),
         }
     }
 }

@@ -53,10 +53,7 @@ mod tests {
     use oxide_providers::{Message, Role};
 
     fn msg(role: Role, n: usize) -> Message {
-        Message {
-            role,
-            content: "x".repeat(n),
-        }
+        Message::new(role, "x".repeat(n))
     }
 
     #[test]
