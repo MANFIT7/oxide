@@ -79,6 +79,8 @@ impl Frontend for Tui {
         mut events: mpsc::Receiver<Event>,
     ) -> anyhow::Result<()> {
         let mut terminal = ratatui::init();
+        // Multi-line pastes arrive as one Paste event instead of N keystrokes.
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste);
         let mut reader = EventStream::new();
         let mut state = State {
             harness: self.harness.clone(),
@@ -91,6 +93,7 @@ impl Frontend for Tui {
         )));
 
         let res = run_loop(&mut terminal, &mut reader, &mut events, &handle, &mut state).await;
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
         ratatui::restore();
         res
     }
@@ -103,17 +106,23 @@ async fn run_loop(
     handle: &EngineHandle,
     state: &mut State,
 ) -> anyhow::Result<()> {
+    // Coalesce redraws to a 60fps frame clock: events set `dirty`, the frame
+    // tick repaints only if something changed. A fast token stream or a paste
+    // burst then yields ~60 repaints/sec instead of one per token/keystroke.
+    let mut frame = tokio::time::interval(std::time::Duration::from_millis(16));
+    frame.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut dirty = true;
     loop {
-        draw(terminal, state)?;
         if state.quit {
             let _ = handle.submit(Op::Shutdown).await;
             return Ok(());
         }
-
         tokio::select! {
             term = reader.next() => {
                 match term {
-                    Some(Ok(CtEvent::Key(key))) => handle_key(key, handle, state).await?,
+                    Some(Ok(CtEvent::Key(key))) => { handle_key(key, handle, state).await?; dirty = true; }
+                    Some(Ok(CtEvent::Paste(s))) => { state.input.push_str(&s); dirty = true; }
+                    Some(Ok(CtEvent::Resize(_, _))) => { dirty = true; }
                     Some(Ok(_)) => {}
                     Some(Err(e)) => return Err(e.into()),
                     None => state.quit = true,
@@ -121,8 +130,14 @@ async fn run_loop(
             }
             ev = events.recv() => {
                 match ev {
-                    Some(event) => apply_event(event, state),
+                    Some(event) => { apply_event(event, state); dirty = true; }
                     None => state.quit = true,
+                }
+            }
+            _ = frame.tick() => {
+                if dirty {
+                    draw(terminal, state)?;
+                    dirty = false;
                 }
             }
         }

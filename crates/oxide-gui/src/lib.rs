@@ -4260,7 +4260,8 @@ fn Composer(
             if (el && !el.__oxpaste) {
               el.__oxpaste = true;
               el.addEventListener('paste', function(ev){
-                const items = (ev.clipboardData || {}).items || [];
+                const cd = ev.clipboardData || window.clipboardData;
+                const items = (cd || {}).items || [];
                 for (const it of items) {
                   if (it.type && it.type.indexOf('image') === 0) {
                     ev.preventDefault();
@@ -4268,7 +4269,15 @@ fn Composer(
                     const r = new FileReader();
                     r.onload = function(){ dioxus.send(r.result); };
                     r.readAsDataURL(f);
+                    return;
                   }
+                }
+                // Plain-text paste — strip the source app's font/colors/styles so
+                // pasted text uses Oxide's own composer styling.
+                const text = cd ? cd.getData('text/plain') : '';
+                if (text) {
+                  ev.preventDefault();
+                  document.execCommand('insertText', false, text);
                 }
               });
             }
