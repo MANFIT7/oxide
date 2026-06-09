@@ -89,6 +89,10 @@ hdiutil create -volname "$APP" -srcfolder "$STAGE" -ov -format UDRW "$RW" >/dev/
 MOUNT="$(hdiutil attach -readwrite -noverify -noautoopen "$RW" | egrep '/Volumes/' | sed 's/.*\(\/Volumes\/.*\)/\1/' | head -1)"
 # Use the ACTUAL mounted volume name (basename), not the hardcoded title.
 VOL="$(basename "$MOUNT")"
+# Give Finder a moment to register the freshly-mounted volume, otherwise the
+# AppleScript `tell disk` races and fails with -1728 (window comes out unstyled).
+open "$MOUNT" >/dev/null 2>&1 || true
+sleep 3
 
 if [ -n "${MOUNT:-}" ] && [ -f "$MOUNT/.background/bg.png" ]; then
 osascript <<APPLESCRIPT || true

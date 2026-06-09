@@ -29,6 +29,82 @@ pub use tools::{Routed, ToolRouter};
 use oxide_config::Config;
 use oxide_config::McpServerConfig;
 
+/// A shallow file-tree of the workspace, injected into the system prompt so the
+/// agent sees the project's real structure from the first message (and doesn't
+/// "forget the codebase" in a fresh tab or invent a standalone solution).
+fn project_map(ws: &Path) -> String {
+    const SKIP: &[&str] = &[
+        ".git", "node_modules", "target", "dist", ".next", ".oxide", "vendor",
+        "build", ".venv", "__pycache__", ".cache", "out", ".turbo", ".idea", ".vscode",
+    ];
+    fn walk(dir: &Path, prefix: &str, depth: usize, count: &mut usize, out: &mut String) {
+        if depth > 2 || *count > 120 {
+            return;
+        }
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        let mut entries: Vec<(bool, String, std::path::PathBuf)> = rd
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                if name.starts_with('.') && name != ".env.example" && name != ".github" {
+                    return None;
+                }
+                if SKIP.contains(&name.as_str()) {
+                    return None;
+                }
+                let p = e.path();
+                Some((p.is_dir(), name, p))
+            })
+            .collect();
+        // Dirs first, then files; alphabetical within each.
+        entries.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        let per_dir = if depth == 0 { 40 } else { 16 };
+        for (is_dir, name, p) in entries.into_iter().take(per_dir) {
+            if *count > 120 {
+                out.push_str(&format!("{prefix}…\n"));
+                return;
+            }
+            *count += 1;
+            if is_dir {
+                out.push_str(&format!("{prefix}{name}/\n"));
+                let child = format!("{prefix}  ");
+                walk(&p, &child, depth + 1, count, out);
+            } else {
+                out.push_str(&format!("{prefix}{name}\n"));
+            }
+        }
+    }
+    let mut out = String::new();
+    let mut count = 0;
+    walk(ws, "", 0, &mut count, &mut out);
+    out
+}
+
+/// Best-effort detect the project's stack so the agent builds with the right
+/// framework instead of inventing a standalone solution.
+fn detect_stack(ws: &Path) -> Option<String> {
+    if let Ok(pkg) = std::fs::read_to_string(ws.join("package.json")) {
+        let p = pkg.to_lowercase();
+        let fw = if p.contains("\"next\"") { "Next.js (React)" }
+            else if p.contains("nuxt") { "Nuxt (Vue)" }
+            else if p.contains("@remix-run") { "Remix (React)" }
+            else if p.contains("svelte") { "Svelte/SvelteKit" }
+            else if p.contains("\"vue\"") { "Vue" }
+            else if p.contains("\"react\"") { "React" }
+            else if p.contains("\"vite\"") { "Vite" }
+            else if p.contains("\"express\"") { "Node/Express" }
+            else { "Node.js" };
+        let extra = if p.contains("supabase") { " + Supabase" } else { "" };
+        return Some(format!("{fw}{extra}"));
+    }
+    if ws.join("Cargo.toml").exists() { return Some("Rust (Cargo)".into()); }
+    if ws.join("go.mod").exists() { return Some("Go".into()); }
+    if ws.join("pyproject.toml").exists() || ws.join("requirements.txt").exists() { return Some("Python".into()); }
+    if ws.join("pom.xml").exists() || ws.join("build.gradle").exists() { return Some("Java/JVM".into()); }
+    if ws.join("Gemfile").exists() { return Some("Ruby".into()); }
+    None
+}
+
 /// A browser-like HTTP client for web tools.
 fn web_client() -> Option<reqwest::Client> {
     reqwest::Client::builder()
@@ -912,12 +988,23 @@ impl Engine {
         let policy = harness.loop_policy();
         let mut sys = harness.system_prompt();
         // Tell the agent exactly where it is working so it never wanders to $HOME.
+        let stack = detect_stack(&self.workspace);
         sys.push_str(&format!(
-            "\n\n# Working directory\nYou are operating in this project: `{}`. \
-             All shell commands run here (cwd) and relative paths resolve here. \
-             Search, read, and edit only inside this directory unless the user explicitly asks otherwise — do NOT scan $HOME or the whole filesystem.",
-            self.workspace.display()
+            "\n\n# Working directory\nYou are operating in this EXISTING project: `{}`{}. \
+             All shell commands run here (cwd) and relative paths resolve here.\n\
+             - Build INSIDE this project, using its existing stack and conventions. Identify the stack first (read package.json / Cargo.toml / the framework config) and add code where it belongs — e.g. for Next.js create pages/components/route handlers in the right folders. NEVER hand-write a standalone `index.html` (or a generic from-scratch solution) when the project is a framework app — use the framework.\n\
+             - Create new files ONLY inside this directory. Do NOT write outside it or invent a new sibling folder (e.g. `../something-new`, `/Volumes/...`). Even when asked for a 'separate' or 'standalone' page, put it inside this project unless the user gives an explicit absolute path elsewhere.\n\
+             - Search, read, and edit inside this directory; do NOT scan $HOME or the whole filesystem.",
+            self.workspace.display(),
+            stack.map(|s| format!(" (detected stack: {s})")).unwrap_or_default()
         ));
+        // Inject a shallow file-tree so the agent knows the real layout up front.
+        let map = project_map(&self.workspace);
+        if !map.trim().is_empty() {
+            sys.push_str("\n\n# Project structure (shallow)\n```\n");
+            sys.push_str(map.trim_end());
+            sys.push_str("\n```\nWork within this existing structure; place new code where it belongs.");
+        }
         // Pinned project instructions (AGENTS.md / CLAUDE.md) — always resident,
         // never compacted away.
         if let Some(agents) = load_project_instructions(&self.workspace) {
@@ -1675,4 +1762,15 @@ fn unified_diff(old: &str, new: &str, path: &str) -> String {
 
 fn tool_arg_string(args: &serde_json::Value, key: &str) -> String {
     args[key].as_str().unwrap_or("").trim().to_string()
+}
+
+#[cfg(test)]
+mod map_test {
+    #[test]
+    fn map_shows_structure() {
+        let ws = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
+        let m = super::project_map(ws);
+        assert!(m.contains("crates/") && m.contains("Cargo.toml"), "map:\n{m}");
+        eprintln!("--- project map sample ---\n{}", &m[..m.len().min(400)]);
+    }
 }
