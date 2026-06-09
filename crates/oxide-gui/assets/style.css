@@ -867,7 +867,10 @@ svg { width: 17px; height: 17px; flex-shrink: 0; }
 .section-add svg { width: 15px; height: 15px; }
 
 /* Composer dropdown direction follows mode: hero centered = downward, chat-dock bottom = upward. */
-.hero .model-menu, .hero .effort-menu, .hero .sel-menu, .hero .plus-menu { top: calc(100% + 6px); bottom: auto; }
+.hero .model-menu, .hero .effort-menu, .hero .sel-menu { top: calc(100% + 6px); bottom: auto; }
+/* The +menu can be tall — drop it UP in the hero so it doesn't collide with the
+   project/branch selectors row below the composer. */
+.hero .plus-menu { bottom: calc(100% + 6px); top: auto; z-index: 90; }
 /* The @-mention list can be long — drop it UP in the hero so it never collides
    with the project/branch selectors row below the composer. */
 .hero .mention-menu { bottom: calc(100% + 6px); top: auto; z-index: 90; }
