@@ -6,6 +6,7 @@ license.workspace = true
 description = "Terminal UI for Oxide (ratatui + crossterm), implementing the oxide-frontend contract."
 
 [dependencies]
+serde_json = { workspace = true }
 oxide-core = { workspace = true }
 oxide-protocol = { workspace = true }
 oxide-frontend = { workspace = true }

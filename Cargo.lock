@@ -4985,6 +4985,7 @@ dependencies = [
  "oxide-frontend",
  "oxide-protocol",
  "ratatui",
+ "serde_json",
  "tokio",
 ]
 

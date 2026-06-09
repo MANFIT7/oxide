@@ -20,12 +20,14 @@ use tokio::sync::mpsc;
 /// The terminal UI. Construct with [`Tui::new`] and run via [`Frontend`].
 pub struct Tui {
     harness: String,
+    workspace: std::path::PathBuf,
 }
 
 impl Tui {
-    pub fn new(harness: impl Into<String>) -> Self {
+    pub fn new(harness: impl Into<String>, workspace: impl Into<std::path::PathBuf>) -> Self {
         Self {
             harness: harness.into(),
+            workspace: workspace.into(),
         }
     }
 }
@@ -91,11 +93,56 @@ impl Frontend for Tui {
             "Oxide TUI — type a message, Enter to send · tool calls prompt y/n/a",
             Style::default().fg(Color::DarkGray),
         )));
+        // Show the last conversation on open (the engine resumes its context).
+        load_last_session(&self.workspace, &mut state);
 
         let res = run_loop(&mut terminal, &mut reader, &mut events, &handle, &mut state).await;
         let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
         ratatui::restore();
         res
+    }
+}
+
+/// Render the most recent persisted session into the transcript so the TUI
+/// opens on the last chat instead of a blank screen.
+fn load_last_session(workspace: &std::path::Path, state: &mut State) {
+    let dir = workspace.join(".oxide/sessions");
+    let Ok(rd) = std::fs::read_dir(&dir) else { return };
+    let mut files: Vec<std::path::PathBuf> = rd
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("jsonl"))
+        .collect();
+    files.sort();
+    let Some(latest) = files.last() else { return };
+    let Ok(text) = std::fs::read_to_string(latest) else { return };
+    let mut shown = 0;
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        let role = v["role"].as_str().unwrap_or("");
+        let content = v["content"].as_str().unwrap_or("").trim();
+        if content.is_empty() {
+            continue;
+        }
+        let (label, color) = match role {
+            "user" => ("you ", Color::Green),
+            "assistant" => ("oxide ", Color::Cyan),
+            _ => continue, // skip tool/system noise in the recap
+        };
+        for (i, l) in content.lines().enumerate() {
+            let prefix = if i == 0 { label } else { "  " };
+            state.push(Line::from(vec![
+                Span::styled(prefix.to_string(), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+                Span::raw(l.to_string()),
+            ]));
+        }
+        shown += 1;
+    }
+    if shown > 0 {
+        state.push(Line::from(Span::styled(
+            "─── resumed last session ───",
+            Style::default().fg(Color::DarkGray),
+        )));
     }
 }
 

@@ -214,10 +214,16 @@ async fn run_exec(config: Config, prompt: String, yes: bool) -> Result<()> {
     Ok(())
 }
 
-async fn run_tui(config: Config) -> Result<()> {
+async fn run_tui(mut config: Config) -> Result<()> {
+    // Open on the last conversation by default (resume context + render it).
+    config.resume = true;
     let harness = config.harness.clone();
+    let ws = config
+        .workspace
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()));
     let (handle, events) = oxide_core::spawn(config)?;
-    let tui = Box::new(Tui::new(harness));
+    let tui = Box::new(Tui::new(harness, ws));
     tui.run(handle, events).await
 }
 
