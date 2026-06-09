@@ -1219,10 +1219,10 @@ any remaining tasks and the recommended next step.\n</system-reminder>"));
                 if nudges < 1 {
                     nudges += 1;
                     self.session.push(Message::new(Role::User,
-                        "<system-reminder>\nYou stopped without calling a tool. If the task requires \
-changes, APPLY them now with the edit/write_file tools (then verify with shell). Do not just describe \
-an edit — make it. Only end without acting if the task is genuinely complete and verified, or you are \
-truly blocked and need a decision (then call ask_user).\n</system-reminder>"));
+                        "<system-reminder>\nYou stopped, but the task may not be fully done. Check honestly:\n\
+- Did you finish EVERY step you planned? If your plan said you'd run a typecheck/lint/tests, run them NOW with `shell` and fix what breaks — a single edit is rarely the whole task.\n\
+- Are there other files/call-sites that need the same change for it to actually work?\n\
+If yes, do it now with edit/write_file/shell — don't describe it. Only end when the task is genuinely COMPLETE and VERIFIED (you ran the check and saw it pass), or you're truly blocked and need a decision (then call ask_user).\n</system-reminder>"));
                     continue;
                 }
                 // Auto-verify: build/typecheck the edits and feed failures back

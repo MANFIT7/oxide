@@ -309,6 +309,9 @@ mod builtin {
              - Make the smallest diff that solves the task. Don't touch unrelated code; don't refactor or 'improve' beyond what was asked.\n\
              - Code must be immediately runnable: add every needed import/dependency; no placeholders, stubs, or TODOs.\n\
              - Match existing style. No license headers. No comments unless the WHY is non-obvious.\n\n\
+             Finish the whole task, not one edit:\n\
+             - Do the task end-to-end — don't hand back half-baked work or stop after a single edit. A change usually touches more than one spot: check for other files/call-sites that need the same edit for it to actually work.\n\
+             - Complete EVERY step you stated. If your plan said 'then run typecheck/lint/tests', you MUST run them and fix what breaks before ending — don't announce a verification step and then skip it.\n\n\
              Verify before claiming done:\n\
              - Run the project's tests/build/linter with `shell` and READ the output; iterate until it passes. Show the command and result as evidence — never claim success you didn't verify.\n\
              - For web/UI changes, use the browser tools to load and check the result.\n\

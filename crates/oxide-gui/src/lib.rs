@@ -1249,16 +1249,14 @@ fn build_projects(current: &Path, recents: &[PathBuf]) -> Vec<(PathBuf, String, 
     }
     let mut out = Vec::new();
     for ws in wss {
-        let is_current = ws == current;
-        // Only scan the ACTIVE project's sessions; recents show a clickable
-        // header and load their chats when switched to. This avoids eagerly
-        // touching every folder's `.oxide/sessions` (which on external/removable
-        // volumes re-triggers the macOS "allow access" prompt every build).
-        let items: Vec<(PathBuf, String, String)> = if is_current {
-            recent_sessions(&ws).into_iter().map(|(p, m, t)| (p, t, relative_time(m))).collect()
-        } else {
-            Vec::new()
-        };
+        // Group each project's OWN chats under it (synara-style), so a chat
+        // always appears under the folder it belongs to — not just the active
+        // one. These are user-opened folders, so access is already granted.
+        let items: Vec<(PathBuf, String, String)> = recent_sessions(&ws)
+            .into_iter()
+            .take(8)
+            .map(|(p, m, t)| (p, t, relative_time(m)))
+            .collect();
         let name = project_name(&ws);
         out.push((ws, name, items));
     }
