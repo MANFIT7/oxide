@@ -1603,3 +1603,72 @@ details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
   .files-panel, .preview-panel, .col.streaming .row.agent:last-of-type .agent-text::after { animation: none; }
   .send, .composer:focus-within { transition: none; }
 }
+
+/* ════ CURSOR-CLEAN OVERHAUL · Phase 1 ════════════════════════════
+   Flat document-flow chat, elevation via background (not borders),
+   sans UI type (mono reserved for code/paths), one calm accent. */
+:root, [data-theme="light"] { --syn-accent: #6e7ff3; }
+.app { font-family: -apple-system, 'SF Pro Text', Inter, 'Segoe UI', sans-serif; }
+
+/* chat = document flow: agent text is plain prose, full width, no avatar */
+.row.agent .avatar { display: none; }
+.row.agent { padding: 2px 0; }
+.agent-text { font-size: 14.5px; line-height: 1.7; max-width: 720px; }
+
+/* user message: quiet quoted block instead of a chat bubble */
+.row.user { justify-content: flex-start; }
+.row.user .bubble {
+  background: color-mix(in srgb, var(--text) 4%, transparent);
+  border: none; border-left: 2px solid var(--syn-accent);
+  border-radius: 6px; max-width: 720px; padding: 8px 14px;
+  font-size: 14px; color: var(--text);
+}
+
+/* tool activity: tiny inline " · verb detail" lines, chrome-free */
+.activity-card { background: transparent; border: none; padding: 2px 0 2px 2px; margin-left: 8px; font-size: 12.5px; }
+.activity-card.running { border: none; }
+.activity-card.fail { border: none; }
+.activity-card.fail .activity-verb { color: var(--danger, #fa423e); }
+.act-group { border: none; background: transparent; }
+.act-group-head { font-size: 12px; color: var(--muted); }
+
+/* cards: elevation via bg, not borders */
+.edits-card, .todo-card, .question-card, .approval-card, .thinking-box, .diff-card {
+  border-color: transparent; background: color-mix(in srgb, var(--text) 4%, transparent);
+}
+
+/* composer: clean elevated slab, ghost pills */
+.composer { background: color-mix(in srgb, var(--text) 5%, var(--bg)); border-color: color-mix(in srgb, var(--text) 8%, transparent); }
+.pill, .selector { background: transparent; border-color: transparent; color: var(--muted); }
+.pill:hover, .selector:hover { background: color-mix(in srgb, var(--text) 6%, transparent); color: var(--text); }
+.pill.fast.on { color: #3ad29f; }
+
+/* selectors row reads as quiet metadata under the composer */
+.selectors { gap: 4px; margin-top: 8px; }
+.selector { font-size: 12px; }
+
+/* headers/panels: drop hairlines, rely on spacing */
+.tabs-bar, .insp-tabs { border-bottom-color: color-mix(in srgb, var(--text) 6%, transparent); }
+.sidebar { border-right: none; }
+.main { box-shadow: none; border-radius: 0; }
+
+/* ── Phase 2: icon rail + minimal header ── */
+.sidebar { transition: width .18s ease; }
+.sidebar.collapsed { width: 56px; padding: 12px 6px; }
+.sidebar.collapsed .brand-name, .sidebar.collapsed .section-label,
+.sidebar.collapsed .projects, .sidebar.collapsed .nav .nav-label,
+.sidebar.collapsed .nav-item span { display: none; }
+.sidebar.collapsed .nav-item { justify-content: center; padding: 8px 0; }
+.sidebar.collapsed .brand { justify-content: center; padding: 6px 0 12px; }
+.logo { cursor: pointer; transition: transform .15s ease; }
+.logo:hover { transform: scale(1.08); }
+/* header buttons: ghost until hover (Cursor restraint) */
+.top-btn { background: transparent; border-color: transparent; color: var(--muted); }
+.top-btn:hover { background: color-mix(in srgb, var(--text) 6%, transparent); color: var(--text); }
+.top-btn.on { background: color-mix(in srgb, var(--text) 8%, transparent); color: var(--text); border-color: transparent; }
+/* menus: elevated surface, no hard borders */
+.model-menu, .effort-menu, .plus-menu, .sel-menu, .access-menu, .theme-menu, .mention-menu, .palette {
+  border-color: color-mix(in srgb, var(--text) 7%, transparent);
+  background: color-mix(in srgb, var(--text) 4%, var(--bg));
+  backdrop-filter: blur(24px) saturate(140%);
+}

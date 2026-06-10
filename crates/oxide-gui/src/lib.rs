@@ -1364,6 +1364,8 @@ fn app() -> Element {
     // ⌘K command palette.
     let mut show_palette = use_signal(|| false);
     let mut show_shortcuts = use_signal(|| false);
+    // Cursor-style icon rail: sidebar collapses to a thin strip.
+    let mut sidebar_collapsed = use_signal(|| false);
     let mut palette_query = use_signal(String::new);
     let mut palette_sel = use_signal(|| 0usize);
     let mut pinned = use_signal(|| false);
@@ -2013,7 +2015,7 @@ fn app() -> Element {
         style { {XTERM_CSS} }
         div { class: "app", "data-theme": "{cfg.read().theme}", "data-density": "{cfg.read().density}", style: "{accent_style}",
             // ── Sidebar ────────────────────────────────────────────────
-            aside { class: "sidebar",
+            aside { class: if *sidebar_collapsed.read() { "sidebar collapsed" } else { "sidebar" },
                 oncontextmenu: move |e: dioxus::prelude::MouseEvent| { e.prevent_default(); let c = e.client_coordinates(); theme_menu_pos.set((c.x, c.y)); session_menu.set(None); show_theme_menu.set(true); },
                 if *show_theme_menu.read() {
                     div { class: "menu-backdrop", onclick: move |_| show_theme_menu.set(false) }
@@ -2085,7 +2087,9 @@ fn app() -> Element {
                     }
                 }
                 div { class: "brand",
-                    img { class: "logo", src: logo_uri() }
+                    img { class: "logo", src: logo_uri(),
+                          title: "Collapse/expand sidebar",
+                          onclick: move |_| { let v = *sidebar_collapsed.read(); sidebar_collapsed.set(!v); } }
                     span { class: "brand-name", "Oxide" }
                 }
                 nav { class: "nav",
