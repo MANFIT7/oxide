@@ -2828,6 +2828,8 @@ fn app() -> Element {
                                                                     div { class: "row diffrow",
                                                                         details { class: "diff-card",
                                                                             summary { class: "diff-head",
+                                                                                // Expanding a diff hides the right inspector so the diff gets the width.
+                                                                                onclick: move |_| { if *show_files.read() { show_files.set(false); } },
                                                                                 span { class: "diff-caret", Icon { name: "chevron" } }
                                                                                 span { class: "diff-path", "{path}" }
                                                                                 span { class: "diff-adds", "+{adds}" }
