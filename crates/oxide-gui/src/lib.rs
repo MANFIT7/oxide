@@ -1995,6 +1995,9 @@ fn app() -> Element {
                             Event::Ready { harness } => {
                                 timeline.write().push(TimelineItem { title: "Engine ready".into(), sub: format!("Harness: {harness}") });
                             }
+                            Event::Followups { items } => {
+                                followups.set(items.into_iter().take(3).collect());
+                            }
                             Event::SessionPath { path } => {
                                 // Bind the active tab to the EXACT transcript this
                                 // engine writes — never guess via newest-file (mixes tabs).

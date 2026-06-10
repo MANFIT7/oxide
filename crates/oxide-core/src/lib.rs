@@ -1481,6 +1481,63 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
         }
         self.fire_hooks("stop", serde_json::json!({})).await;
         self.emit(Event::TurnFinished { turn }).await;
+
+        // Context-aware follow-up suggestions, generated off-turn on the fast
+        // lane. CLI drivers are skipped (a cold CLI spawn for 3 chips isn't
+        // worth the cost) — the UI keeps its heuristic chips there.
+        if !interrupted && !matches!(self.config.provider.as_str(), "codex" | "claude" | "echo") {
+            let last_user = self.session.iter().rev()
+                .find(|m| m.role == Role::User && !m.content.starts_with("<system-reminder>"))
+                .map(|m| m.content.chars().take(1200).collect::<String>())
+                .unwrap_or_default();
+            let last_reply = self.session.iter().rev()
+                .find(|m| m.role == Role::Assistant && !m.content.trim().is_empty())
+                .map(|m| m.content.chars().take(1500).collect::<String>())
+                .unwrap_or_default();
+            if !last_reply.is_empty() {
+                let provider_id = self.config.provider.clone();
+                let model = {
+                    let mut c = self.config.clone();
+                    c.fast_mode = true;
+                    c.effective_model()
+                };
+                let tx = self.event_tx.clone();
+                tokio::spawn(async move {
+                    let provider = oxide_providers::build(&provider_id);
+                    let req = TurnRequest {
+                        model,
+                        reasoning_effort: "low".into(),
+                        temperature: 0.7,
+                        messages: vec![
+                            Message::new(Role::System, "Suggest the user's 3 most likely NEXT prompts for this coding-agent conversation. Short imperative phrases (max 9 words each), in the user's language. Output ONLY the 3 prompts, one per line — no numbering, no quotes."),
+                            Message::new(Role::User, format!("User asked:\n{last_user}\n\nAgent replied:\n{last_reply}")),
+                        ],
+                        tools: Vec::new(),
+                        cwd: String::new(),
+                        conversation_id: String::new(),
+                    };
+                    let (stx, mut srx) = mpsc::channel::<StreamItem>(64);
+                    let task = tokio::spawn(async move { provider.stream(req, stx).await });
+                    let mut out = String::new();
+                    while let Ok(Some(item)) = tokio::time::timeout(std::time::Duration::from_secs(20), srx.recv()).await {
+                        match item {
+                            StreamItem::TextDelta(t) => out.push_str(&t),
+                            StreamItem::Done => break,
+                            _ => {}
+                        }
+                    }
+                    task.abort();
+                    let items: Vec<String> = out.lines()
+                        .map(|l| l.trim().trim_start_matches(['-', '*', '•']).trim().to_string())
+                        .filter(|l| !l.is_empty() && l.len() < 90)
+                        .take(3)
+                        .collect();
+                    if !items.is_empty() {
+                        let _ = tx.send(Event::Followups { items }).await;
+                    }
+                });
+            }
+        }
     }
 
     /// Route one tool call through approval + sandbox and emit its result.

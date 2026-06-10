@@ -53,6 +53,8 @@ pub enum Event {
     /// Path of the session file this engine opened (so the UI can bind the
     /// active tab to its exact transcript instead of guessing).
     SessionPath { path: String },
+    /// Model-generated follow-up prompt suggestions for the composer.
+    Followups { items: Vec<String> },
     /// A new turn began.
     TurnStarted { turn: TurnId },
     /// A chunk of the assistant's streamed message.

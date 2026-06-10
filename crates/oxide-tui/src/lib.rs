@@ -251,6 +251,7 @@ fn apply_event(event: Event, state: &mut State) {
             state.status = "engine ready".into();
         }
         Event::SessionPath { .. } => {}
+        Event::Followups { .. } => {}
         Event::TurnStarted { turn } => state.status = format!("{turn} running…"),
         Event::ApprovalRequested {
             request_id,

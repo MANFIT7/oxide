@@ -134,6 +134,7 @@ async fn run_exec(config: Config, prompt: String, yes: bool) -> Result<()> {
         match ev {
             Event::Ready { harness } => println!("[ready] harness={harness}"),
             Event::SessionPath { .. } => {}
+            Event::Followups { .. } => {}
             Event::TurnStarted { turn } => println!("[{turn}] started"),
             Event::AgentMessageDelta { text, .. } => print!("{text}"),
             Event::ReasoningDelta { .. } => {}
