@@ -62,6 +62,11 @@ impl SessionStore {
         Ok(Self { path: path.to_path_buf(), id })
     }
 
+    /// Absolute path of this session's JSONL file.
+    pub fn path_str(&self) -> String {
+        self.path.display().to_string()
+    }
+
     pub fn append(&self, role: &str, content: &str) -> std::io::Result<()> {
         let rec = StoredMessage {
             role: role.to_string(),

@@ -260,28 +260,40 @@ fn query(idx: &CodeIndex, q: &str) -> String {
 /// files, run the query, and persist ONLY when something changed. The in-memory
 /// cache removes the multi-second JSON parse+rewrite per search on big repos.
 pub fn search(ws: &Path, q: &str) -> String {
-    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, CodeIndex>>> =
+    type Slot = std::sync::Arc<std::sync::Mutex<CodeIndex>>;
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, Slot>>> =
         std::sync::OnceLock::new();
     let key = ws.display().to_string();
     let dir = ws.join(".oxide/index");
     let path = dir.join("code.json");
 
-    let mut map = match CACHE.get_or_init(Default::default).lock() {
+    // Hold the global map lock only long enough to grab THIS workspace's slot,
+    // so a slow update on one workspace can't block searches on another.
+    let slot = {
+        let mut map = match CACHE.get_or_init(Default::default).lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        map.entry(key)
+            .or_insert_with(|| {
+                let loaded: CodeIndex = std::fs::read(&path)
+                    .ok()
+                    .and_then(|b| serde_json::from_slice(&b).ok())
+                    .unwrap_or_default();
+                std::sync::Arc::new(std::sync::Mutex::new(loaded))
+            })
+            .clone()
+    };
+    let mut idx = match slot.lock() {
         Ok(g) => g,
         Err(p) => p.into_inner(),
     };
-    let idx = map.entry(key).or_insert_with(|| {
-        std::fs::read(&path)
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default()
-    });
     let before = idx.files.len();
-    let dirty = update(ws, idx);
-    let result = query(idx, q);
+    let dirty = update(ws, &mut idx);
+    let result = query(&idx, q);
     if dirty || idx.files.len() != before {
         let _ = std::fs::create_dir_all(&dir);
-        if let Ok(b) = serde_json::to_vec(&idx) {
+        if let Ok(b) = serde_json::to_vec(&*idx) {
             let _ = std::fs::write(&path, b);
         }
     }

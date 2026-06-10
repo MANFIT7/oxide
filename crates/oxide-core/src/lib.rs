@@ -804,6 +804,9 @@ impl Engine {
         })
         .await;
         if let Some(store) = &self.session_store {
+            // Tell the UI exactly which file this engine writes, so a tab binds
+            // to its OWN transcript (newest-file guessing mixes tabs up).
+            self.emit(Event::SessionPath { path: store.path_str() }).await;
             let resumed = if self.session.is_empty() {
                 String::new()
             } else {
@@ -980,6 +983,7 @@ impl Engine {
             ],
             tools: vec![],
             cwd: self.workspace.display().to_string(),
+                conversation_id: self.session_store.as_ref().map(|s| s.id.clone()).unwrap_or_default(),
         };
         let (tx, mut rx) = mpsc::channel::<StreamItem>(STREAM_QUEUE);
         let provider = oxide_providers::build(provider_id);
@@ -1263,6 +1267,7 @@ impl Engine {
                 messages: msgs,
                 tools: tools.clone(),
                 cwd: self.workspace.display().to_string(),
+                conversation_id: self.session_store.as_ref().map(|s| s.id.clone()).unwrap_or_default(),
             };
 
             let (stream_tx, mut stream_rx) = mpsc::channel::<StreamItem>(STREAM_QUEUE);

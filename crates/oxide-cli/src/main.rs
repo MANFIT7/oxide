@@ -133,6 +133,7 @@ async fn run_exec(config: Config, prompt: String, yes: bool) -> Result<()> {
     while let Some(ev) = events.recv().await {
         match ev {
             Event::Ready { harness } => println!("[ready] harness={harness}"),
+            Event::SessionPath { .. } => {}
             Event::TurnStarted { turn } => println!("[{turn}] started"),
             Event::AgentMessageDelta { text, .. } => print!("{text}"),
             Event::ReasoningDelta { .. } => {}

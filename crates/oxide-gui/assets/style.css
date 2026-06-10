@@ -1950,3 +1950,7 @@ details[open]::details-content { block-size: auto; }
 .followups .suggestion.followup:first-child { border-top: none; }
 .followups-x { position: absolute; top: 2px; right: 0; background: none; border: none; color: var(--faint); cursor: pointer; font-size: 11px; padding: 4px; }
 .followups-x:hover { color: var(--text); }
+
+/* pin icon button: tidy sizing + pinned = accent fill tilt */
+.row-act-btn svg { width: 13px; height: 13px; }
+.row-act-btn.pinned svg { color: var(--syn-accent); fill: color-mix(in srgb, var(--syn-accent) 22%, transparent); transform: rotate(8deg); }

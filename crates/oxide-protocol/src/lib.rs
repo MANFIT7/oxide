@@ -50,6 +50,9 @@ pub enum Op {
 pub enum Event {
     /// Engine is up; carries the active harness id.
     Ready { harness: String },
+    /// Path of the session file this engine opened (so the UI can bind the
+    /// active tab to its exact transcript instead of guessing).
+    SessionPath { path: String },
     /// A new turn began.
     TurnStarted { turn: TurnId },
     /// A chunk of the assistant's streamed message.

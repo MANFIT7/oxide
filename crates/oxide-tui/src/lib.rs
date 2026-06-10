@@ -250,6 +250,7 @@ fn apply_event(event: Event, state: &mut State) {
             state.harness = harness;
             state.status = "engine ready".into();
         }
+        Event::SessionPath { .. } => {}
         Event::TurnStarted { turn } => state.status = format!("{turn} running…"),
         Event::ApprovalRequested {
             request_id,

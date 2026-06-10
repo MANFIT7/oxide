@@ -22,13 +22,18 @@ use tokio::sync::mpsc;
 /// CLI conversation instead of starting amnesiac one-shots.
 static SESSIONS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 
-fn session_get(bin: &str, cwd: &str) -> Option<String> {
-    SESSIONS.get_or_init(Default::default).lock().ok()?.get(&format!("{bin}|{cwd}")).cloned()
+fn session_key(bin: &str, conv: &str, cwd: &str) -> String {
+    // Prefer the per-conversation id; fall back to cwd if absent.
+    if conv.is_empty() { format!("{bin}|{cwd}") } else { format!("{bin}|{conv}") }
 }
 
-fn session_set(bin: &str, cwd: &str, id: &str) {
+fn session_get(key: &str) -> Option<String> {
+    SESSIONS.get_or_init(Default::default).lock().ok()?.get(key).cloned()
+}
+
+fn session_set(key: &str, id: &str) {
     if let Ok(mut m) = SESSIONS.get_or_init(Default::default).lock() {
-        m.insert(format!("{bin}|{cwd}"), id.to_string());
+        m.insert(key.to_string(), id.to_string());
     }
 }
 
@@ -184,7 +189,8 @@ impl Provider for CodexCliProvider {
 
     async fn stream(&self, req: TurnRequest, sink: mpsc::Sender<StreamItem>) -> anyhow::Result<()> {
         let prompt = last_user_prompt(&req);
-        let resume = session_get(&self.bin, &req.cwd);
+        let skey = session_key(&self.bin, &req.conversation_id, &req.cwd);
+        let resume = session_get(&skey);
         let mut args = vec!["exec".to_string()];
         if let Some(id) = &resume {
             // Continue the same codex thread — context carries across turns.
@@ -211,13 +217,12 @@ impl Provider for CodexCliProvider {
         }
         args.push(prompt);
 
-        let bin = self.bin.clone();
-        let cwd = req.cwd.clone();
+        let skey_cb = skey.clone();
         run_jsonl(&self.bin, &args, &req.cwd, &sink, move |v, sink| {
             match v["type"].as_str() {
                 Some("thread.started") => {
                     if let Some(id) = v["thread_id"].as_str() {
-                        session_set(&bin, &cwd, id);
+                        session_set(&skey_cb, id);
                     }
                 }
                 Some("item.completed") => {
@@ -308,7 +313,8 @@ impl Provider for ClaudeCliProvider {
 
     async fn stream(&self, req: TurnRequest, sink: mpsc::Sender<StreamItem>) -> anyhow::Result<()> {
         let prompt = last_user_prompt(&req);
-        let resume = session_get(&self.bin, &req.cwd);
+        let skey = session_key(&self.bin, &req.conversation_id, &req.cwd);
+        let resume = session_get(&skey);
         let mut args = vec![
             "-p".to_string(),
             prompt,
@@ -333,8 +339,7 @@ impl Provider for ClaudeCliProvider {
             args.push(claude_effort(&req.reasoning_effort).to_string());
         }
 
-        let bin = self.bin.clone();
-        let cwd = req.cwd.clone();
+        let skey_cb = skey.clone();
         // With partial messages on, text arrives via stream_event deltas; the
         // final `assistant` message would duplicate it, so skip its text blocks.
         let mut saw_partial = false;
@@ -342,11 +347,17 @@ impl Provider for ClaudeCliProvider {
             match v["type"].as_str() {
                 Some("system") => {
                     if let Some(id) = v["session_id"].as_str() {
-                        session_set(&bin, &cwd, id);
+                        session_set(&skey_cb, id);
                     }
                 }
                 Some("stream_event") => {
                     let ev = &v["event"];
+                    // Each new assistant message resets the dedupe latch, so a
+                    // later message's final text isn't dropped because an earlier
+                    // one streamed deltas.
+                    if ev["type"].as_str() == Some("message_start") {
+                        saw_partial = false;
+                    }
                     if ev["type"].as_str() == Some("content_block_delta") {
                         match ev["delta"]["type"].as_str() {
                             Some("text_delta") => {
@@ -386,7 +397,7 @@ impl Provider for ClaudeCliProvider {
                 }
                 Some("result") => {
                     if let Some(id) = v["session_id"].as_str() {
-                        session_set(&bin, &cwd, id);
+                        session_set(&skey_cb, id);
                     }
                     if v["is_error"].as_bool() == Some(true) {
                         let msg = v["result"].as_str().unwrap_or("Claude CLI error");

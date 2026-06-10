@@ -74,6 +74,9 @@ pub struct TurnRequest {
     pub tools: Vec<ToolSpec>,
     /// Workspace directory CLI-driver providers run in (API providers ignore it).
     pub cwd: String,
+    /// Stable id for THIS conversation (session file id). CLI drivers key their
+    /// resume map on it so two tabs in one workspace don't share a CLI session.
+    pub conversation_id: String,
 }
 
 /// Normalized streaming output. Each provider maps its SSE events to these.

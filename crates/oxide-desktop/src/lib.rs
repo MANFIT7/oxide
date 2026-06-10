@@ -966,6 +966,7 @@ impl OxideDesktop {
                     request_id: None,
                 });
             }
+            Event::SessionPath { .. } => {}
             Event::TurnStarted { turn } => {
                 self.streaming = true;
                 self.timeline.push(TimelineItem {

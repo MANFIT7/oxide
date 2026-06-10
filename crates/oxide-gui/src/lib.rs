@@ -1220,15 +1220,6 @@ fn push_toast(mut toasts: Signal<Vec<(u64, String, String)>>, mut seq: Signal<u6
     });
 }
 
-/// Newest session file in a workspace — the live engine's backing file.
-fn newest_session_file(ws: &Path) -> Option<PathBuf> {
-    let rd = std::fs::read_dir(ws.join(".oxide/sessions")).ok()?;
-    rd.flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("jsonl"))
-        .max()
-}
-
 /// Open a saved session transcript in a new tab (view).
 fn open_session_tab(
     mut tabs: Signal<Vec<AgentTab>>,
@@ -1639,13 +1630,22 @@ fn app() -> Element {
             r#"
             if (!window.__oxscroll) {
               window.__oxscroll = 1;
-              const attach = () => {
+              let cur = null, inner = null;
+              const rebind = () => {
                 const s = document.querySelector('.scroll');
-                if (!s) { requestAnimationFrame(attach); return; }
+                if (s === cur) return;
+                cur = s;
+                if (inner) { inner.disconnect(); inner = null; }
+                if (!s) return;
                 const stick = () => { if ((s.scrollHeight - s.scrollTop - s.clientHeight) < 140) s.scrollTop = s.scrollHeight; };
-                new MutationObserver(stick).observe(s, { childList: true, subtree: true, characterData: true });
+                inner = new MutationObserver(stick);
+                inner.observe(s, { childList: true, subtree: true, characterData: true });
+                stick();
               };
-              attach();
+              // Watch the whole document subtree so .scroll being remounted
+              // (empty<->transcript, editor toggle, tab switch) re-binds the observer.
+              new MutationObserver(rebind).observe(document.body, { childList: true, subtree: true });
+              rebind();
             }
             while (true) { await new Promise(r => setTimeout(r, 3600000)); }
             "#,
@@ -1795,12 +1795,14 @@ fn app() -> Element {
                             let same_ws = ws == cur_ws;
                             cur_ws = ws.clone();
                             let kept = if same_ws { messages.peek().clone() } else { Vec::new() };
-                            // Same workspace = same conversation: continue the CURRENT
-                            // session file instead of minting a new one per model/effort
-                            // change (this also carries the model context across).
+                            // Same workspace = same conversation: continue THIS tab's
+                            // own session file (bound via Event::SessionPath), so a
+                            // model/effort change doesn't mint a new file or attach to
+                            // another tab's transcript.
                             let mut conf = conf;
                             if same_ws {
-                                conf.resume_path = newest_session_file(&ws);
+                                let cur = *active_tab.peek();
+                                conf.resume_path = tabs.peek().get(cur).and_then(|t| t.session.clone());
                             }
                             // Keep the active tab's provider/logo/title in sync with
                             // the picker — switching ChatGPT→Claude must restyle the tab.
@@ -1834,6 +1836,7 @@ fn app() -> Element {
                             timeline.write().clear();
                             queue.write().clear();
                             questions.write().clear();
+                            followups.write().clear();
                             thinking.set(String::new());
                             streaming.set(false);
                             start_engine!(conf);
@@ -1910,6 +1913,13 @@ fn app() -> Element {
                             // ── Inspector capture ──────────────────────────
                             Event::Ready { harness } => {
                                 timeline.write().push(TimelineItem { title: "Engine ready".into(), sub: format!("Harness: {harness}") });
+                            }
+                            Event::SessionPath { path } => {
+                                // Bind the active tab to the EXACT transcript this
+                                // engine writes — never guess via newest-file (mixes tabs).
+                                let cur = *active_tab.peek();
+                                let pb = std::path::PathBuf::from(&path);
+                                if let Some(t) = tabs.write().get_mut(cur) { t.session = Some(pb); }
                             }
                             Event::TurnStarted { turn } => {
                                 thinking.set(String::new());
@@ -2070,6 +2080,7 @@ fn app() -> Element {
                                 let next = { let mut q = queue.write(); if q.is_empty() { None } else { Some(q.remove(0)) } };
                                 if let Some(text) = next {
                                     if let Some(h) = &handle {
+                                        followups.write().clear();
                                         messages.write().push(ChatMsg { author: Author::User, text: text.clone() });
                                         messages.write().push(ChatMsg { author: Author::Agent, text: String::new() });
                                         streaming.set(true);
@@ -2396,7 +2407,7 @@ fn app() -> Element {
                                             rsx! {
                                                 div { class: "thread-anchor",
                                                     div { class: "row-actions",
-                                                        button { class: "row-act-btn pinned", title: "Unpin", onclick: move |e: dioxus::prelude::MouseEvent| { e.stop_propagation(); toggle_pin(cfg, &p_str); }, "📌" }
+                                                        button { class: "row-act-btn pinned", title: "Unpin", onclick: move |e: dioxus::prelude::MouseEvent| { e.stop_propagation(); toggle_pin(cfg, &p_str); }, Icon { name: "pin" } }
                                                     }
                                                     div { class: "thread recent",
                                                         onclick: move |_| { show_board.set(false); open_session_tab(tabs, active_tab, messages, next_tab_id, cfg, engine, p_open.clone(), t_open.clone()); },
@@ -2506,7 +2517,7 @@ fn app() -> Element {
                                                 div { class: "thread-anchor",
                                                     div { class: "row-actions",
                                                         button { class: if is_pinned { "row-act-btn pinned" } else { "row-act-btn" }, title: if is_pinned { "Unpin" } else { "Pin" },
-                                                            onclick: move |e: dioxus::prelude::MouseEvent| { e.stop_propagation(); toggle_pin(cfg, &path_str); }, "📌" }
+                                                            onclick: move |e: dioxus::prelude::MouseEvent| { e.stop_propagation(); toggle_pin(cfg, &path_str); }, Icon { name: "pin" } }
                                                         button { class: "row-act-btn", title: "Archive", onclick: move |e: dioxus::prelude::MouseEvent| { e.stop_propagation(); archive_session(&p_arch2); projects_list.set(build_projects(&ws_ar2, &cfg.read().recent_workspaces)); }, "⊟" }
                                                         button { class: "row-act-btn danger", title: "Delete", onclick: move |e: dioxus::prelude::MouseEvent| { e.stop_propagation(); delete_session(&p_del2); projects_list.set(build_projects(&ws_d2, &cfg.read().recent_workspaces)); }, "✕" }
                                                     }
@@ -4012,14 +4023,10 @@ fn switch_tab(
     if cur == idx {
         return;
     }
-    let ws = workspace_of(&cfg.read());
     if let Some(t) = tabs.write().get_mut(cur) {
         t.messages = messages.read().clone();
-        // The engine wrote this tab's conversation to the newest session file;
-        // remember it so switching BACK restores the model context too.
-        if t.session.is_none() && !t.messages.is_empty() {
-            t.session = newest_session_file(&ws);
-        }
+        // t.session was bound from Event::SessionPath when this tab's engine
+        // opened its file — no newest-file guessing (that mixes tabs up).
     }
     let t = tabs.read()[idx].clone();
     active_tab.set(idx);
@@ -6367,6 +6374,7 @@ fn Icon(name: &'static str) -> Element {
             line { x1: "9", y1: "18", x2: "21", y2: "18" }
         },
         "target" => rsx! { circle { cx: "12", cy: "12", r: "9" } circle { cx: "12", cy: "12", r: "5" } circle { cx: "12", cy: "12", r: "1" } },
+        "pin" => rsx! { path { d: "M9 3h6l-1 6 3 3v2h-5v5l-1 2-1-2v-5H4v-2l3-3-1-6z" } },
         "brain" => rsx! {
             line { x1: "5", y1: "19", x2: "5", y2: "14" }
             line { x1: "10", y1: "19", x2: "10", y2: "11" }
