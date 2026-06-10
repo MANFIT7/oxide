@@ -2549,7 +2549,7 @@ fn app() -> Element {
                                 button { class: "preview-btn", title: "Rescan localhost ports", onclick: move |_| { spawn(async move { preview_ports.set(scan_ports().await); }); }, "⟳ Scan" }
                                 button { class: "preview-btn pick", title: "Select an element to send to the composer", onclick: move |_| {
                                     spawn(async move { let _ = document::eval("document.querySelector('.preview-frame')?.contentWindow?.postMessage('oxide-pick-on','*')").await; });
-                                }, "📍 Pick" }
+                                }, "Pick" }
                                 button { class: if *design_mode.read() { "preview-btn pick on" } else { "preview-btn" }, title: "Design Mode — click an element, edit it live, Apply writes the code", onclick: move |_| {
                                     let v = *design_mode.read();
                                     design_mode.set(!v);
@@ -2557,7 +2557,7 @@ fn app() -> Element {
                                     let msg = if v { "'oxide-design-off'" } else { "'oxide-design-on'" };
                                     let js = format!("document.querySelector('.preview-frame')?.contentWindow?.postMessage({msg},'*')");
                                     spawn(async move { let _ = document::eval(&js).await; });
-                                }, "🎨 Design" }
+                                }, "Design" }
                                 button { class: "preview-btn", title: "Reload", onclick: move |_| { let u = preview_url.read().clone(); preview_url.set(String::new()); preview_url.set(u); }, "Reload" }
                                 button { class: "preview-btn", title: "Open in system browser", onclick: move |_| { let u = preview_url.read().clone(); if !u.is_empty() { let _ = std::process::Command::new("open").arg(u).spawn(); } }, "↗" }
                                 button { class: "term-x", onclick: move |_| show_preview.set(false), "✕" }
