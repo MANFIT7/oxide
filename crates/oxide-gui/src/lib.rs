@@ -5742,7 +5742,13 @@ fn ChatPane(
                         Some(Event::TurnStarted { .. }) => { thinking.set(String::new()); status.set("Working…".to_string()); }
                         Some(Event::TurnFinished { .. }) => { streaming.set(false); status.set(String::new()); { let mut mm = messages.write(); for c in mm.iter_mut() { if let Author::Activity { running, .. } = &mut c.author { *running = false; } } } }
                         Some(Event::Info { text }) => { if text.starts_with(['🧭','⚙','🔍','🤖','🧩','🔁','✓','⚠']) { status.set(text); } }
-                        Some(Event::Error { message }) => { messages.write().push(ChatMsg { author: Author::Note, text: format!("error: {message}") }); }
+                        Some(Event::Error { message }) => { messages.write().push(ChatMsg { author: Author::Note, text: format!("error: {message}") }); streaming.set(false); }
+                        Some(Event::QuestionAsked { question, options, .. }) => {
+                            // Render the agent's question in the pane; typing a reply answers it
+                            // (the engine accepts a plain UserTurn as the answer).
+                            let opts = if options.is_empty() { String::new() } else { format!("\n{}", options.iter().enumerate().map(|(i, o)| format!("  {}. {o}", i + 1)).collect::<Vec<_>>().join("\n")) };
+                            messages.write().push(ChatMsg { author: Author::Note, text: format!("❓ {question}{opts}\n(ketik jawabanmu di bawah)") });
+                        }
                         Some(Event::Shutdown) | None => break,
                         _ => {}
                     }
