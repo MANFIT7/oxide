@@ -1476,6 +1476,8 @@ fn app() -> Element {
     let mut panel_drag = use_signal(|| None::<(u8, f64, f64)>);
     // Width (px) of the right preview/changes split panel (drag id 3).
     let mut rpanel_w = use_signal(|| 560.0f64);
+    // Height (px) of the bottom terminal panel (drag id 4, vertical).
+    let mut term_h = use_signal(|| 240.0f64);
     let mut sidebar_w = use_signal(|| { cfg.peek().sidebar_width });
     let mut insp_w = use_signal(|| { cfg.peek().inspector_width });
     let mut palette_query = use_signal(String::new);
@@ -2302,9 +2304,11 @@ fn app() -> Element {
             onmousemove: move |e: dioxus::prelude::MouseEvent| {
                 if let Some((which, sx, sw)) = *panel_drag.read() {
                     let x = e.client_coordinates().x;
+                    let y = e.client_coordinates().y;
                     match which {
                         1 => sidebar_w.set((sw + (x - sx)).clamp(170.0, 440.0)),
                         3 => rpanel_w.set((sw + (sx - x)).clamp(320.0, 1100.0)),
+                        4 => term_h.set((sw + (sx - y)).clamp(120.0, 600.0)),
                         _ => insp_w.set((sw + (sx - x)).clamp(220.0, 560.0)),
                     }
                 }
@@ -3408,7 +3412,11 @@ fn app() -> Element {
 
                 // Terminal dock
                 if *show_terminal.read() {
-                    div { class: "terminal",
+                    div { class: "terminal", style: "height:{term_h}px",
+                        div { class: "panel-resizer term", onmousedown: move |e: dioxus::prelude::MouseEvent| {
+                            e.prevent_default();
+                            panel_drag.set(Some((4, e.client_coordinates().y, *term_h.read())));
+                        } }
                         div { class: "term-head",
                             span { "TERMINAL · {project}" }
                             div { class: "term-head-actions",
