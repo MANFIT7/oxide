@@ -244,10 +244,17 @@ impl ToolRouter {
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
         cmd.kill_on_drop(true);
+        // Own process group: a timeout can kill the whole tree (otherwise a
+        // spawned dev server survives the kill, holds its port, AND keeps the
+        // stdout pipe open so wait_with_output never sees EOF).
+        #[cfg(unix)]
+        cmd.process_group(0);
         let child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => return (format!("shell spawn error: {e}"), false),
         };
+        #[cfg(unix)]
+        let pgid = child.id().map(|id| id as i32);
         let dur = std::time::Duration::from_secs(120);
         match tokio::time::timeout(dur, child.wait_with_output()).await {
             Ok(Ok(out)) => {
@@ -263,10 +270,17 @@ impl ToolRouter {
                 (capped, ok)
             }
             Ok(Err(e)) => (format!("shell error: {e}"), false),
-            Err(_) => (
-                "shell: timed out after 120s and was killed. For long-running processes (dev servers, watchers) run them in the background (append ' &' or use nohup) and poll, instead of blocking.".into(),
-                false,
-            ),
+            Err(_) => {
+                // Kill the whole process group so grandchildren die too.
+                #[cfg(unix)]
+                if let Some(pg) = pgid {
+                    unsafe { libc::killpg(pg, libc::SIGKILL); }
+                }
+                (
+                    "shell: timed out after 120s and was killed. For long-running processes (dev servers, watchers) start them detached with output redirected — e.g. `nohup npm run dev >/dev/null 2>&1 &` — then poll, instead of blocking.".into(),
+                    false,
+                )
+            }
         }
     }
 

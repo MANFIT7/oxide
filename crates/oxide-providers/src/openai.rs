@@ -46,11 +46,7 @@ impl OpenAiProvider {
                 .unwrap_or_else(|_| default_base_url.to_string())
                 .trim_end_matches('/')
                 .to_string(),
-            client: reqwest::Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .read_timeout(std::time::Duration::from_secs(120))
-                .build()
-                .unwrap_or_default(),
+            client: crate::http_client(),
         }
     }
 }

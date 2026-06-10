@@ -154,10 +154,12 @@ fn mtime_of(p: &Path) -> u64 {
 }
 
 /// Incrementally bring the index up to date with the workspace.
-fn update(ws: &Path, idx: &mut CodeIndex) {
+/// Returns true if anything changed (so callers persist only when needed).
+fn update(ws: &Path, idx: &mut CodeIndex) -> bool {
     let mut files = Vec::new();
     collect(ws, &mut files);
     let mut present = std::collections::HashSet::new();
+    let mut dirty = false;
     for f in &files {
         let rel = f.strip_prefix(ws).unwrap_or(f).to_string_lossy().replace('\\', "/");
         present.insert(rel.clone());
@@ -166,21 +168,24 @@ fn update(ws: &Path, idx: &mut CodeIndex) {
             continue; // unchanged
         }
         if std::fs::metadata(f).map(|m| m.len() > MAX_FILE_BYTES).unwrap_or(true) {
-            idx.files.remove(&rel);
+            dirty |= idx.files.remove(&rel).is_some();
             continue;
         }
         if let Ok(text) = std::fs::read_to_string(f) {
             // Skip minified/generated files (one giant line) — they're not source
             // the user searches and they swamp ranking with token soup.
             if text.lines().any(|l| l.len() > 5000) {
-                idx.files.remove(&rel);
+                dirty |= idx.files.remove(&rel).is_some();
                 continue;
             }
             idx.files.insert(rel, FileEntry { mtime: mt, chunks: chunk_file(&text) });
+            dirty = true;
         }
     }
     // Drop files that no longer exist.
+    let before = idx.files.len();
     idx.files.retain(|k, _| present.contains(k));
+    dirty || idx.files.len() != before
 }
 
 /// Rank chunks by TF-IDF + symbol/path boosts; return formatted top snippets.
@@ -251,20 +256,34 @@ fn query(idx: &CodeIndex, q: &str) -> String {
     out.chars().take(9000).collect()
 }
 
-/// Load the on-disk index, refresh changed files, run the query, and persist.
-/// Returns the formatted snippet result.
+/// Load the index (in-memory cache first, disk on cold start), refresh changed
+/// files, run the query, and persist ONLY when something changed. The in-memory
+/// cache removes the multi-second JSON parse+rewrite per search on big repos.
 pub fn search(ws: &Path, q: &str) -> String {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, CodeIndex>>> =
+        std::sync::OnceLock::new();
+    let key = ws.display().to_string();
     let dir = ws.join(".oxide/index");
     let path = dir.join("code.json");
-    let mut idx: CodeIndex = std::fs::read(&path)
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default();
-    update(ws, &mut idx);
-    let result = query(&idx, q);
-    let _ = std::fs::create_dir_all(&dir);
-    if let Ok(b) = serde_json::to_vec(&idx) {
-        let _ = std::fs::write(&path, b);
+
+    let mut map = match CACHE.get_or_init(Default::default).lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let idx = map.entry(key).or_insert_with(|| {
+        std::fs::read(&path)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default()
+    });
+    let before = idx.files.len();
+    let dirty = update(ws, idx);
+    let result = query(idx, q);
+    if dirty || idx.files.len() != before {
+        let _ = std::fs::create_dir_all(&dir);
+        if let Ok(b) = serde_json::to_vec(&idx) {
+            let _ = std::fs::write(&path, b);
+        }
     }
     result
 }

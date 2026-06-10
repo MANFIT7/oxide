@@ -49,6 +49,19 @@ impl SessionStore {
         Ok(Self { path, id })
     }
 
+    /// Attach to an EXISTING session file (resume) — appends continue it.
+    pub fn attach(path: &Path) -> std::io::Result<Self> {
+        let id = path
+            .file_stem()
+            .and_then(|x| x.to_str())
+            .unwrap_or("session")
+            .to_string();
+        if !path.exists() {
+            return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "session file missing"));
+        }
+        Ok(Self { path: path.to_path_buf(), id })
+    }
+
     pub fn append(&self, role: &str, content: &str) -> std::io::Result<()> {
         let rec = StoredMessage {
             role: role.to_string(),

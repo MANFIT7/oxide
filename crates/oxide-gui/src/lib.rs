@@ -1585,7 +1585,13 @@ fn app() -> Element {
         });
     });
 
-    // Global keyboard shortcuts (⌘K command palette, Esc to close).
+    // Warm the syntect syntax set off-thread so the first code block in a reply
+    // doesn't stall the UI mid-stream.
+    use_hook(|| {
+        std::thread::spawn(|| { let _ = highlight_code("", "txt"); });
+    });
+
+        // Global keyboard shortcuts (⌘K command palette, Esc to close).
     use_future(move || async move {
         let mut eval = dioxus::document::eval(
             r#"
@@ -1624,15 +1630,24 @@ fn app() -> Element {
 
     // Auto-scroll the chat to the bottom as content streams in — but only when
     // the user is already near the bottom, so reading scrollback isn't yanked.
-    use_effect(move || {
-        let _ = messages.read(); // subscribe to any transcript change
-        let _ = thinking.read().len();
-        let _ = status.read().len();
-        spawn(async move {
-            let _ = dioxus::document::eval(
-                "requestAnimationFrame(()=>{var s=document.querySelector('.scroll');if(s && (s.scrollHeight-s.scrollTop-s.clientHeight)<120)s.scrollTop=s.scrollHeight;});",
-            );
-        });
+    // Autoscroll via ONE persistent MutationObserver (installed once) instead of
+    // a JS eval round-trip per streaming delta.
+    use_future(move || async move {
+        let _ = dioxus::document::eval(
+            r#"
+            if (!window.__oxscroll) {
+              window.__oxscroll = 1;
+              const attach = () => {
+                const s = document.querySelector('.scroll');
+                if (!s) { requestAnimationFrame(attach); return; }
+                const stick = () => { if ((s.scrollHeight - s.scrollTop - s.clientHeight) < 140) s.scrollTop = s.scrollHeight; };
+                new MutationObserver(stick).observe(s, { childList: true, subtree: true, characterData: true });
+              };
+              attach();
+            }
+            while (true) { await new Promise(r => setTimeout(r, 3600000)); }
+            "#,
+        ).recv::<String>().await;
     });
 
     // Load the kanban board + recent chat sessions for the active workspace.
@@ -1673,11 +1688,12 @@ fn app() -> Element {
             .map(|m| m.text.clone());
         if let Some(text) = snippet {
             let cur = *active_tab.read();
-            let mut tw = tabs.write();
-            if let Some(t) = tw.get_mut(cur) {
-                if t.title == provider_title(&t.provider) {
-                    t.title = make_title(&text);
-                }
+            // Peek first — only take a write lock when the title really changes,
+            // so this doesn't dirty `tabs` on every streaming delta.
+            let needs = tabs.peek().get(cur).map(|t| t.title == provider_title(&t.provider)).unwrap_or(false);
+            if needs {
+                let new_title = make_title(&text);
+                if let Some(t) = tabs.write().get_mut(cur) { t.title = new_title; }
             }
         }
     });
@@ -1971,10 +1987,17 @@ fn app() -> Element {
                             Event::TurnFinished { .. } => {
                                 streaming.set(false);
                                 status.set(String::new());
-                                // New/updated session files show up right away.
+                                // New/updated session files show up right away
+                                // (fs walk off the event thread).
                                 {
                                     let c = cfg.peek().clone();
-                                    projects_list.set(build_projects(&workspace_of(&c), &c.recent_workspaces));
+                                    let mut pl = projects_list;
+                                    spawn(async move {
+                                        let groups = tokio::task::spawn_blocking(move || {
+                                            build_projects(&workspace_of(&c), &c.recent_workspaces)
+                                        }).await.unwrap_or_default();
+                                        pl.set(groups);
+                                    });
                                 }
                                 // Settle any activity still showing a spinner so none stays
                                 // "running" stuck at the bottom after the turn ends.
@@ -3064,7 +3087,10 @@ fn app() -> Element {
                                                                     }
                                                                 }
                                                             }
-                                                            _ => rsx! { Message { author: m.author.clone(), text: m.text.clone() } }
+                                                            _ => {
+                                                                let is_live = *streaming.read() && m.author == Author::Agent && i + 1 == messages.read().len();
+                                                                rsx! { Message { author: m.author.clone(), text: m.text.clone(), live: is_live } }
+                                                            }
                                                         }
                                                     }
                                                 }
@@ -4211,7 +4237,7 @@ fn highlight_code(code: &str, lang: &str) -> String {
 /// Render agent markdown to safe HTML: raw HTML in the source is escaped
 /// first (so injection is impossible), then markdown is converted. Fenced code
 /// blocks get class-based syntax highlighting.
-fn md_to_html(src: &str) -> String {
+fn md_to_html(src: &str, live: bool) -> String {
     use pulldown_cmark::{CodeBlockKind, Event as MdEvent, Options, Parser, Tag, TagEnd};
     let escaped = src.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
     let mut opts = Options::empty();
@@ -4243,10 +4269,12 @@ fn md_to_html(src: &str) -> String {
                 // The source was pre-escaped; un-escape so syntect sees real code,
                 // its output re-escapes safely.
                 let raw = code.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&");
-                html.push_str(&format!(
-                    "<pre><code class=\"hl\">{}</code></pre>",
+                let body = if live {
+                    raw.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+                } else {
                     highlight_code(&raw, &lang)
-                ));
+                };
+                html.push_str(&format!("<pre><code class=\"hl\">{body}</code></pre>"));
             }
             MdEvent::Text(t) if in_code => code.push_str(&t),
             other if !in_code => seg.push(other),
@@ -5400,7 +5428,7 @@ fn Composer(
 }
 
 #[component]
-fn Message(author: Author, text: String) -> Element {
+fn Message(author: Author, text: String, #[props(default)] live: bool) -> Element {
     match author {
         Author::User => {
             let segs = user_segments(&text);
@@ -5424,7 +5452,7 @@ fn Message(author: Author, text: String) -> Element {
                     if text.is_empty() {
                         div { class: "typing", span {} span {} span {} }
                     } else {
-                        div { class: "agent-text agent-md", dangerous_inner_html: md_to_html(&text) }
+                        div { class: "agent-text agent-md", dangerous_inner_html: md_to_html(&text, live) }
                         button { class: "msg-copy", title: "Copy message", onclick: move |_| { let c = copy.clone(); spawn(async move { let _ = document::eval(&format!("navigator.clipboard.writeText({c})")).await; }); }, "⧉" }
                     }
                 }

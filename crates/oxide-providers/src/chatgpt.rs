@@ -46,11 +46,7 @@ impl ChatGptProvider {
         let auth_path = std::env::var("OXIDE_CODEX_AUTH")
             .unwrap_or_else(|_| format!("{home}/.codex/auth.json"));
         Self {
-            client: reqwest::Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .read_timeout(std::time::Duration::from_secs(120))
-                .build()
-                .unwrap_or_default(),
+            client: crate::http_client(),
             auth_path,
         }
     }

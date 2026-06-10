@@ -29,11 +29,7 @@ impl AnthropicProvider {
             api_key: std::env::var("ANTHROPIC_API_KEY").unwrap_or_default(),
             base_url: std::env::var("ANTHROPIC_BASE_URL")
                 .unwrap_or_else(|_| "https://api.anthropic.com/v1".to_string()),
-            client: reqwest::Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .read_timeout(std::time::Duration::from_secs(120))
-                .build()
-                .unwrap_or_default(),
+            client: crate::http_client(),
         }
     }
 }

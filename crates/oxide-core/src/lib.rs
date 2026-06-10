@@ -396,10 +396,15 @@ pub fn spawn(config: Config) -> anyhow::Result<(EngineHandle, mpsc::Receiver<Eve
     }
 
     let session_store = if config.persist {
-        match SessionStore::open(&workspace) {
+        // Resuming an existing session continues ITS file — no new file, no
+        // duplicate meta line, one conversation in one transcript.
+        let attached = config.resume_path.as_deref().and_then(|p| SessionStore::attach(p).ok());
+        match attached.map(Ok).unwrap_or_else(|| SessionStore::open(&workspace)) {
             Ok(s) => {
-                // Record which provider/model owns this session (sidebar logos).
-                let _ = s.append("meta", &format!("provider={}", config.provider));
+                if config.resume_path.is_none() {
+                    // Record which provider/model owns this session (sidebar logos).
+                    let _ = s.append("meta", &format!("provider={}", config.provider));
+                }
                 Some(s)
             }
             Err(e) => {
@@ -867,6 +872,7 @@ impl Engine {
             .map(|m| format!("{:?}: {}", m.role, m.content))
             .collect::<Vec<_>>()
             .join("\n\n");
+        self.emit(Event::Info { text: format!("compacting context ({} earlier messages)…", old.len()) }).await;
         let provider = self.config.provider.clone();
         let effort = self.config.reasoning_effort.clone();
         let sys = "You compress conversation history. Summarize the earlier conversation below into a concise but COMPLETE brief that lets the assistant continue seamlessly. Preserve: the user's goal/task, decisions made, files created/edited (with paths), commands run and key results, current state, and open TODOs. Terse bullet points. Output only the summary.";
@@ -910,6 +916,7 @@ impl Engine {
                 Message::new(Role::User, user.to_string()),
             ],
             tools: vec![],
+            cwd: self.workspace.display().to_string(),
         };
         let (tx, mut rx) = mpsc::channel::<StreamItem>(STREAM_QUEUE);
         let provider = oxide_providers::build(provider_id);
@@ -1165,6 +1172,10 @@ impl Engine {
         let max_steps = (policy.max_steps as usize).clamp(1, 60);
         let mut step = 0usize;
         let mut overflow_retries = 0u8;
+        // CLI drivers (codex/claude) are self-agentic: they run their own tool
+        // loop, so Oxide's nudge/wrap-up/auto-verify rounds would just respawn
+        // the CLI with an out-of-context reminder as the whole prompt.
+        let cli_driver = matches!(self.config.provider.as_str(), "codex" | "claude");
         let mut nudges = 0u8;
         let mut verifies = 0u8;
         let mut wrapped_up = false;
@@ -1188,6 +1199,7 @@ impl Engine {
                 temperature: policy.temperature,
                 messages: msgs,
                 tools: tools.clone(),
+                cwd: self.workspace.display().to_string(),
             };
 
             let (stream_tx, mut stream_rx) = mpsc::channel::<StreamItem>(STREAM_QUEUE);
@@ -1334,6 +1346,10 @@ Reply with text only: summarize what you changed (with file paths and how you ve
 any remaining tasks and the recommended next step.\n</system-reminder>"));
                     continue;
                 }
+                break;
+            }
+            if cli_driver && !steered {
+                // One CLI run per turn — it finished, we're done.
                 break;
             }
             if !did_tool && !steered {

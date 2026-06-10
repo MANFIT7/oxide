@@ -12,9 +12,25 @@
 use crate::{Provider, Role, StreamItem, TurnRequest};
 use async_trait::async_trait;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::process::Stdio;
+use std::sync::{Mutex, OnceLock};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
+
+/// CLI session ids per (binary, workspace) so consecutive turns RESUME the same
+/// CLI conversation instead of starting amnesiac one-shots.
+static SESSIONS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+
+fn session_get(bin: &str, cwd: &str) -> Option<String> {
+    SESSIONS.get_or_init(Default::default).lock().ok()?.get(&format!("{bin}|{cwd}")).cloned()
+}
+
+fn session_set(bin: &str, cwd: &str, id: &str) {
+    if let Ok(mut m) = SESSIONS.get_or_init(Default::default).lock() {
+        m.insert(format!("{bin}|{cwd}"), id.to_string());
+    }
+}
 
 /// Resolve a CLI binary. Honors `$env_override`, then probes common install
 /// dirs — needed when launched from Finder (minimal PATH lacks the user's
@@ -58,18 +74,25 @@ fn last_user_prompt(req: &TurnRequest) -> String {
 async fn run_jsonl<F>(
     program: &str,
     args: &[String],
+    cwd: &str,
     sink: &mpsc::Sender<StreamItem>,
     mut on_line: F,
 ) -> anyhow::Result<()>
 where
     F: FnMut(&Value, &mpsc::Sender<StreamItem>) -> bool,
 {
-    let mut child = tokio::process::Command::new(program)
-        .args(args)
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .kill_on_drop(true)
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped());
+    // Run in the workspace — without this the CLI inherits the app's cwd
+    // (Finder launches give `/`) and edits the wrong tree.
+    if !cwd.is_empty() {
+        cmd.current_dir(cwd);
+    }
+    let mut child = cmd
         .spawn()
         .map_err(|e| anyhow::anyhow!("failed to spawn '{program}': {e}"))?;
 
@@ -77,20 +100,54 @@ where
         .stdout
         .take()
         .ok_or_else(|| anyhow::anyhow!("no stdout"))?;
+    // Collect stderr in the background so failures aren't silent.
+    let stderr = child.stderr.take();
+    let err_task = tokio::spawn(async move {
+        let mut tail = String::new();
+        if let Some(e) = stderr {
+            let mut lines = BufReader::new(e).lines();
+            while let Ok(Some(l)) = lines.next_line().await {
+                tail.push_str(&l);
+                tail.push('\n');
+                if tail.len() > 4000 {
+                    tail = tail[tail.len() - 2000..].to_string();
+                }
+            }
+        }
+        tail
+    });
     let mut lines = BufReader::new(stdout).lines();
+    let mut emitted = false;
     while let Some(line) = lines.next_line().await? {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
         if let Ok(v) = serde_json::from_str::<Value>(line) {
+            emitted = true;
             // on_line returns false to stop early.
             if !on_line(&v, sink) {
                 break;
             }
         }
     }
-    let _ = child.wait().await;
+    let status = child.wait().await;
+    let failed = status.map(|st| !st.success()).unwrap_or(true);
+    if failed {
+        let tail = err_task.await.unwrap_or_default();
+        let tail = tail.trim();
+        if !emitted || !tail.is_empty() {
+            let _ = sink
+                .send(StreamItem::Notice(format!(
+                    "error: {program} exited with failure{}{}",
+                    if tail.is_empty() { "" } else { " — " },
+                    tail.chars().take(600).collect::<String>()
+                )))
+                .await;
+        }
+    } else {
+        err_task.abort();
+    }
     let _ = sink.send(StreamItem::Done).await;
     Ok(())
 }
@@ -127,11 +184,20 @@ impl Provider for CodexCliProvider {
 
     async fn stream(&self, req: TurnRequest, sink: mpsc::Sender<StreamItem>) -> anyhow::Result<()> {
         let prompt = last_user_prompt(&req);
-        let mut args = vec![
-            "exec".to_string(),
-            "--json".to_string(),
-            "--dangerously-bypass-approvals-and-sandbox".to_string(),
-        ];
+        let resume = session_get(&self.bin, &req.cwd);
+        let mut args = vec!["exec".to_string()];
+        if let Some(id) = &resume {
+            // Continue the same codex thread — context carries across turns.
+            args.push("resume".to_string());
+            args.push(id.clone());
+        }
+        args.push("--json".to_string());
+        args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
+        args.push("--skip-git-repo-check".to_string());
+        if !req.cwd.is_empty() {
+            args.push("-C".to_string());
+            args.push(req.cwd.clone());
+        }
         if !req.model.is_empty() {
             args.push("-m".to_string());
             args.push(req.model.clone());
@@ -145,8 +211,15 @@ impl Provider for CodexCliProvider {
         }
         args.push(prompt);
 
-        run_jsonl(&self.bin, &args, &sink, |v, sink| {
+        let bin = self.bin.clone();
+        let cwd = req.cwd.clone();
+        run_jsonl(&self.bin, &args, &req.cwd, &sink, move |v, sink| {
             match v["type"].as_str() {
+                Some("thread.started") => {
+                    if let Some(id) = v["thread_id"].as_str() {
+                        session_set(&bin, &cwd, id);
+                    }
+                }
                 Some("item.completed") => {
                     let item = &v["item"];
                     match item["type"].as_str() {
@@ -235,14 +308,22 @@ impl Provider for ClaudeCliProvider {
 
     async fn stream(&self, req: TurnRequest, sink: mpsc::Sender<StreamItem>) -> anyhow::Result<()> {
         let prompt = last_user_prompt(&req);
+        let resume = session_get(&self.bin, &req.cwd);
         let mut args = vec![
             "-p".to_string(),
             prompt,
             "--output-format".to_string(),
             "stream-json".to_string(),
             "--verbose".to_string(),
+            // Token-level deltas: real streaming AND keeps the idle timer fed.
+            "--include-partial-messages".to_string(),
             "--dangerously-skip-permissions".to_string(),
         ];
+        if let Some(id) = &resume {
+            // Continue the same Claude Code session — context carries across turns.
+            args.push("--resume".to_string());
+            args.push(id.clone());
+        }
         if !req.model.is_empty() {
             args.push("--model".to_string());
             args.push(req.model.clone());
@@ -252,15 +333,46 @@ impl Provider for ClaudeCliProvider {
             args.push(claude_effort(&req.reasoning_effort).to_string());
         }
 
-        run_jsonl(&self.bin, &args, &sink, |v, sink| {
+        let bin = self.bin.clone();
+        let cwd = req.cwd.clone();
+        // With partial messages on, text arrives via stream_event deltas; the
+        // final `assistant` message would duplicate it, so skip its text blocks.
+        let mut saw_partial = false;
+        run_jsonl(&self.bin, &args, &req.cwd, &sink, move |v, sink| {
             match v["type"].as_str() {
+                Some("system") => {
+                    if let Some(id) = v["session_id"].as_str() {
+                        session_set(&bin, &cwd, id);
+                    }
+                }
+                Some("stream_event") => {
+                    let ev = &v["event"];
+                    if ev["type"].as_str() == Some("content_block_delta") {
+                        match ev["delta"]["type"].as_str() {
+                            Some("text_delta") => {
+                                if let Some(t) = ev["delta"]["text"].as_str() {
+                                    saw_partial = true;
+                                    send(sink, StreamItem::TextDelta(t.to_string()));
+                                }
+                            }
+                            Some("thinking_delta") => {
+                                if let Some(t) = ev["delta"]["thinking"].as_str() {
+                                    send(sink, StreamItem::ReasoningDelta(t.to_string()));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 Some("assistant") => {
                     if let Some(content) = v["message"]["content"].as_array() {
                         for block in content {
                             match block["type"].as_str() {
                                 Some("text") => {
-                                    if let Some(t) = block["text"].as_str() {
-                                        send(sink, StreamItem::TextDelta(t.to_string()));
+                                    if !saw_partial {
+                                        if let Some(t) = block["text"].as_str() {
+                                            send(sink, StreamItem::TextDelta(t.to_string()));
+                                        }
                                     }
                                 }
                                 Some("tool_use") => {
@@ -273,6 +385,13 @@ impl Provider for ClaudeCliProvider {
                     }
                 }
                 Some("result") => {
+                    if let Some(id) = v["session_id"].as_str() {
+                        session_set(&bin, &cwd, id);
+                    }
+                    if v["is_error"].as_bool() == Some(true) {
+                        let msg = v["result"].as_str().unwrap_or("Claude CLI error");
+                        send(sink, StreamItem::Notice(format!("error: {msg}")));
+                    }
                     let u = &v["usage"];
                     let window = v["modelUsage"]
                         .as_object()

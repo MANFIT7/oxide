@@ -72,6 +72,8 @@ pub struct TurnRequest {
     pub temperature: f32,
     pub messages: Vec<Message>,
     pub tools: Vec<ToolSpec>,
+    /// Workspace directory CLI-driver providers run in (API providers ignore it).
+    pub cwd: String,
 }
 
 /// Normalized streaming output. Each provider maps its SSE events to these.
@@ -282,6 +284,21 @@ impl Provider for MockBrowserProvider {
 }
 
 /// Resolve a provider by id from config. Unknown ids fall back to echo.
+/// Shared HTTP client: one connection pool for all provider calls, so each
+/// agentic round reuses the TLS connection instead of re-handshaking.
+pub fn http_client() -> reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .read_timeout(std::time::Duration::from_secs(120))
+                .build()
+                .unwrap_or_default()
+        })
+        .clone()
+}
+
 pub fn build(provider: &str) -> Box<dyn Provider> {
     match provider {
         "openai" => Box::new(openai::OpenAiProvider::from_env()),
