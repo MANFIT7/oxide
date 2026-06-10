@@ -1874,6 +1874,9 @@ fn app() -> Element {
                     Some(ev) = ev_rx.recv() => {
                         match ev {
                             Event::AgentMessageDelta { text, .. } => {
+                                if status.peek().as_str() != "Writing…" {
+                                    status.set("Writing…".to_string());
+                                }
                                 let mut m = messages.write();
                                 match m.last_mut() {
                                     // Append to the open agent bubble; but if tools/diffs came after it,
@@ -1884,6 +1887,9 @@ fn app() -> Element {
                             }
                             Event::ReasoningDelta { text, .. } => {
                                 thinking.write().push_str(&text);
+                                if status.peek().as_str() != "Thinking…" {
+                                    status.set("Thinking…".to_string());
+                                }
                             }
                             Event::Info { text } => {
                                 if text.starts_with("session") || text.starts_with("mcp ") || text.starts_with("mcp '") {
@@ -1939,7 +1945,9 @@ fn app() -> Element {
                             }
                             Event::ToolCallBegin { tool, args, .. } => {
                                 timeline.write().push(TimelineItem { title: format!("⚙ {tool}"), sub: "running…".into() });
-                                status.set(status_verb(&tool).to_string());
+                                // Live shimmer shows WHAT it's doing ("Reading src/lib.rs…"),
+                                // not just a generic verb.
+                                status.set(activity_label(&tool, &args));
                                 if tool != "ask_user" {
                                     messages.write().push(ChatMsg { author: Author::Activity { running: true, ok: true }, text: activity_label(&tool, &args) });
                                 }
@@ -2497,7 +2505,9 @@ fn app() -> Element {
                                             }
                                         }
                                     }
-                                    for (path, title, reltime, sprov) in sessions.iter().take(if collapsed { 0 } else { shown }).cloned() {
+                                    for (path, title, reltime, sprov) in sessions.iter()
+                                        .filter(|(p, _, _, _)| !is_current || !tabs.read().iter().any(|t| t.session.as_deref() == Some(p.as_path())))
+                                        .take(if collapsed { 0 } else { shown }).cloned() {
                                         {
                                             let p_open = path.clone();
                                             let p_dbl = path.clone();
