@@ -1767,3 +1767,7 @@ svg { stroke-width: 1.6; }
 .dw.del { background: rgba(250,66,62,.26); border-radius: 3px; }
 .app[data-theme="light"] .dw.add { background: rgba(31,138,101,.25); }
 .app[data-theme="light"] .dw.del { background: rgba(207,45,86,.22); }
+
+/* draggable panel resizers */
+.panel-resizer { width: 5px; flex-shrink: 0; cursor: col-resize; background: transparent; transition: background .12s ease; z-index: 6; margin: 0 -2px; }
+.panel-resizer:hover, .panel-resizer:active { background: color-mix(in srgb, var(--syn-accent) 45%, transparent); }

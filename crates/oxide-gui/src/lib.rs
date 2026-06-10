@@ -1381,6 +1381,10 @@ fn app() -> Element {
     let mut show_shortcuts = use_signal(|| false);
     // Cursor-style icon rail: sidebar collapses to a thin strip.
     let mut sidebar_collapsed = use_signal(|| false);
+    // Resizable side panels: (which: 1=left sidebar, 2=right inspector, start_x, start_w).
+    let mut panel_drag = use_signal(|| None::<(u8, f64, f64)>);
+    let mut sidebar_w = use_signal(|| 250.0f64);
+    let mut insp_w = use_signal(|| 280.0f64);
     let mut palette_query = use_signal(String::new);
     let mut palette_sel = use_signal(|| 0usize);
     let mut pinned = use_signal(|| false);
@@ -2048,8 +2052,19 @@ fn app() -> Element {
         style { {CSS} }
         style { {XTERM_CSS} }
         div { class: "app", "data-theme": "{cfg.read().theme}", "data-density": "{cfg.read().density}", style: "{accent_style}",
+            onmousemove: move |e: dioxus::prelude::MouseEvent| {
+                if let Some((which, sx, sw)) = *panel_drag.read() {
+                    let x = e.client_coordinates().x;
+                    match which {
+                        1 => sidebar_w.set((sw + (x - sx)).clamp(170.0, 440.0)),
+                        _ => insp_w.set((sw + (sx - x)).clamp(220.0, 560.0)),
+                    }
+                }
+            },
+            onmouseup: move |_| { if panel_drag.read().is_some() { panel_drag.set(None); } },
             // ── Sidebar ────────────────────────────────────────────────
             aside { class: if *sidebar_collapsed.read() { "sidebar collapsed" } else { "sidebar" },
+                style: if *sidebar_collapsed.read() { String::new() } else { format!("width:{}px", *sidebar_w.read()) },
                 oncontextmenu: move |e: dioxus::prelude::MouseEvent| { e.prevent_default(); let c = e.client_coordinates(); theme_menu_pos.set((c.x, c.y)); session_menu.set(None); show_theme_menu.set(true); },
                 if *show_theme_menu.read() {
                     div { class: "menu-backdrop", onclick: move |_| show_theme_menu.set(false) }
@@ -2344,6 +2359,12 @@ fn app() -> Element {
             }
 
             // ── Center column ──────────────────────────────────────────
+            div { class: "panel-resizer", title: "Drag to resize sidebar",
+                onmousedown: move |e: dioxus::prelude::MouseEvent| {
+                    e.prevent_default();
+                    panel_drag.set(Some((1, e.client_coordinates().x, *sidebar_w.read())));
+                },
+            }
             main { class: "main",
                 if let Some(info) = update_info.read().clone() {
                     {
@@ -3088,7 +3109,13 @@ fn app() -> Element {
 
             // ── Right inspector (tabbed) ───────────────────────────────
             if *show_files.read() && !*show_preview.read() && cfg.read().workspace.is_some() {
-                aside { class: "files-panel",
+                div { class: "panel-resizer", title: "Drag to resize inspector",
+                    onmousedown: move |e: dioxus::prelude::MouseEvent| {
+                        e.prevent_default();
+                        panel_drag.set(Some((2, e.client_coordinates().x, *insp_w.read())));
+                    },
+                }
+                aside { class: "files-panel", style: "width:{insp_w}px",
                     div { class: "insp-tabs",
                         for (key, label) in [("review","Review"),("files","Files"),("timeline","Timeline"),("sessions","Sessions"),("git","Git"),("memory","Memory"),("goal","Goal"),("browser","Browser"),("approvals","Approvals"),("checkpoints","Checkpoints"),("usage","Usage")] {
                             {
