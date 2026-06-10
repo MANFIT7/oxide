@@ -1259,6 +1259,16 @@ fn push_toast(mut toasts: Signal<Vec<(u64, String, String)>>, mut seq: Signal<u6
     });
 }
 
+/// Jump the chat scroll to the bottom after the next render tick.
+fn scroll_chat_bottom() {
+    spawn(async move {
+        let _ = dioxus::document::eval(
+            "setTimeout(()=>requestAnimationFrame(()=>{const s=document.querySelector('.scroll'); if(s) s.scrollTop=s.scrollHeight;}),60);",
+        )
+        .await;
+    });
+}
+
 /// Open a saved session transcript in a new tab (view).
 fn open_session_tab(
     mut tabs: Signal<Vec<AgentTab>>,
@@ -1290,6 +1300,7 @@ fn open_session_tab(
         let mut c = cfg.read().clone();
         c.resume_path = Some(path);
         let _ = engine.send(EngineCmd::SwitchTab(c, loaded));
+        scroll_chat_bottom();
         return;
     }
     if let Some(t) = tabs.write().get_mut(cur) {
@@ -1313,6 +1324,7 @@ fn open_session_tab(
     let mut c = cfg.read().clone();
     c.resume_path = Some(path);
     let _ = engine.send(EngineCmd::SwitchTab(c, loaded));
+    scroll_chat_bottom();
 }
 
 /// Load a session transcript into chat messages.
@@ -1688,7 +1700,9 @@ fn app() -> Element {
                 s.addEventListener('scroll', upd, { passive: true });
                 inner = new MutationObserver(stick);
                 inner.observe(s, { childList: true, subtree: true, characterData: true });
-                stick();
+                // Fresh transcript mount (app start, welcome→chat): start at the bottom.
+                s.scrollTop = s.scrollHeight;
+                upd();
               };
               // Watch the whole document subtree so .scroll being remounted
               // (empty<->transcript, editor toggle, tab switch) re-binds the observer.
@@ -4148,6 +4162,7 @@ fn switch_tab(
     c.resume_path = t.session.clone();
     cfg.set(c.clone());
     let _ = engine.send(EngineCmd::SwitchTab(c, t.messages.clone()));
+    scroll_chat_bottom();
 }
 
 /// Open a fresh agent tab for `provider` and make it active.
