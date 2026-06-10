@@ -1973,3 +1973,10 @@ details[open]::details-content { block-size: auto; }
 .terminal { position: relative; }
 .panel-resizer.term { position: absolute; left: 0; right: 0; top: -2px; height: 5px; cursor: row-resize; z-index: 7; }
 .panel-resizer.term:hover { background: color-mix(in srgb, var(--syn-accent) 35%, transparent); }
+
+/* markdown handles its own spacing — pre-wrap turned the HTML's source
+   newlines into giant literal gaps (numbers stranded on their own line). */
+.agent-text.agent-md { white-space: normal; }
+.agent-md li > p { margin: 0 0 6px; }
+.agent-md li { margin: 3px 0; }
+.agent-md ul ul, .agent-md ol ul, .agent-md ul ol, .agent-md ol ol { margin: 2px 0 4px; }
