@@ -1087,6 +1087,19 @@ impl Engine {
             sys.push_str(map.trim_end());
             sys.push_str("\n```\nWork within this existing structure; place new code where it belongs.");
         }
+        // SOUL.md — persistent persona/identity (hermes-style), loaded first so
+        // it frames everything. Lives in the workspace (or .oxide/) and can be
+        // edited by the user — or by the agent for the root-level copy.
+        for soul in [".oxide/SOUL.md", "SOUL.md"] {
+            if let Ok(text) = std::fs::read_to_string(self.workspace.join(soul)) {
+                let t = text.trim();
+                if !t.is_empty() {
+                    sys.push_str("\n\n# Persona (SOUL.md)\n");
+                    sys.push_str(t);
+                    break;
+                }
+            }
+        }
         // Pinned project instructions (AGENTS.md / CLAUDE.md) — always resident,
         // never compacted away.
         if let Some(agents) = load_project_instructions(&self.workspace) {
@@ -1247,6 +1260,7 @@ impl Engine {
         // the CLI with an out-of-context reminder as the whole prompt.
         let cli_driver = matches!(self.config.provider.as_str(), "codex" | "claude");
         let mut nudges = 0u8;
+        let mut memory_nudged = false;
         let mut verifies = 0u8;
         let mut wrapped_up = false;
         self.turn_edited = false;
@@ -1447,6 +1461,17 @@ then stop. Apply fixes with edit/write_file — do not just explain.\n\n{report}
                         )));
                         continue;
                     }
+                }
+                // Self-improvement loop (hermes-style): after a substantial turn,
+                // nudge ONCE to persist durable learnings before finishing.
+                if !memory_nudged && step >= 8 && !self.turn_edit_paths.is_empty() {
+                    memory_nudged = true;
+                    self.session.push(Message::new(Role::User,
+                        "<system-reminder>\nBefore finishing: did this task teach you anything durable and \
+non-obvious (project quirks, gotchas, user preferences, a reusable multi-step procedure)? \
+If yes, persist it NOW — `remember` for facts, `save_skill` for procedures. If nothing \
+qualifies, just finish; do not save trivia.\n</system-reminder>"));
+                    continue;
                 }
                 break;
             }
