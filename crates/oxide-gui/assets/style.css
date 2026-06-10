@@ -1657,9 +1657,15 @@ details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
 /* ── Phase 2: icon rail + minimal header ── */
 .sidebar { transition: width .18s ease; }
 .sidebar.collapsed { width: 56px; padding: 12px 6px; }
+.sidebar.collapsed .projects { display: none; }
+.sidebar .brand-name, .sidebar .section-label, .sidebar .nav .nav-label, .sidebar .nav-item span {
+  transition: opacity .14s ease;
+}
 .sidebar.collapsed .brand-name, .sidebar.collapsed .section-label,
-.sidebar.collapsed .projects, .sidebar.collapsed .nav .nav-label,
-.sidebar.collapsed .nav-item span { display: none; }
+.sidebar.collapsed .nav .nav-label, .sidebar.collapsed .nav-item span {
+  opacity: 0; width: 0; overflow: hidden; white-space: nowrap; display: inline-block; padding: 0; margin: 0;
+}
+.sidebar.collapsed { overflow: hidden; }
 .sidebar.collapsed .nav-item { justify-content: center; padding: 8px 0; }
 .sidebar.collapsed .brand { justify-content: center; padding: 6px 0 12px; }
 .logo { cursor: pointer; transition: transform .15s ease; }
@@ -1890,3 +1896,42 @@ details[open]::details-content { block-size: auto; }
 .agent-tabs::-webkit-scrollbar { display: none; }
 .agent-tab { flex: 0 1 auto; min-width: 64px; }
 .tab-actions { margin-left: auto; flex-shrink: 0; }
+
+/* ══ Cursor-parity batch: toasts, tab close, stagger, smooth scroll ══ */
+/* toast stack (shadcn/sonner-style) */
+.toasts { position: fixed; right: 16px; bottom: 16px; z-index: 1200; display: flex; flex-direction: column; gap: 8px; pointer-events: none; }
+.toast { pointer-events: auto; display: flex; align-items: center; gap: 8px; min-width: 200px; max-width: 360px;
+  padding: 10px 14px; border-radius: 10px; font-size: 12.5px; cursor: pointer;
+  background: var(--surface); border: 1px solid var(--border); color: var(--text);
+  box-shadow: 0 8px 28px rgba(0,0,0,.35); animation: toast-in .22s cubic-bezier(.22,1,.36,1); }
+.app[data-theme="light"] .toast { box-shadow: 0 8px 28px rgba(20,20,20,.14); }
+@keyframes toast-in { from { opacity: 0; transform: translateY(10px) scale(.97); } to { opacity: 1; transform: none; } }
+.toast-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; background: var(--muted); }
+.toast.ok .toast-dot { background: var(--ok-strong, #40c977); }
+.toast.err .toast-dot { background: var(--danger); }
+/* tab close: width collapse */
+.agent-tab { transition: background .12s ease; }
+.agent-tab.closing { max-width: 0; min-width: 0; padding-left: 0; padding-right: 0; opacity: 0; overflow: hidden;
+  transition: max-width .15s ease, padding .15s ease, opacity .12s ease; }
+/* diff lines cascade in while the agent streams an edit */
+.diff-card .dl { animation: dl-in .16s ease-out both; }
+@keyframes dl-in { from { opacity: 0; transform: translateX(-3px); } to { opacity: 1; transform: none; } }
+.diff-card .dl:nth-child(1) { animation-delay: .00s; } .diff-card .dl:nth-child(2) { animation-delay: .02s; }
+.diff-card .dl:nth-child(3) { animation-delay: .04s; } .diff-card .dl:nth-child(4) { animation-delay: .06s; }
+.diff-card .dl:nth-child(5) { animation-delay: .08s; } .diff-card .dl:nth-child(6) { animation-delay: .10s; }
+.diff-card .dl:nth-child(7) { animation-delay: .12s; } .diff-card .dl:nth-child(8) { animation-delay: .14s; }
+/* smooth scroll only when idle (instant during streaming so it never lags) */
+.scroll.smooth { scroll-behavior: smooth; }
+/* composer grows smoothly with multi-line input (progressive enhancement) */
+.composer, #ce-input { interpolate-size: allow-keywords; transition: block-size .15s ease; }
+/* transcript rows cascade in when a session opens */
+.row { animation: synara-msg-in .18s cubic-bezier(.22,1,.36,1) both; }
+.row:nth-child(2) { animation-delay: .02s; } .row:nth-child(3) { animation-delay: .04s; }
+.row:nth-child(4) { animation-delay: .06s; } .row:nth-child(5) { animation-delay: .08s; }
+.row:nth-child(6) { animation-delay: .10s; } .row:nth-child(7) { animation-delay: .12s; }
+.row:nth-child(8) { animation-delay: .14s; }
+@media (prefers-reduced-motion: reduce) {
+  .toast, .diff-card .dl, .row { animation: none; }
+  .scroll.smooth { scroll-behavior: auto; }
+  .agent-tab.closing { transition: none; }
+}

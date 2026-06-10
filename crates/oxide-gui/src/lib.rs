@@ -1209,6 +1209,17 @@ fn build_projects(current: &Path, recents: &[PathBuf]) -> Vec<(PathBuf, String, 
     out
 }
 
+/// Push a toast (kind: "ok" | "err" | "info") that auto-dismisses after 4s.
+fn push_toast(mut toasts: Signal<Vec<(u64, String, String)>>, mut seq: Signal<u64>, kind: &str, text: &str) {
+    let id = *seq.peek() + 1;
+    seq.set(id);
+    toasts.write().push((id, kind.to_string(), text.to_string()));
+    spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+        toasts.write().retain(|t| t.0 != id);
+    });
+}
+
 /// Newest session file in a workspace — the live engine's backing file.
 fn newest_session_file(ws: &Path) -> Option<PathBuf> {
     let rd = std::fs::read_dir(ws.join(".oxide/sessions")).ok()?;
@@ -1469,6 +1480,11 @@ fn app() -> Element {
     let mut expanded_projects = use_signal(HashSet::<String>::new);
     // Projects whose chat list is collapsed (click the caret on the header).
     let mut collapsed_projects = use_signal(HashSet::<String>::new);
+    // Tab currently animating closed.
+    let mut closing_tab = use_signal(|| None::<u64>);
+    // Toast notifications (bottom-right stack, auto-dismiss).
+    let toasts = use_signal(Vec::<(u64, String, String)>::new);
+    let toast_seq = use_signal(|| 0u64);
     // Agent tabs (multiple agent sessions in one workspace).
     let initial_provider = cfg.read().provider.clone();
     let initial_model = cfg.read().model.clone();
@@ -1825,6 +1841,7 @@ fn app() -> Element {
                             Event::Error { message } => {
                                 // MCP connect errors surface on the manager dots, not the chat.
                                 if !message.starts_with("mcp '") {
+                                    push_toast(toasts, toast_seq, "err", &message.chars().take(120).collect::<String>());
                                     messages.write().push(ChatMsg { author: Author::Note, text: format!("error: {message}") });
                                     // A turn-level error means no TurnFinished may come —
                                     // unstick the composer so the user can send again.
@@ -2525,13 +2542,29 @@ fn app() -> Element {
                                 let logo = provider_logo(&t.provider);
                                 let is_active = i == *active_tab.read();
                                 let many = tabs.read().len() > 1;
+                                let tab_class = if *closing_tab.read() == Some(id) {
+                                    "agent-tab closing"
+                                } else if is_active {
+                                    "agent-tab active"
+                                } else {
+                                    "agent-tab"
+                                };
                                 rsx! {
-                                    div { key: "{id}", class: if is_active { "agent-tab active" } else { "agent-tab" },
+                                    div { key: "{id}", class: "{tab_class}",
                                         onclick: move |_| switch_tab(tabs, active_tab, messages, cfg, engine, i),
                                         if let Some(l) = logo { span { class: "agent-tab-logo prov-logo", dangerous_inner_html: l } }
                                         span { class: "agent-tab-title", "{title}" }
                                         if many {
-                                            button { class: "agent-tab-x", onclick: move |e| { e.stop_propagation(); close_tab(tabs, active_tab, messages, cfg, engine, i); }, "✕" }
+                                            button { class: "agent-tab-x", onclick: move |e| {
+                                                e.stop_propagation();
+                                                closing_tab.set(Some(id));
+                                                spawn(async move {
+                                                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                                                    let idx = tabs.read().iter().position(|t| t.id == id);
+                                                    if let Some(idx) = idx { close_tab(tabs, active_tab, messages, cfg, engine, idx); }
+                                                    closing_tab.set(None);
+                                                });
+                                            }, "✕" }
                                         }
                                     }
                                 }
@@ -2620,7 +2653,9 @@ fn app() -> Element {
                                             let ws = ws_cp.clone();
                                             spawn(async move {
                                                 let _ = run_cmd(&ws, "git", &["add", "-A"]).await;
-                                                let _ = run_cmd(&ws, "git", &["commit", "-m", "wip: changes from Oxide"]).await;
+                                                let r = run_cmd(&ws, "git", &["commit", "-m", "wip: changes from Oxide"]).await;
+                                                let ok = !r.contains("error") && !r.contains("fatal");
+                                                push_toast(toasts, toast_seq, if ok { "ok" } else { "err" }, if ok { "Changes committed" } else { "Commit failed" });
                                                 changed_files.set(load_changed_files(&ws).await);
                                             });
                                         }, "Commit" }
@@ -2908,7 +2943,7 @@ fn app() -> Element {
                             }
                         }
                     } else {
-                        div { class: "scroll",
+                        div { class: if *streaming.read() { "scroll" } else { "scroll smooth" },
                             div { class: if *streaming.read() { "col streaming" } else { "col" },
                                 {
                                     // Group consecutive tool-activity rows so they collapse into one dropdown.
@@ -3000,7 +3035,7 @@ fn app() -> Element {
                                                                             }
                                                                         }
                                                                         div { class: "msg-actions",
-                                                                            button { class: "msg-act", title: "Copy message", onclick: move |_| { let c = copy.clone(); spawn(async move { let _ = document::eval(&format!("navigator.clipboard.writeText({c})")).await; }); }, "⧉" }
+                                                                            button { class: "msg-act", title: "Copy message", onclick: move |_| { let c = copy.clone(); spawn(async move { let _ = document::eval(&format!("navigator.clipboard.writeText({c})")).await; }); push_toast(toasts, toast_seq, "ok", "Copied"); }, "⧉" }
                                                                             if *confirm_restore.read() == Some(idx) {
                                                                                 button { class: "msg-act danger", title: "Click again to confirm — this removes the messages below and reverts the files", onclick: move |_| {
                                                                                     confirm_restore.set(None);
@@ -3565,6 +3600,15 @@ fn app() -> Element {
             }
             if *show_mcp.read() {
                 McpModal { cfg, engine, status: mcp_status, on_close: move |_| show_mcp.set(false) }
+            }
+            div { class: "toasts",
+                for (tid, kind, text) in toasts.read().iter().cloned() {
+                    div { key: "{tid}", class: "toast {kind}",
+                        onclick: move |_| { toasts.clone().write().retain(|t| t.0 != tid); },
+                        span { class: "toast-dot" }
+                        span { "{text}" }
+                    }
+                }
             }
             if *show_shortcuts.read() {
                 div { class: "modal-overlay", onclick: move |_| show_shortcuts.set(false),
