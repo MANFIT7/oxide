@@ -1383,8 +1383,8 @@ fn app() -> Element {
     let mut sidebar_collapsed = use_signal(|| false);
     // Resizable side panels: (which: 1=left sidebar, 2=right inspector, start_x, start_w).
     let mut panel_drag = use_signal(|| None::<(u8, f64, f64)>);
-    let mut sidebar_w = use_signal(|| 250.0f64);
-    let mut insp_w = use_signal(|| 280.0f64);
+    let mut sidebar_w = use_signal(|| { cfg.peek().sidebar_width });
+    let mut insp_w = use_signal(|| { cfg.peek().inspector_width });
     let mut palette_query = use_signal(String::new);
     let mut palette_sel = use_signal(|| 0usize);
     let mut pinned = use_signal(|| false);
@@ -2061,7 +2061,25 @@ fn app() -> Element {
                     }
                 }
             },
-            onmouseup: move |_| { if panel_drag.read().is_some() { panel_drag.set(None); } },
+            onmouseup: move |_| {
+                if panel_drag.read().is_some() {
+                    panel_drag.set(None);
+                    // Persist the new widths.
+                    let mut cfg = cfg;
+                    let mut c = cfg.read().clone();
+                    c.sidebar_width = *sidebar_w.read();
+                    c.inspector_width = *insp_w.read();
+                    cfg.set(c.clone());
+                    if let Ok(t) = toml::to_string(&c) {
+                        let _ = std::fs::write(workspace_of(&c).join("oxide.toml"), &t);
+                        if let Some(home) = std::env::var_os("HOME") {
+                            let d = std::path::PathBuf::from(home).join(".config/oxide");
+                            let _ = std::fs::create_dir_all(&d);
+                            let _ = std::fs::write(d.join("config.toml"), &t);
+                        }
+                    }
+                }
+            },
             // ── Sidebar ────────────────────────────────────────────────
             aside { class: if *sidebar_collapsed.read() { "sidebar collapsed" } else { "sidebar" },
                 style: if *sidebar_collapsed.read() { String::new() } else { format!("width:{}px", *sidebar_w.read()) },
@@ -3996,17 +4014,73 @@ fn git_worktrees(ws: &Path) -> Vec<(PathBuf, String)> {
     res
 }
 
+/// Class-based syntax highlight for one code block (theme colors come from CSS,
+/// so dark/light both work). Falls back to escaped plain text.
+fn highlight_code(code: &str, lang: &str) -> String {
+    use syntect::html::{ClassedHTMLGenerator, ClassStyle};
+    use syntect::parsing::SyntaxSet;
+    use syntect::util::LinesWithEndings;
+    static SS: std::sync::OnceLock<SyntaxSet> = std::sync::OnceLock::new();
+    let ss = SS.get_or_init(SyntaxSet::load_defaults_newlines);
+    let syn = ss
+        .find_syntax_by_token(lang)
+        .or_else(|| ss.find_syntax_by_extension(lang))
+        .unwrap_or_else(|| ss.find_syntax_plain_text());
+    let mut gen = ClassedHTMLGenerator::new_with_class_style(syn, ss, ClassStyle::Spaced);
+    for line in LinesWithEndings::from(code) {
+        if gen.parse_html_for_line_which_includes_newline(line).is_err() {
+            return code.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+        }
+    }
+    gen.finalize()
+}
+
 /// Render agent markdown to safe HTML: raw HTML in the source is escaped
-/// first (so injection is impossible), then markdown is converted.
+/// first (so injection is impossible), then markdown is converted. Fenced code
+/// blocks get class-based syntax highlighting.
 fn md_to_html(src: &str) -> String {
+    use pulldown_cmark::{CodeBlockKind, Event as MdEvent, Options, Parser, Tag, TagEnd};
     let escaped = src.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
-    let mut opts = pulldown_cmark::Options::empty();
-    opts.insert(pulldown_cmark::Options::ENABLE_TABLES);
-    opts.insert(pulldown_cmark::Options::ENABLE_STRIKETHROUGH);
-    opts.insert(pulldown_cmark::Options::ENABLE_TASKLISTS);
-    let parser = pulldown_cmark::Parser::new_ext(&escaped, opts);
+    let mut opts = Options::empty();
+    opts.insert(Options::ENABLE_TABLES);
+    opts.insert(Options::ENABLE_STRIKETHROUGH);
+    opts.insert(Options::ENABLE_TASKLISTS);
+    let parser = Parser::new_ext(&escaped, opts);
+
+    // Intercept fenced code blocks for syntect; stream the rest to the default
+    // HTML writer in segments.
     let mut html = String::with_capacity(src.len() * 2);
-    pulldown_cmark::html::push_html(&mut html, parser);
+    let mut seg: Vec<MdEvent> = Vec::new();
+    let mut code = String::new();
+    let mut lang = String::new();
+    let mut in_code = false;
+    for ev in parser {
+        match ev {
+            MdEvent::Start(Tag::CodeBlock(kind)) => {
+                pulldown_cmark::html::push_html(&mut html, seg.drain(..));
+                in_code = true;
+                code.clear();
+                lang = match kind {
+                    CodeBlockKind::Fenced(l) => l.split_whitespace().next().unwrap_or("").to_string(),
+                    _ => String::new(),
+                };
+            }
+            MdEvent::End(TagEnd::CodeBlock) => {
+                in_code = false;
+                // The source was pre-escaped; un-escape so syntect sees real code,
+                // its output re-escapes safely.
+                let raw = code.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&");
+                html.push_str(&format!(
+                    "<pre><code class=\"hl\">{}</code></pre>",
+                    highlight_code(&raw, &lang)
+                ));
+            }
+            MdEvent::Text(t) if in_code => code.push_str(&t),
+            other if !in_code => seg.push(other),
+            _ => {}
+        }
+    }
+    pulldown_cmark::html::push_html(&mut html, seg.drain(..));
     html
 }
 

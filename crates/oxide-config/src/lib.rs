@@ -85,7 +85,15 @@ pub struct Config {
     /// Override the verify command (empty = auto-detect from project files).
     #[serde(default)]
     pub verify_command: String,
+    /// Persisted GUI panel widths (px): left sidebar / right inspector.
+    #[serde(default = "default_sidebar_w")]
+    pub sidebar_width: f64,
+    #[serde(default = "default_insp_w")]
+    pub inspector_width: f64,
 }
+
+fn default_sidebar_w() -> f64 { 250.0 }
+fn default_insp_w() -> f64 { 280.0 }
 
 fn default_true() -> bool {
     true
@@ -162,6 +170,8 @@ impl Default for Config {
             pinned_sessions: Vec::new(),
             auto_verify: true,
             verify_command: String::new(),
+            sidebar_width: 250.0,
+            inspector_width: 280.0,
         }
     }
 }

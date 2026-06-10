@@ -1807,3 +1807,21 @@ svg { stroke-width: 1.6; }
 /* status pill text changes crossfade slightly */
 .status-pill { transition: opacity .2s ease; }
 @media (prefers-reduced-motion: reduce) { .countup { transition: none; } .edits-row-d { animation: none; } }
+
+/* syntect class-based palette — dark */
+.hl .comment { color: #7d7d88; font-style: italic; }
+.hl .string { color: #9ece8c; }
+.hl .constant, .hl .number { color: #d19a66; }
+.hl .keyword, .hl .storage { color: #c678dd; }
+.hl .entity { color: #61afef; }
+.hl .support { color: #56b6c2; }
+.hl .variable { color: #e06c75; }
+.hl .punctuation { color: var(--muted); }
+/* light */
+.app[data-theme="light"] .hl .comment { color: rgba(20,20,20,.45); }
+.app[data-theme="light"] .hl .string { color: #1f8a65; }
+.app[data-theme="light"] .hl .constant, .app[data-theme="light"] .hl .number { color: #b3591f; }
+.app[data-theme="light"] .hl .keyword, .app[data-theme="light"] .hl .storage { color: #a626a4; }
+.app[data-theme="light"] .hl .entity { color: #3c7cab; }
+.app[data-theme="light"] .hl .support { color: #0e7490; }
+.app[data-theme="light"] .hl .variable { color: #cf2d56; }
