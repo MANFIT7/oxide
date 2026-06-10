@@ -1264,6 +1264,13 @@ impl Engine {
         let mut memory_nudged = false;
         // Files a CLI driver reported changing — diffed + shown at turn end.
         let mut cli_changed: Vec<String> = Vec::new();
+        // Git baseline tree of the workspace BEFORE the CLI runs, so its edits
+        // can be reverted (the engine never sees the CLI's write moments).
+        let cli_baseline: Option<String> = if cli_driver {
+            git_baseline_tree(&self.workspace).await
+        } else {
+            None
+        };
         let mut verifies = 0u8;
         let mut wrapped_up = false;
         self.turn_edited = false;
@@ -1489,7 +1496,8 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
         }
         // CLI drivers edit inside their own process — reconstruct the diffs from
         // git at turn end so the UI gets the same per-file cards + summary.
-        for path in cli_changed.drain(..) {
+        let changed: Vec<String> = cli_changed.drain(..).collect();
+        for path in changed {
             let rel = std::path::Path::new(&path)
                 .strip_prefix(&self.workspace)
                 .map(|p| p.display().to_string())
@@ -1513,7 +1521,27 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
             }
             if !diff.trim().is_empty() {
                 let diff: String = diff.chars().take(20_000).collect();
-                self.emit(Event::FileDiff { turn, path: rel, diff, checkpoint: 0 }).await;
+                // Revertable: prior bytes come from the pre-turn git baseline
+                // (absent there = new file, so revert deletes it).
+                let mut checkpoint = 0u64;
+                if let Some(tree) = &cli_baseline {
+                    let prior = tokio::process::Command::new("git")
+                        .arg("-C").arg(&self.workspace)
+                        .args(["cat-file", "-p", &format!("{tree}:{rel}")])
+                        .output().await
+                        .ok()
+                        .filter(|o| o.status.success())
+                        .map(|o| o.stdout);
+                    let abs = self.workspace.join(&rel);
+                    checkpoint = self.checkpoints.snapshot_with(&abs, prior);
+                    self.emit(Event::CheckpointCreated {
+                        turn,
+                        id: checkpoint,
+                        label: format!("cli edit {rel}"),
+                    })
+                    .await;
+                }
+                self.emit(Event::FileDiff { turn, path: rel, diff, checkpoint }).await;
             }
         }
         self.fire_hooks("stop", serde_json::json!({})).await;
@@ -1995,6 +2023,36 @@ Do NOT read it again. Proceed now: make the edits with the edit/write_file tools
 }
 
 /// Load pinned project instructions from AGENTS.md / CLAUDE.md (first found).
+/// Snapshot the whole worktree as a git tree object WITHOUT touching the real
+/// index or working tree (temp GIT_INDEX_FILE + add -A + write-tree). Returns
+/// the tree sha — `git cat-file -p <sha>:<path>` then yields any file's
+/// pre-turn bytes.
+async fn git_baseline_tree(ws: &std::path::Path) -> Option<String> {
+    let idx = ws.join(format!(".oxide/tmp-index-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(ws.join(".oxide"));
+    let add = tokio::process::Command::new("git")
+        .arg("-C").arg(ws)
+        .env("GIT_INDEX_FILE", &idx)
+        .args(["add", "-A", "."])
+        .output().await.ok()?;
+    if !add.status.success() {
+        let _ = std::fs::remove_file(&idx);
+        return None;
+    }
+    let out = tokio::process::Command::new("git")
+        .arg("-C").arg(ws)
+        .env("GIT_INDEX_FILE", &idx)
+        .args(["write-tree"])
+        .output().await.ok();
+    let _ = std::fs::remove_file(&idx);
+    let out = out?;
+    if !out.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if sha.is_empty() { None } else { Some(sha) }
+}
+
 fn load_project_instructions(workspace: &std::path::Path) -> Option<String> {
     let mut combined = String::new();
     // Single-file instructions — first match among the conventional names wins

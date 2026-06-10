@@ -162,6 +162,18 @@ pub struct CheckpointStore {
 }
 
 impl CheckpointStore {
+    /// Snapshot with EXPLICIT prior bytes (e.g. reconstructed from a git
+    /// baseline for CLI-driver edits, where the file is already modified).
+    pub fn snapshot_with(&mut self, path: &Path, prior: Option<Vec<u8>>) -> u64 {
+        self.next_id += 1;
+        let id = self.next_id;
+        self.checkpoints.push(Checkpoint {
+            id,
+            files: vec![FileSnapshot { path: path.to_path_buf(), prior }],
+        });
+        id
+    }
+
     /// Snapshot `path`'s current bytes (capturing absence) under a new checkpoint.
     /// Returns the checkpoint id to surface to the frontend.
     pub fn snapshot(&mut self, path: &Path) -> u64 {
