@@ -1935,3 +1935,11 @@ details[open]::details-content { block-size: auto; }
   .scroll.smooth { scroll-behavior: auto; }
   .agent-tab.closing { transition: none; }
 }
+
+/* elapsed time in the status pill */
+.status-elapsed { color: var(--faint); font-size: 11px; font-variant-numeric: tabular-nums; }
+/* send ↔ stop morph: circle → rounded square, icon spins in */
+.send { transition: opacity .12s ease, transform .16s cubic-bezier(.34,1.56,.64,1), border-radius .18s ease, background .12s ease; }
+.send.stop { border-radius: 9px; animation: stop-in .18s cubic-bezier(.22,1,.36,1); }
+@keyframes stop-in { from { transform: rotate(-90deg) scale(.7); } to { transform: none; } }
+@media (prefers-reduced-motion: reduce) { .send.stop { animation: none; } }

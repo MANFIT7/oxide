@@ -1546,6 +1546,16 @@ fn app() -> Element {
     let mut act_open = use_signal(std::collections::HashMap::<usize, bool>::new);
     let mut status = use_signal(String::new);
     let mut turn_start = use_signal(|| None::<std::time::Instant>);
+    // Seconds since the turn started (ticks while streaming, shown in the pill).
+    let mut elapsed_s = use_signal(|| 0u64);
+    use_future(move || async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            if let Some(t) = *turn_start.read() {
+                elapsed_s.set(t.elapsed().as_secs());
+            }
+        }
+    });
 
     // File/editor signals, shared with tree/editor via context.
     let ws_sig = use_signal(|| ws0.clone());
@@ -1861,6 +1871,7 @@ fn app() -> Element {
                                 thinking.set(String::new());
                                 status.set("Working…".to_string());
                                 turn_start.set(Some(std::time::Instant::now()));
+                                elapsed_s.set(0);
                                 turn_edits.write().clear();
                                 todos.write().clear();
                                 edits_expanded.set(false);
@@ -3078,6 +3089,9 @@ fn app() -> Element {
                                     div { class: "status-pill",
                                         span { class: "status-spinner" }
                                         span { class: "status-shimmer", "{status}" }
+                                        if *elapsed_s.read() >= 3 {
+                                            span { class: "status-elapsed", "· {elapsed_s}s" }
+                                        }
                                     }
                                 }
                                 if !queue.read().is_empty() {
