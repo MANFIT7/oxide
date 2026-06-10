@@ -1482,6 +1482,8 @@ fn app() -> Element {
     let mut collapsed_projects = use_signal(HashSet::<String>::new);
     // Tab currently animating closed.
     let mut closing_tab = use_signal(|| None::<u64>);
+    // Suggested follow-up prompts shown above the composer after a turn.
+    let mut followups = use_signal(Vec::<String>::new);
     // Toast notifications (bottom-right stack, auto-dismiss).
     let toasts = use_signal(Vec::<(u64, String, String)>::new);
     let toast_seq = use_signal(|| 0u64);
@@ -1764,6 +1766,7 @@ fn app() -> Element {
                 tokio::select! {
                     cmd = rx.next() => match cmd {
                         Some(EngineCmd::Submit { engine: eng, display }) => {
+                            followups.write().clear();
                             if let Some(h) = &handle {
                                 messages.write().push(ChatMsg { author: Author::User, text: display });
                                 messages.write().push(ChatMsg { author: Author::Agent, text: String::new() });
@@ -1987,6 +1990,26 @@ fn app() -> Element {
                             Event::TurnFinished { .. } => {
                                 streaming.set(false);
                                 status.set(String::new());
+                                // Cheap contextual follow-up suggestions (Claude Code-style).
+                                {
+                                    let had_error = messages.peek().iter().rev().take(6)
+                                        .any(|m| m.author == Author::Note && m.text.starts_with("error:"));
+                                    let edited = !turn_edits.peek().is_empty();
+                                    let mut f: Vec<String> = Vec::new();
+                                    if had_error {
+                                        f.push("Fix the error above".into());
+                                    }
+                                    if edited {
+                                        f.push("Review the changes you just made and fix any issues".into());
+                                        f.push("Run the relevant build/tests and fix failures".into());
+                                        f.push("Commit these changes with a clear message".into());
+                                    } else {
+                                        f.push("Go deeper — explain the key parts in more detail".into());
+                                        f.push("What would you recommend doing next?".into());
+                                    }
+                                    f.truncate(3);
+                                    followups.set(f);
+                                }
                                 // New/updated session files show up right away
                                 // (fs walk off the event thread).
                                 {
@@ -3259,6 +3282,20 @@ fn app() -> Element {
                             }
                         }
                         div { class: "composer-dock",
+                            if !*streaming.read() && !followups.read().is_empty() && !messages.read().is_empty() {
+                                div { class: "followups",
+                                    for f in followups.read().iter().cloned() {
+                                        button { class: "suggestion followup",
+                                            onclick: {
+                                                let p = f.clone();
+                                                move |_| { let _ = engine.send(EngineCmd::Submit { engine: p.clone(), display: p.clone() }); }
+                                            },
+                                            Icon { name: "spark" } span { "{f}" }
+                                        }
+                                    }
+                                    button { class: "followups-x", title: "Dismiss", onclick: move |_| followups.write().clear(), "✕" }
+                                }
+                            }
                             Composer { streaming, engine, cfg, model_label, bypass,
                                        project: project.clone(), branch: branch.clone(),
                                        context_used: ctx_used, context_limit: ctx_limit,

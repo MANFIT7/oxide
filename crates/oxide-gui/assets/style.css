@@ -1943,3 +1943,10 @@ details[open]::details-content { block-size: auto; }
 .send.stop { border-radius: 9px; animation: stop-in .18s cubic-bezier(.22,1,.36,1); }
 @keyframes stop-in { from { transform: rotate(-90deg) scale(.7); } to { transform: none; } }
 @media (prefers-reduced-motion: reduce) { .send.stop { animation: none; } }
+
+/* follow-up prompt suggestions above the composer */
+.followups { position: relative; width: 100%; max-width: 760px; margin: 0 auto 6px; display: flex; flex-direction: column; animation: synara-msg-in .2s cubic-bezier(.22,1,.36,1); }
+.followups .suggestion.followup { padding: 9px 6px; font-size: 13px; }
+.followups .suggestion.followup:first-child { border-top: none; }
+.followups-x { position: absolute; top: 2px; right: 0; background: none; border: none; color: var(--faint); cursor: pointer; font-size: 11px; padding: 4px; }
+.followups-x:hover { color: var(--text); }
