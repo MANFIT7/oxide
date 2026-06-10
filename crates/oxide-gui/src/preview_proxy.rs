@@ -174,15 +174,29 @@ const PICKER_JS: &str = r#"
   function reactSource(el){ var f=fiber(el), g=0; while(f&&g++<40){ if(f._debugSource){ return f._debugSource.fileName+':'+f._debugSource.lineNumber; } f=f.return; } return null; }
   function reactName(el){ var f=fiber(el), g=0; while(f&&g++<40){ var t=f.type; if(t&&(t.displayName||t.name)) return t.displayName||t.name; f=f.return; } return null; }
   function onMove(e){ if(!on) return; var el=document.elementFromPoint(e.clientX,e.clientY); if(el&&el!==hl){ last=el; rectTo(el); } }
+  var design=false, selEl=null;
   function onClick(e){ if(!on) return; e.preventDefault(); e.stopPropagation();
-    var el=last||e.target;
+    var el=last||e.target; selEl=el;
+    var cs=getComputedStyle(el);
     var info={ type:'oxide-element', tag:el.tagName.toLowerCase(), selector:selector(el),
       text:(el.innerText||'').replace(/\s+/g,' ').trim().slice(0,120),
-      html:el.outerHTML.slice(0,700), component:reactName(el), source:reactSource(el) };
-    window.parent.postMessage(info,'*'); setOn(false);
+      html:el.outerHTML.slice(0,700), component:reactName(el), source:reactSource(el),
+      styles:{ color:cs.color, background:cs.backgroundColor, fontSize:cs.fontSize,
+               fontWeight:cs.fontWeight, padding:cs.padding, margin:cs.margin,
+               borderRadius:cs.borderRadius } };
+    window.parent.postMessage(info,'*');
+    if(design){ rectTo(el); } else { setOn(false); }
   }
-  function setOn(v){ on=v; overlay().style.display='none'; document.documentElement.style.cursor=v?'crosshair':''; }
-  window.addEventListener('message',function(e){ if(e.data==='oxide-pick-on') setOn(true); else if(e.data==='oxide-pick-off') setOn(false); });
+  function setOn(v){ on=v; if(!v&&!design) overlay().style.display='none'; document.documentElement.style.cursor=v?'crosshair':''; }
+  window.addEventListener('message',function(e){
+    var d=e.data;
+    if(d==='oxide-pick-on'){ design=false; setOn(true); }
+    else if(d==='oxide-design-on'){ design=true; setOn(true); }
+    else if(d==='oxide-pick-off'||d==='oxide-design-off'){ design=false; setOn(false); overlay().style.display='none'; }
+    else if(d && d.type==='oxide-style-set' && selEl){ selEl.style.setProperty(d.prop, d.value); rectTo(selEl); }
+    else if(d && d.type==='oxide-text-set' && selEl){ selEl.textContent = d.text; }
+    else if(d==='oxide-design-reset' && selEl){ selEl.removeAttribute('style'); }
+  });
   document.addEventListener('mousemove',onMove,true);
   document.addEventListener('click',onClick,true);
 })();

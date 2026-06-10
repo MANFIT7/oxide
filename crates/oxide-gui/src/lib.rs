@@ -1293,6 +1293,21 @@ async fn scan_ports() -> Vec<(u16, String)> {
     found.into_iter().collect()
 }
 
+/// Repo-wide working diff: `(path, adds, dels, diff)` per changed file.
+async fn load_changed_files(ws: &Path) -> Vec<(String, u32, u32, String)> {
+    let num = run_cmd(ws, "git", &["diff", "--numstat"]).await;
+    let mut out = Vec::new();
+    for line in num.lines().take(40) {
+        let mut it = line.split_whitespace();
+        let (Some(a), Some(d), Some(path)) = (it.next(), it.next(), it.next()) else { continue };
+        let adds = a.parse().unwrap_or(0);
+        let dels = d.parse().unwrap_or(0);
+        let diff = run_cmd(ws, "git", &["diff", "--", path]).await;
+        out.push((path.to_string(), adds, dels, diff.chars().take(20000).collect()));
+    }
+    out
+}
+
 /// Run an arbitrary command in the workspace, returning stdout+stderr.
 async fn run_cmd(ws: &Path, cmd: &str, args: &[&str]) -> String {
     match tokio::process::Command::new(cmd).args(args).current_dir(ws).output().await {
@@ -1376,9 +1391,16 @@ fn app() -> Element {
     // Tiling split-view (each pane its own live engine).
     let mut show_split = use_signal(|| false);
     let mut show_preview = use_signal(|| false);
+    // Right-hand Changes panel (Cursor-style): repo-wide diff + commit/PR.
+    let mut show_changes = use_signal(|| false);
+    let mut changed_files = use_signal(Vec::<(String, u32, u32, String)>::new);
     let mut preview_url = use_signal(String::new);
     let mut preview_ports = use_signal(Vec::<(u16, String)>::new);
     let mut picked_element = use_signal(|| Option::<String>::None);
+    // Design Mode (Cursor 3.0): selected element + live style edits.
+    let mut design_mode = use_signal(|| false);
+    let mut design_sel = use_signal(|| Option::<serde_json::Value>::None);
+    let mut design_edits = use_signal(Vec::<(String, String, String)>::new);
     let split_panes = use_signal(|| vec![(0u64, "gui".to_string(), cfg.read().provider.clone(), cfg.read().model.clone())]);
     let split_layout = use_signal(|| Tile::Leaf(0));
     let split_next_id = use_signal(|| 1u64);
@@ -1848,7 +1870,13 @@ fn app() -> Element {
                                 if let Some(start) = turn_start.write().take() {
                                     let secs = start.elapsed().as_secs();
                                     let dur = if secs >= 60 { format!("{}m {}s", secs / 60, secs % 60) } else { format!("{secs}s") };
-                                    messages.write().push(ChatMsg { author: Author::Note, text: format!("✓ Done · {dur}") });
+                                    // Cursor-style turn summary: duration + change totals.
+                                    let (nf, ta, td) = {
+                                        let e = turn_edits.read();
+                                        (e.len(), e.iter().map(|x| x.1).sum::<u32>(), e.iter().map(|x| x.2).sum::<u32>())
+                                    };
+                                    let sum = if nf > 0 { format!("✓ Done · {dur} · {nf} file(s) +{ta} −{td}") } else { format!("✓ Done · {dur}") };
+                                    messages.write().push(ChatMsg { author: Author::Note, text: sum });
                                 }
                                 // Submit the next queued message as a fresh turn.
                                 let next = { let mut q = queue.write(); if q.is_empty() { None } else { Some(q.remove(0)) } };
@@ -1922,6 +1950,11 @@ fn app() -> Element {
         loop {
             let raw = match eval.recv::<String>().await { Ok(m) => m, Err(_) => break };
             let v: serde_json::Value = match serde_json::from_str(&raw) { Ok(v) => v, Err(_) => continue };
+            if *design_mode.read() {
+                design_sel.set(Some(v));
+                design_edits.set(Vec::new());
+                continue;
+            }
             let sel = v["selector"].as_str().unwrap_or("");
             let src = v["source"].as_str().unwrap_or("");
             let comp = v["component"].as_str().unwrap_or("");
@@ -1945,6 +1978,7 @@ fn app() -> Element {
         }
     };
     let branch = git_branch(&workspace);
+    let ws_changes = workspace.clone();
     let active_cfg = cfg.read().clone();
     let provider = active_cfg.provider.clone();
     let model = active_cfg.model.clone();
@@ -2415,11 +2449,65 @@ fn app() -> Element {
                                     if !v { spawn(async move { preview_ports.set(scan_ports().await); }); }
                                 }, Icon { name: "browser" } "Preview"
                             }
+                            button { class: if *show_changes.read() { "top-btn on" } else { "top-btn" },
+                                onclick: move |_| {
+                                    let v = *show_changes.read(); show_changes.set(!v);
+                                    if !v { let ws = ws_changes.clone(); spawn(async move { changed_files.set(load_changed_files(&ws).await); }); }
+                                }, Icon { name: "branch" } "Changes"
+                            }
                         }
                     }
                 }
 
-                div { class: if *show_preview.read() { "center with-preview" } else { "center" },
+                div { class: if *show_preview.read() || *show_changes.read() { "center with-preview" } else { "center" },
+                    if *show_changes.read() {
+                        {
+                            let files = changed_files.read().clone();
+                            let n = files.len();
+                            let ta: u32 = files.iter().map(|f| f.1).sum();
+                            let td: u32 = files.iter().map(|f| f.2).sum();
+                            let ws_cp = workspace.clone();
+                            let ws_pr2 = workspace.clone();
+                            rsx! {
+                                div { class: "changes-panel",
+                                    div { class: "changes-head",
+                                        span { class: "changes-branch", Icon { name: "branch" } "{branch}" }
+                                        span { class: "changes-stats", "{n} files " span { class: "diff-adds", "+{ta}" } " " span { class: "diff-dels", "−{td}" } }
+                                        button { class: "git-act", onclick: move |_| {
+                                            let ws = ws_cp.clone();
+                                            spawn(async move {
+                                                let _ = run_cmd(&ws, "git", &["add", "-A"]).await;
+                                                let _ = run_cmd(&ws, "git", &["commit", "-m", "wip: changes from Oxide"]).await;
+                                                changed_files.set(load_changed_files(&ws).await);
+                                            });
+                                        }, "Commit" }
+                                        button { class: "git-act", onclick: move |_| {
+                                            let ws = ws_pr2.clone();
+                                            spawn(async move {
+                                                let b = git_branch(&ws);
+                                                let _ = run_cmd(&ws, "git", &["push", "-u", "origin", &b]).await;
+                                                let _ = run_cmd(&ws, "gh", &["pr", "create", "--fill"]).await;
+                                            });
+                                        }, "Create PR" }
+                                        button { class: "term-x", onclick: move |_| show_changes.set(false), "✕" }
+                                    }
+                                    div { class: "changes-list",
+                                        if files.is_empty() { div { class: "insp-empty", "Working tree clean." } }
+                                        for (path, a, d, diff) in files {
+                                            details { class: "changes-file",
+                                                summary { class: "changes-file-head",
+                                                    span { class: "edits-caret", Icon { name: "chevron" } }
+                                                    span { class: "changes-path", "{path}" }
+                                                    span { class: "diff-adds", "+{a}" } span { class: "diff-dels", "−{d}" }
+                                                }
+                                                HunkedDiff { ws: workspace.clone(), path: path.clone(), diff }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     if *show_preview.read() {
                         div { class: "preview-panel",
                             div { class: "preview-bar",
@@ -2434,6 +2522,14 @@ fn app() -> Element {
                                 button { class: "preview-btn pick", title: "Select an element to send to the composer", onclick: move |_| {
                                     spawn(async move { let _ = document::eval("document.querySelector('.preview-frame')?.contentWindow?.postMessage('oxide-pick-on','*')").await; });
                                 }, "📍 Pick" }
+                                button { class: if *design_mode.read() { "preview-btn pick on" } else { "preview-btn" }, title: "Design Mode — click an element, edit it live, Apply writes the code", onclick: move |_| {
+                                    let v = *design_mode.read();
+                                    design_mode.set(!v);
+                                    if v { design_sel.set(None); design_edits.set(Vec::new()); }
+                                    let msg = if v { "'oxide-design-off'" } else { "'oxide-design-on'" };
+                                    let js = format!("document.querySelector('.preview-frame')?.contentWindow?.postMessage({msg},'*')");
+                                    spawn(async move { let _ = document::eval(&js).await; });
+                                }, "🎨 Design" }
                                 button { class: "preview-btn", title: "Reload", onclick: move |_| { let u = preview_url.read().clone(); preview_url.set(String::new()); preview_url.set(u); }, "Reload" }
                                 button { class: "preview-btn", title: "Open in system browser", onclick: move |_| { let u = preview_url.read().clone(); if !u.is_empty() { let _ = std::process::Command::new("open").arg(u).spawn(); } }, "↗" }
                                 button { class: "term-x", onclick: move |_| show_preview.set(false), "✕" }
@@ -2453,6 +2549,80 @@ fn app() -> Element {
                                     },
                                         span { class: "port-dot" } "localhost:{port}" span { class: "port-cmd", "{cmd}" }
                                     }
+                                }
+                            }
+                            if *design_mode.read() {
+                                if let Some(sel) = design_sel.read().clone() {
+                                    {
+                                        let selector = sel["selector"].as_str().unwrap_or("").to_string();
+                                        let source = sel["source"].as_str().unwrap_or("").to_string();
+                                        let component = sel["component"].as_str().unwrap_or("").to_string();
+                                        let html = sel["html"].as_str().unwrap_or("").to_string();
+                                        let cur_text = sel["text"].as_str().unwrap_or("").to_string();
+                                        let styles = sel["styles"].clone();
+                                        let props = ["color", "background", "fontSize", "fontWeight", "padding", "margin", "borderRadius"];
+                                        rsx! {
+                                            div { class: "design-panel",
+                                                div { class: "design-head",
+                                                    span { class: "design-selector", "{selector}" }
+                                                    if !component.is_empty() { span { class: "design-comp", "<{component}>" } }
+                                                }
+                                                div { class: "design-row",
+                                                    span { class: "design-lbl", "text" }
+                                                    input { class: "design-input", value: "{cur_text}",
+                                                        onchange: move |e| {
+                                                            let t = e.value();
+                                                            design_edits.write().push(("text".into(), String::new(), t.clone()));
+                                                            let js = format!("document.querySelector('.preview-frame')?.contentWindow?.postMessage({{type:'oxide-text-set',text:{}}},'*')", serde_json::to_string(&t).unwrap_or_default());
+                                                            spawn(async move { let _ = document::eval(&js).await; });
+                                                        } }
+                                                }
+                                                for prop in props {
+                                                    {
+                                                        let cssname = match prop { "fontSize" => "font-size", "fontWeight" => "font-weight", "borderRadius" => "border-radius", p => p };
+                                                        let cur = styles[prop].as_str().unwrap_or("").to_string();
+                                                        rsx! {
+                                                            div { class: "design-row",
+                                                                span { class: "design-lbl", "{cssname}" }
+                                                                input { class: "design-input", value: "{cur}",
+                                                                    onchange: move |e| {
+                                                                        let val = e.value();
+                                                                        design_edits.write().push((cssname.to_string(), cur.clone(), val.clone()));
+                                                                        let js = format!("document.querySelector('.preview-frame')?.contentWindow?.postMessage({{type:'oxide-style-set',prop:'{cssname}',value:{}}},'*')", serde_json::to_string(&val).unwrap_or_default());
+                                                                        spawn(async move { let _ = document::eval(&js).await; });
+                                                                    } }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                div { class: "design-actions",
+                                                    button { class: "git-act", onclick: move |_| {
+                                                        let edits = design_edits.read().clone();
+                                                        if edits.is_empty() { return; }
+                                                        let mut spec = String::new();
+                                                        spec.push_str(&format!("- selector: {selector}\n"));
+                                                        if !component.is_empty() { spec.push_str(&format!("- component: <{component}>\n")); }
+                                                        if !source.is_empty() { spec.push_str(&format!("- source: {source}\n")); }
+                                                        spec.push_str(&format!("- html: {html}\n- edits:\n"));
+                                                        for (p2, old, newv) in &edits {
+                                                            if p2 == "text" { spec.push_str(&format!("  - text -> {newv:?}\n")); }
+                                                            else { spec.push_str(&format!("  - {p2}: {old} -> {newv}\n")); }
+                                                        }
+                                                        let prompt = format!("Apply these visual edits from Design Mode to the SOURCE CODE (find the element in the codebase; prefer existing design tokens/classes over raw values):\n{spec}");
+                                                        let _ = engine.send(EngineCmd::Submit { engine: prompt, display: format!("🎨 Apply design edits to {selector}") });
+                                                        design_edits.set(Vec::new());
+                                                        spawn(async move { let _ = document::eval("document.querySelector('.preview-frame')?.contentWindow?.postMessage('oxide-design-reset','*')").await; });
+                                                    }, "Apply → code" }
+                                                    button { class: "preview-btn", onclick: move |_| {
+                                                        design_edits.set(Vec::new());
+                                                        spawn(async move { let _ = document::eval("document.querySelector('.preview-frame')?.contentWindow?.postMessage('oxide-design-reset','*')").await; });
+                                                    }, "Reset" }
+                                                }
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    div { class: "design-hint", "🎨 Design Mode aktif — klik elemen di preview untuk mengedit." }
                                 }
                             }
                             if preview_url.read().is_empty() {
@@ -3779,6 +3949,40 @@ fn git_worktrees(ws: &Path) -> Vec<(PathBuf, String)> {
     res
 }
 
+/// Bundled VSCode Material Icon Theme SVGs (MIT — material-extensions).
+fn material_icon(name: &str, is_dir: bool) -> &'static str {
+    if is_dir { return include_str!("../assets/ficons/folder-base.svg"); }
+    let n = name.to_ascii_lowercase();
+    let ext = n.rsplit('.').next().unwrap_or("");
+    match ext {
+        "rs" => include_str!("../assets/ficons/rust.svg"),
+        "ts" | "mts" | "cts" => include_str!("../assets/ficons/typescript.svg"),
+        "tsx" => include_str!("../assets/ficons/react_ts.svg"),
+        "jsx" => include_str!("../assets/ficons/react.svg"),
+        "js" | "mjs" | "cjs" => include_str!("../assets/ficons/javascript.svg"),
+        "json" | "jsonc" => include_str!("../assets/ficons/json.svg"),
+        "md" => include_str!("../assets/ficons/markdown.svg"),
+        "css" | "scss" | "less" => include_str!("../assets/ficons/css.svg"),
+        "html" | "htm" => include_str!("../assets/ficons/html.svg"),
+        "py" => include_str!("../assets/ficons/python.svg"),
+        "go" => include_str!("../assets/ficons/go.svg"),
+        "yaml" | "yml" => include_str!("../assets/ficons/yaml.svg"),
+        "toml" | "ini" | "conf" => include_str!("../assets/ficons/toml.svg"),
+        "sh" | "bash" | "zsh" => include_str!("../assets/ficons/console.svg"),
+        "sql" => include_str!("../assets/ficons/database.svg"),
+        "vue" => include_str!("../assets/ficons/vue.svg"),
+        "svelte" => include_str!("../assets/ficons/svelte.svg"),
+        "swift" => include_str!("../assets/ficons/swift.svg"),
+        "java" | "kt" => include_str!("../assets/ficons/java.svg"),
+        "c" | "h" => include_str!("../assets/ficons/c.svg"),
+        "cpp" | "hpp" | "cc" | "cxx" => include_str!("../assets/ficons/cpp.svg"),
+        "png" | "jpg" | "jpeg" | "gif" | "svg" | "webp" | "ico" => include_str!("../assets/ficons/image.svg"),
+        "lock" => include_str!("../assets/ficons/lock.svg"),
+        "gitignore" => include_str!("../assets/ficons/git.svg"),
+        _ => include_str!("../assets/ficons/document.svg"),
+    }
+}
+
 /// VSCode Material-style file badge: `(label, color)` by extension.
 fn file_badge(name: &str) -> (&'static str, &'static str) {
     let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
@@ -3853,14 +4057,7 @@ fn FileNode(path: PathBuf, depth: usize, is_root: bool) -> Element {
             style: "{pad}",
             onclick: toggle,
             span { class: "caret", "{caret}" }
-            if is_dir {
-                Icon { name: icon_name }
-            } else {
-                {
-                    let (lbl, col) = file_badge(&name);
-                    rsx! { span { class: "ficon", style: "color:{col}", "{lbl}" } }
-                }
-            }
+            span { class: "ficon-svg", dangerous_inner_html: material_icon(&name, is_dir) }
             span { class: "node-name", "{name}" }
         }
         if is_dir && expanded {

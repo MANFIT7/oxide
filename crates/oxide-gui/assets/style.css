@@ -1680,3 +1680,56 @@ svg { stroke-width: 1.6; }
 
 /* material-style file badges in the tree */
 .ficon { font-family: ui-monospace, Menlo, monospace; font-size: 9px; font-weight: 700; width: 16px; display: inline-flex; justify-content: center; flex-shrink: 0; letter-spacing: -0.5px; }
+.ficon-svg { width: 16px; height: 16px; display: inline-flex; flex-shrink: 0; }
+.ficon-svg svg { width: 16px; height: 16px; stroke-width: 0; }
+
+/* ── Cursor 3.0 light palette (exact hexes, ink-alpha layering) ── */
+.app[data-theme="light"] {
+  --bg: #fcfcfc; --sidebar: #f3f3f3; --surface: #ffffff; --surface-hi: #f0f0f1;
+  --composer: #ffffff; --menu-bg: #ffffff;
+  --border: rgba(20,20,20,.08); --menu-border: rgba(20,20,20,.10);
+  --text: rgba(20,20,20,.92); --muted: rgba(20,20,20,.68); --faint: rgba(20,20,20,.48);
+  --accent: #3c7cab; --syn-accent: #3c7cab; --danger: #cf2d56;
+}
+.app[data-theme="light"] .diff-adds { color: #1f8a65; }
+.app[data-theme="light"] .diff-dels { color: #cf2d56; }
+.app[data-theme="light"] .dl.add { background: rgba(31,138,101,.12); }
+.app[data-theme="light"] .dl.del { background: rgba(207,45,86,.10); }
+.app[data-theme="light"] .row.user .bubble { background: rgba(20,20,20,.04); }
+.app[data-theme="light"] .composer { box-shadow: 0 2px 14px -8px rgba(20,20,20,.18); }
+@media (prefers-color-scheme: light) {
+  .app[data-theme="system"] {
+    --bg: #fcfcfc; --sidebar: #f3f3f3; --surface: #ffffff; --surface-hi: #f0f0f1;
+    --composer: #ffffff; --menu-bg: #ffffff;
+    --border: rgba(20,20,20,.08); --menu-border: rgba(20,20,20,.10);
+    --text: rgba(20,20,20,.92); --muted: rgba(20,20,20,.68); --faint: rgba(20,20,20,.48);
+    --accent: #3c7cab; --syn-accent: #3c7cab; --danger: #cf2d56;
+  }
+}
+
+/* Cursor-style right Changes panel */
+.changes-panel { position: absolute; top: 0; right: 0; bottom: 0; width: 46%; z-index: 5; display: flex; flex-direction: column; background: var(--bg); border-left: 1px solid var(--border); animation: panel-in .18s ease-out; }
+.changes-head { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-bottom: 1px solid var(--border); }
+.changes-branch { display: inline-flex; align-items: center; gap: 5px; font-size: 12.5px; font-weight: 600; }
+.changes-branch svg { width: 13px; height: 13px; }
+.changes-stats { font-size: 12px; color: var(--muted); margin-right: auto; }
+.changes-list { flex: 1; overflow-y: auto; padding: 8px 10px; }
+.changes-file { border-radius: 8px; margin-bottom: 4px; background: color-mix(in srgb, var(--text) 3%, transparent); }
+.changes-file-head { display: flex; align-items: center; gap: 8px; padding: 7px 10px; cursor: pointer; list-style: none; font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
+.changes-file-head::-webkit-details-marker { display: none; }
+.changes-path { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* multi-column agent grid: hairline dividers (Cursor) */
+.split { gap: 1px; background: var(--border); }
+.pane { background: var(--bg); }
+/* Design Mode property panel */
+.design-panel { border-bottom: 1px solid var(--border); padding: 8px 12px; background: color-mix(in srgb, var(--text) 3%, transparent); max-height: 300px; overflow-y: auto; }
+.design-head { display: flex; gap: 8px; align-items: center; margin-bottom: 6px; }
+.design-selector { font-family: ui-monospace, Menlo, monospace; font-size: 11px; color: var(--syn-accent); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.design-comp { font-size: 11px; color: var(--muted); }
+.design-row { display: flex; align-items: center; gap: 8px; padding: 2px 0; }
+.design-lbl { width: 96px; font-size: 11px; color: var(--muted); font-family: ui-monospace, Menlo, monospace; flex-shrink: 0; }
+.design-input { flex: 1; background: var(--surface-hi); border: 1px solid var(--border); border-radius: 6px; padding: 3px 8px; font-size: 12px; color: var(--text); font-family: ui-monospace, Menlo, monospace; }
+.design-input:focus { outline: none; border-color: var(--syn-accent); }
+.design-actions { display: flex; gap: 8px; margin-top: 8px; }
+.design-hint { padding: 10px 12px; font-size: 12.5px; color: var(--muted); border-bottom: 1px solid var(--border); }
+.preview-btn.pick.on { background: var(--syn-accent); color: #fff; border-color: var(--syn-accent); }
