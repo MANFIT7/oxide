@@ -3323,6 +3323,18 @@ fn app() -> Element {
                                                             spawn(async move { let _ = dioxus::document::eval(&js).join::<bool>().await; });
                                                         },
                                                         "{preview}"
+                                                        button { class: "queue-steer", title: "Steer now — inject into the running turn instead of waiting",
+                                                            onclick: move |e: dioxus::prelude::MouseEvent| {
+                                                                e.stop_propagation();
+                                                                let text = {
+                                                                    let mut qv = queue.write();
+                                                                    if qi < qv.len() { Some(qv.remove(qi)) } else { None }
+                                                                };
+                                                                if let Some(t) = text {
+                                                                    let display = strip_scaffold(&t);
+                                                                    let _ = engine.send(EngineCmd::Submit { engine: t, display });
+                                                                }
+                                                            }, "↪" }
                                                         button { class: "queue-x", onclick: move |e: dioxus::prelude::MouseEvent| { e.stop_propagation(); let mut qv = queue.write(); if qi < qv.len() { qv.remove(qi); } }, "✕" }
                                                     }
                                                 }
