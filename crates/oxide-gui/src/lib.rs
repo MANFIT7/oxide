@@ -2500,7 +2500,7 @@ fn app() -> Element {
                                 div { class: "changes-panel",
                                     div { class: "changes-head",
                                         span { class: "changes-branch", Icon { name: "branch" } "{branch}" }
-                                        span { class: "changes-stats", "{n} files " span { class: "diff-adds", "+{ta}" } " " span { class: "diff-dels", "−{td}" } }
+                                        span { class: "changes-stats", "{n} files " span { class: "diff-adds countup plus", style: "--n:{ta}" } " " span { class: "diff-dels countup minus", style: "--n:{td}" } }
                                         button { class: "git-act", onclick: move |_| {
                                             let ws = ws_cp.clone();
                                             spawn(async move {
@@ -3014,7 +3014,7 @@ fn app() -> Element {
                                                     span { class: "edits-ic", Icon { name: "list" } }
                                                     div { class: "edits-title-col",
                                                         span { class: "edits-title", "Edited {n} file{plural}" }
-                                                        span { class: "edits-counts", span { class: "diff-adds", "+{total_add}" } " " span { class: "diff-dels", "−{total_del}" } }
+                                                        span { class: "edits-counts", span { class: "diff-adds countup plus", style: "--n:{total_add}" } " " span { class: "diff-dels countup minus", style: "--n:{total_del}" } }
                                                     }
                                                     if *edits_undone.read() {
                                                         span { class: "edits-undone", "✓ Undone" }

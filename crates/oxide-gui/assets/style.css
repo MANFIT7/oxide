@@ -1790,3 +1790,20 @@ svg { stroke-width: 1.6; }
 .app[data-theme="light"] .menu-check { color: #1f8a65; }
 .app[data-theme="light"] .pill.fast.on { color: #1f8a65; border-color: rgba(31,138,101,.4); background: rgba(31,138,101,.08); }
 .app[data-theme="light"] .pill.fast.on svg { color: #1f8a65; }
+
+/* ── Cursor-style animated counters: +N/−N tick up smoothly ── */
+@property --n { syntax: '<integer>'; initial-value: 0; inherits: false; }
+.countup { transition: --n .6s cubic-bezier(.22,1,.36,1); counter-reset: cnum var(--n); }
+.countup::after { content: counter(cnum); }
+.countup.plus::before { content: "+"; }
+.countup.minus::before { content: "−"; }
+/* new file rows in the edits card slide in */
+.edits-row-d { animation: synara-msg-in .2s cubic-bezier(.22,1,.36,1); }
+/* todo completion: strikethrough + color ease in */
+.todo-row .todo-text { transition: color .3s ease, opacity .3s ease; }
+.todo-row.completed .todo-text { opacity: .65; }
+.todo-box { transition: border-color .2s ease, background .2s ease; }
+.todo-row.completed .todo-box { border-color: rgba(64,201,119,.6); background: rgba(64,201,119,.10); }
+/* status pill text changes crossfade slightly */
+.status-pill { transition: opacity .2s ease; }
+@media (prefers-reduced-motion: reduce) { .countup { transition: none; } .edits-row-d { animation: none; } }
