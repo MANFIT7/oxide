@@ -1703,6 +1703,14 @@ fn app() -> Element {
     // Load the kanban board + recent chat sessions for the active workspace.
     use_effect(move || {
         let ws = ui.workspace.read().clone();
+        if cfg.read().workspace.is_none() {
+            // Welcome state: still show every known project folder + its chats
+            // so picking up where you left off is one click.
+            let recents = cfg.read().recent_workspaces.clone();
+            if !recents.is_empty() {
+                projects_list.set(build_projects(std::path::Path::new(""), &recents));
+            }
+        }
         if cfg.read().workspace.is_some() {
             board.set(board::Board::load(&ws));
             projects_list.set(build_projects(&ws, &cfg.read().recent_workspaces));
