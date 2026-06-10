@@ -430,8 +430,6 @@ fn codex_effort(effort: &str) -> &str {
 }
 
 fn claude_effort(effort: &str) -> &str {
-    match effort {
-        "xhigh" => "max",
-        other => other,
-    }
+    // claude --effort accepts low|medium|high|xhigh|max directly.
+    effort
 }

@@ -205,7 +205,35 @@ const EFFORT_PRESETS: &[EffortPreset] = &[
         label: "Extra",
         summary: "Hardest long-running agent tasks",
     },
+    EffortPreset {
+        value: "max",
+        label: "Max",
+        summary: "Deepest reasoning (Claude only)",
+    },
 ];
+
+/// Effort levels the selected provider actually supports — the menu groups to
+/// each provider's own ceiling (GPT tops out at Extra, Claude reaches Max).
+fn effort_levels(provider: &str) -> &'static [EffortPreset] {
+    match provider {
+        // Claude Code CLI + Anthropic API: low/medium/high/xhigh/max.
+        "claude" | "anthropic" => &EFFORT_PRESETS[0..5],
+        // GPT family (codex/chatgpt/openai): low/medium/high/xhigh.
+        "codex" | "chatgpt" | "openai" => &EFFORT_PRESETS[0..4],
+        // Others: plain low/medium/high.
+        _ => &EFFORT_PRESETS[0..3],
+    }
+}
+
+/// Clamp an effort value to what the provider supports (nearest lower).
+fn clamp_effort(provider: &str, effort: &str) -> String {
+    let levels = effort_levels(provider);
+    if levels.iter().any(|p| p.value == effort) {
+        return effort.to_string();
+    }
+    // Too high for this provider — take its ceiling.
+    levels.last().map(|p| p.value.to_string()).unwrap_or_else(|| "medium".into())
+}
 
 fn selected_model(provider: &str, model: &str) -> Option<&'static ModelPreset> {
     MODEL_PRESETS
@@ -1779,6 +1807,9 @@ fn app() -> Element {
                             }
                         }
                         Some(EngineCmd::Reconfigure(conf)) => {
+                            // Effort must fit the (possibly new) provider's range.
+                            let mut conf = conf;
+                            conf.reasoning_effort = clamp_effort(&conf.provider, &conf.reasoning_effort);
                             // Persist the new config (provider/model/effort/fast/…) so it survives restart.
                             let ws = workspace_of(&conf);
                             if let Ok(s) = toml::to_string(&conf) {
@@ -4699,7 +4730,7 @@ fn SettingsModal(
                                 }
                                 effort.set(next);
                             },
-                            for preset in EFFORT_PRESETS.iter() {
+                            for preset in effort_levels(&cfg.read().provider).iter() {
                                 option {
                                     value: "{preset.value}",
                                     selected: effort.read().as_str() == preset.value,
@@ -4966,7 +4997,7 @@ fn Composer(
     let ws_steer = workspace.clone();
 
     rsx! {
-        div { class: if *streaming.read() { if cur_effort == "xhigh" { "composer working ultra" } else { "composer working" } } else { "composer" },
+        div { class: if *streaming.read() { if cur_effort == "xhigh" || cur_effort == "max" { "composer working ultra" } else { "composer working" } } else { "composer" },
             if !slash_items.is_empty() {
                 div { class: "mention-menu",
                     div { class: "menu-label", "Commands" }
@@ -5374,7 +5405,7 @@ fn Composer(
                             div { class: "menu-backdrop", onclick: move |_| show_effort.set(false) }
                             div { class: "effort-menu",
                                 div { class: "menu-label", "Effort" }
-                                for preset in EFFORT_PRESETS.iter() {
+                                for preset in effort_levels(&cfg.read().provider).iter() {
                                     {
                                         let selected = preset.value == cur_effort;
                                         let value = preset.value.to_string();
