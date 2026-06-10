@@ -1795,6 +1795,13 @@ fn app() -> Element {
                             let same_ws = ws == cur_ws;
                             cur_ws = ws.clone();
                             let kept = if same_ws { messages.peek().clone() } else { Vec::new() };
+                            // Same workspace = same conversation: continue the CURRENT
+                            // session file instead of minting a new one per model/effort
+                            // change (this also carries the model context across).
+                            let mut conf = conf;
+                            if same_ws {
+                                conf.resume_path = newest_session_file(&ws);
+                            }
                             // Keep the active tab's provider/logo/title in sync with
                             // the picker — switching ChatGPT→Claude must restyle the tab.
                             {

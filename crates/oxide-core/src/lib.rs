@@ -416,9 +416,32 @@ pub fn spawn(config: Config) -> anyhow::Result<(EngineHandle, mpsc::Receiver<Eve
         let attached = config.resume_path.as_deref().and_then(|p| SessionStore::attach(p).ok());
         match attached.map(Ok).unwrap_or_else(|| SessionStore::open(&workspace)) {
             Ok(s) => {
-                if config.resume_path.is_none() {
-                    // Record which provider/model owns this session (sidebar logos).
-                    let _ = s.append("meta", &format!("provider={}", config.provider));
+                // Record which provider owns this session (sidebar logos). An
+                // attached file with no real messages yet (only meta lines) is
+                // re-stamped, so switching provider on an empty chat updates the logo.
+                let meta_only = config.resume_path.as_deref().map(|p| {
+                    std::fs::read_to_string(p)
+                        .map(|t| {
+                            t.lines().filter(|l| !l.trim().is_empty()).all(|l| {
+                                serde_json::from_str::<serde_json::Value>(l)
+                                    .ok()
+                                    .and_then(|v| v["role"].as_str().map(|r| r == "meta"))
+                                    .unwrap_or(false)
+                            })
+                        })
+                        .unwrap_or(false)
+                });
+                match meta_only {
+                    None => {
+                        let _ = s.append("meta", &format!("provider={}", config.provider));
+                    }
+                    Some(true) => {
+                        if let Some(p) = config.resume_path.as_deref() {
+                            let _ = std::fs::write(p, "");
+                        }
+                        let _ = s.append("meta", &format!("provider={}", config.provider));
+                    }
+                    Some(false) => {}
                 }
                 Some(s)
             }
