@@ -372,7 +372,17 @@ pub fn spawn(config: Config) -> anyhow::Result<(EngineHandle, mpsc::Receiver<Eve
 
     // Resume reads the previous session *before* opening the new one.
     let mut history: Vec<Message> = Vec::new();
-    if config.resume {
+    // An explicit session file (tab/history) wins over generic "resume latest".
+    if let Some(p) = config.resume_path.clone() {
+        if let Ok(msgs) = SessionStore::load(&p) {
+            history = msgs
+                .into_iter()
+                .filter(|m| m.role != "meta")
+                .map(|m| Message::new(role_from_str(&m.role), m.content))
+                .collect();
+            tracing::info!(count = history.len(), "resumed session from {}", p.display());
+        }
+    } else if config.resume {
         if let Some(prev) = SessionStore::latest(&workspace) {
             if let Ok(msgs) = SessionStore::load(&prev) {
                 history = msgs

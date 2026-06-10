@@ -391,6 +391,8 @@ struct AgentTab {
     mode: String,
     /// CLI binary for tui mode (e.g. "codex", "claude").
     bin: String,
+    /// Session file backing this tab's model context (resume on switch).
+    session: Option<PathBuf>,
 }
 
 /// One row in the inspector Timeline.
@@ -498,11 +500,18 @@ return JSON.stringify({q, empty, slash});
 const CE_SERIALIZE_JS: &str = r#"
 const el=document.getElementById('ce-input'); if(!el) return '{}';
 let body=''; const tokens=[];
-el.childNodes.forEach(n=>{
-  if(n.nodeType===3) body+=n.textContent;
-  else if(n.classList && n.classList.contains('ce-chip')){ tokens.push(n.dataset.token); body+='@'+(n.textContent||''); }
-  else body+=(n.textContent||'');
-});
+function walk(n){
+  n.childNodes.forEach(c=>{
+    if(c.nodeType===3) body+=c.textContent;
+    else if(c.nodeName==='BR') body+='\n';
+    else if(c.classList && c.classList.contains('ce-chip')){ tokens.push(c.dataset.token); body+='@'+(c.textContent||''); }
+    else {
+      if(body && !body.endsWith('\n') && (c.nodeName==='DIV'||c.nodeName==='P')) body+='\n';
+      walk(c);
+    }
+  });
+}
+walk(el);
 return JSON.stringify({body: body.replace(/ /g,' ').trim(), tokens});
 "#;
 
@@ -648,7 +657,7 @@ async fn submit_ce(
     }
     // Built-in /review (Bugbot): review the working diff for bugs.
     if body.trim_start().starts_with("/review") {
-        let _ = dioxus::document::eval("const e=document.getElementById('ce-input'); if(e) e.innerHTML='';").join::<bool>().await;
+        let _ = dioxus::document::eval("const e=document.getElementById('ce-input'); if(e){ e.innerHTML=''; e.dispatchEvent(new InputEvent('input',{bubbles:true})); }").join::<bool>().await;
         let extra = body.trim_start().trim_start_matches("/review").trim();
         let diff = run_cmd(&ws, "git", &["diff"]).await;
         let diff: String = diff.chars().take(12000).collect();
@@ -659,12 +668,16 @@ why it's wrong, and the concrete fix. If the diff is clean, say so plainly.{}\n\
             if extra.is_empty() { String::new() } else { format!(" Extra focus: {extra}.") },
             diff
         );
-        let _ = engine.send(EngineCmd::Submit { engine: prompt, display: "/review (Bugbot)".into() });
+        if *streaming.read() {
+            queue.write().push(prompt);
+        } else {
+            let _ = engine.send(EngineCmd::Submit { engine: prompt, display: "/review (Bugbot)".into() });
+        }
         return;
     }
     // Clear the editor immediately so a rapid second Enter can't double-submit
     // (the next serialize reads an empty body and returns).
-    let _ = dioxus::document::eval("const e=document.getElementById('ce-input'); if(e) e.innerHTML='';")
+    let _ = dioxus::document::eval("const e=document.getElementById('ce-input'); if(e){ e.innerHTML=''; e.dispatchEvent(new InputEvent('input',{bubbles:true})); }")
         .join::<bool>()
         .await;
     let mut text = String::new();
@@ -735,7 +748,7 @@ why it's wrong, and the concrete fix. If the diff is clean, say so plainly.{}\n\
         text.push('\n');
     }
     if n_imgs > 0 {
-        text.push_str(&format!("\n(user attached {n_imgs} image{})", if n_imgs == 1 { "" } else { "s" }));
+        text.push_str(&format!("\n(user attached {n_imgs} image{} — image content is NOT visible to you; ask the user to describe it if needed)", if n_imgs == 1 { "" } else { "s" }));
     }
     if let Some(p) = &picked {
         text.push_str(&format!("\n[Preview selection — change this element]\n{p}\n"));
@@ -1103,7 +1116,7 @@ fn recent_sessions(ws: &Path) -> Vec<(PathBuf, std::time::SystemTime, String, St
                 .as_ref()
                 .and_then(|m| m.modified().ok())
                 .and_then(|t| t.elapsed().ok())
-                .map(|d| d.as_secs() < 90)
+                .map(|d| d.as_secs() < 3600)
                 .unwrap_or(false);
             if meta.as_ref().map(|m| m.len()).unwrap_or(0) == 0 {
                 if !fresh {
@@ -1196,6 +1209,15 @@ fn build_projects(current: &Path, recents: &[PathBuf]) -> Vec<(PathBuf, String, 
     out
 }
 
+/// Newest session file in a workspace — the live engine's backing file.
+fn newest_session_file(ws: &Path) -> Option<PathBuf> {
+    let rd = std::fs::read_dir(ws.join(".oxide/sessions")).ok()?;
+    rd.flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("jsonl"))
+        .max()
+}
+
 /// Open a saved session transcript in a new tab (view).
 fn open_session_tab(
     mut tabs: Signal<Vec<AgentTab>>,
@@ -1203,6 +1225,7 @@ fn open_session_tab(
     mut messages: Signal<Vec<ChatMsg>>,
     mut next_id: Signal<u64>,
     cfg: Signal<Config>,
+    engine: Coroutine<EngineCmd>,
     path: PathBuf,
     title: String,
 ) {
@@ -1219,8 +1242,13 @@ fn open_session_tab(
         if let Some(t) = tabs.write().get_mut(cur) {
             t.title = title;
             t.messages = loaded.clone();
+            t.session = Some(path.clone());
         }
-        messages.set(loaded);
+        // Restart the engine WITH this session's context — otherwise the UI
+        // shows history while the model starts blank.
+        let mut c = cfg.read().clone();
+        c.resume_path = Some(path);
+        let _ = engine.send(EngineCmd::SwitchTab(c, loaded));
         return;
     }
     if let Some(t) = tabs.write().get_mut(cur) {
@@ -1237,10 +1265,13 @@ fn open_session_tab(
         messages: loaded.clone(),
         mode: "gui".to_string(),
         bin: String::new(),
+        session: Some(path.clone()),
     });
     let idx = tabs.read().len() - 1;
     active_tab.set(idx);
-    messages.set(loaded);
+    let mut c = cfg.read().clone();
+    c.resume_path = Some(path);
+    let _ = engine.send(EngineCmd::SwitchTab(c, loaded));
 }
 
 /// Load a session transcript into chat messages.
@@ -1450,6 +1481,7 @@ fn app() -> Element {
             messages: Vec::new(),
             mode: "gui".to_string(),
             bin: String::new(),
+            session: None,
         }]
     });
     let active_tab = use_signal(|| 0usize);
@@ -1637,6 +1669,11 @@ fn app() -> Element {
             // Spawn helper expanded inline (avoids closure borrow issues).
             macro_rules! start_engine {
                 ($conf:expr) => {{
+                    // Stop the old agent first — otherwise its in-flight tool calls
+                    // keep mutating the workspace invisibly after the switch.
+                    if let Some(h) = &handle {
+                        let _ = h.submit(Op::Interrupt).await;
+                    }
                     if let Some(f) = forwarder.take() {
                         f.abort();
                     }
@@ -1703,14 +1740,21 @@ fn app() -> Element {
                             timeline.write().clear();
                             streaming.set(false);
                             start_engine!(conf);
+                            while ev_rx.try_recv().is_ok() {}
                             messages.set(kept);
                         }
                         Some(EngineCmd::SwitchTab(conf, tab_msgs)) => {
                             approvals.write().clear();
                             checkpoints.write().clear();
                             timeline.write().clear();
+                            queue.write().clear();
+                            questions.write().clear();
+                            thinking.set(String::new());
                             streaming.set(false);
                             start_engine!(conf);
+                            // Drain events buffered from the OLD engine so they don't
+                            // bleed into the new tab's transcript.
+                            while ev_rx.try_recv().is_ok() {}
                             *messages.write() = tab_msgs; // restore this tab's transcript
                         }
                         Some(EngineCmd::Answer { id, text }) => {
@@ -1884,6 +1928,11 @@ fn app() -> Element {
                             Event::TurnFinished { .. } => {
                                 streaming.set(false);
                                 status.set(String::new());
+                                // New/updated session files show up right away.
+                                {
+                                    let c = cfg.peek().clone();
+                                    projects_list.set(build_projects(&workspace_of(&c), &c.recent_workspaces));
+                                }
                                 // Settle any activity still showing a spinner so none stays
                                 // "running" stuck at the bottom after the turn ends.
                                 {
@@ -2236,7 +2285,7 @@ fn app() -> Element {
                                                         button { class: "row-act-btn pinned", title: "Unpin", onclick: move |e: dioxus::prelude::MouseEvent| { e.stop_propagation(); toggle_pin(cfg, &p_str); }, "📌" }
                                                     }
                                                     div { class: "thread recent",
-                                                        onclick: move |_| { show_board.set(false); open_session_tab(tabs, active_tab, messages, next_tab_id, cfg, p_open.clone(), t_open.clone()); },
+                                                        onclick: move |_| { show_board.set(false); open_session_tab(tabs, active_tab, messages, next_tab_id, cfg, engine, p_open.clone(), t_open.clone()); },
                                                         span { class: "thread-title", title: "{title}", "{title}" }
                                                     }
                                                 }
@@ -2250,10 +2299,11 @@ fn app() -> Element {
                         for (pws, pname, sessions) in projects_list.read().clone() {
                             {
                                 let is_current = pws == workspace;
-                                let pname2 = pname.clone();
-                                let pname_col = pname.clone();
-                                let collapsed = collapsed_projects.read().contains(&pname);
-                                let expanded = expanded_projects.read().contains(&pname);
+                                let pkey = pws.display().to_string();
+                                let pname2 = pkey.clone();
+                                let pname_col = pkey.clone();
+                                let collapsed = collapsed_projects.read().contains(&pkey);
+                                let expanded = expanded_projects.read().contains(&pkey);
                                 let shown = if expanded { sessions.len() } else { sessions.len().min(5) };
                                 let total = sessions.len();
                                 let ws_rebuild = workspace.clone();
@@ -2308,10 +2358,10 @@ fn app() -> Element {
                                                             input { class: "rename-input", value: "{rename_text}", autofocus: true,
                                                                 oninput: move |e| rename_text.set(e.value()),
                                                                 onkeydown: move |e| {
-                                                                    if e.key() == Key::Enter { e.prevent_default(); let n = rename_text.read().trim().to_string(); if !n.is_empty() { if let Some(t) = tabs.write().get_mut(i) { t.title = n; } } renaming_tab.set(None); }
+                                                                    if e.key() == Key::Enter { e.prevent_default(); let n = rename_text.read().trim().to_string(); if !n.is_empty() { if let Some(t) = tabs.write().iter_mut().find(|t| t.id == id) { t.title = n; } } renaming_tab.set(None); }
                                                                     else if e.key() == Key::Escape { renaming_tab.set(None); }
                                                                 },
-                                                                onblur: move |_| { let n = rename_text.read().trim().to_string(); if !n.is_empty() { if let Some(t) = tabs.write().get_mut(i) { t.title = n; } } renaming_tab.set(None); },
+                                                                onblur: move |_| { let n = rename_text.read().trim().to_string(); if !n.is_empty() { if let Some(t) = tabs.write().iter_mut().find(|t| t.id == id) { t.title = n; } } renaming_tab.set(None); },
                                                                 onclick: move |e| e.stop_propagation(),
                                                             }
                                                         } else {
@@ -2347,7 +2397,7 @@ fn app() -> Element {
                                                         button { class: "row-act-btn danger", title: "Delete", onclick: move |e: dioxus::prelude::MouseEvent| { e.stop_propagation(); delete_session(&p_del2); projects_list.set(build_projects(&ws_d2, &cfg.read().recent_workspaces)); }, "✕" }
                                                     }
                                                     div { class: "thread recent", title: "right-click / double-click for options",
-                                                        onclick: move |_| { show_board.set(false); open_session_tab(tabs, active_tab, messages, next_tab_id, cfg, p_open.clone(), t_open.clone()); },
+                                                        onclick: move |_| { show_board.set(false); open_session_tab(tabs, active_tab, messages, next_tab_id, cfg, engine, p_open.clone(), t_open.clone()); },
                                                         oncontextmenu: {
                                                             let p = p_dbl.clone();
                                                             move |e: dioxus::prelude::MouseEvent| { e.prevent_default(); e.stop_propagation(); show_theme_menu.set(false); session_menu.set(Some(p.clone())); }
@@ -2994,6 +3044,7 @@ fn app() -> Element {
                                                             // Pull the item back into the composer for editing.
                                                             let mut qv = queue.write();
                                                             if qi < qv.len() { qv.remove(qi); }
+                                                            let full = strip_scaffold(&full);
                                                             let js = format!(
                                                                 "const e=document.getElementById('ce-input'); if(e){{ e.textContent={}; e.focus(); const r=document.createRange(); r.selectNodeContents(e); r.collapse(false); const s=window.getSelection(); s.removeAllRanges(); s.addRange(r); }} return true;",
                                                                 serde_json::to_string(&full).unwrap_or_default()
@@ -3607,7 +3658,7 @@ fn app() -> Element {
                                                             let t2 = title.clone();
                                                             rsx! {
                                                                 button { class: "palette-item",
-                                                                    onclick: move |_| { show_palette.set(false); show_board.set(false); open_session_tab(tabs, active_tab, messages, next_tab_id, cfg, p2.clone(), t2.clone()); },
+                                                                    onclick: move |_| { show_palette.set(false); show_board.set(false); open_session_tab(tabs, active_tab, messages, next_tab_id, cfg, engine, p2.clone(), t2.clone()); },
                                                                     Icon { name: "file" } span { class: "palette-label", "{title}" }
                                                                 }
                                                             }
@@ -3800,14 +3851,21 @@ fn switch_tab(
     if cur == idx {
         return;
     }
+    let ws = workspace_of(&cfg.read());
     if let Some(t) = tabs.write().get_mut(cur) {
         t.messages = messages.read().clone();
+        // The engine wrote this tab's conversation to the newest session file;
+        // remember it so switching BACK restores the model context too.
+        if t.session.is_none() && !t.messages.is_empty() {
+            t.session = newest_session_file(&ws);
+        }
     }
     let t = tabs.read()[idx].clone();
     active_tab.set(idx);
     let mut c = cfg.read().clone();
     c.provider = t.provider.clone();
     c.model = t.model.clone();
+    c.resume_path = t.session.clone();
     cfg.set(c.clone());
     let _ = engine.send(EngineCmd::SwitchTab(c, t.messages.clone()));
 }
@@ -3838,6 +3896,7 @@ fn new_agent_tab(
         messages: Vec::new(),
         mode: "gui".to_string(),
         bin: String::new(),
+        session: None,
     });
     let idx = tabs.read().len() - 1;
     active_tab.set(idx);
@@ -3871,6 +3930,7 @@ fn new_tui_tab(
         messages: Vec::new(),
         mode: "tui".to_string(),
         bin: bin.to_string(),
+        session: None,
     });
     let idx = tabs.read().len() - 1;
     active_tab.set(idx);
@@ -3890,16 +3950,24 @@ fn close_tab(
     if len_before <= 1 {
         return; // keep at least one tab
     }
+    let cur = *active_tab.read();
+    // Save the LIVE transcript into the current tab before mutating the list —
+    // otherwise closing a background tab reverts the visible chat to a stale
+    // snapshot.
+    if let Some(t) = tabs_w.write().get_mut(cur) {
+        t.messages = messages.read().clone();
+    }
     tabs_w.write().remove(idx);
     let len_after = tabs_w.read().len();
-    let cur = *active_tab.read();
-    let new_idx = if idx < cur || cur >= len_after {
-        cur.saturating_sub(1)
-    } else {
-        cur
+    if idx != cur {
+        // Active tab survives: just remap the index — no engine restart,
+        // no transcript reload (an in-flight stream keeps going).
+        let new_idx = if idx < cur { cur - 1 } else { cur }.min(len_after - 1);
+        let mut active = active_tab;
+        active.set(new_idx);
+        return;
     }
-    .min(len_after - 1);
-    // Force a reload of the now-active tab (read borrows above are dropped here).
+    let new_idx = cur.min(len_after - 1);
     let mut active = active_tab;
     active.set(usize::MAX);
     switch_tab(tabs_w, active, messages, cfg, engine, new_idx);
@@ -4679,7 +4747,7 @@ fn Composer(
         0.0
     };
     let ring_style = format!(
-        "background: conic-gradient(var(--accent) {p}%, #3a3a42 {p}% 100%)",
+        "background: conic-gradient(var(--accent) {p}%, color-mix(in srgb, var(--text) 18%, transparent) {p}% 100%)",
         p = ring_pct
     );
     let ring_num = format!("{}", ring_pct.round() as u64);
@@ -4840,8 +4908,13 @@ fn Composer(
                             // Walk the workspace off-thread; render/keydown read the cache.
                             if let Some(q) = new_q {
                                 let ws = ws_oninput.clone();
-                                let items = tokio::task::spawn_blocking(move || all_mention_items(&ws, &q)).await.unwrap_or_default();
-                                mention_items_sig.set(items);
+                                let q2 = q.clone();
+                                let items = tokio::task::spawn_blocking(move || all_mention_items(&ws, &q2)).await.unwrap_or_default();
+                                // Drop stale results — a slower walk for an older query
+                                // must not overwrite the newer one.
+                                if mention_q.peek().as_deref() == Some(q.as_str()) {
+                                    mention_items_sig.set(items);
+                                }
                             } else {
                                 mention_items_sig.set(Vec::new());
                             }
@@ -4879,9 +4952,34 @@ fn Composer(
                                 Key::Escape => { e.prevent_default(); mention_q.set(None); return; }
                                 _ => {}
                             }
+                        } else if e.key() == Key::Enter && !e.modifiers().shift() {
+                            // Items still loading — don't let Enter submit a half-typed mention.
+                            e.prevent_default();
+                            return;
+                        }
+                    }
+                    // Slash menu: Esc closes, Enter inserts the top match.
+                    if slash_q.read().is_some() {
+                        if e.key() == Key::Escape { e.prevent_default(); slash_q.set(None); return; }
+                        if e.key() == Key::Enter && !e.modifiers().shift() {
+                            let items = slash_commands(&ws_kd, &slash_q.read().clone().unwrap_or_default());
+                            if let Some((name, _)) = items.first() {
+                                e.prevent_default();
+                                let js = format!(
+                                    "const e=document.getElementById('ce-input'); if(e){{ e.textContent={}; e.focus(); const r=document.createRange(); r.selectNodeContents(e); r.collapse(false); const s=window.getSelection(); s.removeAllRanges(); s.addRange(r); }} return true;",
+                                    serde_json::to_string(&format!("/{name} ")).unwrap_or_default()
+                                );
+                                spawn(async move { let _ = dioxus::document::eval(&js).join::<bool>().await; });
+                                slash_q.set(None);
+                                return;
+                            }
                         }
                     }
                     if e.key() == Key::Enter && !e.modifiers().shift() {
+                        if e.data().is_composing() {
+                            // IME candidate confirmation (CJK) — not a send.
+                            return;
+                        }
                         e.prevent_default();
                         let ws = ws_kd2.clone();
                         spawn(async move { submit_ce(streaming, engine, plan_mode, pursue_goal, goal_text, queue, attachments, picked_element, false, ws).await; });
@@ -5289,7 +5387,7 @@ fn TerminalView(id: u64, bin: String, ws: String) -> Element {
                 const el = document.getElementById("{host}");
                 if (!el || !window.Terminal) return;
                 el.innerHTML = "";
-                const term = new window.Terminal({{ fontSize: 12.5, fontFamily: "'MesloLGS NF', 'JetBrainsMono Nerd Font', 'JetBrainsMono Nerd Font Mono', 'Hack Nerd Font', 'FiraCode Nerd Font', 'CaskaydiaCove Nerd Font', 'Symbols Nerd Font Mono', 'Symbols Nerd Font', ui-monospace, Menlo, monospace", cursorBlink: true, theme: {{ background: "#0e0e10", foreground: "#cdd0d6" }} }});
+                const term = new window.Terminal({{ fontSize: 12.5, fontFamily: "'MesloLGS NF', 'JetBrainsMono Nerd Font', 'JetBrainsMono Nerd Font Mono', 'Hack Nerd Font', 'FiraCode Nerd Font', 'CaskaydiaCove Nerd Font', 'Symbols Nerd Font Mono', 'Symbols Nerd Font', ui-monospace, Menlo, monospace", cursorBlink: true, theme: (function(){{ const cs=getComputedStyle(document.querySelector('.app')); const bg=(cs.getPropertyValue('--composer')||'#0e0e10').trim(); const fg=(cs.getPropertyValue('--text')||'#cdd0d6').trim(); return {{ background: bg, foreground: fg, cursor: fg }}; }})() }});
                 let fit = null;
                 try {{ fit = new window.FitAddon.FitAddon(); term.loadAddon(fit); }} catch (e) {{}}
                 try {{ if (document.fonts && document.fonts.ready) await document.fonts.ready; }} catch (e) {{}}

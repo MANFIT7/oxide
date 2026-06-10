@@ -85,6 +85,10 @@ pub struct Config {
     /// Override the verify command (empty = auto-detect from project files).
     #[serde(default)]
     pub verify_command: String,
+    /// Resume the engine's model context from this exact session file
+    /// (transient — never persisted to disk).
+    #[serde(skip)]
+    pub resume_path: Option<PathBuf>,
     /// Persisted GUI panel widths (px): left sidebar / right inspector.
     #[serde(default = "default_sidebar_w")]
     pub sidebar_width: f64,
@@ -170,6 +174,7 @@ impl Default for Config {
             pinned_sessions: Vec::new(),
             auto_verify: true,
             verify_command: String::new(),
+            resume_path: None,
             sidebar_width: 250.0,
             inspector_width: 280.0,
         }
