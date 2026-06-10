@@ -1528,8 +1528,8 @@ details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
 
 /* preview as a right split pane (ara/Cursor style) — chat stays left */
 .center { position: relative; }
-.center.with-preview { padding-right: 46%; }
-.center.with-preview .preview-panel { position: absolute; top: 0; right: 0; bottom: 0; width: 46%; height: 100%; z-index: 5; box-shadow: -8px 0 24px -18px rgba(0,0,0,.6); }
+.center.with-preview { padding-right: var(--rpanel, 46%); }
+.center.with-preview .preview-panel { position: absolute; top: 0; right: 0; bottom: 0; width: var(--rpanel, 46%); height: 100%; z-index: 5; box-shadow: -8px 0 24px -18px rgba(0,0,0,.6); }
 @media (max-width: 1100px) { .center.with-preview { padding-right: 52%; } .center.with-preview .preview-panel { width: 52%; } }
 
 /* message hover copy (synara MessageActionButton) */
@@ -1716,7 +1716,7 @@ svg { stroke-width: 1.6; }
 }
 
 /* Cursor-style right Changes panel */
-.changes-panel { position: absolute; top: 0; right: 0; bottom: 0; width: 46%; z-index: 5; display: flex; flex-direction: column; background: var(--bg); border-left: 1px solid var(--border); animation: panel-in .18s ease-out; }
+.changes-panel { position: absolute; top: 0; right: 0; bottom: 0; width: var(--rpanel, 46%); z-index: 5; display: flex; flex-direction: column; background: var(--bg); border-left: 1px solid var(--border); animation: panel-in .18s ease-out; }
 .changes-head { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-bottom: 1px solid var(--border); }
 .changes-branch { display: inline-flex; align-items: center; gap: 5px; font-size: 12.5px; font-weight: 600; }
 .changes-branch svg { width: 13px; height: 13px; }
@@ -1960,3 +1960,11 @@ details[open]::details-content { block-size: auto; }
 .model-menu .menu-label.model-group:first-of-type { border-top: none; margin-top: 0; }
 .prov-logo.sm { width: 12px; height: 12px; display: inline-flex; opacity: .75; }
 .prov-logo.sm svg { width: 12px; height: 12px; }
+
+/* right split panel resizer + fullscreen menu backdrop fix:
+   backdrop-filter on .composer makes position:fixed descendants resolve
+   against the composer box — expand the backdrop so it still covers the
+   whole window (click-outside closes the model/effort menus). */
+.menu-backdrop { inset: -150vh -150vw; }
+.panel-resizer.rp { position: absolute; left: 0; top: 0; bottom: 0; width: 5px; cursor: col-resize; z-index: 7; }
+.panel-resizer.rp:hover { background: color-mix(in srgb, var(--syn-accent) 35%, transparent); }

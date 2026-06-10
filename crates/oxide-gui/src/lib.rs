@@ -1463,6 +1463,8 @@ fn app() -> Element {
     let mut sidebar_collapsed = use_signal(|| false);
     // Resizable side panels: (which: 1=left sidebar, 2=right inspector, start_x, start_w).
     let mut panel_drag = use_signal(|| None::<(u8, f64, f64)>);
+    // Width (px) of the right preview/changes split panel (drag id 3).
+    let mut rpanel_w = use_signal(|| 560.0f64);
     let mut sidebar_w = use_signal(|| { cfg.peek().sidebar_width });
     let mut insp_w = use_signal(|| { cfg.peek().inspector_width });
     let mut palette_query = use_signal(String::new);
@@ -2291,6 +2293,7 @@ fn app() -> Element {
                     let x = e.client_coordinates().x;
                     match which {
                         1 => sidebar_w.set((sw + (x - sx)).clamp(170.0, 440.0)),
+                        3 => rpanel_w.set((sw + (sx - x)).clamp(320.0, 1100.0)),
                         _ => insp_w.set((sw + (sx - x)).clamp(220.0, 560.0)),
                     }
                 }
@@ -2770,6 +2773,7 @@ fn app() -> Element {
                 }
 
                 div { class: if *show_preview.read() || *show_changes.read() { "center with-preview" } else { "center" },
+                    style: if *show_preview.read() || *show_changes.read() { format!("--rpanel:{}px", *rpanel_w.read()) } else { String::new() },
                     if *show_changes.read() {
                         {
                             let files = changed_files.read().clone();
@@ -2780,6 +2784,10 @@ fn app() -> Element {
                             let ws_pr2 = workspace.clone();
                             rsx! {
                                 div { class: "changes-panel",
+                                    div { class: "panel-resizer rp", onmousedown: move |e: dioxus::prelude::MouseEvent| {
+                                        e.prevent_default();
+                                        panel_drag.set(Some((3, e.client_coordinates().x, *rpanel_w.read())));
+                                    } }
                                     div { class: "changes-head",
                                         span { class: "changes-branch", Icon { name: "branch" } "{branch}" }
                                         span { class: "changes-stats", "{n} files " span { class: "diff-adds countup plus", style: "--n:{ta}" } " " span { class: "diff-dels countup minus", style: "--n:{td}" } }
@@ -2822,6 +2830,10 @@ fn app() -> Element {
                     }
                     if *show_preview.read() {
                         div { class: "preview-panel",
+                            div { class: "panel-resizer rp", onmousedown: move |e: dioxus::prelude::MouseEvent| {
+                                e.prevent_default();
+                                panel_drag.set(Some((3, e.client_coordinates().x, *rpanel_w.read())));
+                            } }
                             div { class: "preview-bar",
                                 input { class: "preview-addr", placeholder: "http://localhost:3000", value: "{preview_url}",
                                     oninput: move |e| preview_url.set(e.value()),
