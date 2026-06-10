@@ -26,14 +26,20 @@ fn now_ms() -> u128 {
         .unwrap_or(0)
 }
 
-/// Append-only JSONL session log.
+/// Append-only JSONL session log. The file is created LAZILY on the first
+/// append, so an empty chat never leaves a session file behind.
 pub struct SessionStore {
     path: PathBuf,
     pub id: String,
+    /// Whether this store has written to (or attached to) its file yet.
+    wrote: std::sync::atomic::AtomicBool,
+    /// Meta line written right before the first real record.
+    meta: std::sync::Mutex<Option<String>>,
 }
 
 impl SessionStore {
-    /// Open a fresh session file `.oxide/sessions/<id>.jsonl` under `workspace`.
+    /// Open a fresh session `.oxide/sessions/<id>.jsonl` under `workspace`.
+    /// The file is NOT created until the first append.
     pub fn open(workspace: &Path) -> std::io::Result<Self> {
         let dir = workspace.join(".oxide/sessions");
         std::fs::create_dir_all(&dir)?;
@@ -41,12 +47,12 @@ impl SessionStore {
         // collide on one file (which would interleave their JSONL lines).
         let id = format!("{}-{}", now_ms(), std::process::id());
         let path = dir.join(format!("{id}.jsonl"));
-        // Touch the file so it exists even before the first message.
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
-        Ok(Self { path, id })
+        Ok(Self {
+            path,
+            id,
+            wrote: std::sync::atomic::AtomicBool::new(false),
+            meta: std::sync::Mutex::new(None),
+        })
     }
 
     /// Attach to an EXISTING session file (resume) — appends continue it.
@@ -59,7 +65,12 @@ impl SessionStore {
         if !path.exists() {
             return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "session file missing"));
         }
-        Ok(Self { path: path.to_path_buf(), id })
+        Ok(Self {
+            path: path.to_path_buf(),
+            id,
+            wrote: std::sync::atomic::AtomicBool::new(true),
+            meta: std::sync::Mutex::new(None),
+        })
     }
 
     /// Absolute path of this session's JSONL file.
@@ -67,22 +78,45 @@ impl SessionStore {
         self.path.display().to_string()
     }
 
-    pub fn append(&self, role: &str, content: &str) -> std::io::Result<()> {
+    /// Set the meta line (e.g. "provider=claude") to be written lazily before
+    /// the first real record.
+    pub fn set_meta(&self, content: &str) {
+        if let Ok(mut m) = self.meta.lock() {
+            *m = Some(content.to_string());
+        }
+        // Re-stamp immediately if the file already exists (attached, meta-only).
+        if self.wrote.load(std::sync::atomic::Ordering::Relaxed) && self.path.exists() {
+            let _ = self.write_line("meta", content, false);
+        }
+    }
+
+    fn write_line(&self, role: &str, content: &str, create: bool) -> std::io::Result<()> {
         let rec = StoredMessage {
             role: role.to_string(),
             content: content.to_string(),
             ts_ms: now_ms(),
         };
         let line = serde_json::to_string(&rec).unwrap_or_default();
-        // Do NOT recreate the file: if the user deleted this session, stop
-        // persisting instead of resurrecting it. The file is created in `open`.
         let mut f = std::fs::OpenOptions::new()
-            .create(false)
+            .create(create)
             .append(true)
             .open(&self.path)?;
         // Write the line and its newline in ONE syscall so concurrent appenders
         // can't interleave (O_APPEND makes a single write atomic, not a pair).
         f.write_all(format!("{line}\n").as_bytes())
+    }
+
+    pub fn append(&self, role: &str, content: &str) -> std::io::Result<()> {
+        // First write creates the file (and leads with the pending meta line);
+        // after that, do NOT recreate it — if the user deleted this session,
+        // stop persisting instead of resurrecting it.
+        let first = !self.wrote.swap(true, std::sync::atomic::Ordering::SeqCst);
+        if first {
+            if let Some(meta) = self.meta.lock().ok().and_then(|mut m| m.take()) {
+                let _ = self.write_line("meta", &meta, true);
+            }
+        }
+        self.write_line(role, content, first)
     }
 
     /// Load every message from a session file (for resume).

@@ -1153,7 +1153,18 @@ fn recent_sessions(ws: &Path) -> Vec<(PathBuf, std::time::SystemTime, String, St
                 continue;
             }
             let text = read_prefix(&p, 8192);
-            let count = text.lines().filter(|l| !l.trim().is_empty()).count();
+            // "Content" = any non-meta record. Meta-only files are empty chats:
+            // never list them, and clean them up once stale (legacy junk too).
+            let count = text
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .filter(|l| {
+                    serde_json::from_str::<serde_json::Value>(l)
+                        .ok()
+                        .and_then(|v| v["role"].as_str().map(|r| r != "meta"))
+                        .unwrap_or(true)
+                })
+                .count();
             if count == 0 {
                 if !fresh {
                     let _ = std::fs::remove_file(&p);

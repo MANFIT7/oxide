@@ -433,13 +433,16 @@ pub fn spawn(config: Config) -> anyhow::Result<(EngineHandle, mpsc::Receiver<Eve
                 });
                 match meta_only {
                     None => {
-                        let _ = s.append("meta", &format!("provider={}", config.provider));
+                        // Lazy: written right before the first real message, so an
+                        // empty chat never creates a file at all.
+                        s.set_meta(&format!("provider={}", config.provider));
                     }
                     Some(true) => {
+                        // Attached file with no real messages: re-stamp its provider.
                         if let Some(p) = config.resume_path.as_deref() {
                             let _ = std::fs::write(p, "");
                         }
-                        let _ = s.append("meta", &format!("provider={}", config.provider));
+                        s.set_meta(&format!("provider={}", config.provider));
                     }
                     Some(false) => {}
                 }
