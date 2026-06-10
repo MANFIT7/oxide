@@ -5662,6 +5662,8 @@ fn ChatPane(
 ) -> Element {
     let mut messages = use_signal(move || initial.clone());
     let mut input = use_signal(String::new);
+    // Pending ask_user question in this pane: (question, options).
+    let mut pane_question = use_signal(|| None::<(String, Vec<String>)>);
     let mut streaming = use_signal(|| false);
     let mut thinking = use_signal(String::new);
     let mut status = use_signal(String::new);
@@ -5744,11 +5746,10 @@ fn ChatPane(
                         Some(Event::Info { text }) => { if text.starts_with(['🧭','⚙','🔍','🤖','🧩','🔁','✓','⚠']) { status.set(text); } }
                         Some(Event::Error { message }) => { messages.write().push(ChatMsg { author: Author::Note, text: format!("error: {message}") }); streaming.set(false); }
                         Some(Event::QuestionAsked { question, options, .. }) => {
-                            // Render the agent's question in the pane; typing a reply answers it
-                            // (the engine accepts a plain UserTurn as the answer).
-                            let opts = if options.is_empty() { String::new() } else { format!("\n{}", options.iter().enumerate().map(|(i, o)| format!("  {}. {o}", i + 1)).collect::<Vec<_>>().join("\n")) };
-                            messages.write().push(ChatMsg { author: Author::Note, text: format!("❓ {question}{opts}\n(ketik jawabanmu di bawah)") });
+                            messages.write().push(ChatMsg { author: Author::Note, text: format!("❓ {question}") });
+                            pane_question.set(Some((question, options)));
                         }
+                        Some(Event::TurnFinished { .. }) if pane_question.read().is_some() => { pane_question.set(None); streaming.set(false); status.set(String::new()); }
                         Some(Event::Shutdown) | None => break,
                         _ => {}
                     }
@@ -5795,13 +5796,31 @@ fn ChatPane(
                     div { class: "status-pill", span { class: "status-spinner" } span { class: "status-shimmer", "{status}" } }
                 }
             }
+            if let Some((q, opts)) = pane_question.read().clone() {
+                div { class: "question-card",
+                    div { class: "question-q", "❓ {q}" }
+                    div { class: "question-opts",
+                        for opt in opts {
+                            {
+                                let o = opt.clone();
+                                rsx! {
+                                    button { class: "question-opt", onclick: move |_| {
+                                        pane.send(PaneCmd::Submit(o.clone()));
+                                        pane_question.set(None);
+                                    }, "{opt}" }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             div { class: "pane-composer",
                 textarea { class: "input", placeholder: "Message…", value: "{input}",
                     oninput: move |e| input.set(e.value()),
                     onkeydown: move |e| if e.key() == Key::Enter && !e.modifiers().shift() {
                         e.prevent_default();
                         let t = input.read().trim().to_string();
-                        if !t.is_empty() { input.set(String::new()); pane.send(PaneCmd::Submit(t)); }
+                        if !t.is_empty() { input.set(String::new()); pane_question.set(None); pane.send(PaneCmd::Submit(t)); }
                     }
                 }
                 if *streaming.read() {
@@ -5809,7 +5828,7 @@ fn ChatPane(
                 } else {
                     button { class: "send", onclick: move |_| {
                         let t = input.read().trim().to_string();
-                        if !t.is_empty() { input.set(String::new()); pane.send(PaneCmd::Submit(t)); }
+                        if !t.is_empty() { input.set(String::new()); pane_question.set(None); pane.send(PaneCmd::Submit(t)); }
                     }, "↑" }
                 }
             }
