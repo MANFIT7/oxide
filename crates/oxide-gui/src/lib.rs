@@ -5347,18 +5347,30 @@ fn Composer(
                                         oninput: move |e| model_query.set(e.value()),
                                     }
                                 }
-                                div { class: "menu-label", "Recommended models" }
                                 if model_count == 0 {
                                     div { class: "menu-empty", "No matching model" }
                                 }
-                                for preset in MODEL_PRESETS.iter().filter(|preset| model_matches(preset, &query)) {
-                                    {
+                                {
+                                    let visible: Vec<&'static ModelPreset> = MODEL_PRESETS.iter().filter(|preset| model_matches(preset, &query)).collect();
+                                    rsx! {
+                                        for (gi, preset) in visible.iter().cloned().enumerate() {
+                                            {
+                                        // Section header when the provider group changes (synara-style).
+                                        let header = if gi == 0 || visible[gi - 1].provider_label != preset.provider_label {
+                                            Some(preset.provider_label)
+                                        } else { None };
                                         let selected = preset.provider == cur_provider && preset.model == cur_model;
                                         let logo = provider_logo(preset.provider);
                                         let prov = preset.provider.to_string();
                                         let model = preset.model.to_string();
                                         let is_fast = preset.fast;
                                         rsx! {
+                                            if let Some(h) = header {
+                                                div { class: "menu-label model-group",
+                                                    if let Some(svg) = provider_logo(preset.provider) { span { class: "prov-logo sm", dangerous_inner_html: svg } }
+                                                    "{h}"
+                                                }
+                                            }
                                             button {
                                                 class: if selected { "menu-item sel" } else { "menu-item" },
                                                 onclick: move |_| {
@@ -5377,11 +5389,13 @@ fn Composer(
                                                     span { class: "prov-logo dot" }
                                                 }
                                                 span { class: "menu-copy",
-                                                    span { class: "menu-name", "{preset.provider_label} · {preset.label}" }
+                                                    span { class: "menu-name", "{preset.label}" }
                                                     span { class: "menu-meta", "{preset.model} · {preset.summary}" }
                                                 }
                                                 span { class: if preset.fast { "menu-badge fast" } else { "menu-badge" }, "{preset.badge}" }
                                                 if selected { span { class: "menu-check", "✓" } }
+                                            }
+                                        }
                                             }
                                         }
                                     }

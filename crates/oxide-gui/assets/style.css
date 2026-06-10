@@ -1954,3 +1954,9 @@ details[open]::details-content { block-size: auto; }
 /* pin icon button: tidy sizing + pinned = accent fill tilt */
 .row-act-btn svg { width: 13px; height: 13px; }
 .row-act-btn.pinned svg { color: var(--syn-accent); fill: color-mix(in srgb, var(--syn-accent) 22%, transparent); transform: rotate(8deg); }
+
+/* model menu provider group headers */
+.menu-label.model-group { display: flex; align-items: center; gap: 7px; margin-top: 6px; padding-top: 8px; border-top: 1px solid var(--border); }
+.model-menu .menu-label.model-group:first-of-type { border-top: none; margin-top: 0; }
+.prov-logo.sm { width: 12px; height: 12px; display: inline-flex; opacity: .75; }
+.prov-logo.sm svg { width: 12px; height: 12px; }
