@@ -1733,3 +1733,37 @@ svg { stroke-width: 1.6; }
 .design-actions { display: flex; gap: 8px; margin-top: 8px; }
 .design-hint { padding: 10px 12px; font-size: 12.5px; color: var(--muted); border-bottom: 1px solid var(--border); }
 .preview-btn.pick.on { background: var(--syn-accent); color: #fff; border-color: var(--syn-accent); }
+
+/* markdown document styling for agent replies (Cursor-style) */
+.agent-md p { margin: 0 0 10px; }
+.agent-md p:last-child { margin-bottom: 0; }
+.agent-md h1, .agent-md h2, .agent-md h3 { margin: 14px 0 6px; font-size: 15px; font-weight: 650; }
+.agent-md h1 { font-size: 17px; }
+.agent-md ul, .agent-md ol { margin: 4px 0 10px; padding-left: 22px; }
+.agent-md li { margin: 2px 0; }
+.agent-md code { font-family: ui-monospace, Menlo, monospace; font-size: 12.5px; background: color-mix(in srgb, var(--text) 7%, transparent); border-radius: 4px; padding: 1px 5px; }
+.agent-md pre { background: color-mix(in srgb, var(--text) 5%, transparent); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; overflow-x: auto; margin: 8px 0 12px; }
+.agent-md pre code { background: transparent; padding: 0; font-size: 12.5px; line-height: 1.55; }
+.agent-md blockquote { border-left: 2px solid var(--border); margin: 6px 0; padding-left: 12px; color: var(--muted); }
+.agent-md table { border-collapse: collapse; margin: 8px 0; font-size: 13px; }
+.agent-md th, .agent-md td { border: 1px solid var(--border); padding: 4px 10px; }
+.agent-md a { color: var(--syn-accent); }
+.agent-md hr { border: none; border-top: 1px solid var(--border); margin: 12px 0; }
+.agent-md strong { font-weight: 650; }
+
+/* sidebar rhythm: consistent spacing between sessions/projects/sections */
+.projects { padding: 0 8px; }
+.project { margin: 14px 0 4px; padding: 0 8px; }
+.thread { height: 30px; margin: 2px 0; padding: 0 8px; border-radius: 7px; }
+.thread-anchor { margin: 1px 0; }
+.section-label { margin: 14px 8px 4px; font-size: 10.5px; letter-spacing: .6px; text-transform: uppercase; color: var(--faint); }
+.nav { padding: 0 8px; display: flex; flex-direction: column; gap: 1px; }
+.nav-item { height: 30px; border-radius: 7px; }
+.brand { padding: 6px 12px 14px; }
+.thread-title { font-size: 12.5px; }
+.thread-time { font-size: 11px; }
+/* word-level diff highlights */
+.dw.add { background: rgba(64,201,119,.28); border-radius: 3px; }
+.dw.del { background: rgba(250,66,62,.26); border-radius: 3px; }
+.app[data-theme="light"] .dw.add { background: rgba(31,138,101,.25); }
+.app[data-theme="light"] .dw.del { background: rgba(207,45,86,.22); }

@@ -2907,10 +2907,21 @@ fn app() -> Element {
                                             {
                                                 let qi = qi;
                                                 let preview: String = q.lines().last().unwrap_or("").chars().take(48).collect();
+                                                let full = q.clone();
                                                 rsx! {
-                                                    span { class: "queue-chip",
+                                                    span { class: "queue-chip", title: "Click to edit this queued message",
+                                                        onclick: move |_| {
+                                                            // Pull the item back into the composer for editing.
+                                                            let mut qv = queue.write();
+                                                            if qi < qv.len() { qv.remove(qi); }
+                                                            let js = format!(
+                                                                "const e=document.getElementById('ce-input'); if(e){{ e.textContent={}; e.focus(); const r=document.createRange(); r.selectNodeContents(e); r.collapse(false); const s=window.getSelection(); s.removeAllRanges(); s.addRange(r); }} return true;",
+                                                                serde_json::to_string(&full).unwrap_or_default()
+                                                            );
+                                                            spawn(async move { let _ = dioxus::document::eval(&js).join::<bool>().await; });
+                                                        },
                                                         "{preview}"
-                                                        button { class: "queue-x", onclick: move |_| { queue.write().remove(qi); }, "✕" }
+                                                        button { class: "queue-x", onclick: move |e: dioxus::prelude::MouseEvent| { e.stop_propagation(); let mut qv = queue.write(); if qi < qv.len() { qv.remove(qi); } }, "✕" }
                                                     }
                                                 }
                                             }
@@ -3947,6 +3958,20 @@ fn git_worktrees(ws: &Path) -> Vec<(PathBuf, String)> {
         }
     }
     res
+}
+
+/// Render agent markdown to safe HTML: raw HTML in the source is escaped
+/// first (so injection is impossible), then markdown is converted.
+fn md_to_html(src: &str) -> String {
+    let escaped = src.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    let mut opts = pulldown_cmark::Options::empty();
+    opts.insert(pulldown_cmark::Options::ENABLE_TABLES);
+    opts.insert(pulldown_cmark::Options::ENABLE_STRIKETHROUGH);
+    opts.insert(pulldown_cmark::Options::ENABLE_TASKLISTS);
+    let parser = pulldown_cmark::Parser::new_ext(&escaped, opts);
+    let mut html = String::with_capacity(src.len() * 2);
+    pulldown_cmark::html::push_html(&mut html, parser);
+    html
 }
 
 /// Bundled VSCode Material Icon Theme SVGs (MIT — material-extensions).
@@ -5086,7 +5111,7 @@ fn Message(author: Author, text: String) -> Element {
                     if text.is_empty() {
                         div { class: "typing", span {} span {} span {} }
                     } else {
-                        div { class: "agent-text", "{text}" }
+                        div { class: "agent-text agent-md", dangerous_inner_html: md_to_html(&text) }
                         button { class: "msg-copy", title: "Copy message", onclick: move |_| { let c = copy.clone(); spawn(async move { let _ = document::eval(&format!("navigator.clipboard.writeText({c})")).await; }); }, "⧉" }
                     }
                 }
@@ -5750,6 +5775,28 @@ fn ChatPane(
     }
 }
 
+fn esc(s: &str) -> String { s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;") }
+
+/// Word-level diff for a paired -/+ line: common prefix/suffix kept, the
+/// changed middle wrapped in a highlight span (Cursor-style).
+fn word_diff(old: &str, new: &str) -> (String, String) {
+    let ob: Vec<char> = old.chars().collect();
+    let nb: Vec<char> = new.chars().collect();
+    let mut p = 0;
+    while p < ob.len() && p < nb.len() && ob[p] == nb[p] { p += 1; }
+    let mut sfx = 0;
+    while sfx < ob.len() - p && sfx < nb.len() - p && ob[ob.len() - 1 - sfx] == nb[nb.len() - 1 - sfx] { sfx += 1; }
+    let seg = |c: &[char], a: usize, b: usize| -> String { c[a..b].iter().collect() };
+    let o_mid = seg(&ob, p, ob.len() - sfx);
+    let n_mid = seg(&nb, p, nb.len() - sfx);
+    let pre = seg(&ob, 0, p);
+    let suf = seg(&ob, ob.len() - sfx, ob.len());
+    (
+        format!("{}<span class=\"dw del\">{}</span>{}", esc(&pre), esc(&o_mid), esc(&suf)),
+        format!("{}<span class=\"dw add\">{}</span>{}", esc(&pre), esc(&n_mid), esc(&suf)),
+    )
+}
+
 /// Split a unified diff into `(hunk_header, lines)` groups (drops the file
 /// `---`/`+++` preamble; each group starts at an `@@` line).
 fn split_hunks(diff: &str) -> Vec<(String, Vec<String>)> {
@@ -5815,11 +5862,28 @@ fn HunkedDiff(ws: PathBuf, path: String, diff: String) -> Element {
                                         onclick: move |_| { if revert_hunk(&ws2, &path2, &lines2) { reverted.write().insert(hi); } }, "Revert hunk" }
                                 }
                             }
-                            pre { class: "diff-body",
-                                for line in lines {
-                                    {
-                                        let cls = if line.starts_with('+') { "dl add" } else if line.starts_with('-') { "dl del" } else { "dl ctx" };
-                                        rsx! { div { class: "{cls}", "{line}" } }
+                            {
+                                // Pair consecutive -/+ lines for word-level highlights.
+                                let mut rows: Vec<(&'static str, String)> = Vec::new();
+                                let mut i = 0;
+                                while i < lines.len() {
+                                    let l = &lines[i];
+                                    if l.starts_with('-') && i + 1 < lines.len() && lines[i + 1].starts_with('+') {
+                                        let (oh, nh) = word_diff(&l[1..], &lines[i + 1][1..]);
+                                        rows.push(("dl del", format!("-{oh}")));
+                                        rows.push(("dl add", format!("+{nh}")));
+                                        i += 2;
+                                        continue;
+                                    }
+                                    let cls = if l.starts_with('+') { "dl add" } else if l.starts_with('-') { "dl del" } else { "dl ctx" };
+                                    rows.push((cls, esc(l)));
+                                    i += 1;
+                                }
+                                rsx! {
+                                    pre { class: "diff-body",
+                                        for (cls, html) in rows {
+                                            div { class: "{cls}", dangerous_inner_html: "{html}" }
+                                        }
                                     }
                                 }
                             }
