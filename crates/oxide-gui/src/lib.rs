@@ -2138,10 +2138,9 @@ fn app() -> Element {
                                         f.push("Review the changes you just made and fix any issues".into());
                                         f.push("Run the relevant build/tests and fix failures".into());
                                         f.push("Commit these changes with a clear message".into());
-                                    } else {
-                                        f.push("Go deeper — explain the key parts in more detail".into());
-                                        f.push("What would you recommend doing next?".into());
                                     }
+                                    // Prose-only turns get no generic filler — chips stay
+                                    // hidden unless the model generates real ones.
                                     f.truncate(3);
                                     followups.set(f);
                                 }
