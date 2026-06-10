@@ -220,6 +220,29 @@ impl Provider for CodexCliProvider {
         let skey_cb = skey.clone();
         run_jsonl(&self.bin, &args, &req.cwd, &sink, move |v, sink| {
             match v["type"].as_str() {
+                Some("item.started") => {
+                    // Live status while the CLI runs a command/edits a file.
+                    let item = &v["item"];
+                    match item["type"].as_str() {
+                        Some("command_execution") => {
+                            let cmd = item["command"].as_str().unwrap_or("");
+                            let cmd = cmd.strip_prefix("/bin/zsh -lc ").unwrap_or(cmd)
+                                .strip_prefix("/bin/sh -c ").unwrap_or(cmd)
+                                .trim_matches('\'');
+                            let cmd: String = cmd.chars().take(80).collect();
+                            send(sink, StreamItem::Notice(format!("⚙ Running {cmd}")));
+                        }
+                        Some("file_change") => {
+                            let p = item["path"].as_str().or_else(|| item["text"].as_str()).unwrap_or("file");
+                            send(sink, StreamItem::Notice(format!("⚙ Editing {p}")));
+                        }
+                        Some("web_search") => {
+                            let q = item["query"].as_str().unwrap_or("");
+                            send(sink, StreamItem::Notice(format!("⚙ Searching {q}")));
+                        }
+                        _ => {}
+                    }
+                }
                 Some("thread.started") => {
                     if let Some(id) = v["thread_id"].as_str() {
                         session_set(&skey_cb, id);
@@ -388,7 +411,16 @@ impl Provider for ClaudeCliProvider {
                                 }
                                 Some("tool_use") => {
                                     let name = block["name"].as_str().unwrap_or("tool");
-                                    send(sink, StreamItem::Notice(format!("⚙ {name}")));
+                                    // Pull the human-relevant arg so the live status reads
+                                    // "⚙ Read src/lib.rs", not a bare tool name.
+                                    let input = &block["input"];
+                                    let detail = ["file_path", "path", "command", "pattern", "query", "url", "description"]
+                                        .iter()
+                                        .find_map(|k| input[k].as_str())
+                                        .unwrap_or("");
+                                    let detail: String = detail.chars().take(80).collect();
+                                    let label = if detail.is_empty() { format!("⚙ {name}") } else { format!("⚙ {name} {detail}") };
+                                    send(sink, StreamItem::Notice(label));
                                 }
                                 _ => {}
                             }

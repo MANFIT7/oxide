@@ -1940,7 +1940,13 @@ fn app() -> Element {
                             Event::Info { text } => {
                                 if text.starts_with("session") || text.starts_with("mcp ") || text.starts_with("mcp '") {
                                     // internal/MCP noise — status shown in the MCP manager, not chat
-                                } else if text.starts_with(['🧭','⚙','🔍','🤖','🧩','🔁','✓','⚠']) {
+                                } else if text.starts_with('⚙') {
+                                    // CLI-driver tool activity: live shimmer + an activity
+                                    // trail row in the chat (synara-style).
+                                    let label = text.trim_start_matches('⚙').trim().to_string();
+                                    status.set(label.clone());
+                                    messages.write().push(ChatMsg { author: Author::Activity { running: false, ok: true }, text: label });
+                                } else if text.starts_with(['🧭','🔍','🤖','🧩','🔁','✓','⚠']) {
                                     // pipeline stage → live animated status, not a chat note
                                     status.set(text);
                                 } else {
