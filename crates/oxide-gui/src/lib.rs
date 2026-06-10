@@ -2478,7 +2478,13 @@ fn app() -> Element {
                     }
                 }
                 div { class: "projects",
-                    if cfg.read().workspace.is_some() {
+                    if cfg.read().workspace.is_none() {
+                        button { class: "open-codebase", onclick: move |_| open_folder(cfg, ui, engine),
+                            Icon { name: "folder" } span { "Open codebase" }
+                        }
+                    }
+                    // Welcome state still lists known projects + their chats.
+                    if cfg.read().workspace.is_some() || !projects_list.read().is_empty() {
                         {
                             let pins: Vec<(PathBuf, String)> = cfg.read().pinned_sessions.iter()
                                 .map(PathBuf::from)
@@ -2646,10 +2652,6 @@ fn app() -> Element {
                                     }
                                 }
                             }
-                        }
-                    } else {
-                        button { class: "open-codebase", onclick: move |_| open_folder(cfg, ui, engine),
-                            Icon { name: "folder" } span { "Open codebase" }
                         }
                     }
                 }
