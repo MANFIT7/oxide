@@ -1436,6 +1436,8 @@ fn app() -> Element {
     let mut projects_list = use_signal(Vec::<ProjGroup>::new);
     let mut session_menu = use_signal(|| None::<PathBuf>);
     let mut expanded_projects = use_signal(HashSet::<String>::new);
+    // Projects whose chat list is collapsed (click the caret on the header).
+    let mut collapsed_projects = use_signal(HashSet::<String>::new);
     // Agent tabs (multiple agent sessions in one workspace).
     let initial_provider = cfg.read().provider.clone();
     let initial_model = cfg.read().model.clone();
@@ -2249,6 +2251,8 @@ fn app() -> Element {
                             {
                                 let is_current = pws == workspace;
                                 let pname2 = pname.clone();
+                                let pname_col = pname.clone();
+                                let collapsed = collapsed_projects.read().contains(&pname);
                                 let expanded = expanded_projects.read().contains(&pname);
                                 let shown = if expanded { sessions.len() } else { sessions.len().min(5) };
                                 let total = sessions.len();
@@ -2258,6 +2262,14 @@ fn app() -> Element {
                                     div { class: if is_current { "project current" } else { "project" },
                                         title: if is_current { "" } else { "Switch to this project" },
                                         onclick: move |_| { if !is_current { apply_workspace(cfg, ui, engine, pws_switch.clone()); } },
+                                        span { class: if collapsed { "proj-caret closed" } else { "proj-caret" },
+                                            onclick: move |e: dioxus::prelude::MouseEvent| {
+                                                e.stop_propagation();
+                                                let mut c = collapsed_projects.write();
+                                                if !c.remove(&pname_col) { c.insert(pname_col.clone()); }
+                                            },
+                                            Icon { name: "chevron" }
+                                        }
                                         Icon { name: "folder" }
                                         span { class: "project-name", "{pname}" }
                                         if is_current && *streaming.read() { span { class: "syn-spinner", style: "margin-left:6px" } }
@@ -2274,7 +2286,7 @@ fn app() -> Element {
                                             Icon { name: "plus" }
                                         }
                                     }
-                                    if is_current {
+                                    if is_current && !collapsed {
                                         for (i, t) in tabs.read().iter().enumerate() {
                                             {
                                                 let i = i;
@@ -2310,7 +2322,7 @@ fn app() -> Element {
                                             }
                                         }
                                     }
-                                    for (path, title, reltime, sprov) in sessions.iter().take(shown).cloned() {
+                                    for (path, title, reltime, sprov) in sessions.iter().take(if collapsed { 0 } else { shown }).cloned() {
                                         {
                                             let p_open = path.clone();
                                             let p_dbl = path.clone();
@@ -2360,7 +2372,7 @@ fn app() -> Element {
                                             }
                                         }
                                     }
-                                    if total > 5 {
+                                    if total > 5 && !collapsed {
                                         button { class: "show-more", onclick: move |_| {
                                             let mut e = expanded_projects.write();
                                             if e.contains(&pname2) { e.remove(&pname2); } else { e.insert(pname2.clone()); }
