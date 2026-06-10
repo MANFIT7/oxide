@@ -106,6 +106,15 @@ const MODEL_PRESETS: &[ModelPreset] = &[
     },
     ModelPreset {
         provider: "claude",
+        model: "claude-fable-5",
+        provider_label: "Claude Code",
+        label: "Fable 5",
+        summary: "Anthropic's newest frontier coding model",
+        badge: "New",
+        fast: false,
+    },
+    ModelPreset {
+        provider: "claude",
         model: "claude-opus-4-8",
         provider_label: "Claude Code",
         label: "Opus 4.8",
@@ -139,6 +148,15 @@ const MODEL_PRESETS: &[ModelPreset] = &[
         summary: "Faster frontier coding lane",
         badge: "Fast",
         fast: true,
+    },
+    ModelPreset {
+        provider: "anthropic",
+        model: "claude-fable-5",
+        provider_label: "Anthropic API",
+        label: "Fable 5",
+        summary: "Anthropic's newest frontier coding model",
+        badge: "New",
+        fast: false,
     },
     ModelPreset {
         provider: "anthropic",
