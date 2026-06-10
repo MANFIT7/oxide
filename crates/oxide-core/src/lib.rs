@@ -264,6 +264,18 @@ async fn fetch_url(url: &str) -> (String, bool) {
 /// Discover MCP servers configured in Codex (`~/.codex/config.toml`) and Claude
 /// desktop / Claude Code (`mcpServers` JSON), so Oxide can reuse them.
 pub fn discover_external_mcp() -> Vec<McpServerConfig> {
+    // Cache for 60s — engines respawn on every tab switch and ~/.claude.json
+    // can be megabytes; no need to re-read + re-parse it each time.
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<(std::time::Instant, Vec<McpServerConfig>)>>> =
+        std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    if let Ok(g) = cache.lock() {
+        if let Some((t, v)) = g.as_ref() {
+            if t.elapsed() < std::time::Duration::from_secs(60) {
+                return v.clone();
+            }
+        }
+    }
     let mut out: Vec<McpServerConfig> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
@@ -312,6 +324,9 @@ pub fn discover_external_mcp() -> Vec<McpServerConfig> {
                 }
             }
         }
+    }
+    if let Ok(mut g) = cache.lock() {
+        *g = Some((std::time::Instant::now(), out.clone()));
     }
     out
 }
@@ -470,7 +485,7 @@ struct Engine {
     /// Undo log for file-mutating tool calls.
     checkpoints: CheckpointStore,
     /// Connected MCP servers (one per configured launcher).
-    mcp_clients: Vec<McpClient>,
+    mcp_clients: Vec<std::sync::Arc<McpClient>>,
     /// Namespaced tool specs discovered from all MCP servers.
     mcp_tools: Vec<ToolSpec>,
     /// Lazily launched browser-automation session.
@@ -616,6 +631,13 @@ impl Engine {
     /// Launch each configured MCP server and merge its tools. Failures are
     /// reported but never fatal — a missing server just means fewer tools.
     async fn connect_mcp_servers(&mut self) {
+        // Process-wide pool of live MCP connections, keyed by server config.
+        // Tab switches respawn the engine; without this every switch paid the
+        // full reconnect (npx cold start) for every server.
+        type Pool = std::collections::HashMap<String, (std::sync::Arc<McpClient>, Vec<oxide_protocol::ToolSpec>)>;
+        static MCP_POOL: std::sync::OnceLock<tokio::sync::Mutex<Pool>> = std::sync::OnceLock::new();
+        let pool = MCP_POOL.get_or_init(Default::default);
+
         let mut servers = self.config.mcp_servers.clone();
         // Auto-import MCP servers configured in Codex / Claude desktop so they
         // are available in Oxide without re-declaring them.
@@ -633,6 +655,21 @@ impl Engine {
             .map(|srv| {
                 let srv = srv.clone();
                 async move {
+                    let key = format!("{}|{}|{}|{}", srv.name, srv.command, srv.args.join(" "), srv.url);
+                    // Reuse a live pooled connection when it still answers.
+                    if let Some((client, tools)) = pool.lock().await.get(&key).cloned() {
+                        let alive = tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            client.list_tools(),
+                        )
+                        .await
+                        .map(|r| r.is_ok())
+                        .unwrap_or(false);
+                        if alive {
+                            return (srv, Ok((client, tools)));
+                        }
+                        pool.lock().await.remove(&key);
+                    }
                     let fut = async {
                         let client = if !srv.url.is_empty() {
                             McpClient::connect_http(&srv.name, &srv.url).await?
@@ -640,12 +677,15 @@ impl Engine {
                             McpClient::connect_stdio(&srv.name, &srv.command, &srv.args).await?
                         };
                         let tools = client.list_tools().await?;
-                        Ok::<_, anyhow::Error>((client, tools))
+                        Ok::<_, anyhow::Error>((std::sync::Arc::new(client), tools))
                     };
                     let res = match tokio::time::timeout(std::time::Duration::from_secs(15), fut).await {
                         Ok(r) => r,
                         Err(_) => Err(anyhow::anyhow!("timed out after 15s")),
                     };
+                    if let Ok((client, tools)) = &res {
+                        pool.lock().await.insert(key, (client.clone(), tools.clone()));
+                    }
                     (srv, res)
                 }
             })
