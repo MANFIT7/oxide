@@ -1795,6 +1795,24 @@ fn app() -> Element {
                             let same_ws = ws == cur_ws;
                             cur_ws = ws.clone();
                             let kept = if same_ws { messages.peek().clone() } else { Vec::new() };
+                            // Keep the active tab's provider/logo/title in sync with
+                            // the picker — switching ChatGPT→Claude must restyle the tab.
+                            {
+                                let cur = *active_tab.peek();
+                                let mut tw = tabs.write();
+                                if let Some(t) = tw.get_mut(cur) {
+                                    if t.mode == "gui" && t.provider != conf.provider {
+                                        let was_default = t.title == provider_title(&t.provider);
+                                        t.provider = conf.provider.clone();
+                                        t.model = conf.model.clone();
+                                        if was_default {
+                                            t.title = provider_title(&conf.provider).to_string();
+                                        }
+                                    } else if t.mode == "gui" {
+                                        t.model = conf.model.clone();
+                                    }
+                                }
+                            }
                             approvals.write().clear();
                             checkpoints.write().clear();
                             timeline.write().clear();
