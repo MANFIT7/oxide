@@ -29,7 +29,11 @@ impl AnthropicProvider {
             api_key: std::env::var("ANTHROPIC_API_KEY").unwrap_or_default(),
             base_url: std::env::var("ANTHROPIC_BASE_URL")
                 .unwrap_or_else(|_| "https://api.anthropic.com/v1".to_string()),
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .read_timeout(std::time::Duration::from_secs(120))
+                .build()
+                .unwrap_or_default(),
         }
     }
 }
@@ -52,14 +56,36 @@ fn body(req: &TurnRequest) -> Value {
         .collect::<Vec<_>>()
         .join("\n\n");
 
+    // Tool calls become assistant `tool_use` blocks and results become user
+    // `tool_result` blocks paired by id — flattening them to text makes the
+    // model re-plan/re-call the same tool every round.
     let messages: Vec<Value> = req
         .messages
         .iter()
         .filter(|m| m.role != Role::System)
         .map(|m| {
+            if let Some(tc) = &m.tool_call {
+                let mut content = Vec::new();
+                if !m.content.is_empty() {
+                    content.push(json!({ "type": "text", "text": m.content }));
+                }
+                content.push(json!({
+                    "type": "tool_use", "id": tc.id, "name": tc.name, "input": tc.arguments,
+                }));
+                return json!({ "role": "assistant", "content": content });
+            }
+            if m.role == Role::Tool {
+                if let Some(id) = &m.tool_call_id {
+                    return json!({
+                        "role": "user",
+                        "content": [{ "type": "tool_result", "tool_use_id": id, "content": m.content }]
+                    });
+                }
+                return json!({ "role": "user", "content": m.content });
+            }
             let role = match m.role {
                 Role::Assistant => "assistant",
-                _ => "user", // user + tool results fold into the user turn for now
+                _ => "user",
             };
             json!({ "role": role, "content": m.content })
         })

@@ -7,16 +7,39 @@
 //! quality — it never blocks search.
 
 use model2vec_rs::model::StaticModel;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::OnceLock;
 
 const REPO: &str = "minishlab/potion-base-8M";
 
-static MODEL: OnceLock<Option<StaticModel>> = OnceLock::new();
+static MODEL: OnceLock<StaticModel> = OnceLock::new();
+// 0 = not started, 1 = loading (background), 2 = ready, 3 = failed.
+static STATE: AtomicU8 = AtomicU8::new(0);
 
+/// Non-blocking model access. The ~30MB download (first run) happens on a
+/// DETACHED thread: a stalled fetch must never block `codebase_search` — the
+/// hf-hub read has no timeout, and a blocked OnceLock init would make every
+/// later search burn its full budget and leak a thread. Until the model is
+/// ready, callers just skip the semantic rerank (TF-IDF order stands).
 fn model() -> Option<&'static StaticModel> {
-    MODEL
-        .get_or_init(|| StaticModel::from_pretrained(REPO, None, None, None).ok())
-        .as_ref()
+    match STATE.load(Ordering::Acquire) {
+        2 => MODEL.get(),
+        3 => None,
+        _ => {
+            if STATE.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                std::thread::spawn(|| {
+                    match StaticModel::from_pretrained(REPO, None, None, None) {
+                        Ok(m) => {
+                            let _ = MODEL.set(m);
+                            STATE.store(2, Ordering::Release);
+                        }
+                        Err(_) => STATE.store(3, Ordering::Release),
+                    }
+                });
+            }
+            None
+        }
+    }
 }
 
 fn dot(a: &[f32], b: &[f32]) -> f32 {

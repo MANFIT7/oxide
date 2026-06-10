@@ -32,6 +32,7 @@ impl StdioTransport {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
+            .kill_on_drop(true)
             .spawn()?;
         let stdin = child
             .stdin
@@ -67,13 +68,13 @@ impl Transport for StdioTransport {
         let req = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
 
         let mut io = self.inner.lock().await;
-        StdioTransport::send(&mut io, &req).await?;
 
-        // Read lines until we get the response with our id (skipping any
-        // notifications the server emits in between) — bounded so a silent
-        // server can't hang the agent.
+        // Both the WRITE and the read are inside the timeout: a server that
+        // stopped reading stdin would otherwise block write_all forever while
+        // holding the transport mutex (wedging every later call).
         let mut line = String::new();
         let read = async {
+            StdioTransport::send(&mut io, &req).await?;
             loop {
                 line.clear();
                 let n = io.stdout.read_line(&mut line).await?;

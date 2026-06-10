@@ -114,24 +114,6 @@ fn web_client() -> Option<reqwest::Client> {
         .ok()
 }
 
-/// Decode `%XX` percent-escapes (UTF-8).
-fn percent_decode(s: &str) -> String {
-    let b = s.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len() {
-            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                out.push(v);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(if b[i] == b'+' { b' ' } else { b[i] });
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).to_string()
-}
 
 /// Decode the few HTML entities that matter for plain-text output.
 fn html_decode(s: &str) -> String {
@@ -154,15 +136,6 @@ fn strip_tags(s: &str) -> String {
     out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// A DuckDuckGo redirect href (`...uddg=<enc>`) → the real URL.
-fn decode_ddg(href: &str) -> String {
-    if let Some(i) = href.find("uddg=") {
-        let v = &href[i + 5..];
-        let end = v.find('&').unwrap_or(v.len());
-        return percent_decode(&v[..end]);
-    }
-    href.trim_start_matches("//").to_string()
-}
 
 /// Extract text inside `marker … > BODY <end>` from `hay`, tags stripped.
 fn extract_between(hay: &str, marker: &str, end: &str) -> Option<String> {
@@ -442,6 +415,8 @@ pub fn spawn(config: Config) -> anyhow::Result<(EngineHandle, mpsc::Receiver<Eve
         turn_edited: false,
         turn_edit_paths: Vec::new(),
         turn_reads: std::collections::HashSet::new(),
+        last_tool_sig: String::new(),
+        last_tool_reps: 0,
         event_tx,
     };
 
@@ -494,6 +469,9 @@ struct Engine {
     /// Files already read THIS turn — re-reading the same file is intercepted to
     /// break the "read README → re-plan → read README again" loop.
     turn_reads: std::collections::HashSet<String>,
+    /// Doom-loop guard: last tool call signature + consecutive repeat count.
+    last_tool_sig: String,
+    last_tool_reps: u8,
     event_tx: mpsc::Sender<Event>,
 }
 
@@ -626,18 +604,36 @@ impl Engine {
                 servers.push(ext);
             }
         }
-        for srv in servers {
-            if !srv.enabled {
-                continue;
-            }
-            let connect = if !srv.url.is_empty() {
-                McpClient::connect_http(&srv.name, &srv.url).await
-            } else {
-                McpClient::connect_stdio(&srv.name, &srv.command, &srv.args).await
-            };
-            match connect {
-                Ok(client) => match client.list_tools().await {
-                    Ok(tools) => {
+        // Connect all servers CONCURRENTLY with a hard per-server deadline —
+        // sequential 60s connects to stale npx servers used to make the engine
+        // ignore the first user message for minutes.
+        let conn_futs = servers
+            .iter()
+            .filter(|s| s.enabled)
+            .map(|srv| {
+                let srv = srv.clone();
+                async move {
+                    let fut = async {
+                        let client = if !srv.url.is_empty() {
+                            McpClient::connect_http(&srv.name, &srv.url).await?
+                        } else {
+                            McpClient::connect_stdio(&srv.name, &srv.command, &srv.args).await?
+                        };
+                        let tools = client.list_tools().await?;
+                        Ok::<_, anyhow::Error>((client, tools))
+                    };
+                    let res = match tokio::time::timeout(std::time::Duration::from_secs(15), fut).await {
+                        Ok(r) => r,
+                        Err(_) => Err(anyhow::anyhow!("timed out after 15s")),
+                    };
+                    (srv, res)
+                }
+            })
+            .collect::<Vec<_>>();
+        for (srv, connect) in futures::future::join_all(conn_futs).await {
+            match connect.map(|(c, t)| { self.mcp_clients.push(c); t }) {
+                Ok(tools) => {
+                    {
                         let tool_names = tools.iter().map(|tool| tool.name.clone()).collect();
                         self.emit(Event::McpServerStatus {
                             name: srv.name.clone(),
@@ -652,23 +648,8 @@ impl Engine {
                         })
                         .await;
                         self.mcp_tools.extend(tools);
-                        self.mcp_clients.push(client);
                     }
-                    Err(e) => {
-                        self.emit(Event::McpServerStatus {
-                            name: srv.name.clone(),
-                            status: "error".to_string(),
-                            tool_count: 0,
-                            tools: Vec::new(),
-                            detail: format!("tools/list failed: {e}"),
-                        })
-                        .await;
-                        self.emit(Event::Error {
-                            message: format!("mcp '{}' tools/list failed: {e}", srv.name),
-                        })
-                        .await;
-                    }
-                },
+                }
                 Err(e) => {
                     self.emit(Event::McpServerStatus {
                         name: srv.name.clone(),
@@ -693,15 +674,18 @@ impl Engine {
         let hooks = hooks::Hooks::load(&self.workspace);
         let mut blocked = false;
         for cmd in hooks.commands(event) {
-            let status = tokio::process::Command::new("/bin/sh")
+            let fut = tokio::process::Command::new("/bin/sh")
                 .arg("-c")
                 .arg(cmd)
                 .current_dir(&self.workspace)
                 .env("OXIDE_HOOK_EVENT", event)
                 .env("OXIDE_HOOK_PAYLOAD", payload.to_string())
-                .output()
-                .await;
-            let ok = status.map(|o| o.status.success()).unwrap_or(false);
+                .stdin(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .output();
+            // A hook must never wedge the agent — bound it (60s, then killed).
+            let status = tokio::time::timeout(std::time::Duration::from_secs(60), fut).await;
+            let ok = matches!(&status, Ok(Ok(o)) if o.status.success());
             let this_blocked = event == "pre_tool" && !ok;
             if this_blocked {
                 blocked = true;
@@ -916,7 +900,12 @@ impl Engine {
         let provider = oxide_providers::build(provider_id);
         let task = tokio::spawn(async move { provider.stream(req, tx).await });
         let mut out = String::new();
-        while let Some(item) = rx.recv().await {
+        // Idle-timeout like run_turn — a stalled provider must not wedge
+        // compaction/orchestration forever (this path can't be interrupted).
+        while let Some(item) = match tokio::time::timeout(std::time::Duration::from_secs(180), rx.recv()).await {
+            Ok(it) => it,
+            Err(_) => { task.abort(); None }
+        } {
             match item {
                 StreamItem::TextDelta(t) => {
                     out.push_str(&t);
@@ -1162,9 +1151,12 @@ impl Engine {
         let mut overflow_retries = 0u8;
         let mut nudges = 0u8;
         let mut verifies = 0u8;
+        let mut wrapped_up = false;
         self.turn_edited = false;
         self.turn_reads.clear();
         self.turn_edit_paths.clear();
+        self.last_tool_sig.clear();
+        self.last_tool_reps = 0;
         loop {
             // Keep the running history under budget on EVERY request — long
             // agentic turns accumulate tool output and would otherwise overflow.
@@ -1253,6 +1245,12 @@ impl Engine {
                                 self.emit(Event::Info { text: format!("↪ steering: {text}") }).await;
                                 steered = true;
                             }
+                            // Rewind works mid-turn too — restoring a checkpoint
+                            // is independent of the stream in flight.
+                            Some(Op::Rewind { checkpoint_id }) => {
+                                let restored = self.checkpoints.rewind(checkpoint_id);
+                                self.emit(Event::RewindDone { id: checkpoint_id, restored }).await;
+                            }
                             Some(other) => {
                                 self.emit(Event::Info { text: format!("queued op ignored mid-turn: {other:?}") }).await;
                             }
@@ -1293,11 +1291,17 @@ impl Engine {
                 break;
             }
             if step >= max_steps {
-                // Force a text-only wrap-up instead of silently stopping (opencode-style).
-                self.session.push(Message::new(Role::User,
-                    "<system-reminder>\nMaximum tool steps reached. Do NOT call any more tools. \
+                // Force a text-only wrap-up instead of silently stopping
+                // (opencode-style). One extra round so the model actually SEES
+                // the reminder — pushing it and breaking sent nothing.
+                if !wrapped_up {
+                    wrapped_up = true;
+                    self.session.push(Message::new(Role::User,
+                        "<system-reminder>\nMaximum tool steps reached. Do NOT call any more tools. \
 Reply with text only: summarize what you changed (with file paths and how you verified), and list \
 any remaining tasks and the recommended next step.\n</system-reminder>"));
+                    continue;
+                }
                 break;
             }
             if !did_tool && !steered {
@@ -1454,7 +1458,14 @@ then stop. Apply fixes with edit/write_file — do not just explain.\n\n{report}
             let answer = loop {
                 match op_rx.recv().await {
                     Some(Op::QuestionAnswer { request_id: rid, answer }) if rid == request_id => break answer,
-                    Some(Op::Interrupt) | Some(Op::Shutdown) | None => return true,
+                    // A typed message while a question is pending IS the answer —
+                    // frontends without a dedicated answer UI (TUI, panes) would
+                    // otherwise deadlock here.
+                    Some(Op::UserTurn { text }) => break text,
+                    Some(Op::Interrupt) | Some(Op::Shutdown) | None => {
+                        self.session.push(Message::tool_result("interrupted before answering", call_id));
+                        return true;
+                    }
                     Some(_) => {}
                 }
             };
@@ -1476,6 +1487,9 @@ then stop. Apply fixes with edit/write_file — do not just explain.\n\n{report}
         // Gate on policy; request approval if needed.
         match router.route(&name) {
             Routed::Denied(reason) => {
+                // Always pair the recorded tool call with a result — a dangling
+                // function_call poisons every later request on paired providers.
+                self.session.push(Message::tool_result(format!("denied: {reason}"), call_id));
                 self.emit(Event::ToolCallEnd {
                     turn,
                     tool: name,
@@ -1504,6 +1518,7 @@ then stop. Apply fixes with edit/write_file — do not just explain.\n\n{report}
                             decision,
                         }) if rid == request_id => match decision {
                             ApprovalDecision::Reject => {
+                                self.session.push(Message::tool_result("rejected by user", call_id));
                                 self.emit(Event::ToolCallEnd {
                                     turn,
                                     tool: name,
@@ -1519,7 +1534,10 @@ then stop. Apply fixes with edit/write_file — do not just explain.\n\n{report}
                             }
                             ApprovalDecision::Approve => break,
                         },
-                        Some(Op::Interrupt) | Some(Op::Shutdown) | None => return true,
+                        Some(Op::Interrupt) | Some(Op::Shutdown) | None => {
+                            self.session.push(Message::tool_result("interrupted before approval", call_id));
+                            return true;
+                        }
                         Some(_) => {} // ignore unrelated ops while awaiting approval
                     }
                 }
@@ -1528,6 +1546,7 @@ then stop. Apply fixes with edit/write_file — do not just explain.\n\n{report}
 
         // pre_tool hook — may block.
         if self.fire_hooks("pre_tool", serde_json::json!({ "tool": name.clone(), "args": arguments.clone() })).await {
+            self.session.push(Message::tool_result("blocked by pre_tool hook", call_id));
             self.emit(Event::ToolCallEnd {
                 turn,
                 tool: name,
@@ -1536,6 +1555,30 @@ then stop. Apply fixes with edit/write_file — do not just explain.\n\n{report}
             })
             .await;
             return false;
+        }
+
+        // Doom-loop guard (opencode-style): the SAME tool with byte-identical
+        // input 3× in a row is never progress — stop executing it and force a
+        // change of approach instead of burning the turn.
+        {
+            let sig = format!("{name}:{arguments}");
+            if sig == self.last_tool_sig {
+                self.last_tool_reps += 1;
+            } else {
+                self.last_tool_sig = sig;
+                self.last_tool_reps = 0;
+            }
+            if self.last_tool_reps >= 2 {
+                let msg = format!(
+                    "Loop detected: you've called `{name}` with identical input {} times in a row. \
+The result will not change. STOP repeating this call — change your approach (different arguments, \
+a different tool, or ask_user if you're blocked).",
+                    self.last_tool_reps + 1
+                );
+                self.session.push(Message::tool_result(msg.clone(), call_id));
+                self.emit(Event::ToolCallEnd { turn, tool: name, output: msg, ok: false }).await;
+                return false;
+            }
         }
 
         // Break the re-read loop: if the model reads a file it already read this

@@ -68,6 +68,7 @@ where
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
+        .kill_on_drop(true)
         .stderr(Stdio::null())
         .spawn()
         .map_err(|e| anyhow::anyhow!("failed to spawn '{program}': {e}"))?;

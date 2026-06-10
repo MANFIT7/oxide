@@ -46,7 +46,11 @@ impl OpenAiProvider {
                 .unwrap_or_else(|_| default_base_url.to_string())
                 .trim_end_matches('/')
                 .to_string(),
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .read_timeout(std::time::Duration::from_secs(120))
+                .build()
+                .unwrap_or_default(),
         }
     }
 }
@@ -72,10 +76,36 @@ fn tool_json(t: &ToolSpec) -> Value {
 }
 
 fn body(req: &TurnRequest) -> Value {
+    // Tool calls/results must stay structurally paired (tool_calls + tool_call_id)
+    // or the model loses track of executed tools and the API rejects orphan
+    // role:"tool" messages.
     let messages: Vec<Value> = req
         .messages
         .iter()
-        .map(|m: &Message| json!({ "role": role_str(m.role), "content": m.content }))
+        .map(|m: &Message| {
+            if let Some(tc) = &m.tool_call {
+                return json!({
+                    "role": "assistant",
+                    "content": if m.content.is_empty() { Value::Null } else { Value::String(m.content.clone()) },
+                    "tool_calls": [{
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.name,
+                            "arguments": serde_json::to_string(&tc.arguments).unwrap_or_else(|_| "{}".into()),
+                        }
+                    }]
+                });
+            }
+            if m.role == Role::Tool {
+                if let Some(id) = &m.tool_call_id {
+                    return json!({ "role": "tool", "tool_call_id": id, "content": m.content });
+                }
+                // Legacy unpaired tool note — fold into a user message.
+                return json!({ "role": "user", "content": m.content });
+            }
+            json!({ "role": role_str(m.role), "content": m.content })
+        })
         .collect();
     let mut b = json!({
         "model": req.model,

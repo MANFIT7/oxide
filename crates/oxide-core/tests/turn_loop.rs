@@ -94,48 +94,6 @@ async fn mock_provider_tool_call_writes_file_in_sandbox() {
 }
 
 #[tokio::test]
-async fn mock_provider_browser_tool_emits_browser_events() {
-    let tmp = std::env::temp_dir().join(format!("oxide-browser-event-{}", std::process::id()));
-    std::fs::create_dir_all(&tmp).unwrap();
-
-    let mut config = Config::default();
-    config.provider = "mock_browser".into();
-    config.approval_policy = oxide_protocol::ApprovalPolicy::Never;
-    config.persist = false;
-    config.workspace = Some(tmp.clone());
-
-    let (handle, mut events) = oxide_core::spawn(config).expect("spawn");
-    let _ = events.recv().await; // Ready
-
-    handle
-        .submit(Op::UserTurn {
-            text: "open browser".into(),
-        })
-        .await
-        .unwrap();
-
-    let mut target_seen = false;
-    let mut snapshot_seen = false;
-    while let Some(ev) = events.recv().await {
-        match ev {
-            Event::BrowserTargetChanged { url, note, .. } => {
-                target_seen = url == "http://localhost:3000" && note == "Open login page";
-            }
-            Event::BrowserSnapshotRequested { url, note, .. } => {
-                snapshot_seen = url == "http://localhost:3000" && note == "Capture login page";
-            }
-            Event::TurnFinished { .. } => break,
-            _ => {}
-        }
-    }
-
-    assert!(target_seen, "browser target event should be emitted");
-    assert!(snapshot_seen, "browser snapshot event should be emitted");
-    handle.submit(Op::Shutdown).await.unwrap();
-    std::fs::remove_dir_all(tmp).ok();
-}
-
-#[tokio::test]
 async fn checkpoint_then_rewind_undoes_write() {
     let tmp = std::env::temp_dir().join(format!("oxide-rewind-{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();

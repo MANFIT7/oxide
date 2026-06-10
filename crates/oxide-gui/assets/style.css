@@ -1562,3 +1562,26 @@ details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
 .todo-row.in_progress .todo-text { color: var(--text); }
 .todo-row.pending .todo-text { color: var(--muted); }
 .todo-row .syn-spinner { width: 11px; height: 11px; }
+
+/* ── UX polish: micro-animations + feedback ───────────────────── */
+/* menus/popovers/modals ease in instead of popping */
+@keyframes menu-in { from { opacity: 0; transform: translateY(4px) scale(.985); } to { opacity: 1; transform: none; } }
+.model-menu, .effort-menu, .plus-menu, .sel-menu, .access-menu, .palette, .modal,
+.theme-menu, .mention-menu, .thread-menu, .newtab-menu { animation: menu-in .12s ease-out; }
+/* non-.row cards get the same entrance as messages */
+.question-card, .approval-card, .edits-card, .todo-card, .queue-bar, .status-pill,
+.thinking-box, .attach-card, .elem-chip { animation: synara-msg-in .22s cubic-bezier(.22,1,.36,1); }
+/* smooth hover on dense controls */
+.menu-item, .plus-item, .insp-tab, .agent-tab, .node, .ed-save, .ed-close,
+.diff-revert, .review-accept, .review-reject, .msg-act, .row-act-btn, .top-btn,
+.git-act, .preview-btn { transition: background .12s ease, color .12s ease, border-color .12s ease; }
+/* destructive confirm state for the restore button */
+.msg-act.danger { color: #fff; background: var(--danger, #fa423e); border-color: var(--danger, #fa423e); width: auto; padding: 0 8px; font-size: 11px; }
+/* edits-card undone state */
+.edits-undone { margin-left: auto; font-size: 12px; color: var(--muted); }
+@media (prefers-reduced-motion: reduce) {
+  .model-menu, .effort-menu, .plus-menu, .sel-menu, .access-menu, .palette, .modal,
+  .theme-menu, .mention-menu, .thread-menu, .newtab-menu,
+  .question-card, .approval-card, .edits-card, .todo-card, .queue-bar, .status-pill,
+  .thinking-box, .attach-card, .elem-chip { animation: none; }
+}

@@ -349,7 +349,7 @@ struct ChatMsg {
 /// Commands sent into the engine coroutine.
 enum EngineCmd {
     /// `engine` is the full prompt (with mention/skill/MCP context); `display`
-    /// is the clean bubble text, optionally `"<space-joined mentions>\u{1}<body>"`.
+    /// is the clean bubble text.
     Submit { engine: String, display: String },
     Reconfigure(Config),
     /// Switch to another agent tab: reconfigure the engine to `0` and restore
@@ -392,23 +392,6 @@ struct Ui {
     dirty: Signal<bool>,
 }
 
-/// Detect an in-progress `@mention` at the end of the input: returns the byte
-/// index of the `@` and the query typed after it (no whitespace yet).
-fn active_mention(text: &str) -> Option<(usize, String)> {
-    let at = text.rfind('@')?;
-    // The `@` must start a token (preceded by start-of-string or whitespace).
-    if at > 0 {
-        let prev = text[..at].chars().next_back().unwrap();
-        if !prev.is_whitespace() {
-            return None;
-        }
-    }
-    let q = &text[at + 1..];
-    if q.chars().any(|c| c.is_whitespace()) {
-        return None;
-    }
-    Some((at, q.to_string()))
-}
 
 /// Walk the workspace for files/folders matching `query` (codebase `@` picker).
 fn mention_candidates(ws: &Path, query: &str) -> Vec<String> {
@@ -484,7 +467,13 @@ if(sel && sel.rangeCount){
 }
 const empty = !el || (el.textContent.replace(/ /g,'').trim()==='' && el.querySelectorAll('.ce-chip').length===0);
 if (empty && el && el.innerHTML !== '') el.innerHTML = '';
-return JSON.stringify({q, empty});
+// Leading "/query" (no space yet) -> drive the slash-command menu.
+let slash=null;
+if (el) {
+  const sm = el.textContent.trim().match(/^\/([a-zA-Z0-9_-]*)$/);
+  if (sm) slash = sm[1];
+}
+return JSON.stringify({q, empty, slash});
 "#;
 
 /// JS: serialize the editor into `{body, tokens}` for submission.
@@ -612,85 +601,6 @@ fn mention_label(token: &str) -> String {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn submit_prompt(
-    mut input: Signal<String>,
-    streaming: Signal<bool>,
-    engine: Coroutine<EngineCmd>,
-    plan_mode: Signal<bool>,
-    pursue_goal: Signal<bool>,
-    goal_text: Signal<String>,
-    mut mentions: Signal<Vec<String>>,
-    mut queue: Signal<Vec<String>>,
-    steer: bool,
-    ws: &Path,
-) {
-    let raw = input.read().trim().to_string();
-    if raw.is_empty() {
-        return;
-    }
-    let mut text = String::new();
-    if *plan_mode.read() {
-        text.push_str("[Plan mode] Produce a clear, numbered plan first and do NOT modify anything yet — wait for approval.\n\n");
-    }
-    if *pursue_goal.read() {
-        let g = goal_text.read().clone();
-        if g.trim().is_empty() {
-            text.push_str("[Pursue goal] Keep working autonomously until this is fully done.\n\n");
-        } else {
-            text.push_str(&format!("[Pursue goal] Keep working autonomously until this goal is fully done: {}\n\n", g.trim()));
-        }
-    }
-    let ms = mentions.read().clone();
-    if !ms.is_empty() {
-        let mut files = Vec::new();
-        let mut skills_block = String::new();
-        let mut mcp_block = String::new();
-        for m in &ms {
-            if let Some(name) = m.strip_prefix("mcp:") {
-                mcp_block.push_str(&format!("\n- `{name}` — call its tools via `mcp__{name}__*`"));
-            } else if let Some(name) = m.strip_prefix("skill:") {
-                let p = ws.join(".oxide/memory/skills").join(format!("{name}.md"));
-                match std::fs::read_to_string(&p) {
-                    Ok(c) => skills_block.push_str(&format!("\n## Skill: {name}\n{}\n", c.trim())),
-                    Err(_) => skills_block.push_str(&format!("\n## Skill: {name} (not found)\n")),
-                }
-            } else {
-                files.push(format!("@{m}"));
-            }
-        }
-        if !mcp_block.is_empty() {
-            text.push_str("Use these MCP servers for this task:");
-            text.push_str(&mcp_block);
-            text.push('\n');
-        }
-        if !files.is_empty() {
-            text.push_str("Context files: ");
-            text.push_str(&files.join(" "));
-            text.push('\n');
-        }
-        if !skills_block.is_empty() {
-            text.push_str(&skills_block);
-        }
-        text.push('\n');
-    }
-    text.push_str(&raw);
-    // Clean bubble text: just what the user typed, with the picked mentions
-    // shown as chips (encoded before a \u{1} marker) instead of inline context.
-    let display = if ms.is_empty() {
-        raw.clone()
-    } else {
-        format!("{}\u{1}{}", ms.join(" "), raw)
-    };
-    mentions.set(Vec::new());
-    input.set(String::new());
-    if !steer && *streaming.read() {
-        // Default while running: queue — don't disturb the current turn.
-        queue.write().push(text);
-    } else {
-        // Idle → new turn. Steer → inject into the running turn.
-        let _ = engine.send(EngineCmd::Submit { engine: text, display });
-    }
-}
 
 /// Serialize the contenteditable composer, build the prompt, and submit it.
 #[allow(clippy::too_many_arguments)]
@@ -1000,15 +910,6 @@ fn list_harnesses(dir: &Path) -> Vec<String> {
     out
 }
 
-/// Active `/slash` query (input starts with `/`, no space yet).
-fn active_slash(text: &str) -> Option<String> {
-    let t = text.trim_start();
-    let rest = t.strip_prefix('/')?;
-    if rest.contains(char::is_whitespace) {
-        return None;
-    }
-    Some(rest.to_string())
-}
 
 /// Available slash commands `(name, description)` matching `query`.
 fn slash_commands(ws: &Path, query: &str) -> Vec<(String, String)> {
@@ -1140,8 +1041,8 @@ fn archive_session(path: &Path) {
 
 /// First user line of a session as its title.
 fn session_title(path: &Path) -> String {
-    std::fs::read_to_string(path)
-        .ok()
+    Some(read_prefix(path, 8192))
+        .filter(|t| !t.is_empty())
         .and_then(|t| {
             t.lines().find_map(|l| {
                 let v: serde_json::Value = serde_json::from_str(l).ok()?;
@@ -1154,6 +1055,16 @@ fn session_title(path: &Path) -> String {
         })
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "Chat".to_string())
+}
+
+/// Read only the first ~8KB of a file — enough for a session title without
+/// slurping multi-MB transcripts on every sidebar/palette render.
+fn read_prefix(path: &Path, cap: usize) -> String {
+    use std::io::Read;
+    let Ok(f) = std::fs::File::open(path) else { return String::new() };
+    let mut buf = String::new();
+    let _ = f.take(cap as u64).read_to_string(&mut buf);
+    buf
 }
 
 /// Recent non-empty sessions `(path, title, msg_count)`, newest first. Deletes
@@ -1182,7 +1093,7 @@ fn recent_sessions(ws: &Path) -> Vec<(PathBuf, std::time::SystemTime, String)> {
                 }
                 continue;
             }
-            let text = std::fs::read_to_string(&p).unwrap_or_default();
+            let text = read_prefix(&p, 8192);
             let count = text.lines().filter(|l| !l.trim().is_empty()).count();
             if count == 0 {
                 if !fresh {
@@ -1211,18 +1122,6 @@ fn recent_sessions(ws: &Path) -> Vec<(PathBuf, std::time::SystemTime, String)> {
     items.into_iter().take(30).collect()
 }
 
-/// Format a reset-after duration (seconds) like "in 5h" / "in 5d".
-fn fmt_reset(secs: u64) -> String {
-    if secs == 0 {
-        "—".to_string()
-    } else if secs < 3600 {
-        format!("{}m", (secs / 60).max(1))
-    } else if secs < 86_400 {
-        format!("{}h", secs / 3600)
-    } else {
-        format!("{}d", secs / 86_400)
-    }
-}
 
 /// Short relative time like "5m", "3h", "2d", "1w".
 fn relative_time(t: std::time::SystemTime) -> String {
@@ -1408,19 +1307,6 @@ async fn git_run(ws: PathBuf, args: Vec<String>) -> String {
     }
 }
 
-/// Commit an `@mention` selection: strip the in-progress `@query` from the
-/// input and add the path as a chip.
-fn pick_mention(mut input: Signal<String>, mut mentions: Signal<Vec<String>>, at: usize, path: String) {
-    let text = input.read().clone();
-    let base = text.get(..at).unwrap_or("").trim_end().to_string();
-    input.set(base);
-    let clean = path.trim_end_matches('/').to_string();
-    let mut m = mentions.read().clone();
-    if !m.contains(&clean) {
-        m.push(clean);
-    }
-    mentions.set(m);
-}
 
 fn open_file(mut ui: Ui, path: PathBuf) {
     match std::fs::read_to_string(&path) {
@@ -1446,7 +1332,6 @@ fn app() -> Element {
 
     // Chat state.
     let mut messages = use_signal(Vec::<ChatMsg>::new);
-    let input = use_signal(String::new);
     let mut context_limit = use_signal(|| None::<u64>);
     let mut streaming = use_signal(|| false);
 
@@ -1500,7 +1385,7 @@ fn app() -> Element {
             bin: String::new(),
         }]
     });
-    let mut active_tab = use_signal(|| 0usize);
+    let active_tab = use_signal(|| 0usize);
     let mut renaming_tab = use_signal(|| None::<u64>);
     let mut rename_text = use_signal(String::new);
     let next_tab_id = use_signal(|| 1u64);
@@ -1509,7 +1394,6 @@ fn app() -> Element {
     // Composer modes (shared across both Composer instances).
     let plan_mode = use_signal(|| false);
     let pursue_goal = use_signal(|| false);
-    let mentions = use_signal(Vec::<String>::new);
 
     // Inspector (right panel) state — ported from the desktop command center.
     let mut inspector_tab = use_signal(|| "files".to_string());
@@ -1536,6 +1420,11 @@ fn app() -> Element {
     let mut turn_edits = use_signal(Vec::<(String, u32, u32, u64, String)>::new);
     let mut todos = use_signal(Vec::<(String, String)>::new);
     let mut edits_expanded = use_signal(|| false);
+    let mut edits_undone = use_signal(|| false);
+    // Two-click confirm for the destructive restore-checkpoint hover button.
+    let mut confirm_restore = use_signal(|| None::<usize>);
+    // User override for the thinking-box open state (None = follow streaming).
+    let mut think_open = use_signal(|| None::<bool>);
     // Per activity-group open state (keyed by first row index). Defaults to the
     // running state but, once the user toggles, their choice sticks across the
     // streaming re-renders that would otherwise force it back open.
@@ -1608,14 +1497,15 @@ fn app() -> Element {
         });
     });
 
-    // Auto-scroll the chat to the bottom as content streams in.
+    // Auto-scroll the chat to the bottom as content streams in — but only when
+    // the user is already near the bottom, so reading scrollback isn't yanked.
     use_effect(move || {
         let _ = messages.read(); // subscribe to any transcript change
         let _ = thinking.read().len();
         let _ = status.read().len();
         spawn(async move {
             let _ = dioxus::document::eval(
-                "requestAnimationFrame(()=>{var s=document.querySelector('.scroll');if(s)s.scrollTop=s.scrollHeight;});",
+                "requestAnimationFrame(()=>{var s=document.querySelector('.scroll');if(s && (s.scrollHeight-s.scrollTop-s.clientHeight)<120)s.scrollTop=s.scrollHeight;});",
             );
         });
     });
@@ -1707,6 +1597,7 @@ fn app() -> Element {
             }
 
             start_engine!(initial);
+            let mut cur_ws = workspace_of(&{ cfg.peek().clone() });
 
             loop {
                 tokio::select! {
@@ -1717,6 +1608,10 @@ fn app() -> Element {
                                 messages.write().push(ChatMsg { author: Author::Agent, text: String::new() });
                                 streaming.set(true);
                                 let _ = h.submit(Op::UserTurn { text: eng }).await;
+                            } else {
+                                // Engine failed to start — don't eat the message silently.
+                                messages.write().push(ChatMsg { author: Author::User, text: display });
+                                messages.write().push(ChatMsg { author: Author::Note, text: "⚠ engine not running — check provider/settings, or switch model to restart it".into() });
                             }
                         }
                         Some(EngineCmd::Reconfigure(conf)) => {
@@ -1731,12 +1626,17 @@ fn app() -> Element {
                                     let _ = std::fs::write(gdir.join("config.toml"), &s);
                                 }
                             }
-                            messages.write().clear();
+                            // Only wipe the transcript when switching PROJECT — a
+                            // model/effort/fast/access change must not erase the chat.
+                            let same_ws = ws == cur_ws;
+                            cur_ws = ws.clone();
+                            let kept = if same_ws { messages.peek().clone() } else { Vec::new() };
                             approvals.write().clear();
                             checkpoints.write().clear();
                             timeline.write().clear();
                             streaming.set(false);
                             start_engine!(conf);
+                            messages.set(kept);
                         }
                         Some(EngineCmd::SwitchTab(conf, tab_msgs)) => {
                             approvals.write().clear();
@@ -1800,6 +1700,10 @@ fn app() -> Element {
                                 // MCP connect errors surface on the manager dots, not the chat.
                                 if !message.starts_with("mcp '") {
                                     messages.write().push(ChatMsg { author: Author::Note, text: format!("error: {message}") });
+                                    // A turn-level error means no TurnFinished may come —
+                                    // unstick the composer so the user can send again.
+                                    streaming.set(false);
+                                    status.set(String::new());
                                 }
                             }
                             Event::ContextWindow { limit } => context_limit.set(Some(limit)),
@@ -1817,6 +1721,8 @@ fn app() -> Element {
                                 turn_edits.write().clear();
                                 todos.write().clear();
                                 edits_expanded.set(false);
+                                edits_undone.set(false);
+                                think_open.set(None);
                                 timeline.write().push(TimelineItem { title: format!("Turn {turn} started"), sub: String::new() });
                             }
                             Event::ApprovalRequested { request_id, tool, summary } => {
@@ -1866,6 +1772,12 @@ fn app() -> Element {
                                     sub: command,
                                 });
                             }
+                            Event::BrowserTargetChanged { url, note, .. } => {
+                                timeline.write().push(TimelineItem { title: format!("🌐 open {url}"), sub: note });
+                            }
+                            Event::BrowserSnapshotRequested { url, note, .. } => {
+                                timeline.write().push(TimelineItem { title: format!("📸 snapshot {url}"), sub: note });
+                            }
                             Event::QuestionAsked { request_id, question, options } => {
                                 questions.write().push((request_id, question, options));
                             }
@@ -1876,11 +1788,16 @@ fn app() -> Element {
                                 let js = format!(
                                     "const P={primary_reset_s},S={secondary_reset_s};const p=new Date(Date.now()+P*1000),s=new Date(Date.now()+S*1000);const t=d=>d.toLocaleTimeString([],{{hour:'numeric',minute:'2-digit'}});const dd=d=>d.toLocaleDateString([],{{month:'short',day:'numeric'}});return JSON.stringify({{p:t(p),s:dd(s)}});"
                                 );
-                                let labels = dioxus::document::eval(&js).join::<String>().await.unwrap_or_default();
-                                let lv: serde_json::Value = serde_json::from_str(&labels).unwrap_or(serde_json::Value::Null);
-                                let pl = lv["p"].as_str().unwrap_or("").to_string();
-                                let sl = lv["s"].as_str().unwrap_or("").to_string();
-                                usage_info.set(Some((plan, p_rem, s_rem, pl, sl)));
+                                // Do NOT await the webview inline — a stalled eval here
+                                // blocks the whole engine-event loop (frozen stream).
+                                let mut usage_info = usage_info;
+                                spawn(async move {
+                                    let labels = dioxus::document::eval(&js).join::<String>().await.unwrap_or_default();
+                                    let lv: serde_json::Value = serde_json::from_str(&labels).unwrap_or(serde_json::Value::Null);
+                                    let pl = lv["p"].as_str().unwrap_or("").to_string();
+                                    let sl = lv["s"].as_str().unwrap_or("").to_string();
+                                    usage_info.set(Some((plan, p_rem, s_rem, pl, sl)));
+                                });
                             }
                             Event::CheckpointCreated { id, label, .. } => {
                                 checkpoints.write().push((id, label.clone()));
@@ -1888,6 +1805,8 @@ fn app() -> Element {
                             }
                             Event::RewindDone { id, restored } => {
                                 timeline.write().push(TimelineItem { title: format!("⎌ rewound to #{id}"), sub: format!("{restored} file(s) restored") });
+                                // Confirm in the transcript too — the timeline tab is rarely open.
+                                messages.write().push(ChatMsg { author: Author::Note, text: format!("⎌ Restored {restored} file(s) (checkpoint #{id})") });
                             }
                             Event::TokensUsed { input, output, .. } => {
                                 usage.set((input, output));
@@ -2635,10 +2554,10 @@ fn app() -> Element {
                     } else if is_empty {
                         div { class: "hero",
                             h1 { class: "hero-title", "What should we build in {project}?" }
-                            Composer { input, streaming, engine, cfg, model_label: model_label.clone(),
+                            Composer { streaming, engine, cfg, model_label: model_label.clone(),
                                        bypass, project: project.clone(), branch: branch.clone(),
                                        context_used: ctx_used, context_limit: ctx_limit,
-                                       workspace: workspace.clone(), plan_mode, pursue_goal, goal_text, mentions, queue, picked_element,
+                                       workspace: workspace.clone(), plan_mode, pursue_goal, goal_text, queue, picked_element,
                                        on_settings: move |_| show_settings.set(true),
                                        on_open_folder: move |_| open_folder(cfg, ui, engine), on_pick_workspace: move |dir| apply_workspace(cfg, ui, engine, dir) }
                             div { class: "suggestions",
@@ -2745,14 +2664,19 @@ fn app() -> Element {
                                                                         }
                                                                         div { class: "msg-actions",
                                                                             button { class: "msg-act", title: "Copy message", onclick: move |_| { let c = copy.clone(); spawn(async move { let _ = document::eval(&format!("navigator.clipboard.writeText({c})")).await; }); }, "⧉" }
-                                                                            button { class: "msg-act", title: "Restore checkpoint — revert files and chat back to here", onclick: move |_| {
-                                                                                let floor = { let ms = messages.read(); ms.iter().skip(idx + 1).find_map(|mm| if let Author::Diff(_, cp) = mm.author { Some(cp) } else { None }) };
-                                                                                if let Some(fl) = floor {
-                                                                                    let ids: Vec<u64> = checkpoints.read().iter().map(|(id, _)| *id).filter(|id| *id >= fl).collect();
-                                                                                    for id in ids.into_iter().rev() { let _ = engine.send(EngineCmd::Rewind { id }); reverted.write().insert(id); }
-                                                                                }
-                                                                                messages.write().truncate(idx + 1);
-                                                                            }, "↩" }
+                                                                            if *confirm_restore.read() == Some(idx) {
+                                                                                button { class: "msg-act danger", title: "Click again to confirm — this removes the messages below and reverts the files", onclick: move |_| {
+                                                                                    confirm_restore.set(None);
+                                                                                    let floor = { let ms = messages.read(); ms.iter().skip(idx + 1).find_map(|mm| if let Author::Diff(_, cp) = mm.author { Some(cp) } else { None }) };
+                                                                                    if let Some(fl) = floor {
+                                                                                        let ids: Vec<u64> = checkpoints.read().iter().map(|(id, _)| *id).filter(|id| *id >= fl).collect();
+                                                                                        for id in ids.into_iter().rev() { let _ = engine.send(EngineCmd::Rewind { id }); reverted.write().insert(id); }
+                                                                                    }
+                                                                                    messages.write().truncate(idx + 1);
+                                                                                }, "Restore?" }
+                                                                            } else {
+                                                                                button { class: "msg-act", title: "Restore checkpoint — revert files and chat back to here", onclick: move |_| confirm_restore.set(Some(idx)), "↩" }
+                                                                            }
                                                                         }
                                                                     }
                                                                 }
@@ -2766,8 +2690,15 @@ fn app() -> Element {
                                     }
                                 }
                                 if !thinking.read().is_empty() {
-                                    details { class: "thinking-box", open: *streaming.read(),
-                                        summary { class: "thinking-sum", "💭 Thinking" }
+                                    details { class: "thinking-box", open: think_open.read().unwrap_or(*streaming.read()),
+                                        summary { class: "thinking-sum",
+                                            onclick: move |e: dioxus::prelude::MouseEvent| {
+                                                e.prevent_default();
+                                                let cur = think_open.read().unwrap_or(*streaming.read());
+                                                think_open.set(Some(!cur));
+                                            },
+                                            "💭 Thinking"
+                                        }
                                         div { class: "thinking-body", "{thinking}" }
                                     }
                                 }
@@ -2852,9 +2783,14 @@ fn app() -> Element {
                                                         span { class: "edits-title", "Edited {n} file{plural}" }
                                                         span { class: "edits-counts", span { class: "diff-adds", "+{total_add}" } " " span { class: "diff-dels", "−{total_del}" } }
                                                     }
-                                                    button { class: "edits-undo", onclick: move |_| {
-                                                        for (_, _, _, cp, _) in turn_edits.read().iter() { let _ = engine.send(EngineCmd::Rewind { id: *cp }); reverted.write().insert(*cp); }
-                                                    }, "Undo ↺" }
+                                                    if *edits_undone.read() {
+                                                        span { class: "edits-undone", "✓ Undone" }
+                                                    } else {
+                                                        button { class: "edits-undo", onclick: move |_| {
+                                                            for (_, _, _, cp, _) in turn_edits.read().iter() { let _ = engine.send(EngineCmd::Rewind { id: *cp }); reverted.write().insert(*cp); }
+                                                            edits_undone.set(true);
+                                                        }, "Undo ↺" }
+                                                    }
                                                 }
                                                 for (path, a, d, _cp, diff) in edits.iter().take(shown).cloned() {
                                                     details { class: "edits-row-d",
@@ -2899,10 +2835,10 @@ fn app() -> Element {
                             }
                         }
                         div { class: "composer-dock",
-                            Composer { input, streaming, engine, cfg, model_label, bypass,
+                            Composer { streaming, engine, cfg, model_label, bypass,
                                        project: project.clone(), branch: branch.clone(),
                                        context_used: ctx_used, context_limit: ctx_limit,
-                                       workspace: workspace.clone(), plan_mode, pursue_goal, goal_text, mentions, queue, picked_element,
+                                       workspace: workspace.clone(), plan_mode, pursue_goal, goal_text, queue, picked_element,
                                        on_settings: move |_| show_settings.set(true),
                                        on_open_folder: move |_| open_folder(cfg, ui, engine), on_pick_workspace: move |dir| apply_workspace(cfg, ui, engine, dir) }
                         }
@@ -2974,7 +2910,7 @@ fn app() -> Element {
                                         span { class: "review-count", "{turn_edits.read().len()} changed file(s)" }
                                         button { class: "ed-close", onclick: move |_| {
                                             let edits = turn_edits.read().clone();
-                                            for (_, _, _, cp, _) in edits.iter().rev() { let _ = engine.send(EngineCmd::Rewind { id: *cp }); }
+                                            for (_, _, _, cp, _) in edits.iter().rev() { let _ = engine.send(EngineCmd::Rewind { id: *cp }); reverted.write().insert(*cp); }
                                             turn_edits.write().clear();
                                         }, "Reject all" }
                                     }
@@ -2995,6 +2931,7 @@ fn app() -> Element {
                                                 }, "Accept" }
                                                 button { class: "review-reject", title: "Revert this change", onclick: move |_| {
                                                     let _ = engine.send(EngineCmd::Rewind { id: cp });
+                                                    reverted.write().insert(cp);
                                                     let mut v = turn_edits.write(); if idx < v.len() { v.remove(idx); }
                                                 }, "Reject" }
                                             }
@@ -3565,7 +3502,7 @@ fn apply_workspace(mut cfg: Signal<Config>, mut ui: Ui, engine: Coroutine<Engine
 fn switch_tab(
     mut tabs: Signal<Vec<AgentTab>>,
     mut active_tab: Signal<usize>,
-    mut messages: Signal<Vec<ChatMsg>>,
+    messages: Signal<Vec<ChatMsg>>,
     mut cfg: Signal<Config>,
     engine: Coroutine<EngineCmd>,
     idx: usize,
@@ -3590,7 +3527,7 @@ fn switch_tab(
 fn new_agent_tab(
     mut tabs: Signal<Vec<AgentTab>>,
     mut active_tab: Signal<usize>,
-    mut messages: Signal<Vec<ChatMsg>>,
+    messages: Signal<Vec<ChatMsg>>,
     mut cfg: Signal<Config>,
     engine: Coroutine<EngineCmd>,
     mut next_id: Signal<u64>,
@@ -3626,7 +3563,7 @@ fn new_agent_tab(
 fn new_tui_tab(
     mut tabs: Signal<Vec<AgentTab>>,
     mut active_tab: Signal<usize>,
-    mut messages: Signal<Vec<ChatMsg>>,
+    messages: Signal<Vec<ChatMsg>>,
     mut next_id: Signal<u64>,
     bin: &str,
     title: &str,
@@ -3945,8 +3882,8 @@ fn SettingsModal(
     let mut front = use_signal(|| base.front_provider.clone());
     let mut backend = use_signal(|| base.backend_provider.clone());
     let mut subagents = use_signal(|| base.subagents);
-    let mut upd_url = use_signal(|| base.update_url.clone());
-    let mut gh_repo = use_signal(|| if base.github_repo.trim().is_empty() { "MANFIT7/oxide".to_string() } else { base.github_repo.clone() });
+    let upd_url = use_signal(|| base.update_url.clone());
+    let gh_repo = use_signal(|| if base.github_repo.trim().is_empty() { "MANFIT7/oxide".to_string() } else { base.github_repo.clone() });
     let mut upd_status = use_signal(|| "Up to date".to_string());
     let mut tab_mode = use_signal(|| base.default_tab_mode.clone());
     let mut browser_headless = use_signal(|| base.browser_headless);
@@ -4214,7 +4151,6 @@ fn SettingsModal(
 
 #[component]
 fn Composer(
-    input: Signal<String>,
     streaming: Signal<bool>,
     engine: Coroutine<EngineCmd>,
     cfg: Signal<Config>,
@@ -4228,7 +4164,6 @@ fn Composer(
     plan_mode: Signal<bool>,
     pursue_goal: Signal<bool>,
     goal_text: Signal<String>,
-    mentions: Signal<Vec<String>>,
     queue: Signal<Vec<String>>,
     mut picked_element: Signal<Option<String>>,
     on_settings: EventHandler<()>,
@@ -4241,12 +4176,17 @@ fn Composer(
     let access_label = if bypass { "Full access" } else { "Ask first" };
     let mut plan_mode = plan_mode;
     let mut pursue_goal = pursue_goal;
-    let mut mentions = mentions;
     let mut show_plus = use_signal(|| false);
     let mut show_access = use_signal(|| false);
     let mut mention_sel = use_signal(|| 0usize);
     // `@mention` picker driven by the contenteditable caret query.
     let mut mention_q = use_signal(|| None::<String>);
+    // Leading `/query` in the contenteditable — drives the slash-command menu.
+    let mut slash_q = use_signal(|| None::<String>);
+    // Cached @mention results — computed off-thread on query change, NOT per keystroke in render.
+    let mut mention_items_sig = use_signal(Vec::<String>::new);
+    // Branch-menu data loaded async on open (sync git subprocesses in render froze the UI).
+    let mut branch_data = use_signal(|| (Vec::<(PathBuf, String)>::new(), Vec::<String>::new()));
     let mut ce_empty = use_signal(|| true);
     // Pasted image attachments (data URLs), shown as preview cards.
     let mut attachments = use_signal(Vec::<String>::new);
@@ -4292,21 +4232,23 @@ fn Composer(
         }
     });
     let mention_items: Vec<String> = match mention_q.read().as_ref() {
-        Some(q) => all_mention_items(&workspace, q),
+        Some(_) => mention_items_sig.read().clone(),
         None => Vec::new(),
     };
-    let mention_at = if mention_q.read().is_some() { Some(0usize) } else { None };
+    let mention_open = mention_q.read().is_some();
     let msel = if mention_items.is_empty() {
         0
     } else {
         (*mention_sel.read()).min(mention_items.len() - 1)
     };
-    // `/slash` command picker.
-    let slash_items: Vec<(String, String)> = match active_slash(&input.read()) {
-        Some(q) => slash_commands(&workspace, &q),
+    // `/slash` command picker — driven by the contenteditable's leading "/query".
+    let slash_items: Vec<(String, String)> = match slash_q.read().as_ref() {
+        Some(q) => slash_commands(&workspace, q),
         None => Vec::new(),
     };
     let ws_kd = workspace.clone();
+    let ws_oninput = workspace.clone();
+    let ws_branch_load = workspace.clone();
     // Context-usage ring (conic donut) shown in the composer toolbar.
     let ring_pct = if context_limit > 0 {
         (context_used as f64 / context_limit as f64 * 100.0).clamp(0.0, 100.0)
@@ -4333,7 +4275,6 @@ fn Composer(
     } else {
         "pill access"
     };
-    let mut input = input;
     let mut show_models = use_signal(|| false);
     let mut show_effort = use_signal(|| false);
     let mut model_query = use_signal(String::new);
@@ -4363,7 +4304,17 @@ fn Composer(
                             let n = name.clone();
                             rsx! {
                                 button { class: "menu-item",
-                                    onclick: move |_| input.set(format!("/{n} ")),
+                                    onclick: move |_| {
+                                        // Replace the editor content with "/cmd " (the editor is
+                                        // a contenteditable — writing a signal would do nothing).
+                                        let js = format!(
+                                            "const e=document.getElementById('ce-input'); if(e){{ e.textContent={}; e.focus(); const r=document.createRange(); r.selectNodeContents(e); r.collapse(false); const s=window.getSelection(); s.removeAllRanges(); s.addRange(r); }} return true;",
+                                            serde_json::to_string(&format!("/{n} ")).unwrap_or_default()
+                                        );
+                                        spawn(async move { let _ = dioxus::document::eval(&js).join::<bool>().await; });
+                                        slash_q.set(None);
+                                        ce_empty.set(false);
+                                    },
                                     Icon { name: "spark" }
                                     span { class: "menu-name", "/{name}" }
                                     if !desc.is_empty() { span { class: "menu-meta", "{desc}" } }
@@ -4373,7 +4324,7 @@ fn Composer(
                     }
                 }
             }
-            if let Some(at) = mention_at {
+            if mention_open {
                 if !mention_items.is_empty() {
                     div { class: "mention-menu",
                         for (i, path) in mention_items.iter().cloned().enumerate() {
@@ -4453,6 +4404,7 @@ fn Composer(
                 "data-empty": "{ce_empty}",
                 "data-ph": if *streaming.read() { "Steer the agent (sent mid-run)…" } else { "Do anything" },
                 oninput: move |_| {
+                    let ws_oninput = ws_oninput.clone();
                     spawn(async move {
                         let j = dioxus::document::eval(CE_QUERY_JS).join::<String>().await.unwrap_or_default();
                         let v: serde_json::Value = serde_json::from_str(&j).unwrap_or(serde_json::Value::Null);
@@ -4460,12 +4412,24 @@ fn Composer(
                         // otherwise every keystroke re-renders and the caret jitters.
                         let new_q = v["q"].as_str().map(|s| s.to_string());
                         if *mention_q.read() != new_q {
-                            mention_q.set(new_q);
+                            mention_q.set(new_q.clone());
                             mention_sel.set(0);
+                            // Walk the workspace off-thread; render/keydown read the cache.
+                            if let Some(q) = new_q {
+                                let ws = ws_oninput.clone();
+                                let items = tokio::task::spawn_blocking(move || all_mention_items(&ws, &q)).await.unwrap_or_default();
+                                mention_items_sig.set(items);
+                            } else {
+                                mention_items_sig.set(Vec::new());
+                            }
                         }
                         let new_empty = v["empty"].as_bool().unwrap_or(true);
                         if *ce_empty.read() != new_empty {
                             ce_empty.set(new_empty);
+                        }
+                        let new_slash = v["slash"].as_str().map(|s| s.to_string());
+                        if *slash_q.read() != new_slash {
+                            slash_q.set(new_slash);
                         }
                     });
                 },
@@ -4473,7 +4437,7 @@ fn Composer(
                     // When the @mention popup is open, the keyboard drives it.
                     let q = mention_q.read().clone();
                     if let Some(q) = q {
-                        let items = all_mention_items(&ws_kd, &q);
+                        let _ = &q; let items = mention_items_sig.read().clone();
                         if !items.is_empty() {
                             match e.key() {
                                 Key::ArrowDown => { e.prevent_default(); let n = items.len(); let s = (*mention_sel.read() + 1) % n; mention_sel.set(s); return; }
@@ -4783,14 +4747,22 @@ fn Composer(
                 }
             }
             div { class: "sel-anchor",
-                button { class: "selector", onclick: move |_| { let v = *show_branch.read(); show_branch.set(!v); show_proj.set(false); },
+                button { class: "selector", onclick: move |_| {
+                    let v = *show_branch.read(); show_branch.set(!v); show_proj.set(false);
+                    if !v {
+                        let ws = ws_branch_load.clone();
+                        spawn(async move {
+                            let data = tokio::task::spawn_blocking(move || (git_worktrees(&ws), git_branches(&ws))).await.unwrap_or_default();
+                            branch_data.set(data);
+                        });
+                    }
+                },
                     Icon { name: "branch" } "{branch}" span { class: "chev", Icon { name: "chevron" } }
                 }
                 if *show_branch.read() {
                     div { class: "menu-backdrop", onclick: move |_| show_branch.set(false) }
                     {
-                        let worktrees = git_worktrees(&workspace);
-                        let branches = git_branches(&workspace);
+                        let (worktrees, branches) = branch_data.read().clone();
                         let ws_branch = workspace.clone();
                         rsx! {
                             div { class: "sel-menu",

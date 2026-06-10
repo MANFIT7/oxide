@@ -256,32 +256,9 @@ mod builtin {
                     "required": ["query"]
                 }),
             ),
-            ToolSpec::new(
-                "browser_open",
-                "Request the frontend to open or focus a browser target URL.",
-            )
-            .mutating(true)
-            .params(serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "url": { "type": "string" },
-                    "note": { "type": "string" }
-                },
-                "required": ["url"]
-            })),
-            ToolSpec::new(
-                "browser_snapshot",
-                "Request the frontend to capture browser visual evidence for a URL.",
-            )
-            .mutating(true)
-            .params(serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "url": { "type": "string" },
-                    "note": { "type": "string" }
-                },
-                "required": ["url"]
-            })),
+            // NOTE: the legacy `browser_open`/`browser_snapshot` stubs were removed —
+            // the engine's real automation tools (`browser_navigate`, `browser_read`,
+            // `browser_screenshot`, …) are added in `all_tools()`.
         ]
     }
 
