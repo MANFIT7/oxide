@@ -5742,14 +5742,13 @@ fn ChatPane(
                         }
                         Some(Event::FileDiff { path, diff, checkpoint, .. }) => { messages.write().push(ChatMsg { author: Author::Diff(path, checkpoint), text: diff }); }
                         Some(Event::TurnStarted { .. }) => { thinking.set(String::new()); status.set("Working…".to_string()); }
-                        Some(Event::TurnFinished { .. }) => { streaming.set(false); status.set(String::new()); { let mut mm = messages.write(); for c in mm.iter_mut() { if let Author::Activity { running, .. } = &mut c.author { *running = false; } } } }
+                        Some(Event::TurnFinished { .. }) => { streaming.set(false); status.set(String::new()); pane_question.set(None); { let mut mm = messages.write(); for c in mm.iter_mut() { if let Author::Activity { running, .. } = &mut c.author { *running = false; } } } }
                         Some(Event::Info { text }) => { if text.starts_with(['🧭','⚙','🔍','🤖','🧩','🔁','✓','⚠']) { status.set(text); } }
                         Some(Event::Error { message }) => { messages.write().push(ChatMsg { author: Author::Note, text: format!("error: {message}") }); streaming.set(false); }
                         Some(Event::QuestionAsked { question, options, .. }) => {
                             messages.write().push(ChatMsg { author: Author::Note, text: format!("❓ {question}") });
                             pane_question.set(Some((question, options)));
                         }
-                        Some(Event::TurnFinished { .. }) if pane_question.read().is_some() => { pane_question.set(None); streaming.set(false); status.set(String::new()); }
                         Some(Event::Shutdown) | None => break,
                         _ => {}
                     }
