@@ -1825,3 +1825,6 @@ svg { stroke-width: 1.6; }
 .app[data-theme="light"] .hl .entity { color: #3c7cab; }
 .app[data-theme="light"] .hl .support { color: #0e7490; }
 .app[data-theme="light"] .hl .variable { color: #cf2d56; }
+/* provider logo on session rows */
+.sess-logo { width: 13px; height: 13px; display: inline-flex; flex-shrink: 0; opacity: .8; }
+.sess-logo svg { width: 13px; height: 13px; }

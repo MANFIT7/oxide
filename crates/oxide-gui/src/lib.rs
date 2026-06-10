@@ -1087,9 +1087,9 @@ fn read_prefix(path: &Path, cap: usize) -> String {
 
 /// Recent non-empty sessions `(path, title, msg_count)`, newest first. Deletes
 /// empty/0-byte session files as it scans (cleanup).
-fn recent_sessions(ws: &Path) -> Vec<(PathBuf, std::time::SystemTime, String)> {
+fn recent_sessions(ws: &Path) -> Vec<(PathBuf, std::time::SystemTime, String, String)> {
     let dir = ws.join(".oxide/sessions");
-    let mut items: Vec<(PathBuf, std::time::SystemTime, String)> = Vec::new();
+    let mut items: Vec<(PathBuf, std::time::SystemTime, String, String)> = Vec::new();
     if let Ok(rd) = std::fs::read_dir(&dir) {
         for e in rd.flatten() {
             let p = e.path();
@@ -1119,12 +1119,28 @@ fn recent_sessions(ws: &Path) -> Vec<(PathBuf, std::time::SystemTime, String)> {
                 }
                 continue;
             }
+            // Provider recorded as a meta line at session start (for the logo).
+            let provider = text
+                .lines()
+                .take(3)
+                .find_map(|l| {
+                    let v: serde_json::Value = serde_json::from_str(l).ok()?;
+                    if v["role"].as_str()? == "meta" {
+                        v["content"].as_str()?.strip_prefix("provider=").map(str::to_string)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_default();
             let title = text
                 .lines()
                 .find_map(|l| {
                     let v: serde_json::Value = serde_json::from_str(l).ok()?;
                     if v["role"].as_str()? == "user" {
-                        Some(v["content"].as_str()?.lines().next().unwrap_or("").chars().take(38).collect::<String>())
+                        // Strip injected scaffolding so titles read like the human ask.
+                        let clean = strip_scaffold(v["content"].as_str()?);
+                        let first = clean.lines().find(|x| !x.trim().is_empty())?.trim().to_string();
+                        Some(first.chars().take(38).collect::<String>())
                     } else {
                         None
                     }
@@ -1133,7 +1149,7 @@ fn recent_sessions(ws: &Path) -> Vec<(PathBuf, std::time::SystemTime, String)> {
                 .unwrap_or_else(|| "Chat".to_string());
             let _ = count;
             let mtime = meta.and_then(|m| m.modified().ok()).unwrap_or(std::time::UNIX_EPOCH);
-            items.push((p, mtime, title));
+            items.push((p, mtime, title, provider));
         }
     }
     items.sort_by(|a, b| b.1.cmp(&a.1));
@@ -1156,7 +1172,7 @@ fn relative_time(t: std::time::SystemTime) -> String {
 }
 
 /// Group recent sessions by project: `(workspace, name, [(path, title, reltime)])`.
-fn build_projects(current: &Path, recents: &[PathBuf]) -> Vec<(PathBuf, String, Vec<(PathBuf, String, String)>)> {
+fn build_projects(current: &Path, recents: &[PathBuf]) -> Vec<(PathBuf, String, Vec<(PathBuf, String, String, String)>)> {
     let mut seen = HashSet::new();
     let mut wss: Vec<PathBuf> = Vec::new();
     for w in std::iter::once(current.to_path_buf()).chain(recents.iter().cloned()) {
@@ -1169,10 +1185,10 @@ fn build_projects(current: &Path, recents: &[PathBuf]) -> Vec<(PathBuf, String, 
         // Group each project's OWN chats under it (synara-style), so a chat
         // always appears under the folder it belongs to — not just the active
         // one. These are user-opened folders, so access is already granted.
-        let items: Vec<(PathBuf, String, String)> = recent_sessions(&ws)
+        let items: Vec<(PathBuf, String, String, String)> = recent_sessions(&ws)
             .into_iter()
             .take(8)
-            .map(|(p, m, t)| (p, t, relative_time(m)))
+            .map(|(p, m, t, prov)| (p, t, relative_time(m), prov))
             .collect();
         let name = project_name(&ws);
         out.push((ws, name, items));
@@ -1236,6 +1252,9 @@ fn load_session(path: &Path) -> Vec<ChatMsg> {
         .filter_map(|l| {
             let v: serde_json::Value = serde_json::from_str(l).ok()?;
             let role = v["role"].as_str()?;
+            if role == "meta" || role == "tool" || role == "system" {
+                return None;
+            }
             let content = v["content"].as_str()?.to_string();
             let author = match role {
                 "user" => Author::User,
@@ -1413,7 +1432,7 @@ fn app() -> Element {
     let mut show_board = use_signal(|| false);
     let mut board = use_signal(board::Board::default);
     let mut new_card_title = use_signal(String::new);
-    type ProjGroup = (PathBuf, String, Vec<(PathBuf, String, String)>);
+    type ProjGroup = (PathBuf, String, Vec<(PathBuf, String, String, String)>);
     let mut projects_list = use_signal(Vec::<ProjGroup>::new);
     let mut session_menu = use_signal(|| None::<PathBuf>);
     let mut expanded_projects = use_signal(HashSet::<String>::new);
@@ -2291,7 +2310,7 @@ fn app() -> Element {
                                             }
                                         }
                                     }
-                                    for (path, title, reltime) in sessions.iter().take(shown).cloned() {
+                                    for (path, title, reltime, sprov) in sessions.iter().take(shown).cloned() {
                                         {
                                             let p_open = path.clone();
                                             let p_dbl = path.clone();
@@ -2322,7 +2341,8 @@ fn app() -> Element {
                                                             move |e: dioxus::prelude::MouseEvent| { e.prevent_default(); e.stop_propagation(); show_theme_menu.set(false); session_menu.set(Some(p.clone())); }
                                                         },
                                                         ondoubleclick: move |_| { let cur = session_menu.read().clone(); session_menu.set(if cur.as_ref() == Some(&p_dbl) { None } else { Some(p_dbl.clone()) }); },
-                                                        span { class: "thread-title", title: "{title}", "{title}" }
+                                                        if let Some(l) = provider_logo(&sprov) { span { class: "sess-logo prov-logo", dangerous_inner_html: l } }
+                                                    span { class: "thread-title", title: "{title}", "{title}" }
                                                         span { class: "thread-time", "{reltime}" }
                                                     }
                                                     if menu_open {
@@ -3563,7 +3583,7 @@ fn app() -> Element {
                                     if !q.is_empty() {
                                         {
                                             let chats: Vec<(PathBuf, String)> = recent_sessions(&workspace).into_iter()
-                                                .map(|(p, _, t)| (p, t))
+                                                .map(|(p, _, t, _)| (p, t))
                                                 .filter(|(_, t)| t.to_lowercase().contains(&q))
                                                 .take(8).collect();
                                             if chats.is_empty() { rsx!{} } else {

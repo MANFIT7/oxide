@@ -386,7 +386,11 @@ pub fn spawn(config: Config) -> anyhow::Result<(EngineHandle, mpsc::Receiver<Eve
 
     let session_store = if config.persist {
         match SessionStore::open(&workspace) {
-            Ok(s) => Some(s),
+            Ok(s) => {
+                // Record which provider/model owns this session (sidebar logos).
+                let _ = s.append("meta", &format!("provider={}", config.provider));
+                Some(s)
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "session persistence disabled");
                 None
