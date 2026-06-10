@@ -35,20 +35,24 @@ pub struct Message {
     pub tool_call: Option<ToolCall>,
     /// For a `Tool` message: which assistant tool call this is the result of.
     pub tool_call_id: Option<String>,
+    /// Raw provider reasoning item (e.g. OpenAI Responses `reasoning` with
+    /// `encrypted_content`) replayed verbatim so the model doesn't re-think
+    /// from scratch every agentic round.
+    pub reasoning_item: Option<serde_json::Value>,
 }
 
 impl Message {
     /// A plain text message (no tool call).
     pub fn new(role: Role, content: impl Into<String>) -> Self {
-        Self { role, content: content.into(), tool_call: None, tool_call_id: None }
+        Self { role, content: content.into(), tool_call: None, tool_call_id: None, reasoning_item: None }
     }
     /// An assistant message that issued a tool call.
     pub fn with_tool_call(content: impl Into<String>, call: ToolCall) -> Self {
-        Self { role: Role::Assistant, content: content.into(), tool_call: Some(call), tool_call_id: None }
+        Self { role: Role::Assistant, content: content.into(), tool_call: Some(call), tool_call_id: None, reasoning_item: None }
     }
     /// A tool result paired to the assistant call `id`.
     pub fn tool_result(content: impl Into<String>, id: impl Into<String>) -> Self {
-        Self { role: Role::Tool, content: content.into(), tool_call: None, tool_call_id: Some(id.into()) }
+        Self { role: Role::Tool, content: content.into(), tool_call: None, tool_call_id: Some(id.into()), reasoning_item: None }
     }
 }
 
@@ -77,6 +81,9 @@ pub enum StreamItem {
     TextDelta(String),
     /// A chunk of reasoning/thinking text.
     ReasoningDelta(String),
+    /// A complete provider reasoning item (opaque, e.g. encrypted_content) to
+    /// replay on later requests.
+    ReasoningItem(serde_json::Value),
     /// The model wants to call a tool. `id` is the provider's call id (used to
     /// pair the result back); empty for backends that don't supply one.
     ToolCall {

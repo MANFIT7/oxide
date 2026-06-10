@@ -68,7 +68,20 @@ pub fn check_read(policy: SandboxPolicy, root: &Path, requested: &Path) -> PathC
 pub fn check_write(policy: SandboxPolicy, root: &Path, requested: &Path) -> PathCheck {
     let abs = lexical_normalize(root, requested);
     match policy {
-        SandboxPolicy::DangerFullAccess => PathCheck::Ok(abs),
+        // Even in full access, file-creation tools stay inside the project —
+        // the agent inventing sibling folders (e.g. /Volumes/x/new-app) was a
+        // real failure mode. Shell remains unrestricted in this mode; an
+        // explicit user request can still go through it.
+        SandboxPolicy::DangerFullAccess => {
+            if within(root, &abs) {
+                PathCheck::Ok(abs)
+            } else {
+                PathCheck::Denied(format!(
+                    "write outside workspace: {} — create files inside the project (use shell if the user explicitly asked for an outside path)",
+                    abs.display()
+                ))
+            }
+        }
         SandboxPolicy::ReadOnly => {
             PathCheck::Denied("sandbox is read-only; writes are denied".to_string())
         }

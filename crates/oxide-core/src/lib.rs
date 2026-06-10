@@ -935,6 +935,7 @@ impl Engine {
                     self.emit(Event::RateLimit { plan, primary_pct, secondary_pct, primary_reset_s, secondary_reset_s }).await;
                 }
                 StreamItem::ToolCall { .. } => {}
+                StreamItem::ReasoningItem(_) => {}
                 StreamItem::Done => break,
             }
         }
@@ -1176,6 +1177,7 @@ impl Engine {
             let stream_task = tokio::spawn(async move { provider.stream(req, stream_tx).await });
 
             let mut round_text = String::new();
+            let mut pending_reasoning: Option<serde_json::Value> = None;
             let mut did_tool = false;
             let mut steered = false;
             loop {
@@ -1200,16 +1202,23 @@ impl Engine {
                             Some(StreamItem::ReasoningDelta(t)) => {
                                 self.emit(Event::ReasoningDelta { turn, text: t }).await;
                             }
+                            Some(StreamItem::ReasoningItem(v)) => {
+                                pending_reasoning = Some(v);
+                            }
                             Some(StreamItem::ToolCall { id, name, arguments }) => {
                                 did_tool = true;
                                 // Record the assistant's tool call structurally so the model
                                 // sees a real function_call/tool_use (with id) on replay — not
                                 // flattened text. This is what stops the re-plan/re-read loop.
                                 let prose = std::mem::take(&mut round_text);
-                                self.session.push(Message::with_tool_call(
+                                let mut msg = Message::with_tool_call(
                                     prose,
                                     oxide_providers::ToolCall { id: id.clone(), name: name.clone(), arguments: arguments.clone() },
-                                ));
+                                );
+                                // Carry the model's encrypted reasoning so it keeps its train
+                                // of thought instead of re-thinking every round.
+                                msg.reasoning_item = pending_reasoning.take();
+                                self.session.push(msg);
                                 if self.handle_tool_call(turn, name, arguments, id, op_rx).await {
                                     interrupted = true;
                                     break;
@@ -1284,7 +1293,9 @@ impl Engine {
                 if let Some(store) = &self.session_store {
                     let _ = store.append("assistant", &round_text);
                 }
-                self.session.push(Message::new(Role::Assistant, round_text));
+                let mut msg = Message::new(Role::Assistant, round_text);
+                msg.reasoning_item = pending_reasoning.take();
+                self.session.push(msg);
             }
             step += 1;
             if interrupted {

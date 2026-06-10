@@ -116,6 +116,11 @@ fn build_body(req: &TurnRequest) -> Value {
                 "content": [{ "type": "input_text", "text": m.content }]
             })),
             Role::Assistant => {
+                // Replay the model's own (encrypted) reasoning first so it keeps
+                // its train of thought across rounds instead of re-thinking.
+                if let Some(r) = &m.reasoning_item {
+                    input.push(r.clone());
+                }
                 // Any assistant prose first, then a structured function_call item.
                 if !m.content.is_empty() {
                     input.push(json!({
@@ -142,6 +147,7 @@ fn build_body(req: &TurnRequest) -> Value {
         "input": input,
         "stream": true,
         "store": false,
+        "include": ["reasoning.encrypted_content"],
         "reasoning": { "effort": effort }
     });
     if !req.tools.is_empty() {
@@ -240,6 +246,9 @@ impl Provider for ChatGptProvider {
                 }
                 Some("response.output_item.done") => {
                     let item = &v["item"];
+                    if item["type"].as_str() == Some("reasoning") {
+                        let _ = sink.send(StreamItem::ReasoningItem(item.clone())).await;
+                    }
                     if item["type"].as_str() == Some("function_call") {
                         if let Some(name) = item["name"].as_str() {
                             let args: Value = item["arguments"]

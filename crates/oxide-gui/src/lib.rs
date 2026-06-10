@@ -2574,7 +2574,7 @@ fn app() -> Element {
                         }
                     } else {
                         div { class: "scroll",
-                            div { class: "col",
+                            div { class: if *streaming.read() { "col streaming" } else { "col" },
                                 {
                                     // Group consecutive tool-activity rows so they collapse into one dropdown.
                                     let groups = {
