@@ -37,7 +37,9 @@ impl SessionStore {
     pub fn open(workspace: &Path) -> std::io::Result<Self> {
         let dir = workspace.join(".oxide/sessions");
         std::fs::create_dir_all(&dir)?;
-        let id = format!("{}", now_ms());
+        // Include the pid so two engines opening in the same millisecond can't
+        // collide on one file (which would interleave their JSONL lines).
+        let id = format!("{}-{}", now_ms(), std::process::id());
         let path = dir.join(format!("{id}.jsonl"));
         // Touch the file so it exists even before the first message.
         std::fs::OpenOptions::new()
@@ -60,7 +62,9 @@ impl SessionStore {
             .create(false)
             .append(true)
             .open(&self.path)?;
-        writeln!(f, "{line}")
+        // Write the line and its newline in ONE syscall so concurrent appenders
+        // can't interleave (O_APPEND makes a single write atomic, not a pair).
+        f.write_all(format!("{line}\n").as_bytes())
     }
 
     /// Load every message from a session file (for resume).

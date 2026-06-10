@@ -1615,9 +1615,24 @@ fn app() -> Element {
         if cfg.read().workspace.is_some() {
             board.set(board::Board::load(&ws));
             projects_list.set(build_projects(&ws, &cfg.read().recent_workspaces));
-            // Clean up orphaned pane worktrees from a previous run.
+            // Clean up orphaned pane worktrees from a previous run. `prune` only
+            // drops metadata for already-deleted dirs, so force-remove the
+            // pane-* worktree dirs and their branches that a crash/quit left.
             let ws2 = ws.clone();
             spawn(async move {
+                if let Ok(rd) = std::fs::read_dir(ws2.join(".oxide/worktrees")) {
+                    for e in rd.flatten() {
+                        let p = e.path();
+                        if p.file_name().and_then(|n| n.to_str()).map(|n| n.starts_with("pane-")).unwrap_or(false) {
+                            let _ = tokio::process::Command::new("git").arg("-C").arg(&ws2)
+                                .args(["worktree", "remove", "--force"]).arg(&p).output().await;
+                            if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                                let _ = tokio::process::Command::new("git").arg("-C").arg(&ws2)
+                                    .args(["branch", "-D", &format!("oxide/{name}")]).output().await;
+                            }
+                        }
+                    }
+                }
                 let _ = tokio::process::Command::new("git").arg("-C").arg(&ws2).args(["worktree", "prune"]).output().await;
             });
         }

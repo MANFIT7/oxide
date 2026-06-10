@@ -41,8 +41,11 @@ pub async fn ensure_proxy() -> u16 {
         return PROXY_PORT.load(Ordering::Relaxed);
     }
     tokio::spawn(async move {
+        // No TOTAL timeout — SSE/long-poll streams stay open. A connect cap plus
+        // a per-read inactivity cap keep a dead upstream from hanging forever.
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(20))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .read_timeout(std::time::Duration::from_secs(60))
             .build()
             .unwrap_or_default();
         loop {
@@ -84,9 +87,15 @@ async fn handle(mut sock: tokio::net::TcpStream, client: reqwest::Client) -> std
     let path = parts.next().unwrap_or("/").to_string();
 
     let mut content_len = 0usize;
+    let mut is_upgrade = false;
     for l in lines {
-        if let Some(v) = l.to_ascii_lowercase().strip_prefix("content-length:") {
+        let low = l.to_ascii_lowercase();
+        if let Some(v) = low.strip_prefix("content-length:") {
             content_len = v.trim().parse().unwrap_or(0);
+        }
+        // WebSocket / HTTP upgrade (Vite/Next HMR) — must be raw-tunneled.
+        if low.starts_with("connection:") && low.contains("upgrade") {
+            is_upgrade = true;
         }
     }
     // Read any remaining body bytes.
@@ -104,6 +113,17 @@ async fn handle(mut sock: tokio::net::TcpStream, client: reqwest::Client) -> std
         let _ = sock.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
         return Ok(());
     }
+
+    // HMR WebSocket: open a raw socket to the upstream, replay the bytes we've
+    // already read, then copy bytes both ways until either side closes.
+    if is_upgrade {
+        if let Ok(mut up) = tokio::net::TcpStream::connect(("127.0.0.1", target)).await {
+            up.write_all(&buf).await?;
+            let _ = tokio::io::copy_bidirectional(&mut sock, &mut up).await;
+        }
+        return Ok(());
+    }
+
     let url = format!("http://127.0.0.1:{target}{path}");
     let m = reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET);
     let mut rb = client.request(m, &url).header("Accept-Encoding", "identity");
@@ -129,6 +149,41 @@ async fn handle(mut sock: tokio::net::TcpStream, client: reqwest::Client) -> std
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/octet-stream")
         .to_string();
+
+    // Streaming responses (SSE, RSC/chunked) must NOT be buffered — pipe them
+    // straight through with no Content-Length so events flow live. Only HTML
+    // is buffered (it needs the picker-script injection).
+    let streaming = ct.contains("text/event-stream")
+        || resp
+            .headers()
+            .get("transfer-encoding")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.contains("chunked"))
+            .unwrap_or(false);
+    if streaming {
+        let header = format!(
+            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nConnection: close\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
+            status.as_u16(),
+            status.canonical_reason().unwrap_or("OK"),
+            ct
+        );
+        sock.write_all(header.as_bytes()).await?;
+        let mut stream = resp.bytes_stream();
+        use futures::StreamExt;
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(b) => {
+                    if sock.write_all(&b).await.is_err() {
+                        break;
+                    }
+                    let _ = sock.flush().await;
+                }
+                Err(_) => break,
+            }
+        }
+        return Ok(());
+    }
+
     let bytes = resp.bytes().await.unwrap_or_default();
 
     let out_body: Vec<u8> = if ct.contains("text/html") {

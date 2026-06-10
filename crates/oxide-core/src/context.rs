@@ -8,6 +8,51 @@
 //! in a tokenizer.
 
 use oxide_providers::{Message, Role};
+use std::collections::HashSet;
+
+/// Drop dangling tool-call/tool-result pairs so the provider request never 400s.
+///
+/// Compaction, interrupts and rewinds can leave an assistant `tool_call` whose
+/// result was removed, or a `Tool` result whose call was removed. Every provider
+/// rejects such an orphan ("tool_result with no preceding tool_use" etc.). This
+/// pass runs just before a request is built: it removes any `Tool` message whose
+/// `tool_call_id` has no matching assistant `tool_call`, and neutralizes any
+/// assistant `tool_call` that has no matching result (dropping the message if it
+/// carried nothing but the call, else clearing the call so it serializes as
+/// plain text). Returns true if anything changed.
+pub fn sanitize_tool_pairs(messages: &mut Vec<Message>) -> bool {
+    let call_ids: HashSet<String> = messages
+        .iter()
+        .filter_map(|m| m.tool_call.as_ref().map(|c| c.id.clone()))
+        .collect();
+    let result_ids: HashSet<String> = messages
+        .iter()
+        .filter_map(|m| m.tool_call_id.clone())
+        .collect();
+
+    let before = messages.len();
+    // Drop tool results whose call is gone.
+    messages.retain(|m| match &m.tool_call_id {
+        Some(id) => call_ids.contains(id),
+        None => true,
+    });
+    // Neutralize assistant calls whose result is gone.
+    let after_results = messages.len();
+    let mut cleared = false;
+    messages.retain_mut(|m| {
+        if let Some(call) = &m.tool_call {
+            if !result_ids.contains(&call.id) {
+                if m.content.trim().is_empty() && m.reasoning_item.is_none() {
+                    return false; // nothing but a dangling call — drop it
+                }
+                m.tool_call = None; // keep the prose, drop the orphan call
+                cleared = true;
+            }
+        }
+        true
+    });
+    before != after_results || after_results != messages.len() || cleared
+}
 
 /// Roughly 4 characters per token for English/code.
 pub fn estimate_tokens(messages: &[Message]) -> u64 {
@@ -81,5 +126,43 @@ mod tests {
         // Recent tail preserved.
         assert!(m.len() >= 3);
         assert!(estimate_tokens(&m) <= before);
+    }
+}
+
+#[cfg(test)]
+mod pair_tests {
+    use super::*;
+    use oxide_providers::{Message, Role, ToolCall};
+
+    fn call(id: &str) -> Message {
+        let mut m = Message::new(Role::Assistant, "");
+        m.tool_call = Some(ToolCall { id: id.to_string(), name: "x".to_string(), arguments: serde_json::json!({}) });
+        m
+    }
+    fn result(id: &str) -> Message {
+        let mut m = Message::new(Role::Tool, "ok");
+        m.tool_call_id = Some(id.into());
+        m
+    }
+
+    #[test]
+    fn drops_orphan_tool_result() {
+        let mut v = vec![result("a"), Message::new(Role::Assistant, "hi")];
+        assert!(sanitize_tool_pairs(&mut v));
+        assert_eq!(v.len(), 1);
+    }
+
+    #[test]
+    fn drops_orphan_call_with_no_prose() {
+        let mut v = vec![call("a")];
+        assert!(sanitize_tool_pairs(&mut v));
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn keeps_matched_pair() {
+        let mut v = vec![call("a"), result("a")];
+        assert!(!sanitize_tool_pairs(&mut v));
+        assert_eq!(v.len(), 2);
     }
 }

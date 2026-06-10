@@ -387,6 +387,7 @@ pub fn spawn(config: Config) -> anyhow::Result<(EngineHandle, mpsc::Receiver<Eve
             if let Ok(msgs) = SessionStore::load(&prev) {
                 history = msgs
                     .into_iter()
+                    .filter(|m| m.role != "meta")
                     .map(|m| Message::new(role_from_str(&m.role), m.content))
                     .collect();
                 tracing::info!(count = history.len(), "resumed prior session");
@@ -1176,6 +1177,9 @@ impl Engine {
             // Keep the running history under budget on EVERY request — long
             // agentic turns accumulate tool output and would otherwise overflow.
             self.compact_session(turn).await;
+            // Compaction/interrupt/rewind can orphan a tool_call or tool_result;
+            // strip any dangling pair so the provider request never 400s.
+            context::sanitize_tool_pairs(&mut self.session);
             let mut msgs = vec![Message::new(Role::System, sys.clone())];
             msgs.extend(self.session.iter().cloned());
             let req = TurnRequest {
@@ -1277,7 +1281,10 @@ impl Engine {
                             Some(other) => {
                                 self.emit(Event::Info { text: format!("queued op ignored mid-turn: {other:?}") }).await;
                             }
-                            None => break,
+                            // Op channel closed (handle dropped — e.g. a pane was
+                            // closed): abort the live stream instead of waiting for
+                            // the model to finish on its own.
+                            None => { interrupted = true; break; }
                         }
                     }
                 }
