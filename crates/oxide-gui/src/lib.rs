@@ -1958,7 +1958,17 @@ fn app() -> Element {
                                     // trail row in the chat (synara-style).
                                     let label = text.trim_start_matches('⚙').trim().to_string();
                                     status.set(label.clone());
-                                    messages.write().push(ChatMsg { author: Author::Activity { running: false, ok: true }, text: label });
+                                    // ActivityRow parses "icon\tverb\tdetail".
+                                    let (verb, detail) = label.split_once(' ').unwrap_or((label.as_str(), ""));
+                                    let icon = match verb.to_ascii_lowercase().as_str() {
+                                        "bash" | "shell" | "running" => "terminal",
+                                        "read" | "write" | "edit" | "editing" | "multiedit" => "file",
+                                        "grep" | "glob" | "search" | "searching" | "websearch" => "search",
+                                        "task" | "agent" => "spark",
+                                        _ => "spark",
+                                    };
+                                    let row = format!("{icon}\t{verb}\t{detail}");
+                                    messages.write().push(ChatMsg { author: Author::Activity { running: false, ok: true }, text: row });
                                 } else if text.starts_with(['🧭','🔍','🤖','🧩','🔁','✓','⚠']) {
                                     // pipeline stage → live animated status, not a chat note
                                     status.set(text);
@@ -5310,8 +5320,7 @@ fn Composer(
                                         let _ = engine.send(EngineCmd::Reconfigure(c));
                                     },
                                     Icon { name: "spark" }
-                                    span { class: "plus-name", "Orchestrate" }
-                                    span { class: "plus-hint", "plan→do→review" }
+                                    span { class: "plus-name", title: "Two-stage: a planner delegates to an implementer, then reviews (plan→do→review)", "Orchestrate" }
                                     span { class: if cfg.read().orchestrate { "switch on" } else { "switch" }, span { class: "knob" } }
                                 }
                             }
