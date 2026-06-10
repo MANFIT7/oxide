@@ -2446,13 +2446,20 @@ fn app() -> Element {
                             button { class: if *show_preview.read() { "top-btn on" } else { "top-btn" },
                                 onclick: move |_| {
                                     let v = *show_preview.read(); show_preview.set(!v);
-                                    if !v { spawn(async move { preview_ports.set(scan_ports().await); }); }
+                                    if !v {
+                                        show_files.set(false);
+                                        spawn(async move { preview_ports.set(scan_ports().await); });
+                                    }
                                 }, Icon { name: "browser" } "Preview"
                             }
                             button { class: if *show_changes.read() { "top-btn on" } else { "top-btn" },
                                 onclick: move |_| {
                                     let v = *show_changes.read(); show_changes.set(!v);
-                                    if !v { let ws = ws_changes.clone(); spawn(async move { changed_files.set(load_changed_files(&ws).await); }); }
+                                    if !v {
+                                        show_files.set(false); // the right inspector would overlap
+                                        let ws = ws_changes.clone();
+                                        spawn(async move { changed_files.set(load_changed_files(&ws).await); });
+                                    }
                                 }, Icon { name: "branch" } "Changes"
                             }
                         }
