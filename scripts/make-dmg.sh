@@ -63,8 +63,20 @@ cat > "$APPDIR/Contents/Info.plist" <<PLIST
 </dict></plist>
 PLIST
 
-# ad-hoc codesign so Gatekeeper lets the user open it locally
-codesign --force --deep --sign - "$APPDIR" 2>/dev/null || true
+# Sign with the stable "Oxide Dev" identity when present (scripts/make-cert.sh)
+# so macOS TCC "Allow" grants persist across updates; ad-hoc otherwise.
+SIGN_ID="$(security find-identity -v -p codesigning 2>/dev/null | grep -m1 'Oxide Dev' | awk '{print $2}' || true)"
+if [ -n "${SIGN_ID:-}" ]; then
+  echo "▶ signing with Oxide Dev (stable identity)…"
+  codesign --force --sign "$SIGN_ID" --identifier com.oxide.desktop "$APPDIR/Contents/MacOS/oxide-bin"
+  codesign --force --sign "$SIGN_ID" --identifier com.oxide.desktop "$APPDIR/Contents/MacOS/$APP"
+  codesign --force --deep --sign "$SIGN_ID" --identifier com.oxide.desktop "$APPDIR"
+  # Sign the raw release binary too so the OTA-swapped binary keeps the SAME
+  # identity (otherwise the first OTA update reverts to ad-hoc and TCC re-asks).
+  codesign --force --sign "$SIGN_ID" --identifier com.oxide.desktop "$BIN" 2>/dev/null || true
+else
+  codesign --force --deep --sign - "$APPDIR" 2>/dev/null || true
+fi
 
 echo "▶ building $APP.dmg…"
 STAGE="$DIST/stage"
