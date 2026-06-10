@@ -277,6 +277,17 @@ impl Provider for CodexCliProvider {
                                 .or_else(|| item["path"].as_str())
                                 .unwrap_or("file change");
                             send(sink, StreamItem::Notice(format!("✎ {summary}")));
+                            // Single path or a changes[] list, depending on codex version.
+                            if let Some(p) = item["path"].as_str() {
+                                send(sink, StreamItem::FileChanged(p.to_string()));
+                            }
+                            if let Some(arr) = item["changes"].as_array() {
+                                for c in arr {
+                                    if let Some(p) = c["path"].as_str() {
+                                        send(sink, StreamItem::FileChanged(p.to_string()));
+                                    }
+                                }
+                            }
                         }
                         Some("web_search") => {
                             let q = item["query"].as_str().or_else(|| item["text"].as_str()).unwrap_or("");
@@ -421,6 +432,11 @@ impl Provider for ClaudeCliProvider {
                                     let detail: String = detail.chars().take(80).collect();
                                     let label = if detail.is_empty() { format!("⚙ {name}") } else { format!("⚙ {name} {detail}") };
                                     send(sink, StreamItem::Notice(label));
+                                    if matches!(name, "Edit" | "Write" | "MultiEdit" | "NotebookEdit") {
+                                        if let Some(p) = input["file_path"].as_str() {
+                                            send(sink, StreamItem::FileChanged(p.to_string()));
+                                        }
+                                    }
                                 }
                                 _ => {}
                             }

@@ -84,6 +84,8 @@ pub struct TurnRequest {
 pub enum StreamItem {
     /// A chunk of assistant text.
     TextDelta(String),
+    /// A CLI-driver reported it changed this file (engine diffs it at turn end).
+    FileChanged(String),
     /// A chunk of reasoning/thinking text.
     ReasoningDelta(String),
     /// A complete provider reasoning item (opaque, e.g. encrypted_content) to

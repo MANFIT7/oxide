@@ -3228,7 +3228,7 @@ fn app() -> Element {
                                                                                 span { class: "diff-dels", "−{dels}" }
                                                                                 if is_reverted {
                                                                                     span { class: "diff-reverted", "✓ Reverted" }
-                                                                                } else {
+                                                                                } else if cp != 0 {
                                                                                     button { class: "diff-revert", onclick: move |e| { e.prevent_default(); let _ = engine.send(EngineCmd::Rewind { id: cp }); reverted.write().insert(cp); }, "Revert" }
                                                                                 }
                                                                             }

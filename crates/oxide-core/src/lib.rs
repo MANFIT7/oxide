@@ -999,6 +999,7 @@ impl Engine {
             Err(_) => { task.abort(); None }
         } {
             match item {
+                StreamItem::FileChanged(_) => {}
                 StreamItem::TextDelta(t) => {
                     out.push_str(&t);
                     if silent {
@@ -1261,6 +1262,8 @@ impl Engine {
         let cli_driver = matches!(self.config.provider.as_str(), "codex" | "claude");
         let mut nudges = 0u8;
         let mut memory_nudged = false;
+        // Files a CLI driver reported changing — diffed + shown at turn end.
+        let mut cli_changed: Vec<String> = Vec::new();
         let mut verifies = 0u8;
         let mut wrapped_up = false;
         self.turn_edited = false;
@@ -1337,6 +1340,11 @@ impl Engine {
                                 if self.handle_tool_call(turn, name, arguments, id, op_rx).await {
                                     interrupted = true;
                                     break;
+                                }
+                            }
+                            Some(StreamItem::FileChanged(path)) => {
+                                if !cli_changed.contains(&path) {
+                                    cli_changed.push(path);
                                 }
                             }
                             Some(StreamItem::Notice(text)) => {
@@ -1478,6 +1486,35 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
         }
         if interrupted {
             self.emit(Event::Info { text: "turn interrupted".into() }).await;
+        }
+        // CLI drivers edit inside their own process — reconstruct the diffs from
+        // git at turn end so the UI gets the same per-file cards + summary.
+        for path in cli_changed.drain(..) {
+            let rel = std::path::Path::new(&path)
+                .strip_prefix(&self.workspace)
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| path.clone());
+            let out = tokio::process::Command::new("git")
+                .arg("-C").arg(&self.workspace)
+                .args(["diff", "--no-color", "--"]).arg(&rel)
+                .output().await;
+            let mut diff = out
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                .unwrap_or_default();
+            if diff.trim().is_empty() {
+                // Untracked/new file: render it as all-adds (capped).
+                if let Ok(text) = std::fs::read_to_string(self.workspace.join(&rel)) {
+                    let body: String = text.lines().take(400).map(|l| format!("+{l}\n")).collect();
+                    if !body.is_empty() {
+                        diff = format!("@@ new file @@\n{body}");
+                    }
+                }
+            }
+            if !diff.trim().is_empty() {
+                let diff: String = diff.chars().take(20_000).collect();
+                self.emit(Event::FileDiff { turn, path: rel, diff, checkpoint: 0 }).await;
+            }
         }
         self.fire_hooks("stop", serde_json::json!({})).await;
         self.emit(Event::TurnFinished { turn }).await;
