@@ -1680,7 +1680,12 @@ fn app() -> Element {
                 cur = s;
                 if (inner) { inner.disconnect(); inner = null; }
                 if (!s) return;
-                const stick = () => { if ((s.scrollHeight - s.scrollTop - s.clientHeight) < 140) s.scrollTop = s.scrollHeight; };
+                const stick = () => { if ((s.scrollHeight - s.scrollTop - s.clientHeight) < 140) s.scrollTop = s.scrollHeight; upd(); };
+                const upd = () => {
+                  const b = s.querySelector('.jump-bottom');
+                  if (b) b.classList.toggle('show', (s.scrollHeight - s.scrollTop - s.clientHeight) > 300);
+                };
+                s.addEventListener('scroll', upd, { passive: true });
                 inner = new MutationObserver(stick);
                 inner.observe(s, { childList: true, subtree: true, characterData: true });
                 stick();
@@ -3111,6 +3116,12 @@ fn app() -> Element {
                         }
                     } else {
                         div { class: if *streaming.read() { "scroll" } else { "scroll smooth" },
+                            div { class: "jump-anchor",
+                                button { class: "jump-bottom", title: "Scroll to bottom",
+                                    onclick: move |_| { spawn(async move { let _ = dioxus::document::eval("const s=document.querySelector('.scroll'); if(s) s.scrollTo({top:s.scrollHeight, behavior:'smooth'});").await; }); },
+                                    "↓"
+                                }
+                            }
                             div { class: if *streaming.read() { "col streaming" } else { "col" },
                                 {
                                     // Group consecutive tool-activity rows so they collapse into one dropdown.

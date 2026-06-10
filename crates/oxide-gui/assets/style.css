@@ -1980,3 +1980,13 @@ details[open]::details-content { block-size: auto; }
 .agent-md li > p { margin: 0 0 6px; }
 .agent-md li { margin: 3px 0; }
 .agent-md ul ul, .agent-md ol ul, .agent-md ul ol, .agent-md ol ol { margin: 2px 0 4px; }
+
+/* scroll-to-bottom button: sticky pill near the bottom of the chat scrollport */
+.jump-anchor { position: sticky; top: calc(100% - 56px); height: 0; display: flex; justify-content: center; z-index: 6; pointer-events: none; }
+.jump-bottom { pointer-events: none; opacity: 0; transform: translateY(8px); transition: opacity .16s ease, transform .16s ease, background .12s ease;
+  width: 34px; height: 34px; border-radius: 50%; border: 1px solid var(--border); background: var(--surface-hi, var(--surface));
+  color: var(--text); font-size: 15px; cursor: pointer; box-shadow: 0 6px 18px rgba(0,0,0,.28); }
+.app[data-theme="light"] .jump-bottom { box-shadow: 0 6px 18px rgba(20,20,20,.14); }
+.jump-bottom.show { pointer-events: auto; opacity: 1; transform: none; }
+.jump-bottom:hover { background: color-mix(in srgb, var(--text) 8%, var(--surface)); }
+@media (prefers-reduced-motion: reduce) { .jump-bottom { transition: none; } }
