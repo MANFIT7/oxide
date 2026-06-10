@@ -3779,6 +3779,36 @@ fn git_worktrees(ws: &Path) -> Vec<(PathBuf, String)> {
     res
 }
 
+/// VSCode Material-style file badge: `(label, color)` by extension.
+fn file_badge(name: &str) -> (&'static str, &'static str) {
+    let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    match ext.as_str() {
+        "rs" => ("RS", "#dea584"),
+        "ts" | "mts" | "cts" => ("TS", "#3178c6"),
+        "tsx" => ("TX", "#3178c6"),
+        "js" | "mjs" | "cjs" => ("JS", "#f1dd35"),
+        "jsx" => ("JX", "#f1dd35"),
+        "json" | "jsonc" => ("{}", "#f1dd35"),
+        "md" => ("MD", "#42a5f5"),
+        "css" | "scss" | "less" => ("#", "#42a5f5"),
+        "html" | "htm" => ("<>", "#e44d26"),
+        "py" => ("PY", "#3572a5"),
+        "go" => ("GO", "#00add8"),
+        "toml" | "yaml" | "yml" | "ini" => ("⚙", "#9e9e9e"),
+        "sh" | "bash" | "zsh" => ("$_", "#89e051"),
+        "sql" => ("DB", "#ffca28"),
+        "vue" => ("V", "#41b883"),
+        "svelte" => ("S", "#ff3e00"),
+        "swift" => ("SW", "#f05138"),
+        "java" | "kt" => ("JV", "#b07219"),
+        "c" | "h" => ("C", "#555fbb"),
+        "cpp" | "hpp" | "cc" => ("C+", "#f34b7d"),
+        "png" | "jpg" | "jpeg" | "gif" | "svg" | "webp" | "ico" => ("◍", "#26a69a"),
+        "lock" => ("🔒", "#9e9e9e"),
+        _ => ("·", "#8a8a8a"),
+    }
+}
+
 #[component]
 fn FileNode(path: PathBuf, depth: usize, is_root: bool) -> Element {
     let ui = use_context::<Ui>();
@@ -3823,7 +3853,14 @@ fn FileNode(path: PathBuf, depth: usize, is_root: bool) -> Element {
             style: "{pad}",
             onclick: toggle,
             span { class: "caret", "{caret}" }
-            Icon { name: icon_name }
+            if is_dir {
+                Icon { name: icon_name }
+            } else {
+                {
+                    let (lbl, col) = file_badge(&name);
+                    rsx! { span { class: "ficon", style: "color:{col}", "{lbl}" } }
+                }
+            }
             span { class: "node-name", "{name}" }
         }
         if is_dir && expanded {

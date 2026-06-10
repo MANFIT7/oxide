@@ -1672,3 +1672,11 @@ details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
   background: color-mix(in srgb, var(--text) 4%, var(--bg));
   backdrop-filter: blur(24px) saturate(140%);
 }
+
+/* icon normalization: one size + weight everywhere (lucide-like) */
+svg { stroke-width: 1.6; }
+.nav-item svg, .top-btn svg, .insp-tab svg, .menu-item svg, .plus-item svg { width: 15px; height: 15px; color: var(--muted); }
+.nav-item:hover svg, .top-btn:hover svg, .menu-item:hover svg { color: var(--text); }
+
+/* material-style file badges in the tree */
+.ficon { font-family: ui-monospace, Menlo, monospace; font-size: 9px; font-weight: 700; width: 16px; display: inline-flex; justify-content: center; flex-shrink: 0; letter-spacing: -0.5px; }
