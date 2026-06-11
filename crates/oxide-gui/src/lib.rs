@@ -1272,57 +1272,46 @@ fn scroll_chat_bottom() {
 /// Open a saved session transcript in a new tab (view).
 fn open_session_tab(
     mut tabs: Signal<Vec<AgentTab>>,
-    mut active_tab: Signal<usize>,
-    mut messages: Signal<Vec<ChatMsg>>,
-    mut next_id: Signal<u64>,
-    cfg: Signal<Config>,
+    active_tab: Signal<usize>,
+    messages: Signal<Vec<ChatMsg>>,
+    _next_id: Signal<u64>,
+    mut cfg: Signal<Config>,
+    mut ui: Ui,
     engine: Coroutine<EngineCmd>,
     path: PathBuf,
     title: String,
 ) {
     let loaded = load_session(&path);
     let cur = *active_tab.read();
-    // If the current tab is an empty GUI chat, open the history IN PLACE instead
-    // of spawning a new tab (user picked a chat from history with nothing typed).
-    let cur_empty = {
-        let t = tabs.read();
-        messages.read().is_empty()
-            && t.get(cur).map(|tab| tab.mode == "gui" && tab.messages.is_empty()).unwrap_or(false)
-    };
-    if cur_empty {
-        if let Some(t) = tabs.write().get_mut(cur) {
-            t.title = title;
-            t.messages = loaded.clone();
-            t.session = Some(path.clone());
-        }
-        // Restart the engine WITH this session's context — otherwise the UI
-        // shows history while the model starts blank.
-        let mut c = cfg.read().clone();
-        c.resume_path = Some(path);
-        let _ = engine.send(EngineCmd::SwitchTab(c, loaded));
-        scroll_chat_bottom();
-        return;
-    }
-    if let Some(t) = tabs.write().get_mut(cur) {
-        t.messages = messages.read().clone();
-    }
-    let id = *next_id.read();
-    next_id.set(id + 1);
-    let (provider, model) = { let c = cfg.read(); (c.provider.clone(), c.model.clone()) };
-    tabs.write().push(AgentTab {
-        id,
-        title,
-        provider,
-        model,
-        messages: loaded.clone(),
-        mode: "gui".to_string(),
-        bin: String::new(),
-        session: Some(path.clone()),
-    });
-    let idx = tabs.read().len() - 1;
-    active_tab.set(idx);
+    // A session file lives at <workspace>/.oxide/sessions/<id>.jsonl — the
+    // chat MUST run in that workspace, or the engine (in another folder)
+    // appends this conversation into the wrong project.
+    let session_ws = path
+        .parent() // sessions/
+        .and_then(|p| p.parent()) // .oxide/
+        .and_then(|p| p.parent()) // workspace
+        .map(|p| p.to_path_buf());
     let mut c = cfg.read().clone();
+    if let Some(ws) = session_ws {
+        if c.workspace.as_deref() != Some(ws.as_path()) {
+            ui.workspace.set(ws.clone());
+            ui.open_path.set(None);
+            ui.expanded.set(HashSet::new());
+            c.recent_workspaces.retain(|p| p != &ws);
+            c.recent_workspaces.insert(0, ws.clone());
+            c.recent_workspaces.truncate(8);
+            c.workspace = Some(ws);
+        }
+    }
+    // Open in the CURRENT tab (synara-style) — a sidebar click navigates, it
+    // doesn't multiply tabs. New tabs come from the + button.
+    if let Some(t) = tabs.write().get_mut(cur) {
+        t.title = title;
+        t.messages = loaded.clone();
+        t.session = Some(path.clone());
+    }
     c.resume_path = Some(path);
+    cfg.set(c.clone());
     let _ = engine.send(EngineCmd::SwitchTab(c, loaded));
     scroll_chat_bottom();
 }
@@ -1906,6 +1895,9 @@ fn app() -> Element {
                             messages.set(kept);
                         }
                         Some(EngineCmd::SwitchTab(conf, tab_msgs)) => {
+                            // Keep the project tracker in sync — opening a session
+                            // from another folder switches workspace through here.
+                            cur_ws = workspace_of(&conf);
                             approvals.write().clear();
                             checkpoints.write().clear();
                             timeline.write().clear();
@@ -2529,7 +2521,7 @@ fn app() -> Element {
                                                         button { class: "row-act-btn pinned", title: "Unpin", onclick: move |e: dioxus::prelude::MouseEvent| { e.stop_propagation(); toggle_pin(cfg, &p_str); }, Icon { name: "pin" } }
                                                     }
                                                     div { class: "thread recent",
-                                                        onclick: move |_| { show_board.set(false); open_session_tab(tabs, active_tab, messages, next_tab_id, cfg, engine, p_open.clone(), t_open.clone()); },
+                                                        onclick: move |_| { show_board.set(false); open_session_tab(tabs, active_tab, messages, next_tab_id, cfg, ui, engine, p_open.clone(), t_open.clone()); },
                                                         span { class: "thread-title", title: "{title}", "{title}" }
                                                     }
                                                 }
@@ -2643,7 +2635,7 @@ fn app() -> Element {
                                                         button { class: "row-act-btn danger", title: "Delete", onclick: move |e: dioxus::prelude::MouseEvent| { e.stop_propagation(); delete_session(&p_del2); projects_list.set(build_projects(&ws_d2, &cfg.read().recent_workspaces)); }, "✕" }
                                                     }
                                                     div { class: "thread recent", title: "right-click / double-click for options",
-                                                        onclick: move |_| { show_board.set(false); open_session_tab(tabs, active_tab, messages, next_tab_id, cfg, engine, p_open.clone(), t_open.clone()); },
+                                                        onclick: move |_| { show_board.set(false); open_session_tab(tabs, active_tab, messages, next_tab_id, cfg, ui, engine, p_open.clone(), t_open.clone()); },
                                                         oncontextmenu: {
                                                             let p = p_dbl.clone();
                                                             move |e: dioxus::prelude::MouseEvent| { e.prevent_default(); e.stop_propagation(); show_theme_menu.set(false); session_menu.set(Some(p.clone())); }
@@ -4009,7 +4001,7 @@ fn app() -> Element {
                                                             let t2 = title.clone();
                                                             rsx! {
                                                                 button { class: "palette-item",
-                                                                    onclick: move |_| { show_palette.set(false); show_board.set(false); open_session_tab(tabs, active_tab, messages, next_tab_id, cfg, engine, p2.clone(), t2.clone()); },
+                                                                    onclick: move |_| { show_palette.set(false); show_board.set(false); open_session_tab(tabs, active_tab, messages, next_tab_id, cfg, ui, engine, p2.clone(), t2.clone()); },
                                                                     Icon { name: "file" } span { class: "palette-label", "{title}" }
                                                                 }
                                                             }
