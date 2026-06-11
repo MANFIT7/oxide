@@ -1860,8 +1860,8 @@ svg { stroke-width: 1.6; }
 .sess-logo svg { width: 13px; height: 13px; }
 /* project chat-list collapse caret */
 .proj-caret { display: inline-flex; flex-shrink: 0; cursor: pointer; transition: transform .15s ease; color: var(--faint); }
-.proj-caret svg { width: 12px; height: 12px; transform: rotate(90deg); }
-.proj-caret.closed svg { transform: rotate(0deg); }
+.proj-caret svg { width: 12px; height: 12px; transform: rotate(180deg); }   /* expanded = ^ */
+.proj-caret.closed svg { transform: rotate(0deg); }                         /* collapsed = v */
 .proj-caret:hover { color: var(--text); }
 
 /* ══ Audit sweep: animation consistency + light fixes ══ */
@@ -2183,8 +2183,16 @@ details[open]::details-content { block-size: auto; }
 .app:not([data-theme="light"]) .env-card { background: var(--surface); }
 
 /* session rows read as SUB-items of their project: indent + ↳ enter icon */
-.thread.sub { padding-left: 14px; margin-left: 12px; border-left: 1px solid color-mix(in srgb, var(--text) 9%, transparent); border-radius: 0; }
-.thread.sub:hover { border-left-color: color-mix(in srgb, var(--syn-accent) 50%, transparent); }
+.thread.sub { position: relative; margin-left: 16px; padding-left: 16px; border-radius: 0; }
+/* continuous vertical rail */
+.thread.sub::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 0;
+  border-left: 1.5px solid color-mix(in srgb, var(--text) 10%, transparent); }
+/* rounded elbow turning right into the row — no arrowhead */
+.thread.sub::after { content: ""; position: absolute; left: 0; top: 0; width: 11px; height: 50%;
+  border-left: 1.5px solid color-mix(in srgb, var(--text) 10%, transparent);
+  border-bottom: 1.5px solid color-mix(in srgb, var(--text) 10%, transparent);
+  border-bottom-left-radius: 9px; }
+.thread.sub:hover::before, .thread.sub:hover::after { border-color: color-mix(in srgb, var(--syn-accent) 55%, transparent); }
 
 /* project header: hover delete (removes its chats from the list) */
 .project-del { width: 20px; height: 20px; display: flex; align-items: center; justify-content: center;
