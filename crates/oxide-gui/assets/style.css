@@ -934,7 +934,7 @@ svg { width: 17px; height: 17px; flex-shrink: 0; }
   border-bottom: 2px solid transparent; color: var(--muted); font-size: 13px; max-width: 240px;
 }
 .agent-tab:hover { color: var(--text); }
-.agent-tab.active { color: var(--text); border-bottom-color: var(--accent); }
+.agent-tab.active { color: var(--text); border-bottom-color: transparent; }
 .agent-tab-logo { width: 16px; height: 16px; border-radius: 4px; flex-shrink: 0; }
 .agent-tab-title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .agent-tab-x {
@@ -1870,7 +1870,7 @@ details::details-content { block-size: 0; overflow: clip; transition: block-size
 details[open]::details-content { block-size: auto; }
 /* active tab underline slides in */
 .agent-tab { position: relative; }
-.agent-tab.active::after { content: ""; position: absolute; left: 10px; right: 10px; bottom: -1px; height: 2px; border-radius: 2px; background: var(--syn-accent); transform-origin: left; animation: underline-in .18s cubic-bezier(.22,1,.36,1); }
+.agent-tab.active::after { content: ""; position: absolute; left: 10px; right: 10px; bottom: 0; height: 2px; border-radius: 2px; background: var(--syn-accent); transform-origin: left; animation: underline-in .18s cubic-bezier(.22,1,.36,1); }
 @keyframes underline-in { from { transform: scaleX(0); } to { transform: scaleX(1); } }
 /* send pop on dispatch */
 @keyframes send-pop { 0% { transform: scale(1); } 40% { transform: scale(.85); } 100% { transform: scale(1); } }
