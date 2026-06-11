@@ -2853,6 +2853,7 @@ fn app() -> Element {
                                                     div { key: "tab{id}", class: if is_active { "thread active" } else { "thread" },
                                                         onclick: move |_| { show_board.set(false); switch_tab(tabs, active_tab, messages, cfg, engine, i); },
                                                         ondoubleclick: move |_| { rename_text.set(ttl_dc.clone()); renaming_tab.set(Some(id)); },
+                                                        span { class: "sess-branch", Icon { name: "branch" } }
                                                         if busy { span { class: "syn-spinner" } }
                                                         else if let Some(l) = logo { span { class: "tab-prov", dangerous_inner_html: l } }
                                                         if editing {
@@ -2911,6 +2912,7 @@ fn app() -> Element {
                                                             move |e: dioxus::prelude::MouseEvent| { e.prevent_default(); e.stop_propagation(); show_theme_menu.set(false); session_menu.set(Some(p.clone())); }
                                                         },
                                                         ondoubleclick: move |_| { let cur = session_menu.read().clone(); session_menu.set(if cur.as_ref() == Some(&p_dbl) { None } else { Some(p_dbl.clone()) }); },
+                                                        span { class: "sess-branch", Icon { name: "branch" } }
                                                         if let Some(l) = provider_logo(&sprov) { span { class: "sess-logo prov-logo", dangerous_inner_html: l } }
                                                     span { class: "thread-title", title: "{title}", "{title}" }
                                                         span { class: "thread-time", "{reltime}" }
