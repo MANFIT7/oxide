@@ -1994,3 +1994,31 @@ details[open]::details-content { block-size: auto; }
 /* steer-now button inside a queued chip */
 .queue-steer { background: none; border: none; color: var(--faint); cursor: pointer; font-size: 12px; padding: 0 2px; border-radius: 4px; }
 .queue-steer:hover { color: var(--syn-accent); }
+
+/* ══ Environment pane (synara-style): Files / Terminals / Preview / Diffs ══ */
+.env-panel { position: absolute; top: 0; right: 0; bottom: 0; width: var(--rpanel, 46%); z-index: 5;
+  display: flex; flex-direction: column; background: var(--bg); border-left: 1px solid var(--border); animation: panel-in .18s ease-out; }
+.env-tabs { display: flex; align-items: center; gap: 2px; padding: 6px 8px; border-bottom: 1px solid var(--border); flex-shrink: 0; }
+.env-tab { display: flex; align-items: center; gap: 6px; padding: 5px 10px; border-radius: 7px; border: none; background: none;
+  color: var(--muted); font-size: 12.5px; cursor: pointer; transition: background .12s ease, color .12s ease; }
+.env-tab svg { width: 13px; height: 13px; }
+.env-tab:hover { color: var(--text); background: color-mix(in srgb, var(--text) 5%, transparent); }
+.env-tab.on { color: var(--text); background: color-mix(in srgb, var(--text) 8%, transparent); }
+.env-x { margin-left: auto; background: none; border: none; color: var(--faint); cursor: pointer; font-size: 12px; padding: 4px 6px; border-radius: 6px; }
+.env-x:hover { color: var(--text); background: color-mix(in srgb, var(--text) 6%, transparent); }
+.env-body { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+/* moved panels fill the body instead of floating */
+.env-body .changes-panel, .env-body .preview-panel { position: static; width: 100%; height: 100%; border-left: none; animation: none; box-shadow: none; }
+.env-body .files-panel { position: static; width: 100% !important; height: 100%; border-left: none; animation: none; display: flex; flex-direction: column; }
+/* multi-terminal */
+.env-terms { flex: 1; min-height: 0; display: flex; flex-direction: column; background: var(--composer); }
+.term-tabs { display: flex; align-items: center; gap: 4px; padding: 6px 8px; border-bottom: 1px solid var(--border); flex-shrink: 0; }
+.term-tab { display: flex; align-items: center; gap: 6px; padding: 3px 9px; border-radius: 6px; border: 1px solid transparent; background: none;
+  color: var(--muted); font-size: 12px; font-family: ui-monospace, Menlo, monospace; cursor: pointer; }
+.term-tab:hover { color: var(--text); }
+.term-tab.on { color: var(--text); background: color-mix(in srgb, var(--text) 7%, transparent); border-color: var(--border); }
+.term-tab.add { font-size: 13px; padding: 3px 7px; }
+.term-tab-x { color: var(--faint); font-size: 10px; }
+.term-tab-x:hover { color: var(--danger); }
+.env-terms .term-body { flex: 1; overflow-y: auto; padding: 10px 14px; font-family: ui-monospace, Menlo, monospace; font-size: 12.5px; }
+.env-terms .term-input-row { display: flex; align-items: center; gap: 8px; padding: 8px 14px; border-top: 1px solid var(--border); flex-shrink: 0; }

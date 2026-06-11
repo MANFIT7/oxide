@@ -1472,8 +1472,13 @@ fn app() -> Element {
     let mut streaming = use_signal(|| false);
 
     // Panels.
-    let mut show_files = use_signal(|| true);
-    let mut show_terminal = use_signal(|| false);
+    // Environment pane (right): one tabbed home for Files/Terminals/Preview/Diffs.
+    let mut show_env = use_signal(|| false);
+    let mut env_tab = use_signal(|| "files".to_string());
+    // Multi-terminal model: (id, title, lines).
+    let mut terms = use_signal(|| vec![(1u64, "zsh 1".to_string(), Vec::<String>::new())]);
+    let mut term_sel = use_signal(|| 0usize);
+    let mut term_seq = use_signal(|| 1u64);
     let mut show_settings = use_signal(|| false);
     let mut show_skills = use_signal(|| false);
     let mut show_mcp = use_signal(|| false);
@@ -1501,9 +1506,7 @@ fn app() -> Element {
     let mut usage_info = use_signal(|| None::<(String, u8, u8, String, String)>);
     // Tiling split-view (each pane its own live engine).
     let mut show_split = use_signal(|| false);
-    let mut show_preview = use_signal(|| false);
     // Right-hand Changes panel (Cursor-style): repo-wide diff + commit/PR.
-    let mut show_changes = use_signal(|| false);
     let mut changed_files = use_signal(Vec::<(String, u32, u32, String)>::new);
     let mut preview_url = use_signal(String::new);
     let mut preview_ports = use_signal(Vec::<(u16, String)>::new);
@@ -1658,7 +1661,7 @@ fn app() -> Element {
         loop {
             match eval.recv::<String>().await {
                 Ok(k) if k == "palette" => { let v = !*show_palette.read(); show_palette.set(v); palette_query.set(String::new()); palette_sel.set(0); }
-                Ok(k) if k == "files" => { let v = !*show_files.read(); show_files.set(v); }
+                Ok(k) if k == "files" => { if *show_env.read() && env_tab.read().as_str() == "files" { show_env.set(false); } else { env_tab.set("files".to_string()); show_env.set(true); } }
                 Ok(k) if k == "shortcuts" => { let v = !*show_shortcuts.read(); show_shortcuts.set(v); }
                 Ok(k) if k == "esc" => { show_palette.set(false); show_shortcuts.set(false); }
                 Ok(_) => {}
@@ -1784,7 +1787,6 @@ fn app() -> Element {
     });
 
     // Terminal.
-    let mut term_lines = use_signal(Vec::<String>::new);
     let mut term_input = use_signal(String::new);
 
     // ── Engine coroutine (reconfigurable) ─────────────────────────────
@@ -2317,7 +2319,12 @@ fn app() -> Element {
             return;
         }
         term_input.set(String::new());
-        term_lines.write().push(format!("$ {cmd}"));
+        {
+            let sel = *term_sel.peek();
+            if let Some(t) = terms.write().get_mut(sel) {
+                t.2.push(format!("$ {cmd}"));
+            }
+        }
         let ws = ui.workspace.read().clone();
         spawn(async move {
             let out = tokio::process::Command::new("/bin/sh")
@@ -2338,7 +2345,10 @@ fn app() -> Element {
                 }
                 Err(e) => format!("error: {e}"),
             };
-            term_lines.write().push(text);
+            let sel = *term_sel.peek();
+            if let Some(t) = terms.write().get_mut(sel) {
+                t.2.push(text);
+            }
         });
     };
 
@@ -2802,29 +2812,35 @@ fn app() -> Element {
                             button { class: "top-btn", onclick: move |_| open_folder(cfg, ui, engine),
                                 Icon { name: "folder" } "Open folder"
                             }
-                            button { class: if *show_files.read() { "top-btn on" } else { "top-btn" },
-                                onclick: move |_| { let v = *show_files.read(); show_files.set(!v); }, Icon { name: "plugins" } "Files"
+                            button { class: if *show_env.read() && env_tab.read().as_str() == "files" { "top-btn on" } else { "top-btn" },
+                                onclick: move |_| {
+                                    if *show_env.read() && env_tab.read().as_str() == "files" { show_env.set(false); }
+                                    else { env_tab.set("files".to_string()); show_env.set(true); }
+                                }, Icon { name: "plugins" } "Files"
                             }
-                            button { class: if *show_terminal.read() { "top-btn on" } else { "top-btn" },
-                                onclick: move |_| { let v = *show_terminal.read(); show_terminal.set(!v); }, Icon { name: "terminal" } "Terminal"
+                            button { class: if *show_env.read() && env_tab.read().as_str() == "term" { "top-btn on" } else { "top-btn" },
+                                onclick: move |_| {
+                                    if *show_env.read() && env_tab.read().as_str() == "term" { show_env.set(false); }
+                                    else { env_tab.set("term".to_string()); show_env.set(true); }
+                                }, Icon { name: "terminal" } "Terminal"
                             }
                             button { class: if *show_split.read() { "top-btn on" } else { "top-btn" },
                                 onclick: move |_| { let v = *show_split.read(); show_split.set(!v); }, Icon { name: "plugins" } "Split"
                             }
-                            button { class: if *show_preview.read() { "top-btn on" } else { "top-btn" },
+                            button { class: if *show_env.read() && env_tab.read().as_str() == "preview" { "top-btn on" } else { "top-btn" },
                                 onclick: move |_| {
-                                    let v = *show_preview.read(); show_preview.set(!v);
-                                    if !v {
-                                        show_files.set(false);
+                                    if *show_env.read() && env_tab.read().as_str() == "preview" { show_env.set(false); }
+                                    else {
+                                        env_tab.set("preview".to_string()); show_env.set(true);
                                         spawn(async move { preview_ports.set(scan_ports().await); });
                                     }
                                 }, Icon { name: "browser" } "Preview"
                             }
-                            button { class: if *show_changes.read() { "top-btn on" } else { "top-btn" },
+                            button { class: if *show_env.read() && env_tab.read().as_str() == "changes" { "top-btn on" } else { "top-btn" },
                                 onclick: move |_| {
-                                    let v = *show_changes.read(); show_changes.set(!v);
-                                    if !v {
-                                        show_files.set(false); // the right inspector would overlap
+                                    if *show_env.read() && env_tab.read().as_str() == "changes" { show_env.set(false); }
+                                    else {
+                                        env_tab.set("changes".to_string()); show_env.set(true);
                                         let ws = ws_changes.clone();
                                         spawn(async move { changed_files.set(load_changed_files(&ws).await); });
                                     }
@@ -2834,187 +2850,573 @@ fn app() -> Element {
                     }
                 }
 
-                div { class: if *show_preview.read() || *show_changes.read() { "center with-preview" } else { "center" },
-                    style: if *show_preview.read() || *show_changes.read() { format!("--rpanel:{}px", *rpanel_w.read()) } else { String::new() },
-                    if *show_changes.read() {
-                        {
-                            let files = changed_files.read().clone();
-                            let n = files.len();
-                            let ta: u32 = files.iter().map(|f| f.1).sum();
-                            let td: u32 = files.iter().map(|f| f.2).sum();
-                            let ws_cp = workspace.clone();
-                            let ws_pr2 = workspace.clone();
-                            rsx! {
-                                div { class: "changes-panel",
-                                    div { class: "panel-resizer rp", onmousedown: move |e: dioxus::prelude::MouseEvent| {
-                                        e.prevent_default();
-                                        panel_drag.set(Some((3, e.client_coordinates().x, *rpanel_w.read())));
-                                    } }
-                                    div { class: "changes-head",
-                                        span { class: "changes-branch", Icon { name: "branch" } "{branch}" }
-                                        span { class: "changes-stats", "{n} files " span { class: "diff-adds countup plus", style: "--n:{ta}" } " " span { class: "diff-dels countup minus", style: "--n:{td}" } }
-                                        button { class: "git-act", onclick: move |_| {
-                                            let ws = ws_cp.clone();
-                                            spawn(async move {
-                                                let _ = run_cmd(&ws, "git", &["add", "-A"]).await;
-                                                let r = run_cmd(&ws, "git", &["commit", "-m", "wip: changes from Oxide"]).await;
-                                                let ok = !r.contains("error") && !r.contains("fatal");
-                                                push_toast(toasts, toast_seq, if ok { "ok" } else { "err" }, if ok { "Changes committed" } else { "Commit failed" });
-                                                changed_files.set(load_changed_files(&ws).await);
-                                            });
-                                        }, "Commit" }
-                                        button { class: "git-act", onclick: move |_| {
-                                            let ws = ws_pr2.clone();
-                                            spawn(async move {
-                                                let b = git_branch(&ws);
-                                                let _ = run_cmd(&ws, "git", &["push", "-u", "origin", &b]).await;
-                                                let _ = run_cmd(&ws, "gh", &["pr", "create", "--fill"]).await;
-                                            });
-                                        }, "Create PR" }
-                                        button { class: "term-x", onclick: move |_| show_changes.set(false), "✕" }
-                                    }
-                                    div { class: "changes-list",
-                                        if files.is_empty() { div { class: "insp-empty", "Working tree clean." } }
-                                        for (path, a, d, diff) in files {
-                                            details { class: "changes-file",
-                                                summary { class: "changes-file-head",
-                                                    span { class: "edits-caret", Icon { name: "chevron" } }
-                                                    span { class: "changes-path", "{path}" }
-                                                    span { class: "diff-adds", "+{a}" } span { class: "diff-dels", "−{d}" }
-                                                }
-                                                HunkedDiff { ws: workspace.clone(), path: path.clone(), diff }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if *show_preview.read() {
-                        div { class: "preview-panel",
+                div { class: if *show_env.read() { "center with-preview" } else { "center" },
+                    style: if *show_env.read() { format!("--rpanel:{}px", *rpanel_w.read()) } else { String::new() },
+                    if *show_env.read() {
+                        div { class: "env-panel",
                             div { class: "panel-resizer rp", onmousedown: move |e: dioxus::prelude::MouseEvent| {
                                 e.prevent_default();
                                 panel_drag.set(Some((3, e.client_coordinates().x, *rpanel_w.read())));
                             } }
-                            div { class: "preview-bar",
-                                input { class: "preview-addr", placeholder: "http://localhost:3000", value: "{preview_url}",
-                                    oninput: move |e| preview_url.set(e.value()),
-                                    onkeydown: move |e| if e.key() == Key::Enter {
-                                        let mut u = preview_url.read().clone();
-                                        if !u.is_empty() && !u.contains("://") { u = format!("http://{u}"); preview_url.set(u); }
+                            div { class: "env-tabs",
+                                for (tid, label, ic) in [("files", "Files", "plugins"), ("term", "Terminals", "terminal"), ("preview", "Preview", "spark"), ("changes", "Diffs", "branch")] {
+                                    button { class: if env_tab.read().as_str() == tid { "env-tab on" } else { "env-tab" },
+                                        onclick: move |_| env_tab.set(tid.to_string()),
+                                        Icon { name: ic } span { "{label}" }
                                     }
                                 }
-                                button { class: "preview-btn", title: "Rescan localhost ports", onclick: move |_| { spawn(async move { preview_ports.set(scan_ports().await); }); }, "⟳ Scan" }
-                                button { class: "preview-btn pick", title: "Select an element to send to the composer", onclick: move |_| {
-                                    spawn(async move { let _ = document::eval("document.querySelector('.preview-frame')?.contentWindow?.postMessage('oxide-pick-on','*')").await; });
-                                }, "Pick" }
-                                button { class: if *design_mode.read() { "preview-btn pick on" } else { "preview-btn" }, title: "Design Mode — click an element, edit it live, Apply writes the code", onclick: move |_| {
-                                    let v = *design_mode.read();
-                                    design_mode.set(!v);
-                                    if v { design_sel.set(None); design_edits.set(Vec::new()); }
-                                    let msg = if v { "'oxide-design-off'" } else { "'oxide-design-on'" };
-                                    let js = format!("document.querySelector('.preview-frame')?.contentWindow?.postMessage({msg},'*')");
-                                    spawn(async move { let _ = document::eval(&js).await; });
-                                }, "Design" }
-                                button { class: "preview-btn", title: "Reload", onclick: move |_| { let u = preview_url.read().clone(); preview_url.set(String::new()); preview_url.set(u); }, "Reload" }
-                                button { class: "preview-btn", title: "Open in system browser", onclick: move |_| { let u = preview_url.read().clone(); if !u.is_empty() { let _ = std::process::Command::new("open").arg(u).spawn(); } }, "↗" }
-                                button { class: "term-x", onclick: move |_| show_preview.set(false), "✕" }
+                                button { class: "env-x", title: "Close", onclick: move |_| show_env.set(false), "✕" }
                             }
-                            div { class: "preview-ports",
-                                if preview_ports.read().is_empty() {
-                                    span { class: "preview-hint", "No localhost servers detected. Start a dev server, then ⟳ Scan." }
-                                }
-                                for (port, cmd) in preview_ports.read().iter().cloned() {
-                                    button { class: "port-chip", title: "{cmd}", onclick: move |_| {
-                                        spawn(async move {
-                                            preview_proxy::set_target(port);
-                                            let pp = preview_proxy::ensure_proxy().await;
-                                            if pp != 0 { preview_url.set(format!("http://127.0.0.1:{pp}/")); }
-                                            else { preview_url.set(format!("http://localhost:{port}")); }
-                                        });
-                                    },
-                                        span { class: "port-dot" } "localhost:{port}" span { class: "port-cmd", "{cmd}" }
-                                    }
-                                }
-                            }
-                            if *design_mode.read() {
-                                if let Some(sel) = design_sel.read().clone() {
-                                    {
-                                        let selector = sel["selector"].as_str().unwrap_or("").to_string();
-                                        let source = sel["source"].as_str().unwrap_or("").to_string();
-                                        let component = sel["component"].as_str().unwrap_or("").to_string();
-                                        let html = sel["html"].as_str().unwrap_or("").to_string();
-                                        let cur_text = sel["text"].as_str().unwrap_or("").to_string();
-                                        let styles = sel["styles"].clone();
-                                        let props = ["color", "background", "fontSize", "fontWeight", "padding", "margin", "borderRadius"];
-                                        rsx! {
-                                            div { class: "design-panel",
-                                                div { class: "design-head",
-                                                    span { class: "design-selector", "{selector}" }
-                                                    if !component.is_empty() { span { class: "design-comp", "<{component}>" } }
-                                                }
-                                                div { class: "design-row",
-                                                    span { class: "design-lbl", "text" }
-                                                    input { class: "design-input", value: "{cur_text}",
-                                                        onchange: move |e| {
-                                                            let t = e.value();
-                                                            design_edits.write().push(("text".into(), String::new(), t.clone()));
-                                                            let js = format!("document.querySelector('.preview-frame')?.contentWindow?.postMessage({{type:'oxide-text-set',text:{}}},'*')", serde_json::to_string(&t).unwrap_or_default());
-                                                            spawn(async move { let _ = document::eval(&js).await; });
-                                                        } }
-                                                }
-                                                for prop in props {
-                                                    {
-                                                        let cssname = match prop { "fontSize" => "font-size", "fontWeight" => "font-weight", "borderRadius" => "border-radius", p => p };
-                                                        let cur = styles[prop].as_str().unwrap_or("").to_string();
-                                                        rsx! {
-                                                            div { class: "design-row",
-                                                                span { class: "design-lbl", "{cssname}" }
-                                                                input { class: "design-input", value: "{cur}",
-                                                                    onchange: move |e| {
-                                                                        let val = e.value();
-                                                                        design_edits.write().push((cssname.to_string(), cur.clone(), val.clone()));
-                                                                        let js = format!("document.querySelector('.preview-frame')?.contentWindow?.postMessage({{type:'oxide-style-set',prop:'{cssname}',value:{}}},'*')", serde_json::to_string(&val).unwrap_or_default());
-                                                                        spawn(async move { let _ = document::eval(&js).await; });
-                                                                    } }
-                                                            }
+                            div { class: "env-body",
+                            if env_tab.read().as_str() == "changes" {
+                                {
+                                    let files = changed_files.read().clone();
+                                    let n = files.len();
+                                    let ta: u32 = files.iter().map(|f| f.1).sum();
+                                    let td: u32 = files.iter().map(|f| f.2).sum();
+                                    let ws_cp = workspace.clone();
+                                    let ws_pr2 = workspace.clone();
+                                    rsx! {
+                                        div { class: "changes-panel",
+                                            div { class: "changes-head",
+                                                span { class: "changes-branch", Icon { name: "branch" } "{branch}" }
+                                                span { class: "changes-stats", "{n} files " span { class: "diff-adds countup plus", style: "--n:{ta}" } " " span { class: "diff-dels countup minus", style: "--n:{td}" } }
+                                                button { class: "git-act", onclick: move |_| {
+                                                    let ws = ws_cp.clone();
+                                                    spawn(async move {
+                                                        let _ = run_cmd(&ws, "git", &["add", "-A"]).await;
+                                                        let r = run_cmd(&ws, "git", &["commit", "-m", "wip: changes from Oxide"]).await;
+                                                        let ok = !r.contains("error") && !r.contains("fatal");
+                                                        push_toast(toasts, toast_seq, if ok { "ok" } else { "err" }, if ok { "Changes committed" } else { "Commit failed" });
+                                                        changed_files.set(load_changed_files(&ws).await);
+                                                    });
+                                                }, "Commit" }
+                                                button { class: "git-act", onclick: move |_| {
+                                                    let ws = ws_pr2.clone();
+                                                    spawn(async move {
+                                                        let b = git_branch(&ws);
+                                                        let _ = run_cmd(&ws, "git", &["push", "-u", "origin", &b]).await;
+                                                        let _ = run_cmd(&ws, "gh", &["pr", "create", "--fill"]).await;
+                                                    });
+                                                }, "Create PR" }
+                                                button { class: "term-x", onclick: move |_| show_env.set(false), "✕" }
+                                            }
+                                            div { class: "changes-list",
+                                                if files.is_empty() { div { class: "insp-empty", "Working tree clean." } }
+                                                for (path, a, d, diff) in files {
+                                                    details { class: "changes-file",
+                                                        summary { class: "changes-file-head",
+                                                            span { class: "edits-caret", Icon { name: "chevron" } }
+                                                            span { class: "changes-path", "{path}" }
+                                                            span { class: "diff-adds", "+{a}" } span { class: "diff-dels", "−{d}" }
                                                         }
+                                                        HunkedDiff { ws: workspace.clone(), path: path.clone(), diff }
                                                     }
-                                                }
-                                                div { class: "design-actions",
-                                                    button { class: "git-act", onclick: move |_| {
-                                                        let edits = design_edits.read().clone();
-                                                        if edits.is_empty() { return; }
-                                                        let mut spec = String::new();
-                                                        spec.push_str(&format!("- selector: {selector}\n"));
-                                                        if !component.is_empty() { spec.push_str(&format!("- component: <{component}>\n")); }
-                                                        if !source.is_empty() { spec.push_str(&format!("- source: {source}\n")); }
-                                                        spec.push_str(&format!("- html: {html}\n- edits:\n"));
-                                                        for (p2, old, newv) in &edits {
-                                                            if p2 == "text" { spec.push_str(&format!("  - text -> {newv:?}\n")); }
-                                                            else { spec.push_str(&format!("  - {p2}: {old} -> {newv}\n")); }
-                                                        }
-                                                        let prompt = format!("Apply these visual edits from Design Mode to the SOURCE CODE (find the element in the codebase; prefer existing design tokens/classes over raw values):\n{spec}");
-                                                        let _ = engine.send(EngineCmd::Submit { engine: prompt, display: format!("🎨 Apply design edits to {selector}") });
-                                                        design_edits.set(Vec::new());
-                                                        spawn(async move { let _ = document::eval("document.querySelector('.preview-frame')?.contentWindow?.postMessage('oxide-design-reset','*')").await; });
-                                                    }, "Apply → code" }
-                                                    button { class: "preview-btn", onclick: move |_| {
-                                                        design_edits.set(Vec::new());
-                                                        spawn(async move { let _ = document::eval("document.querySelector('.preview-frame')?.contentWindow?.postMessage('oxide-design-reset','*')").await; });
-                                                    }, "Reset" }
                                                 }
                                             }
                                         }
                                     }
-                                } else {
-                                    div { class: "design-hint", "🎨 Design Mode aktif — klik elemen di preview untuk mengedit." }
                                 }
                             }
-                            if preview_url.read().is_empty() {
-                                div { class: "preview-empty", "Pick a detected server above, or type a URL. Build + run + see it without leaving Oxide." }
-                            } else {
-                                iframe { class: "preview-frame", src: "{preview_url}" }
+                            if env_tab.read().as_str() == "preview" {
+                                div { class: "preview-panel",
+                                    div { class: "preview-bar",
+                                        input { class: "preview-addr", placeholder: "http://localhost:3000", value: "{preview_url}",
+                                            oninput: move |e| preview_url.set(e.value()),
+                                            onkeydown: move |e| if e.key() == Key::Enter {
+                                                let mut u = preview_url.read().clone();
+                                                if !u.is_empty() && !u.contains("://") { u = format!("http://{u}"); preview_url.set(u); }
+                                            }
+                                        }
+                                        button { class: "preview-btn", title: "Rescan localhost ports", onclick: move |_| { spawn(async move { preview_ports.set(scan_ports().await); }); }, "⟳ Scan" }
+                                        button { class: "preview-btn pick", title: "Select an element to send to the composer", onclick: move |_| {
+                                            spawn(async move { let _ = document::eval("document.querySelector('.preview-frame')?.contentWindow?.postMessage('oxide-pick-on','*')").await; });
+                                        }, "Pick" }
+                                        button { class: if *design_mode.read() { "preview-btn pick on" } else { "preview-btn" }, title: "Design Mode — click an element, edit it live, Apply writes the code", onclick: move |_| {
+                                            let v = *design_mode.read();
+                                            design_mode.set(!v);
+                                            if v { design_sel.set(None); design_edits.set(Vec::new()); }
+                                            let msg = if v { "'oxide-design-off'" } else { "'oxide-design-on'" };
+                                            let js = format!("document.querySelector('.preview-frame')?.contentWindow?.postMessage({msg},'*')");
+                                            spawn(async move { let _ = document::eval(&js).await; });
+                                        }, "Design" }
+                                        button { class: "preview-btn", title: "Reload", onclick: move |_| { let u = preview_url.read().clone(); preview_url.set(String::new()); preview_url.set(u); }, "Reload" }
+                                        button { class: "preview-btn", title: "Open in system browser", onclick: move |_| { let u = preview_url.read().clone(); if !u.is_empty() { let _ = std::process::Command::new("open").arg(u).spawn(); } }, "↗" }
+                                        button { class: "term-x", onclick: move |_| show_env.set(false), "✕" }
+                                    }
+                                    div { class: "preview-ports",
+                                        if preview_ports.read().is_empty() {
+                                            span { class: "preview-hint", "No localhost servers detected. Start a dev server, then ⟳ Scan." }
+                                        }
+                                        for (port, cmd) in preview_ports.read().iter().cloned() {
+                                            button { class: "port-chip", title: "{cmd}", onclick: move |_| {
+                                                spawn(async move {
+                                                    preview_proxy::set_target(port);
+                                                    let pp = preview_proxy::ensure_proxy().await;
+                                                    if pp != 0 { preview_url.set(format!("http://127.0.0.1:{pp}/")); }
+                                                    else { preview_url.set(format!("http://localhost:{port}")); }
+                                                });
+                                            },
+                                                span { class: "port-dot" } "localhost:{port}" span { class: "port-cmd", "{cmd}" }
+                                            }
+                                        }
+                                    }
+                                    if *design_mode.read() {
+                                        if let Some(sel) = design_sel.read().clone() {
+                                            {
+                                                let selector = sel["selector"].as_str().unwrap_or("").to_string();
+                                                let source = sel["source"].as_str().unwrap_or("").to_string();
+                                                let component = sel["component"].as_str().unwrap_or("").to_string();
+                                                let html = sel["html"].as_str().unwrap_or("").to_string();
+                                                let cur_text = sel["text"].as_str().unwrap_or("").to_string();
+                                                let styles = sel["styles"].clone();
+                                                let props = ["color", "background", "fontSize", "fontWeight", "padding", "margin", "borderRadius"];
+                                                rsx! {
+                                                    div { class: "design-panel",
+                                                        div { class: "design-head",
+                                                            span { class: "design-selector", "{selector}" }
+                                                            if !component.is_empty() { span { class: "design-comp", "<{component}>" } }
+                                                        }
+                                                        div { class: "design-row",
+                                                            span { class: "design-lbl", "text" }
+                                                            input { class: "design-input", value: "{cur_text}",
+                                                                onchange: move |e| {
+                                                                    let t = e.value();
+                                                                    design_edits.write().push(("text".into(), String::new(), t.clone()));
+                                                                    let js = format!("document.querySelector('.preview-frame')?.contentWindow?.postMessage({{type:'oxide-text-set',text:{}}},'*')", serde_json::to_string(&t).unwrap_or_default());
+                                                                    spawn(async move { let _ = document::eval(&js).await; });
+                                                                } }
+                                                        }
+                                                        for prop in props {
+                                                            {
+                                                                let cssname = match prop { "fontSize" => "font-size", "fontWeight" => "font-weight", "borderRadius" => "border-radius", p => p };
+                                                                let cur = styles[prop].as_str().unwrap_or("").to_string();
+                                                                rsx! {
+                                                                    div { class: "design-row",
+                                                                        span { class: "design-lbl", "{cssname}" }
+                                                                        input { class: "design-input", value: "{cur}",
+                                                                            onchange: move |e| {
+                                                                                let val = e.value();
+                                                                                design_edits.write().push((cssname.to_string(), cur.clone(), val.clone()));
+                                                                                let js = format!("document.querySelector('.preview-frame')?.contentWindow?.postMessage({{type:'oxide-style-set',prop:'{cssname}',value:{}}},'*')", serde_json::to_string(&val).unwrap_or_default());
+                                                                                spawn(async move { let _ = document::eval(&js).await; });
+                                                                            } }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                        div { class: "design-actions",
+                                                            button { class: "git-act", onclick: move |_| {
+                                                                let edits = design_edits.read().clone();
+                                                                if edits.is_empty() { return; }
+                                                                let mut spec = String::new();
+                                                                spec.push_str(&format!("- selector: {selector}\n"));
+                                                                if !component.is_empty() { spec.push_str(&format!("- component: <{component}>\n")); }
+                                                                if !source.is_empty() { spec.push_str(&format!("- source: {source}\n")); }
+                                                                spec.push_str(&format!("- html: {html}\n- edits:\n"));
+                                                                for (p2, old, newv) in &edits {
+                                                                    if p2 == "text" { spec.push_str(&format!("  - text -> {newv:?}\n")); }
+                                                                    else { spec.push_str(&format!("  - {p2}: {old} -> {newv}\n")); }
+                                                                }
+                                                                let prompt = format!("Apply these visual edits from Design Mode to the SOURCE CODE (find the element in the codebase; prefer existing design tokens/classes over raw values):\n{spec}");
+                                                                let _ = engine.send(EngineCmd::Submit { engine: prompt, display: format!("🎨 Apply design edits to {selector}") });
+                                                                design_edits.set(Vec::new());
+                                                                spawn(async move { let _ = document::eval("document.querySelector('.preview-frame')?.contentWindow?.postMessage('oxide-design-reset','*')").await; });
+                                                            }, "Apply → code" }
+                                                            button { class: "preview-btn", onclick: move |_| {
+                                                                design_edits.set(Vec::new());
+                                                                spawn(async move { let _ = document::eval("document.querySelector('.preview-frame')?.contentWindow?.postMessage('oxide-design-reset','*')").await; });
+                                                            }, "Reset" }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            div { class: "design-hint", "🎨 Design Mode aktif — klik elemen di preview untuk mengedit." }
+                                        }
+                                    }
+                                    if preview_url.read().is_empty() {
+                                        div { class: "preview-empty", "Pick a detected server above, or type a URL. Build + run + see it without leaving Oxide." }
+                                    } else {
+                                        iframe { class: "preview-frame", src: "{preview_url}" }
+                                    }
+                                }
+                            }
+                    if env_tab.read().as_str() == "files" {
+                        div { class: "panel-resizer", title: "Drag to resize inspector",
+                            onmousedown: move |e: dioxus::prelude::MouseEvent| {
+                                e.prevent_default();
+                                panel_drag.set(Some((2, e.client_coordinates().x, *insp_w.read())));
+                            },
+                        }
+                        aside { class: "files-panel",
+                            div { class: "insp-tabs",
+                                for (key, label) in [("review","Review"),("files","Files"),("timeline","Timeline"),("sessions","Sessions"),("git","Git"),("memory","Memory"),("goal","Goal"),("browser","Browser"),("approvals","Approvals"),("checkpoints","Checkpoints"),("usage","Usage")] {
+                                    {
+                                        let active = *inspector_tab.read() == key;
+                                        let badge = match key {
+                                            "approvals" => approvals.read().len(),
+                                            "checkpoints" => checkpoints.read().len(),
+                                            "review" => turn_edits.read().len(),
+                                            _ => 0,
+                                        };
+                                        let k = key.to_string();
+                                        rsx! {
+                                            button {
+                                                class: if active { "insp-tab on" } else { "insp-tab" },
+                                                onclick: move |_| inspector_tab.set(k.clone()),
+                                                "{label}"
+                                                if badge > 0 { span { class: "insp-badge", "{badge}" } }
+                                            }
+                                        }
+                                    }
+                                }
+                                button { class: "term-x", onclick: move |_| show_env.set(false), "✕" }
+                            }
+                            div { class: "insp-body",
+                                match inspector_tab.read().as_str() {
+                                    "review" => rsx! {
+                                        if turn_edits.read().is_empty() {
+                                            div { class: "insp-empty", "No changes to review. Edits the agent makes appear here — accept to keep, reject to revert." }
+                                        } else {
+                                            div { class: "review-head",
+                                                span { class: "review-count", "{turn_edits.read().len()} changed file(s)" }
+                                                button { class: "ed-close", onclick: move |_| {
+                                                    let edits = turn_edits.read().clone();
+                                                    for (_, _, _, cp, _) in edits.iter().rev() { let _ = engine.send(EngineCmd::Rewind { id: *cp }); reverted.write().insert(*cp); }
+                                                    turn_edits.write().clear();
+                                                }, "Reject all" }
+                                            }
+                                            for (idx, (path, adds, dels, cp, diff)) in turn_edits.read().clone().into_iter().enumerate() {
+                                                div { class: "review-item",
+                                                    details { class: "review-diff-d",
+                                                        summary { class: "review-file",
+                                                            span { class: "edits-caret", Icon { name: "chevron" } }
+                                                            span { class: "review-path", "{path}" }
+                                                            span { class: "diff-adds", "+{adds}" }
+                                                            span { class: "diff-dels", "−{dels}" }
+                                                        }
+                                                        HunkedDiff { ws: workspace.clone(), path: path.clone(), diff }
+                                                    }
+                                                    div { class: "review-actions",
+                                                        button { class: "review-accept", title: "Keep this change", onclick: move |_| {
+                                                            let mut v = turn_edits.write(); if idx < v.len() { v.remove(idx); }
+                                                        }, "Accept" }
+                                                        button { class: "review-reject", title: "Revert this change", onclick: move |_| {
+                                                            let _ = engine.send(EngineCmd::Rewind { id: cp });
+                                                            reverted.write().insert(cp);
+                                                            let mut v = turn_edits.write(); if idx < v.len() { v.remove(idx); }
+                                                        }, "Reject" }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    },
+                                    "files" => rsx! {
+                                        div { class: "tree",
+                                            FileNode { path: workspace.clone(), depth: 0, is_root: true }
+                                        }
+                                    },
+                                    "approvals" => rsx! {
+                                        if approvals.read().is_empty() {
+                                            div { class: "insp-empty", "No pending approvals. (Bypass is on — use --safe to require them.)" }
+                                        }
+                                        for (id, tool, summary) in approvals.read().iter().cloned() {
+                                            div { class: "insp-card",
+                                                div { class: "insp-card-title", "{tool}" }
+                                                div { class: "insp-card-sub", "{summary}" }
+                                                div { class: "insp-card-actions",
+                                                    button { class: "ed-save", onclick: move |_| { let _ = engine.send(EngineCmd::Approve { id, decision: ApprovalDecision::Approve }); }, "Approve" }
+                                                    button { class: "ed-close", onclick: move |_| { let _ = engine.send(EngineCmd::Approve { id, decision: ApprovalDecision::Reject }); }, "Reject" }
+                                                }
+                                            }
+                                        }
+                                    },
+                                    "checkpoints" => rsx! {
+                                        if checkpoints.read().is_empty() {
+                                            div { class: "insp-empty", "No checkpoints yet. Each file write the agent makes is snapshotted here." }
+                                        }
+                                        for (id, label) in checkpoints.read().iter().cloned().rev() {
+                                            div { class: "insp-card",
+                                                div { class: "insp-card-title", "#{id} · {label}" }
+                                                div { class: "insp-card-actions",
+                                                    button { class: "ed-close", onclick: move |_| { let _ = engine.send(EngineCmd::Rewind { id }); }, "Rewind to here" }
+                                                }
+                                            }
+                                        }
+                                    },
+                                    "sessions" => rsx! {
+                                        {
+                                            let sessions = list_sessions(&workspace);
+                                            rsx! {
+                                                if sessions.is_empty() {
+                                                    div { class: "insp-empty", "No saved sessions yet. Conversations persist to .oxide/sessions." }
+                                                }
+                                                for (id, count, path) in sessions {
+                                                    div { class: "insp-card",
+                                                        div { class: "insp-card-title", "session {id}" }
+                                                        div { class: "insp-card-sub", "{count} message(s)" }
+                                                        div { class: "insp-card-actions",
+                                                            button { class: "ed-save", onclick: move |_| {
+                                                                let msgs = load_session(&path);
+                                                                messages.set(msgs);
+                                                            }, "Open transcript" }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    },
+                                    "git" => {
+                                        let ws_refresh = workspace.clone();
+                                        let ws_commit = workspace.clone();
+                                        let ws_files = workspace.clone();
+                                        let ws_refresh2 = workspace.clone();
+                                        let ws_pr = workspace.clone();
+                                        rsx! {
+                                            div { class: "git-bar",
+                                                button { class: "ed-close", onclick: move |_| {
+                                                    let ws = ws_refresh.clone();
+                                                    spawn(async move {
+                                                        let s = git_run(ws, vec!["status".into(),"--short".into()]).await;
+                                                        git_status.set(s.lines().map(|l| l.to_string()).collect());
+                                                    });
+                                                }, "Refresh" }
+                                            }
+                                            if git_status.read().is_empty() {
+                                                div { class: "insp-empty", "Click Refresh to load git status." }
+                                            }
+                                            for line in git_status.read().iter().cloned() {
+                                                {
+                                                    let file = line.get(3..).unwrap_or("").trim().to_string();
+                                                    let ch = line.get(..2).unwrap_or("").trim().chars().next().unwrap_or('?');
+                                                    let (badge_cls, badge) = match ch {
+                                                        'M' | 'R' => ("git-badge m", "M"),
+                                                        'A' => ("git-badge a", "A"),
+                                                        'D' => ("git-badge d", "D"),
+                                                        _ => ("git-badge u", "U"),
+                                                    };
+                                                    let ws = ws_files.clone();
+                                                    rsx! {
+                                                        button { class: "git-file", onclick: move |_| {
+                                                            let ws = ws.clone();
+                                                            let f = file.clone();
+                                                            spawn(async move {
+                                                                let d = git_run(ws, vec!["diff".into(), f]).await;
+                                                                git_diff.set(d);
+                                                            });
+                                                        },
+                                                            span { class: "{badge_cls}", "{badge}" }
+                                                            span { class: "git-name", "{file}" }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            if !git_diff.read().is_empty() {
+                                                pre { class: "git-diff", "{git_diff}" }
+                                            }
+                                            div { class: "git-commit",
+                                                input { class: "field-input", placeholder: "Commit message…",
+                                                    value: "{commit_msg}", oninput: move |e| commit_msg.set(e.value()) }
+                                                button { class: "ed-save", onclick: move |_| {
+                                                    let ws = ws_commit.clone();
+                                                    let msg = commit_msg.read().clone();
+                                                    if !msg.trim().is_empty() {
+                                                        commit_msg.set(String::new());
+                                                        spawn(async move {
+                                                            let _ = git_run(ws.clone(), vec!["add".into(),"-A".into()]).await;
+                                                            let out = git_run(ws.clone(), vec!["commit".into(),"-m".into(), msg]).await;
+                                                            let s = git_run(ws.clone(), vec!["status".into(),"--short".into()]).await;
+                                                            git_status.set(s.lines().map(|l| l.to_string()).collect());
+                                                            git_diff.set(out);
+                                                        });
+                                                    }
+                                                }, "Commit" }
+                                            }
+                                            div { class: "git-actions",
+                                                span { class: "git-branch-label", Icon { name: "git" } "{branch}" }
+                                                button { class: "git-act", title: "Push to origin", onclick: {
+                                                    let ws = ws_refresh2.clone();
+                                                    move |_| {
+                                                        let ws = ws.clone();
+                                                        git_busy.set("Pushing…".into());
+                                                        spawn(async move {
+                                                            let out = git_run(ws.clone(), vec!["push".into()]).await;
+                                                            let out = if out.to_lowercase().contains("no upstream") || out.to_lowercase().contains("set-upstream") {
+                                                                let b = git_branch(&ws);
+                                                                git_run(ws.clone(), vec!["push".into(),"-u".into(),"origin".into(), b]).await
+                                                            } else { out };
+                                                            git_busy.set(String::new());
+                                                            git_diff.set(format!("$ git push\n{out}"));
+                                                        });
+                                                    }
+                                                }, "Push ↑" }
+                                                button { class: "git-act", title: "Create a pull request (gh)", onclick: {
+                                                    let ws = ws_pr.clone();
+                                                    move |_| {
+                                                        let ws = ws.clone();
+                                                        git_busy.set("Creating PR…".into());
+                                                        spawn(async move {
+                                                            let b = git_branch(&ws);
+                                                            let _ = git_run(ws.clone(), vec!["push".into(),"-u".into(),"origin".into(), b]).await;
+                                                            let out = run_cmd(&ws, "gh", &["pr","create","--fill"]).await;
+                                                            git_busy.set(String::new());
+                                                            git_diff.set(format!("$ gh pr create --fill\n{out}"));
+                                                        });
+                                                    }
+                                                }, "Create PR" }
+                                                if !git_busy.read().is_empty() { span { class: "git-busy", span { class: "syn-spinner" } "{git_busy}" } }
+                                            }
+                                        }
+                                    },
+                                    "memory" => {
+                                        let mem_path = workspace.join(".oxide/memory/MEMORY.md");
+                                        let mem_save = mem_path.clone();
+                                        let skills_dir = workspace.join(".oxide/memory/skills");
+                                        let mut skills: Vec<String> = std::fs::read_dir(&skills_dir)
+                                            .into_iter().flatten().flatten()
+                                            .map(|e| e.path())
+                                            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("md"))
+                                            .filter_map(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
+                                            .collect();
+                                        skills.sort();
+                                        rsx! {
+                                            div { class: "git-bar",
+                                                button { class: "ed-close", onclick: move |_| {
+                                                    memory_text.set(std::fs::read_to_string(&mem_path).unwrap_or_default());
+                                                }, "Load" }
+                                            }
+                                            div { class: "insp-empty", "Durable facts the agent remembers across sessions (MEMORY.md). It also reads/writes this via the remember tool." }
+                                            textarea { class: "goal-input", placeholder: "Nothing remembered yet — click Load, or the agent will fill this.",
+                                                value: "{memory_text}", oninput: move |e| memory_text.set(e.value()) }
+                                            button { class: "ed-save", onclick: move |_| {
+                                                if let Some(parent) = mem_save.parent() { let _ = std::fs::create_dir_all(parent); }
+                                                let _ = std::fs::write(&mem_save, memory_text.read().clone());
+                                            }, "Save memory" }
+                                            div { class: "menu-label", "Learned skills" }
+                                            if skills.is_empty() {
+                                                div { class: "insp-empty", "No skills yet. The agent saves reusable procedures via save_skill." }
+                                            }
+                                            for s in skills {
+                                                div { class: "tl-item", div { class: "tl-title", "🛠 {s}" } }
+                                            }
+                                        }
+                                    },
+                                    "goal" => rsx! {
+                                        {
+                                            let mut goal_text = goal_text;
+                                            let mut pursue = pursue_goal;
+                                            let active = *pursue.read();
+                                            rsx! {
+                                                div { class: "insp-empty", "Set a goal — the agent keeps working toward it until done." }
+                                                textarea { class: "goal-input", placeholder: "Describe the goal…",
+                                                    value: "{goal_text}", oninput: move |e| goal_text.set(e.value()) }
+                                                button { class: if active { "ed-save" } else { "ed-close" },
+                                                    onclick: move |_| { let v = *pursue.read(); pursue.set(!v); },
+                                                    if active { "Goal active · click to stop" } else { "Activate goal" }
+                                                }
+                                            }
+                                        }
+                                    },
+                                    "browser" => rsx! {
+                                        div { class: "git-commit",
+                                            input { class: "field-input", placeholder: "https://…",
+                                                value: "{browser_url}", oninput: move |e| browser_url.set(e.value()) }
+                                            button { class: "ed-save", onclick: move |_| {
+                                                let url = browser_url.read().trim().to_string();
+                                                if !url.is_empty() {
+                                                    browser_log.write().push(url.clone());
+                                                    spawn(async move {
+                                                        let _ = tokio::process::Command::new("open").arg(&url).output().await;
+                                                    });
+                                                }
+                                            }, "Open" }
+                                        }
+                                        if browser_log.read().is_empty() {
+                                            div { class: "insp-empty", "Open a URL in your browser, or the agent's browser_open tool will log here." }
+                                        }
+                                        for u in browser_log.read().iter().cloned().rev() {
+                                            div { class: "tl-item", div { class: "tl-title", "{u}" } }
+                                        }
+                                    },
+                                    "usage" => rsx! {
+                                        {
+                                            let (tin, tout) = *usage.read();
+                                            let limit = context_limit.read().unwrap_or(0);
+                                            let pct = if limit > 0 { (tin as f64 / limit as f64 * 100.0).min(100.0) } else { 0.0 };
+                                            rsx! {
+                                                div { class: "usage-grid",
+                                                    div { class: "usage-stat", div { class: "usage-num", "{tin}" } div { class: "usage-lbl", "input tokens" } }
+                                                    div { class: "usage-stat", div { class: "usage-num", "{tout}" } div { class: "usage-lbl", "output tokens" } }
+                                                }
+                                                if limit > 0 {
+                                                    div { class: "usage-bar-wrap",
+                                                        div { class: "usage-bar-label", "context · {tin/1000}k / {limit/1000}k" }
+                                                        div { class: "usage-bar", div { class: "usage-bar-fill", style: "width: {pct}%" } }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    },
+                                    _ => rsx! {
+                                        if timeline.read().is_empty() {
+                                            div { class: "insp-empty", "Activity will appear here as the agent works." }
+                                        }
+                                        for item in timeline.read().iter().cloned().rev() {
+                                            div { class: "tl-item",
+                                                div { class: "tl-title", "{item.title}" }
+                                                if !item.sub.is_empty() { div { class: "tl-sub", "{item.sub}" } }
+                                            }
+                                        }
+                                    },
+                                }
+                            }
+                        }
+                    }
+                                if env_tab.read().as_str() == "term" {
+                                    div { class: "env-terms",
+                                        div { class: "term-tabs",
+                                            for ti in 0..terms.read().len() {
+                                                {
+                                                    let title = terms.read()[ti].1.clone();
+                                                    rsx! {
+                                                        button { class: if ti == *term_sel.read() { "term-tab on" } else { "term-tab" },
+                                                            onclick: move |_| term_sel.set(ti),
+                                                            "{title}"
+                                                            if terms.read().len() > 1 {
+                                                                span { class: "term-tab-x", onclick: move |e: dioxus::prelude::MouseEvent| {
+                                                                    e.stop_propagation();
+                                                                    let n = { let mut tv = terms.write(); if ti < tv.len() { tv.remove(ti); } tv.len() };
+                                                                    if *term_sel.read() >= n { term_sel.set(n.saturating_sub(1)); }
+                                                                }, "✕" }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            button { class: "term-tab add", title: "New terminal", onclick: move |_| {
+                                                let id = *term_seq.read() + 1; term_seq.set(id);
+                                                terms.write().push((id, format!("zsh {id}"), Vec::new()));
+                                                let n = terms.read().len(); term_sel.set(n - 1);
+                                            }, "+" }
+                                            button { class: "term-tab add", title: "Clear output", onclick: move |_| { let sel = *term_sel.read(); if let Some(t) = terms.write().get_mut(sel) { t.2.clear(); } }, "⌫" }
+                                        }
+                                        div { class: "term-body",
+                                            {
+                                                let sel = *term_sel.read();
+                                                let tl: Vec<String> = terms.read().get(sel).map(|t| t.2.clone()).unwrap_or_default();
+                                                rsx! { for l in tl { div { class: "term-line", "{l}" } } }
+                                            }
+                                        }
+                                        div { class: "term-input-row",
+                                            span { class: "term-prompt", "❯" }
+                                            input { class: "term-input", placeholder: "command…", value: "{term_input}",
+                                                oninput: move |e| term_input.set(e.value()),
+                                                onkeydown: move |e| if e.key() == Key::Enter { run_term(); },
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -3221,7 +3623,7 @@ fn app() -> Element {
                                                                         details { class: "diff-card",
                                                                             summary { class: "diff-head",
                                                                                 // Expanding a diff hides the right inspector so the diff gets the width.
-                                                                                onclick: move |_| { if *show_files.read() { show_files.set(false); } },
+                                                                                onclick: move |_| { if *show_env.read() && env_tab.read().as_str() == "files" { show_env.set(false); } },
                                                                                 span { class: "diff-caret", Icon { name: "chevron" } }
                                                                                 span { class: "diff-path", "{path}" }
                                                                                 span { class: "diff-adds", "+{adds}" }
@@ -3476,370 +3878,9 @@ fn app() -> Element {
                 }
 
                 // Terminal dock
-                if *show_terminal.read() {
-                    div { class: "terminal", style: "height:{term_h}px",
-                        div { class: "panel-resizer term", onmousedown: move |e: dioxus::prelude::MouseEvent| {
-                            e.prevent_default();
-                            panel_drag.set(Some((4, e.client_coordinates().y, *term_h.read())));
-                        } }
-                        div { class: "term-head",
-                            span { "TERMINAL · {project}" }
-                            div { class: "term-head-actions",
-                                button { class: "term-x", onclick: move |_| term_lines.write().clear(), "clear" }
-                                button { class: "term-x", onclick: move |_| show_terminal.set(false), "✕" }
-                            }
-                        }
-                        div { class: "term-body",
-                            for line in term_lines.read().iter() {
-                                pre { class: "term-line", "{line}" }
-                            }
-                        }
-                        div { class: "term-input-row",
-                            span { class: "term-prompt", "$" }
-                            input {
-                                class: "term-input",
-                                placeholder: "run a command…",
-                                value: "{term_input}",
-                                oninput: move |e| term_input.set(e.value()),
-                                onkeydown: move |e| if e.key() == Key::Enter { run_term(); },
-                            }
-                        }
-                    }
-                }
             }
 
             // ── Right inspector (tabbed) ───────────────────────────────
-            if *show_files.read() && !*show_preview.read() && cfg.read().workspace.is_some() {
-                div { class: "panel-resizer", title: "Drag to resize inspector",
-                    onmousedown: move |e: dioxus::prelude::MouseEvent| {
-                        e.prevent_default();
-                        panel_drag.set(Some((2, e.client_coordinates().x, *insp_w.read())));
-                    },
-                }
-                aside { class: "files-panel", style: "width:{insp_w}px",
-                    div { class: "insp-tabs",
-                        for (key, label) in [("review","Review"),("files","Files"),("timeline","Timeline"),("sessions","Sessions"),("git","Git"),("memory","Memory"),("goal","Goal"),("browser","Browser"),("approvals","Approvals"),("checkpoints","Checkpoints"),("usage","Usage")] {
-                            {
-                                let active = *inspector_tab.read() == key;
-                                let badge = match key {
-                                    "approvals" => approvals.read().len(),
-                                    "checkpoints" => checkpoints.read().len(),
-                                    "review" => turn_edits.read().len(),
-                                    _ => 0,
-                                };
-                                let k = key.to_string();
-                                rsx! {
-                                    button {
-                                        class: if active { "insp-tab on" } else { "insp-tab" },
-                                        onclick: move |_| inspector_tab.set(k.clone()),
-                                        "{label}"
-                                        if badge > 0 { span { class: "insp-badge", "{badge}" } }
-                                    }
-                                }
-                            }
-                        }
-                        button { class: "term-x", onclick: move |_| show_files.set(false), "✕" }
-                    }
-                    div { class: "insp-body",
-                        match inspector_tab.read().as_str() {
-                            "review" => rsx! {
-                                if turn_edits.read().is_empty() {
-                                    div { class: "insp-empty", "No changes to review. Edits the agent makes appear here — accept to keep, reject to revert." }
-                                } else {
-                                    div { class: "review-head",
-                                        span { class: "review-count", "{turn_edits.read().len()} changed file(s)" }
-                                        button { class: "ed-close", onclick: move |_| {
-                                            let edits = turn_edits.read().clone();
-                                            for (_, _, _, cp, _) in edits.iter().rev() { let _ = engine.send(EngineCmd::Rewind { id: *cp }); reverted.write().insert(*cp); }
-                                            turn_edits.write().clear();
-                                        }, "Reject all" }
-                                    }
-                                    for (idx, (path, adds, dels, cp, diff)) in turn_edits.read().clone().into_iter().enumerate() {
-                                        div { class: "review-item",
-                                            details { class: "review-diff-d",
-                                                summary { class: "review-file",
-                                                    span { class: "edits-caret", Icon { name: "chevron" } }
-                                                    span { class: "review-path", "{path}" }
-                                                    span { class: "diff-adds", "+{adds}" }
-                                                    span { class: "diff-dels", "−{dels}" }
-                                                }
-                                                HunkedDiff { ws: workspace.clone(), path: path.clone(), diff }
-                                            }
-                                            div { class: "review-actions",
-                                                button { class: "review-accept", title: "Keep this change", onclick: move |_| {
-                                                    let mut v = turn_edits.write(); if idx < v.len() { v.remove(idx); }
-                                                }, "Accept" }
-                                                button { class: "review-reject", title: "Revert this change", onclick: move |_| {
-                                                    let _ = engine.send(EngineCmd::Rewind { id: cp });
-                                                    reverted.write().insert(cp);
-                                                    let mut v = turn_edits.write(); if idx < v.len() { v.remove(idx); }
-                                                }, "Reject" }
-                                            }
-                                        }
-                                    }
-                                }
-                            },
-                            "files" => rsx! {
-                                div { class: "tree",
-                                    FileNode { path: workspace.clone(), depth: 0, is_root: true }
-                                }
-                            },
-                            "approvals" => rsx! {
-                                if approvals.read().is_empty() {
-                                    div { class: "insp-empty", "No pending approvals. (Bypass is on — use --safe to require them.)" }
-                                }
-                                for (id, tool, summary) in approvals.read().iter().cloned() {
-                                    div { class: "insp-card",
-                                        div { class: "insp-card-title", "{tool}" }
-                                        div { class: "insp-card-sub", "{summary}" }
-                                        div { class: "insp-card-actions",
-                                            button { class: "ed-save", onclick: move |_| { let _ = engine.send(EngineCmd::Approve { id, decision: ApprovalDecision::Approve }); }, "Approve" }
-                                            button { class: "ed-close", onclick: move |_| { let _ = engine.send(EngineCmd::Approve { id, decision: ApprovalDecision::Reject }); }, "Reject" }
-                                        }
-                                    }
-                                }
-                            },
-                            "checkpoints" => rsx! {
-                                if checkpoints.read().is_empty() {
-                                    div { class: "insp-empty", "No checkpoints yet. Each file write the agent makes is snapshotted here." }
-                                }
-                                for (id, label) in checkpoints.read().iter().cloned().rev() {
-                                    div { class: "insp-card",
-                                        div { class: "insp-card-title", "#{id} · {label}" }
-                                        div { class: "insp-card-actions",
-                                            button { class: "ed-close", onclick: move |_| { let _ = engine.send(EngineCmd::Rewind { id }); }, "Rewind to here" }
-                                        }
-                                    }
-                                }
-                            },
-                            "sessions" => rsx! {
-                                {
-                                    let sessions = list_sessions(&workspace);
-                                    rsx! {
-                                        if sessions.is_empty() {
-                                            div { class: "insp-empty", "No saved sessions yet. Conversations persist to .oxide/sessions." }
-                                        }
-                                        for (id, count, path) in sessions {
-                                            div { class: "insp-card",
-                                                div { class: "insp-card-title", "session {id}" }
-                                                div { class: "insp-card-sub", "{count} message(s)" }
-                                                div { class: "insp-card-actions",
-                                                    button { class: "ed-save", onclick: move |_| {
-                                                        let msgs = load_session(&path);
-                                                        messages.set(msgs);
-                                                    }, "Open transcript" }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            },
-                            "git" => {
-                                let ws_refresh = workspace.clone();
-                                let ws_commit = workspace.clone();
-                                let ws_files = workspace.clone();
-                                let ws_refresh2 = workspace.clone();
-                                let ws_pr = workspace.clone();
-                                rsx! {
-                                    div { class: "git-bar",
-                                        button { class: "ed-close", onclick: move |_| {
-                                            let ws = ws_refresh.clone();
-                                            spawn(async move {
-                                                let s = git_run(ws, vec!["status".into(),"--short".into()]).await;
-                                                git_status.set(s.lines().map(|l| l.to_string()).collect());
-                                            });
-                                        }, "Refresh" }
-                                    }
-                                    if git_status.read().is_empty() {
-                                        div { class: "insp-empty", "Click Refresh to load git status." }
-                                    }
-                                    for line in git_status.read().iter().cloned() {
-                                        {
-                                            let file = line.get(3..).unwrap_or("").trim().to_string();
-                                            let ch = line.get(..2).unwrap_or("").trim().chars().next().unwrap_or('?');
-                                            let (badge_cls, badge) = match ch {
-                                                'M' | 'R' => ("git-badge m", "M"),
-                                                'A' => ("git-badge a", "A"),
-                                                'D' => ("git-badge d", "D"),
-                                                _ => ("git-badge u", "U"),
-                                            };
-                                            let ws = ws_files.clone();
-                                            rsx! {
-                                                button { class: "git-file", onclick: move |_| {
-                                                    let ws = ws.clone();
-                                                    let f = file.clone();
-                                                    spawn(async move {
-                                                        let d = git_run(ws, vec!["diff".into(), f]).await;
-                                                        git_diff.set(d);
-                                                    });
-                                                },
-                                                    span { class: "{badge_cls}", "{badge}" }
-                                                    span { class: "git-name", "{file}" }
-                                                }
-                                            }
-                                        }
-                                    }
-                                    if !git_diff.read().is_empty() {
-                                        pre { class: "git-diff", "{git_diff}" }
-                                    }
-                                    div { class: "git-commit",
-                                        input { class: "field-input", placeholder: "Commit message…",
-                                            value: "{commit_msg}", oninput: move |e| commit_msg.set(e.value()) }
-                                        button { class: "ed-save", onclick: move |_| {
-                                            let ws = ws_commit.clone();
-                                            let msg = commit_msg.read().clone();
-                                            if !msg.trim().is_empty() {
-                                                commit_msg.set(String::new());
-                                                spawn(async move {
-                                                    let _ = git_run(ws.clone(), vec!["add".into(),"-A".into()]).await;
-                                                    let out = git_run(ws.clone(), vec!["commit".into(),"-m".into(), msg]).await;
-                                                    let s = git_run(ws.clone(), vec!["status".into(),"--short".into()]).await;
-                                                    git_status.set(s.lines().map(|l| l.to_string()).collect());
-                                                    git_diff.set(out);
-                                                });
-                                            }
-                                        }, "Commit" }
-                                    }
-                                    div { class: "git-actions",
-                                        span { class: "git-branch-label", Icon { name: "git" } "{branch}" }
-                                        button { class: "git-act", title: "Push to origin", onclick: {
-                                            let ws = ws_refresh2.clone();
-                                            move |_| {
-                                                let ws = ws.clone();
-                                                git_busy.set("Pushing…".into());
-                                                spawn(async move {
-                                                    let out = git_run(ws.clone(), vec!["push".into()]).await;
-                                                    let out = if out.to_lowercase().contains("no upstream") || out.to_lowercase().contains("set-upstream") {
-                                                        let b = git_branch(&ws);
-                                                        git_run(ws.clone(), vec!["push".into(),"-u".into(),"origin".into(), b]).await
-                                                    } else { out };
-                                                    git_busy.set(String::new());
-                                                    git_diff.set(format!("$ git push\n{out}"));
-                                                });
-                                            }
-                                        }, "Push ↑" }
-                                        button { class: "git-act", title: "Create a pull request (gh)", onclick: {
-                                            let ws = ws_pr.clone();
-                                            move |_| {
-                                                let ws = ws.clone();
-                                                git_busy.set("Creating PR…".into());
-                                                spawn(async move {
-                                                    let b = git_branch(&ws);
-                                                    let _ = git_run(ws.clone(), vec!["push".into(),"-u".into(),"origin".into(), b]).await;
-                                                    let out = run_cmd(&ws, "gh", &["pr","create","--fill"]).await;
-                                                    git_busy.set(String::new());
-                                                    git_diff.set(format!("$ gh pr create --fill\n{out}"));
-                                                });
-                                            }
-                                        }, "Create PR" }
-                                        if !git_busy.read().is_empty() { span { class: "git-busy", span { class: "syn-spinner" } "{git_busy}" } }
-                                    }
-                                }
-                            },
-                            "memory" => {
-                                let mem_path = workspace.join(".oxide/memory/MEMORY.md");
-                                let mem_save = mem_path.clone();
-                                let skills_dir = workspace.join(".oxide/memory/skills");
-                                let mut skills: Vec<String> = std::fs::read_dir(&skills_dir)
-                                    .into_iter().flatten().flatten()
-                                    .map(|e| e.path())
-                                    .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("md"))
-                                    .filter_map(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
-                                    .collect();
-                                skills.sort();
-                                rsx! {
-                                    div { class: "git-bar",
-                                        button { class: "ed-close", onclick: move |_| {
-                                            memory_text.set(std::fs::read_to_string(&mem_path).unwrap_or_default());
-                                        }, "Load" }
-                                    }
-                                    div { class: "insp-empty", "Durable facts the agent remembers across sessions (MEMORY.md). It also reads/writes this via the remember tool." }
-                                    textarea { class: "goal-input", placeholder: "Nothing remembered yet — click Load, or the agent will fill this.",
-                                        value: "{memory_text}", oninput: move |e| memory_text.set(e.value()) }
-                                    button { class: "ed-save", onclick: move |_| {
-                                        if let Some(parent) = mem_save.parent() { let _ = std::fs::create_dir_all(parent); }
-                                        let _ = std::fs::write(&mem_save, memory_text.read().clone());
-                                    }, "Save memory" }
-                                    div { class: "menu-label", "Learned skills" }
-                                    if skills.is_empty() {
-                                        div { class: "insp-empty", "No skills yet. The agent saves reusable procedures via save_skill." }
-                                    }
-                                    for s in skills {
-                                        div { class: "tl-item", div { class: "tl-title", "🛠 {s}" } }
-                                    }
-                                }
-                            },
-                            "goal" => rsx! {
-                                {
-                                    let mut goal_text = goal_text;
-                                    let mut pursue = pursue_goal;
-                                    let active = *pursue.read();
-                                    rsx! {
-                                        div { class: "insp-empty", "Set a goal — the agent keeps working toward it until done." }
-                                        textarea { class: "goal-input", placeholder: "Describe the goal…",
-                                            value: "{goal_text}", oninput: move |e| goal_text.set(e.value()) }
-                                        button { class: if active { "ed-save" } else { "ed-close" },
-                                            onclick: move |_| { let v = *pursue.read(); pursue.set(!v); },
-                                            if active { "Goal active · click to stop" } else { "Activate goal" }
-                                        }
-                                    }
-                                }
-                            },
-                            "browser" => rsx! {
-                                div { class: "git-commit",
-                                    input { class: "field-input", placeholder: "https://…",
-                                        value: "{browser_url}", oninput: move |e| browser_url.set(e.value()) }
-                                    button { class: "ed-save", onclick: move |_| {
-                                        let url = browser_url.read().trim().to_string();
-                                        if !url.is_empty() {
-                                            browser_log.write().push(url.clone());
-                                            spawn(async move {
-                                                let _ = tokio::process::Command::new("open").arg(&url).output().await;
-                                            });
-                                        }
-                                    }, "Open" }
-                                }
-                                if browser_log.read().is_empty() {
-                                    div { class: "insp-empty", "Open a URL in your browser, or the agent's browser_open tool will log here." }
-                                }
-                                for u in browser_log.read().iter().cloned().rev() {
-                                    div { class: "tl-item", div { class: "tl-title", "{u}" } }
-                                }
-                            },
-                            "usage" => rsx! {
-                                {
-                                    let (tin, tout) = *usage.read();
-                                    let limit = context_limit.read().unwrap_or(0);
-                                    let pct = if limit > 0 { (tin as f64 / limit as f64 * 100.0).min(100.0) } else { 0.0 };
-                                    rsx! {
-                                        div { class: "usage-grid",
-                                            div { class: "usage-stat", div { class: "usage-num", "{tin}" } div { class: "usage-lbl", "input tokens" } }
-                                            div { class: "usage-stat", div { class: "usage-num", "{tout}" } div { class: "usage-lbl", "output tokens" } }
-                                        }
-                                        if limit > 0 {
-                                            div { class: "usage-bar-wrap",
-                                                div { class: "usage-bar-label", "context · {tin/1000}k / {limit/1000}k" }
-                                                div { class: "usage-bar", div { class: "usage-bar-fill", style: "width: {pct}%" } }
-                                            }
-                                        }
-                                    }
-                                }
-                            },
-                            _ => rsx! {
-                                if timeline.read().is_empty() {
-                                    div { class: "insp-empty", "Activity will appear here as the agent works." }
-                                }
-                                for item in timeline.read().iter().cloned().rev() {
-                                    div { class: "tl-item",
-                                        div { class: "tl-title", "{item.title}" }
-                                        if !item.sub.is_empty() { div { class: "tl-sub", "{item.sub}" } }
-                                    }
-                                }
-                            },
-                        }
-                    }
-                }
-            }
 
             // ── Settings modal ─────────────────────────────────────────
             if *show_settings.read() {
@@ -3907,8 +3948,8 @@ fn app() -> Element {
                             "MCP servers" => show_mcp.set(true),
                             "Skills" => show_skills.set(true),
                             "Board" => { show_board.set(true); }
-                            "Files panel" => { let v = !*show_files.read(); show_files.set(v); }
-                            "Terminal" => { let v = !*show_terminal.read(); show_terminal.set(v); }
+                            "Files panel" => { if *show_env.read() && env_tab.read().as_str() == "files" { show_env.set(false); } else { env_tab.set("files".to_string()); show_env.set(true); } }
+                            "Terminal" => { if *show_env.read() && env_tab.read().as_str() == "term" { show_env.set(false); } else { env_tab.set("term".to_string()); show_env.set(true); } }
                             "Settings…" => show_settings.set(true),
                             "Theme: Light" => set_theme(cfg, "light"),
                             "Theme: Dark" => set_theme(cfg, "dark"),
