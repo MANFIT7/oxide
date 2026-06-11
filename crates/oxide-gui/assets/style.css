@@ -1623,8 +1623,8 @@ details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
 .row.user .bubble {
   background: color-mix(in srgb, var(--text) 4%, transparent);
   border: none; border-left: 2px solid var(--syn-accent);
-  border-radius: 6px; max-width: 720px; padding: 8px 14px;
-  font-size: 14px; color: var(--text);
+  border-radius: 0 6px 6px 0; max-width: 100%; width: 100%;
+  padding: 10px 14px; font-size: 14px; box-shadow: none;
 }
 
 /* tool activity: tiny inline " · verb detail" lines, chrome-free */
@@ -2086,13 +2086,6 @@ details[open]::details-content { block-size: auto; }
 .mark-swatch.c2 { background: #4fcf8f; } .mark-swatch.c3 { background: #e87aa4; }
 
 /* ══ Cursor Glass parity: quiet user block, thinking, pre-token shimmer ══ */
-/* user message: quiet block — border-left accent, 4% fill, small radius */
-.row.user .bubble {
-  background: color-mix(in srgb, var(--text) 4%, transparent);
-  border: none; border-left: 2px solid var(--syn-accent);
-  border-radius: 6px; max-width: 100%; width: 100%;
-  padding: 10px 14px; font-size: 14px;
-}
 /* pre-first-token shimmer: subtle sweep bar (Glass spec), not dots */
 .typing { display: block; width: 100%; max-width: 420px; height: 38px; border-radius: 8px; padding: 0;
   background: linear-gradient(90deg,
