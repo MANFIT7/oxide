@@ -18,10 +18,15 @@ fn db_path() -> PathBuf {
 fn conn() -> &'static Mutex<Connection> {
     static DB: OnceLock<Mutex<Connection>> = OnceLock::new();
     DB.get_or_init(|| {
-        let c = Connection::open(db_path()).unwrap_or_else(|_| {
-            // Last resort: in-memory DB so the app still runs (non-persistent).
+        // Unit tests must never touch the real user db.
+        let c = if cfg!(test) {
             Connection::open_in_memory().expect("sqlite in-memory")
-        });
+        } else {
+            Connection::open(db_path()).unwrap_or_else(|_| {
+                Connection::open_in_memory().expect("sqlite in-memory")
+            })
+        };
+
         let _ = c.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=NORMAL;
@@ -82,6 +87,12 @@ pub fn exists(id: &str) -> bool {
 /// Append one message; creates the session row on first use (lazy, so an
 /// empty chat never leaves anything behind).
 pub fn append(id: &str, workspace: &Path, provider: &str, role: &str, content: &str) {
+    // Never record throwaway workspaces (test temp dirs) in the global db.
+    let wss = workspace.to_string_lossy();
+    let throwaway = wss.starts_with("/var/folders/") || wss.starts_with("/tmp/") || std::env::var_os("OXIDE_NO_DB").is_some();
+    if throwaway && !cfg!(test) {
+        return;
+    }
     let c = conn().lock().unwrap();
     let t = now_ms();
     let ws = workspace.display().to_string();
