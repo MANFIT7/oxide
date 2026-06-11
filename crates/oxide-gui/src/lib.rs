@@ -313,6 +313,7 @@ pub fn run(config: Config) -> anyhow::Result<()> {
     let window = WindowBuilder::new()
         .with_title("Oxide")
         .with_maximized(true)
+        .with_transparent(true)
         .with_inner_size(dioxus::desktop::tao::dpi::LogicalSize::new(1280.0, 820.0));
     LaunchBuilder::desktop()
         .with_cfg(DesktopConfig::new().with_window(window))
@@ -1723,6 +1724,22 @@ fn app() -> Element {
     // the user is already near the bottom, so reading scrollback isn't yanked.
     // Serve the bundled mermaid lib from the app's OWN origin (custom-scheme
     // origins block remote/module script loads — same-origin is allowed).
+    // macOS liquid-glass: apply window vibrancy once. Only the "ara" theme
+    // reveals it (transparent app bg + glass sidebar); solid themes cover it.
+    use_hook(|| {
+        #[cfg(target_os = "macos")]
+        {
+            use window_vibrancy::{apply_vibrancy, NSVisualEffectMaterial, NSVisualEffectState};
+            let win = dioxus::desktop::window();
+            let _ = apply_vibrancy(
+                &win.window,
+                NSVisualEffectMaterial::Sidebar,
+                Some(NSVisualEffectState::Active),
+                None,
+            );
+        }
+    });
+
     // Serve workspace-local images so the agent's ![](path) screenshots render.
     {
         let ws_sig = ui.workspace;
@@ -2642,6 +2659,10 @@ fn app() -> Element {
                         button { class: "menu-item", onclick: move |_| { set_theme(cfg, "dark"); show_theme_menu.set(false); },
                             Icon { name: "target" } span { class: "menu-name", "Dark" }
                             if cfg.read().theme == "dark" { span { class: "menu-check", "✓" } }
+                        }
+                        button { class: "menu-item", onclick: move |_| { set_theme(cfg, "ara"); show_theme_menu.set(false); },
+                            Icon { name: "spark" } span { class: "menu-name", "Liquid Glass" }
+                            if cfg.read().theme == "ara" { span { class: "menu-check", "✓" } }
                         }
                         button { class: "menu-item", onclick: move |_| { set_theme(cfg, "system"); show_theme_menu.set(false); },
                             Icon { name: "settings" } span { class: "menu-name", "System" }

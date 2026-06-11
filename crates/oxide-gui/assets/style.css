@@ -2138,3 +2138,50 @@ details[open]::details-content { block-size: auto; }
 
 /* images in agent replies */
 .agent-md img { max-width: 100%; height: auto; border-radius: 8px; margin: 8px 0; display: block; border: 1px solid var(--border); }
+
+/* ══ Ara — liquid-glass dark theme (ara.so palette + macOS vibrancy) ══ */
+.app[data-theme="ara"] {
+  --bg: #16140f;           /* warm near-black */
+  --sidebar: rgba(28, 25, 20, 0.55);
+  --surface: #1c1915;
+  --surface-hi: #262119;
+  --border: rgba(255, 240, 220, .08);
+  --text: #efe9e0;         /* warm light */
+  --muted: #b3a99b;
+  --faint: #7a7166;
+  --accent: #efe9e0;
+  --on-accent: #16140f;
+  --danger: #f0654a;
+  --composer: rgba(30, 26, 20, 0.72);
+  --menu-bg: rgba(30, 26, 20, 0.86);
+  --menu-border: rgba(255, 240, 220, .1);
+  --syn-accent: #e8915a;   /* ara warm orange */
+  --ok: #8fe3b8; --ok-strong: #46c98a; --del-soft: #f0a58c;
+  --ctx-text: #c9bfb0; --hunk-text: var(--syn-accent); --pre-text: #d8cfc0;
+  background: transparent;
+}
+/* the window is transparent — only the sidebar reveals the vibrancy; the rest
+   of the app stays solid so text and code are readable. */
+.app[data-theme="ara"] { background: transparent !important; }
+.app[data-theme="ara"] .sidebar {
+  background: var(--sidebar);
+  backdrop-filter: blur(30px) saturate(180%);
+  -webkit-backdrop-filter: blur(30px) saturate(180%);
+  border-right: 1px solid rgba(255,240,220,.07);
+}
+/* everything that isn't the sidebar must be opaque (vibrancy is behind all) */
+.app[data-theme="ara"] .main,
+.app[data-theme="ara"] .center,
+.app[data-theme="ara"] .env-panel,
+.app[data-theme="ara"] .terminal,
+.app[data-theme="ara"] .agent-tabs,
+.app[data-theme="ara"] .files-panel {
+  background: var(--bg);
+}
+.app[data-theme="ara"] .composer {
+  background: color-mix(in srgb, var(--composer) 92%, transparent);
+  backdrop-filter: blur(18px) saturate(160%);
+}
+/* glassy floating env card + menus pick up the warm translucency automatically
+   via --menu-bg / --surface */
+.app[data-theme="ara"] .env-card { backdrop-filter: blur(22px) saturate(180%); }
