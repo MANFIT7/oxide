@@ -668,6 +668,7 @@ async fn submit_ce(
     mut queue: Signal<Vec<String>>,
     mut attachments: Signal<Vec<String>>,
     mut picked_element: Signal<Option<String>>,
+    mut pasted_blobs: Signal<Vec<(u64, String)>>,
     steer: bool,
     ws: PathBuf,
 ) {
@@ -724,8 +725,16 @@ why it's wrong, and the concrete fix. If the diff is clean, say so plainly.{}\n\
     let mut skills_block = String::new();
     let mut mcp_block = String::new();
     let mut ctx_block = String::new();
+    let mut paste_block = String::new();
     for tkn in &tokens {
-        if let Some(name) = tkn.strip_prefix("mcp:") {
+        if let Some(id) = tkn.strip_prefix("paste:") {
+            // Long pasted text was collapsed to a chip — expand it for the model.
+            if let Ok(id) = id.parse::<u64>() {
+                if let Some((_, full)) = pasted_blobs.read().iter().find(|(i, _)| *i == id).cloned() {
+                    paste_block.push_str(&format!("\n## Pasted content\n````\n{full}\n````\n"));
+                }
+            }
+        } else if let Some(name) = tkn.strip_prefix("mcp:") {
             mcp_block.push_str(&format!("\n- `{name}` — call its tools via `mcp__{name}__*`"));
         } else if let Some(name) = tkn.strip_prefix("skill:") {
             let p = ws.join(".oxide/memory/skills").join(format!("{name}.md"));
@@ -759,6 +768,9 @@ why it's wrong, and the concrete fix. If the diff is clean, say so plainly.{}\n\
         text.push_str(&ctx_block);
         text.push('\n');
     }
+    if !paste_block.is_empty() {
+        text.push_str(&paste_block);
+    }
     if !mcp_block.is_empty() {
         text.push_str("Use these MCP servers for this task:");
         text.push_str(&mcp_block);
@@ -789,6 +801,7 @@ why it's wrong, and the concrete fix. If the diff is clean, say so plainly.{}\n\
         body
     };
     attachments.write().clear();
+    pasted_blobs.write().clear();
     if !steer && *streaming.read() {
         queue.write().push(text);
     } else {
@@ -5471,6 +5484,9 @@ fn Composer(
     let mut show_plus = use_signal(|| false);
     let mut show_access = use_signal(|| false);
     let mut mention_sel = use_signal(|| 0usize);
+    // Long pastes collapsed to chips: (id, full text).
+    let pasted_blobs = use_signal(Vec::<(u64, String)>::new);
+    let mut paste_seq = use_signal(|| 0u64);
     // `@mention` picker driven by the contenteditable caret query.
     let mut mention_q = use_signal(|| None::<String>);
     // Leading `/query` in the contenteditable — drives the slash-command menu.
@@ -5509,7 +5525,13 @@ fn Composer(
                 const text = cd ? cd.getData('text/plain') : '';
                 if (text) {
                   ev.preventDefault();
-                  document.execCommand('insertText', false, text);
+                  const lines = text.split('\n').length;
+                  if (text.length > 800 || lines > 12) {
+                    // Long paste → collapse to a chip (full text kept Rust-side).
+                    dioxus.send('PASTE:' + text);
+                  } else {
+                    document.execCommand('insertText', false, text);
+                  }
                 }
               });
             }
@@ -5518,7 +5540,23 @@ fn Composer(
         );
         loop {
             match eval.recv::<String>().await {
-                Ok(durl) => attachments.write().push(durl),
+                Ok(msg) => {
+                    if let Some(text) = msg.strip_prefix("PASTE:") {
+                        let id = *paste_seq.peek() + 1;
+                        paste_seq.set(id);
+                        let lines = text.lines().count();
+                        let mut pb = pasted_blobs;
+                        pb.write().push((id, text.to_string()));
+                        let label = format!("Pasted #{id} ({lines} lines)");
+                        let tok = format!("paste:{id}");
+                        spawn(async move {
+                            let _ = dioxus::document::eval(&ce_insert_js(&tok, &label)).join::<bool>().await;
+                        });
+                        ce_empty.set(false);
+                    } else {
+                        attachments.write().push(msg);
+                    }
+                }
                 Err(_) => break,
             }
         }
@@ -5783,7 +5821,7 @@ fn Composer(
                         }
                         e.prevent_default();
                         let ws = ws_kd2.clone();
-                        spawn(async move { submit_ce(streaming, engine, plan_mode, pursue_goal, goal_text, queue, attachments, picked_element, false, ws).await; });
+                        spawn(async move { submit_ce(streaming, engine, plan_mode, pursue_goal, goal_text, queue, attachments, picked_element, pasted_blobs, false, ws).await; });
                     } else if e.key() == Key::Tab && e.modifiers().shift() {
                         e.prevent_default();
                         let v = *plan_mode.read();
@@ -6042,10 +6080,10 @@ fn Composer(
                         }
                     }
                     if *streaming.read() {
-                        button { class: "send steer", title: "Steer (inject into the running turn)", onclick: move |_| { let ws = ws_steer.clone(); spawn(async move { submit_ce(streaming, engine, plan_mode, pursue_goal, goal_text, queue, attachments, picked_element, true, ws).await; }); }, "↪" }
+                        button { class: "send steer", title: "Steer (inject into the running turn)", onclick: move |_| { let ws = ws_steer.clone(); spawn(async move { submit_ce(streaming, engine, plan_mode, pursue_goal, goal_text, queue, attachments, picked_element, pasted_blobs, true, ws).await; }); }, "↪" }
                         button { class: "send stop", title: "Stop", onclick: move |_| { let _ = engine.send(EngineCmd::Interrupt); }, "■" }
                     } else {
-                        button { class: "send", onclick: move |_| { let ws = ws_btn.clone(); spawn(async move { submit_ce(streaming, engine, plan_mode, pursue_goal, goal_text, queue, attachments, picked_element, false, ws).await; }); }, "↑" }
+                        button { class: "send", onclick: move |_| { let ws = ws_btn.clone(); spawn(async move { submit_ce(streaming, engine, plan_mode, pursue_goal, goal_text, queue, attachments, picked_element, pasted_blobs, false, ws).await; }); }, "↑" }
                     }
                 }
             }
