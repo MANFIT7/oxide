@@ -50,6 +50,17 @@ fn conn() -> &'static Mutex<Connection> {
                PRIMARY KEY (session_id, seq)
              );",
         );
+        // Backfill: legacy imports stamped rows with the import moment, which
+        // flattened ordering/relative times. The id leads with the original
+        // epoch-ms — restore created/updated from it when they disagree wildly.
+        let _ = c.execute_batch(
+            "UPDATE sessions SET
+               created_ms = CAST(substr(id,1,13) AS INTEGER),
+               updated_ms = CAST(substr(id,1,13) AS INTEGER)
+             WHERE length(id) >= 13
+               AND substr(id,1,13) GLOB '[0-9]*'
+               AND ABS(created_ms - CAST(substr(id,1,13) AS INTEGER)) > 60000;",
+        );
         Mutex::new(c)
     })
 }
@@ -306,6 +317,16 @@ pub fn import_workspace(ws: &Path) {
         }
         for (role, content) in &msgs {
             append(&id, ws, &provider, role, content);
+        }
+        // Preserve the ORIGINAL creation time (id prefix), not the import moment.
+        if id.len() >= 13 {
+            if let Ok(ms) = id[..13].parse::<i64>() {
+                let c = conn().lock().unwrap();
+                let _ = c.execute(
+                    "UPDATE sessions SET created_ms=?2, updated_ms=?2 WHERE id=?1",
+                    rusqlite::params![id, ms],
+                );
+            }
         }
         let _ = std::fs::rename(&p, p.with_extension("jsonl.imported"));
     }

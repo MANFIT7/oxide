@@ -2881,13 +2881,19 @@ fn app() -> Element {
                                                         button { class: "row-act-btn", title: "Archive", onclick: move |e: dioxus::prelude::MouseEvent| { e.stop_propagation(); archive_session(&p_arch2); sessions_refresh.set(sessions_refresh() + 1); projects_list.set(build_projects(&ws_ar2, &cfg.read().recent_workspaces)); }, "⊟" }
                                                         button { class: "row-act-btn danger", title: "Delete", onclick: move |e: dioxus::prelude::MouseEvent| { e.stop_propagation(); delete_session(&p_del2); sessions_refresh.set(sessions_refresh() + 1); projects_list.set(build_projects(&ws_d2, &cfg.read().recent_workspaces)); }, "✕" }
                                                     }
-                                                    div { class: "thread recent", title: "right-click / double-click for options",
+                                                    div { class: "thread recent sub", title: "right-click / double-click for options",
                                                         onclick: move |_| { show_board.set(false); open_session_tab(tabs, active_tab, messages, next_tab_id, cfg, ui, engine, p_open.clone(), t_open.clone()); },
                                                         oncontextmenu: {
                                                             let p = p_dbl.clone();
                                                             move |e: dioxus::prelude::MouseEvent| { e.prevent_default(); e.stop_propagation(); show_theme_menu.set(false); session_menu.set(Some(p.clone())); }
                                                         },
                                                         ondoubleclick: move |_| { let cur = session_menu.read().clone(); session_menu.set(if cur.as_ref() == Some(&p_dbl) { None } else { Some(p_dbl.clone()) }); },
+                                                        span { class: "sub-ic",
+                                                            svg { view_box: "0 0 16 16", width: "12", height: "12", fill: "none", stroke: "currentColor", stroke_width: "1.4", stroke_linecap: "round", stroke_linejoin: "round",
+                                                                path { d: "M4 3v5a3 3 0 0 0 3 3h5" }
+                                                                path { d: "M9 8l3 3-3 3" }
+                                                            }
+                                                        }
                                                         if let Some(l) = provider_logo(&sprov) { span { class: "sess-logo prov-logo", dangerous_inner_html: l } }
                                                     span { class: "thread-title", title: "{title}", "{title}" }
                                                         span { class: "thread-time", "{reltime}" }
