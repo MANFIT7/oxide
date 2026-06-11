@@ -94,7 +94,12 @@ pub struct Config {
     pub sidebar_width: f64,
     #[serde(default = "default_insp_w")]
     pub inspector_width: f64,
+    /// Persisted Environment panel width (px).
+    #[serde(default = "default_env_w")]
+    pub env_width: f64,
 }
+
+fn default_env_w() -> f64 { 560.0 }
 
 fn default_sidebar_w() -> f64 { 250.0 }
 fn default_insp_w() -> f64 { 280.0 }
@@ -177,6 +182,7 @@ impl Default for Config {
             resume_path: None,
             sidebar_width: 250.0,
             inspector_width: 280.0,
+            env_width: 560.0,
         }
     }
 }

@@ -1491,8 +1491,8 @@ fn app() -> Element {
     let mut sidebar_collapsed = use_signal(|| false);
     // Resizable side panels: (which: 1=left sidebar, 2=right inspector, start_x, start_w).
     let mut panel_drag = use_signal(|| None::<(u8, f64, f64)>);
-    // Width (px) of the right preview/changes split panel (drag id 3).
-    let mut rpanel_w = use_signal(|| 560.0f64);
+    // Width (px) of the Environment panel (drag id 3) — persisted.
+    let mut rpanel_w = use_signal(|| { cfg.peek().env_width });
     // Height (px) of the bottom terminal panel (drag id 4, vertical).
     let mut term_h = use_signal(|| 240.0f64);
     let mut sidebar_w = use_signal(|| { cfg.peek().sidebar_width });
@@ -2376,6 +2376,7 @@ fn app() -> Element {
                     let mut c = cfg.read().clone();
                     c.sidebar_width = *sidebar_w.read();
                     c.inspector_width = *insp_w.read();
+                    c.env_width = *rpanel_w.read();
                     cfg.set(c.clone());
                     if let Ok(t) = toml::to_string(&c) {
                         let _ = std::fs::write(workspace_of(&c).join("oxide.toml"), &t);
