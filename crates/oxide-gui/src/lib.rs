@@ -1799,39 +1799,37 @@ fn app() -> Element {
 
     // Auto-scroll the chat to the bottom as content streams in — but only when
     // the user is already near the bottom, so reading scrollback isn't yanked.
-    // Load mermaid once and render any .mermaid blocks as themed SVG.
+    // Load mermaid once (inline-injected like xterm.js) and render any .mermaid
+    // blocks as themed SVG. Same-origin script (no file:// / CORS issues).
     use_future(move || async move {
         let dark = cfg.peek().theme != "light";
-        let js = format!(
-            r#"
-            (function(){{
-              if (window.__oxmermaid) return;
-              window.__oxmermaid = 1;
-              const boot = () => {{
-                if (!window.mermaid) return;
-                window.mermaid.initialize({{ startOnLoad:false, theme: {theme}, securityLevel:'strict', fontFamily:'inherit' }});
-                const run = () => {{
-                  document.querySelectorAll('.mermaid:not([data-ox-done])').forEach((el,i)=>{{
-                    el.setAttribute('data-ox-done','1');
-                    const src = el.textContent;
-                    const id = 'oxmmd-'+Date.now()+'-'+i;
-                    window.mermaid.render(id, src).then(r=>{{ el.innerHTML = r.svg; }}).catch(e=>{{ el.setAttribute('data-ox-done',''); el.classList.add('mermaid-err'); }});
-                  }});
-                }};
-                run();
-                new MutationObserver(()=>run()).observe(document.body,{{childList:true,subtree:true}});
+        let theme = if dark { "dark" } else { "default" };
+        let boot = format!(
+            r#"window.__oxmermaid=1;(function(){{
+              try {{
+                window.mermaid.initialize({{startOnLoad:false,theme:'{theme}',securityLevel:'loose',fontFamily:'inherit'}});
+              }} catch(e) {{}}
+              const run=()=>{{
+                if(!window.mermaid) return;
+                document.querySelectorAll('.mermaid:not([data-ox-done])').forEach((el)=>{{
+                  const src=(el.textContent||'').trim(); if(!src) return;
+                  el.setAttribute('data-ox-done','1');
+                  const id='oxmmd-'+(window.__oxmc=(window.__oxmc||0)+1);
+                  window.mermaid.render(id,src).then(r=>{{el.innerHTML=r.svg;}}).catch(()=>{{el.removeAttribute('data-ox-done');el.classList.add('mermaid-err');}});
+                }});
               }};
-              const s = document.createElement('script');
-              s.textContent = {lib};
-              document.head.appendChild(s);
-              boot();
-            }})();
-            while (true) {{ await new Promise(r => setTimeout(r, 3600000)); }}
-            "#,
-            theme = if dark { "'dark'" } else { "'default'" },
-            lib = serde_json::to_string(MERMAID_JS).unwrap_or_default(),
+              run();
+              new MutationObserver(run).observe(document.body,{{childList:true,subtree:true}});
+            }})();"#
         );
-        let _ = dioxus::document::eval(&js).recv::<String>().await;
+        if dioxus::document::eval(&format!("return typeof window.__oxmermaid;")).join::<String>().await.map(|v| v.contains("undefined")).unwrap_or(true) {
+            // Inject the library, then bootstrap once it has parsed.
+            let js = format!("{MERMAID_JS}
+;
+{boot}
+return 'ok';");
+            let _ = dioxus::document::eval(&js).join::<String>().await;
+        }
     });
 
     // Autoscroll via ONE persistent MutationObserver (installed once) instead of
@@ -4169,6 +4167,7 @@ fn app() -> Element {
                                                             Author::User => {
                                                                 let segs = user_segments(&m.text);
                                                                 let copy = serde_json::to_string(&strip_scaffold(&m.text)).unwrap_or_default();
+                                                                let edit_text = strip_scaffold(&m.text);
                                                                 let idx = i;
                                                                 rsx! {
                                                                     div { class: "row user",
@@ -4180,17 +4179,25 @@ fn app() -> Element {
                                                                         div { class: "msg-actions",
                                                                             button { class: "msg-act", title: "Copy message", onclick: move |_| { let c = copy.clone(); spawn(async move { let _ = document::eval(&format!("navigator.clipboard.writeText({c})")).await; }); push_toast(toasts, toast_seq, "ok", "Copied"); }, "⧉" }
                                                                             if *confirm_restore.read() == Some(idx) {
-                                                                                button { class: "msg-act danger", title: "Click again to confirm — this removes the messages below and reverts the files", onclick: move |_| {
+                                                                                button { class: "msg-act danger", title: "Click again to confirm — reverts files and brings this message back to the composer to edit & resend", onclick: move |_| {
                                                                                     confirm_restore.set(None);
-                                                                                    let floor = { let ms = messages.read(); ms.iter().skip(idx + 1).find_map(|mm| if let Author::Diff(_, cp) = mm.author { Some(cp) } else { None }) };
+                                                                                    // Revert every file change from this turn onward.
+                                                                                    let floor = { let ms = messages.read(); ms.iter().skip(idx).find_map(|mm| if let Author::Diff(_, cp) = mm.author { Some(cp) } else { None }) };
                                                                                     if let Some(fl) = floor {
                                                                                         let ids: Vec<u64> = checkpoints.read().iter().map(|(id, _)| *id).filter(|id| *id >= fl).collect();
                                                                                         for id in ids.into_iter().rev() { let _ = engine.send(EngineCmd::Rewind { id }); reverted.write().insert(id); }
                                                                                     }
-                                                                                    messages.write().truncate(idx + 1);
-                                                                                }, "Restore?" }
+                                                                                    // Drop this turn and everything after it…
+                                                                                    messages.write().truncate(idx);
+                                                                                    // …and load the message back into the composer to edit & resend.
+                                                                                    let t = edit_text.clone();
+                                                                                    spawn(async move {
+                                                                                        let js = format!("const e=document.getElementById('ce-input'); if(e){{ e.textContent={}; e.focus(); const r=document.createRange(); r.selectNodeContents(e); r.collapse(false); const s=window.getSelection(); s.removeAllRanges(); s.addRange(r); }} return true;", serde_json::to_string(&t).unwrap_or_default());
+                                                                                        let _ = dioxus::document::eval(&js).join::<bool>().await;
+                                                                                    });
+                                                                                }, "Edit & restore?" }
                                                                             } else {
-                                                                                button { class: "msg-act", title: "Restore checkpoint — revert files and chat back to here", onclick: move |_| confirm_restore.set(Some(idx)), "↩" }
+                                                                                button { class: "msg-act", title: "Restore — revert files and edit this message", onclick: move |_| confirm_restore.set(Some(idx)), "↩" }
                                                                             }
                                                                         }
                                                                     }

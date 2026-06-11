@@ -2882,6 +2882,7 @@ flowchart LR
 | Skills (automate, hooks, canvas) | `~/.cursor/skills-cursor/*/SKILL.md` |
 | Oxide GUI chat loop | `crates/oxide-gui/src/lib.rs` |
 | Oxide GUI styles | `crates/oxide-gui/assets/style.css` |
+| **Chat sesi & restore** | [cursor-agent-chat-sessions.md](./cursor-agent-chat-sessions.md) |
 
 ---
 
