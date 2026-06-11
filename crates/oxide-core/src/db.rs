@@ -295,6 +295,70 @@ pub fn delete(id: &str) {
     let _ = c.execute("DELETE FROM sessions WHERE id=?1", [id]);
 }
 
+/// Import Claude Code CLI (TUI) transcripts for a workspace into the global db,
+/// so TUI conversations show up and persist like normal chats. Claude stores
+/// them at ~/.claude/projects/<slug>/<uuid>.jsonl (slug = cwd with '/'→'-').
+/// Re-imported each call (claude appends live) — cheap, keyed by a stable id.
+pub fn import_claude_sessions(workspace: &Path) {
+    // Throttle: re-scan a workspace's claude dir at most every 5s.
+    static LAST: OnceLock<Mutex<std::collections::HashMap<String, std::time::Instant>>> = OnceLock::new();
+    {
+        let mut g = LAST.get_or_init(Default::default).lock().unwrap();
+        let key = workspace.display().to_string();
+        if let Some(t) = g.get(&key) {
+            if t.elapsed() < std::time::Duration::from_secs(5) { return; }
+        }
+        g.insert(key, std::time::Instant::now());
+    }
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else { return };
+    let slug = workspace.display().to_string().replace('/', "-").replace('.', "-");
+    let dir = home.join(".claude/projects").join(&slug);
+    let Ok(rd) = std::fs::read_dir(&dir) else { return };
+    for e in rd.flatten() {
+        let path = e.path();
+        if path.extension().and_then(|x| x.to_str()) != Some("jsonl") { continue; }
+        let stem = path.file_stem().and_then(|x| x.to_str()).unwrap_or("");
+        if stem.is_empty() { continue; }
+        let id = format!("claude-{stem}");
+        let Ok(text) = std::fs::read_to_string(&path) else { continue };
+        let mut msgs: Vec<(String, String)> = Vec::new();
+        for line in text.lines() {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+            let role = match v["type"].as_str() {
+                Some("user") => "user",
+                Some("assistant") => "assistant",
+                _ => continue,
+            };
+            let content = match &v["message"]["content"] {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Array(a) => a.iter()
+                    .filter_map(|x| if x["type"] == "text" { x["text"].as_str() } else { None })
+                    .collect::<Vec<_>>().join("\n"),
+                _ => String::new(),
+            };
+            let content = content.trim().to_string();
+            if !content.is_empty() {
+                msgs.push((role.to_string(), content));
+            }
+        }
+        if msgs.is_empty() { continue; }
+        // Only rewrite when the message count changed (claude appended).
+        let existing = load(&id).len();
+        if existing == msgs.len() { continue; }
+        rewrite(&id, workspace, "claude", &msgs);
+        // Preserve order by file mtime.
+        if let Ok(meta) = std::fs::metadata(&path) {
+            if let Ok(mt) = meta.modified() {
+                if let Ok(d) = mt.duration_since(std::time::UNIX_EPOCH) {
+                    let ms = d.as_millis() as i64;
+                    let c = conn().lock().unwrap();
+                    let _ = c.execute("UPDATE sessions SET created_ms=?2, updated_ms=?2 WHERE id=?1", rusqlite::params![id, ms]);
+                }
+            }
+        }
+    }
+}
+
 /// Import legacy per-workspace JSONL sessions (idempotent — skips ids that are
 /// already in the DB). Files are left in place, renamed to `.imported`.
 pub fn import_workspace(ws: &Path) {

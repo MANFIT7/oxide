@@ -22,7 +22,7 @@ use std::sync::OnceLock;
 
 const CSS: &str = include_str!("../assets/style.css");
 const MERMAID_JS: &[u8] = include_bytes!("../assets/vendor/mermaid.min.js");
-const NERD_FONT: &[u8] = include_bytes!("../assets/fonts/SymbolsNerdFontMono-Regular.ttf");
+const NERD_FONT: &[u8] = include_bytes!("../assets/fonts/JetBrainsMonoNerdFontMono-Regular.ttf");
 const LOGO_BYTES: &[u8] = include_bytes!("../assets/logo.png");
 
 fn logo_uri() -> &'static str {
@@ -1132,8 +1132,9 @@ fn read_prefix(path: &Path, cap: usize) -> String {
 /// Recent non-empty sessions `(path, title, msg_count)`, newest first. Deletes
 /// empty/0-byte session files as it scans (cleanup).
 fn recent_sessions(ws: &Path) -> Vec<(PathBuf, std::time::SystemTime, String, String)> {
-    // One-time import of any legacy JSONL files, then query the global db.
+    // Import legacy JSONL + Claude Code TUI transcripts, then query the global db.
     oxide_core::db::import_workspace(ws);
+    oxide_core::db::import_claude_sessions(ws);
     oxide_core::db::list(ws, 30)
         .into_iter()
         .map(|m| {
@@ -6486,10 +6487,10 @@ fn TerminalView(id: u64, bin: String, ws: String) -> Element {
                 const el = document.getElementById("{host}");
                 if (!el || !window.Terminal) return;
                 el.innerHTML = "";
-                const term = new window.Terminal({{ fontSize: 12.5, macOptionIsMeta: true, fontFamily: "'MesloLGS NF', 'JetBrainsMono Nerd Font', 'JetBrainsMono Nerd Font Mono', 'Hack Nerd Font', 'FiraCode Nerd Font', 'CaskaydiaCove Nerd Font', 'Symbols Nerd Font Mono', 'Symbols Nerd Font', ui-monospace, Menlo, monospace", cursorBlink: true, theme: (function(){{ const cs=getComputedStyle(document.querySelector('.app')); const bg=(cs.getPropertyValue('--composer')||'#0e0e10').trim(); const fg=(cs.getPropertyValue('--text')||'#cdd0d6').trim(); return {{ background: bg, foreground: fg, cursor: fg }}; }})() }});
+                const term = new window.Terminal({{ fontSize: 12.5, macOptionIsMeta: true, fontFamily: "'JetBrainsMono Nerd Font Mono', 'JetBrainsMono Nerd Font', 'MesloLGS NF', 'Symbols Nerd Font Mono', ui-monospace, Menlo, monospace", cursorBlink: true, theme: (function(){{ const cs=getComputedStyle(document.querySelector('.app')); const bg=(cs.getPropertyValue('--composer')||'#0e0e10').trim(); const fg=(cs.getPropertyValue('--text')||'#cdd0d6').trim(); return {{ background: bg, foreground: fg, cursor: fg }}; }})() }});
                 let fit = null;
                 try {{ fit = new window.FitAddon.FitAddon(); term.loadAddon(fit); }} catch (e) {{}}
-                try {{ if (document.fonts && document.fonts.ready) await document.fonts.ready; }} catch (e) {{}}
+                try {{ await document.fonts.load("12.5px 'JetBrainsMono Nerd Font Mono'"); await document.fonts.ready; }} catch (e) {{}}
                 term.open(el);
                 try {{ if (fit) fit.fit(); }} catch (e) {{}}
                 term.focus();
