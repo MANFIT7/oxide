@@ -1098,36 +1098,22 @@ fn list_sessions(ws: &Path) -> Vec<(String, usize, PathBuf)> {
 }
 
 /// Delete a saved session file.
+/// Session id carried in the PathBuf-typed handles the UI passes around.
+fn sid(path: &Path) -> String { path.display().to_string() }
+
 fn delete_session(path: &Path) {
-    let _ = std::fs::remove_file(path);
+    oxide_core::db::delete(&sid(path));
 }
 
-/// Move a saved session into `.oxide/sessions/archive/` (hidden from the list).
 fn archive_session(path: &Path) {
-    if let Some(dir) = path.parent() {
-        let arch = dir.join("archive");
-        let _ = std::fs::create_dir_all(&arch);
-        if let Some(name) = path.file_name() {
-            let _ = std::fs::rename(path, arch.join(name));
-        }
-    }
+    oxide_core::db::archive(&sid(path));
 }
 
-/// First user line of a session as its title.
+/// First user line of a session as its title (from the db).
 fn session_title(path: &Path) -> String {
-    Some(read_prefix(path, 8192))
-        .filter(|t| !t.is_empty())
-        .and_then(|t| {
-            t.lines().find_map(|l| {
-                let v: serde_json::Value = serde_json::from_str(l).ok()?;
-                if v["role"].as_str()? == "user" {
-                    Some(v["content"].as_str()?.lines().next().unwrap_or("").chars().take(38).collect::<String>())
-                } else {
-                    None
-                }
-            })
-        })
-        .filter(|s| !s.trim().is_empty())
+    oxide_core::db::meta(&sid(path))
+        .map(|m| m.title)
+        .filter(|t| !t.trim().is_empty())
         .unwrap_or_else(|| "Chat".to_string())
 }
 
@@ -1144,83 +1130,19 @@ fn read_prefix(path: &Path, cap: usize) -> String {
 /// Recent non-empty sessions `(path, title, msg_count)`, newest first. Deletes
 /// empty/0-byte session files as it scans (cleanup).
 fn recent_sessions(ws: &Path) -> Vec<(PathBuf, std::time::SystemTime, String, String)> {
-    let dir = ws.join(".oxide/sessions");
-    let mut items: Vec<(PathBuf, std::time::SystemTime, String, String)> = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(&dir) {
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.extension().and_then(|x| x.to_str()) != Some("jsonl") {
-                continue;
-            }
-            let meta = e.metadata().ok();
-            // Don't delete a brand-new empty file — it's likely the active
-            // session still being written (otherwise we'd resurrect the bug).
-            let fresh = meta
-                .as_ref()
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.elapsed().ok())
-                .map(|d| d.as_secs() < 3600)
-                .unwrap_or(false);
-            if meta.as_ref().map(|m| m.len()).unwrap_or(0) == 0 {
-                if !fresh {
-                    let _ = std::fs::remove_file(&p);
-                }
-                continue;
-            }
-            let text = read_prefix(&p, 8192);
-            // "Content" = any non-meta record. Meta-only files are empty chats:
-            // never list them, and clean them up once stale (legacy junk too).
-            let count = text
-                .lines()
-                .filter(|l| !l.trim().is_empty())
-                .filter(|l| {
-                    serde_json::from_str::<serde_json::Value>(l)
-                        .ok()
-                        .and_then(|v| v["role"].as_str().map(|r| r != "meta"))
-                        .unwrap_or(true)
-                })
-                .count();
-            if count == 0 {
-                if !fresh {
-                    let _ = std::fs::remove_file(&p);
-                }
-                continue;
-            }
-            // Provider recorded as a meta line at session start (for the logo).
-            let provider = text
-                .lines()
-                .take(3)
-                .find_map(|l| {
-                    let v: serde_json::Value = serde_json::from_str(l).ok()?;
-                    if v["role"].as_str()? == "meta" {
-                        v["content"].as_str()?.strip_prefix("provider=").map(str::to_string)
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or_default();
-            let title = text
-                .lines()
-                .find_map(|l| {
-                    let v: serde_json::Value = serde_json::from_str(l).ok()?;
-                    if v["role"].as_str()? == "user" {
-                        // Strip injected scaffolding so titles read like the human ask.
-                        let clean = strip_scaffold(v["content"].as_str()?);
-                        let first = clean.lines().find(|x| !x.trim().is_empty())?.trim().to_string();
-                        Some(first.chars().take(38).collect::<String>())
-                    } else {
-                        None
-                    }
-                })
-                .filter(|t| !t.trim().is_empty())
-                .unwrap_or_else(|| "Chat".to_string());
-            let _ = count;
-            let mtime = meta.and_then(|m| m.modified().ok()).unwrap_or(std::time::UNIX_EPOCH);
-            items.push((p, mtime, title, provider));
-        }
-    }
-    items.sort_by(|a, b| b.1.cmp(&a.1));
-    items.into_iter().take(30).collect()
+    // One-time import of any legacy JSONL files, then query the global db.
+    oxide_core::db::import_workspace(ws);
+    oxide_core::db::list(ws, 30)
+        .into_iter()
+        .map(|m| {
+            let t = std::time::UNIX_EPOCH + std::time::Duration::from_millis(m.updated_ms.max(0) as u64);
+            let title = {
+                let clean = strip_scaffold(&m.title);
+                clean.lines().find(|x| !x.trim().is_empty()).unwrap_or("Chat").chars().take(38).collect::<String>()
+            };
+            (PathBuf::from(m.id), t, title, m.provider)
+        })
+        .collect()
 }
 
 
@@ -1242,8 +1164,11 @@ fn relative_time(t: std::time::SystemTime) -> String {
 fn build_projects(current: &Path, recents: &[PathBuf]) -> Vec<(PathBuf, String, Vec<(PathBuf, String, String, String)>)> {
     let mut seen = HashSet::new();
     let mut wss: Vec<PathBuf> = Vec::new();
-    for w in std::iter::once(current.to_path_buf()).chain(recents.iter().cloned()) {
-        if w.exists() && seen.insert(w.clone()) {
+    // Current + recents + EVERY workspace the db knows has sessions, so a
+    // project never falls off the sidebar (the SQLite index is the source).
+    let db_ws: Vec<PathBuf> = oxide_core::db::workspaces().into_iter().map(PathBuf::from).collect();
+    for w in std::iter::once(current.to_path_buf()).chain(recents.iter().cloned()).chain(db_ws) {
+        if !w.as_os_str().is_empty() && w.exists() && seen.insert(w.clone()) {
             wss.push(w);
         }
     }
@@ -1334,11 +1259,9 @@ fn open_session_tab(
     // A session file lives at <workspace>/.oxide/sessions/<id>.jsonl — the
     // chat MUST run in that workspace, or the engine (in another folder)
     // appends this conversation into the wrong project.
-    let session_ws = path
-        .parent() // sessions/
-        .and_then(|p| p.parent()) // .oxide/
-        .and_then(|p| p.parent()) // workspace
-        .map(|p| p.to_path_buf());
+    let session_ws = oxide_core::db::meta(&sid(&path))
+        .map(|m| PathBuf::from(m.workspace))
+        .filter(|w| !w.as_os_str().is_empty());
     let mut c = cfg.read().clone();
     if let Some(ws) = session_ws {
         if c.workspace.as_deref() != Some(ws.as_path()) {
@@ -1366,18 +1289,13 @@ fn open_session_tab(
 
 /// Load a session transcript into chat messages.
 fn load_session(path: &Path) -> Vec<ChatMsg> {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return Vec::new();
-    };
-    text.lines()
-        .filter_map(|l| {
-            let v: serde_json::Value = serde_json::from_str(l).ok()?;
-            let role = v["role"].as_str()?;
+    oxide_core::db::load(&sid(path))
+        .into_iter()
+        .filter_map(|(role, content)| {
             if role == "meta" || role == "tool" || role == "system" {
                 return None;
             }
-            let content = v["content"].as_str()?.to_string();
-            let author = match role {
+            let author = match role.as_str() {
                 "user" => Author::User,
                 "assistant" => Author::Agent,
                 _ => Author::Note,
@@ -1649,6 +1567,8 @@ fn app() -> Element {
     let mut expanded_projects = use_signal(HashSet::<String>::new);
     // Projects whose chat list is collapsed (click the caret on the header).
     let mut collapsed_projects = use_signal(HashSet::<String>::new);
+    // Bump to force the sidebar (pins/projects) to re-read the session db.
+    let mut sessions_refresh = use_signal(|| 0u64);
     // Tab currently animating closed.
     let mut closing_tab = use_signal(|| None::<u64>);
     // Suggested follow-up prompts shown above the composer after a turn.
@@ -1966,6 +1886,7 @@ fn app() -> Element {
                 projects_list.set(build_projects(std::path::Path::new(""), &recents));
             }
         }
+        let _ = sessions_refresh.read();
         if cfg.read().workspace.is_some() {
             board.set(board::Board::load(&ws));
             projects_list.set(build_projects(&ws, &cfg.read().recent_workspaces));
@@ -2430,7 +2351,8 @@ fn app() -> Element {
                                     f.truncate(3);
                                     followups.set(f);
                                 }
-                                // New/updated session files show up right away
+                                sessions_refresh.set(sessions_refresh() + 1);
+                                // New/updated sessions show up right away
                                 // (fs walk off the event thread).
                                 {
                                     let c = cfg.peek().clone();
@@ -2794,10 +2716,10 @@ fn app() -> Element {
                     // Welcome state still lists known projects + their chats.
                     if cfg.read().workspace.is_some() || !projects_list.read().is_empty() {
                         {
-                            let pins: Vec<(PathBuf, String)> = cfg.read().pinned_sessions.iter()
-                                .map(PathBuf::from)
-                                .filter(|p| p.exists())
-                                .map(|p| { let title = session_title(&p); (p, title) })
+                            let _ = sessions_refresh.read();
+                            let pins: Vec<(PathBuf, String)> = oxide_core::db::pinned()
+                                .into_iter()
+                                .map(|m| (PathBuf::from(m.id), if m.title.trim().is_empty() { "Chat".to_string() } else { m.title }))
                                 .collect();
                             if pins.is_empty() { rsx!{} } else {
                                 rsx! {
@@ -2810,7 +2732,7 @@ fn app() -> Element {
                                             rsx! {
                                                 div { class: "thread-anchor",
                                                     div { class: "row-actions",
-                                                        button { class: "row-act-btn pinned", title: "Unpin", onclick: move |e: dioxus::prelude::MouseEvent| { e.stop_propagation(); toggle_pin(cfg, &p_str); }, Icon { name: "pin" } }
+                                                        button { class: "row-act-btn pinned", title: "Unpin", onclick: move |e: dioxus::prelude::MouseEvent| { e.stop_propagation(); toggle_pin(cfg, &p_str); sessions_refresh.set(sessions_refresh() + 1); }, Icon { name: "pin" } }
                                                     }
                                                     div { class: "thread recent",
                                                         onclick: move |_| { show_board.set(false); open_session_tab(tabs, active_tab, messages, next_tab_id, cfg, ui, engine, p_open.clone(), t_open.clone()); },
@@ -2917,14 +2839,14 @@ fn app() -> Element {
                                             let ws_d2 = ws_rebuild.clone();
                                             let ws_ar2 = ws_rebuild.clone();
                                             let path_str = path.display().to_string();
-                                            let is_pinned = cfg.read().pinned_sessions.iter().any(|p| p == &path_str);
+                                            let is_pinned = oxide_core::db::meta(&path_str).map(|m| m.pinned).unwrap_or(false);
                                             rsx! {
                                                 div { class: "thread-anchor",
                                                     div { class: "row-actions",
                                                         button { class: if is_pinned { "row-act-btn pinned" } else { "row-act-btn" }, title: if is_pinned { "Unpin" } else { "Pin" },
-                                                            onclick: move |e: dioxus::prelude::MouseEvent| { e.stop_propagation(); toggle_pin(cfg, &path_str); }, Icon { name: "pin" } }
-                                                        button { class: "row-act-btn", title: "Archive", onclick: move |e: dioxus::prelude::MouseEvent| { e.stop_propagation(); archive_session(&p_arch2); projects_list.set(build_projects(&ws_ar2, &cfg.read().recent_workspaces)); }, "⊟" }
-                                                        button { class: "row-act-btn danger", title: "Delete", onclick: move |e: dioxus::prelude::MouseEvent| { e.stop_propagation(); delete_session(&p_del2); projects_list.set(build_projects(&ws_d2, &cfg.read().recent_workspaces)); }, "✕" }
+                                                            onclick: move |e: dioxus::prelude::MouseEvent| { e.stop_propagation(); toggle_pin(cfg, &path_str); sessions_refresh.set(sessions_refresh() + 1); }, Icon { name: "pin" } }
+                                                        button { class: "row-act-btn", title: "Archive", onclick: move |e: dioxus::prelude::MouseEvent| { e.stop_propagation(); archive_session(&p_arch2); sessions_refresh.set(sessions_refresh() + 1); projects_list.set(build_projects(&ws_ar2, &cfg.read().recent_workspaces)); }, "⊟" }
+                                                        button { class: "row-act-btn danger", title: "Delete", onclick: move |e: dioxus::prelude::MouseEvent| { e.stop_propagation(); delete_session(&p_del2); sessions_refresh.set(sessions_refresh() + 1); projects_list.set(build_projects(&ws_d2, &cfg.read().recent_workspaces)); }, "✕" }
                                                     }
                                                     div { class: "thread recent", title: "right-click / double-click for options",
                                                         onclick: move |_| { show_board.set(false); open_session_tab(tabs, active_tab, messages, next_tab_id, cfg, ui, engine, p_open.clone(), t_open.clone()); },
@@ -4648,10 +4570,10 @@ fn app() -> Element {
                                     }
                                     if !q.is_empty() {
                                         {
-                                            let chats: Vec<(PathBuf, String)> = recent_sessions(&workspace).into_iter()
-                                                .map(|(p, _, t, _)| (p, t))
-                                                .filter(|(_, t)| t.to_lowercase().contains(&q))
-                                                .take(8).collect();
+                                            // Search ALL workspaces' sessions, not just the active one.
+                                            let chats: Vec<(PathBuf, String)> = oxide_core::db::search(&q, 8).into_iter()
+                                                .map(|m| (PathBuf::from(m.id), if m.title.trim().is_empty() { "Chat".to_string() } else { m.title }))
+                                                .collect();
                                             if chats.is_empty() { rsx!{} } else {
                                                 rsx! {
                                                     div { class: "menu-label", style: "padding:8px 12px 4px", "Chats" }
@@ -4998,12 +4920,10 @@ fn provider_title(provider: &str) -> &'static str {
 
 /// Pin / unpin a session path and persist.
 fn toggle_pin(mut cfg: Signal<Config>, path: &str) {
-    let mut c = cfg.read().clone();
-    if let Some(i) = c.pinned_sessions.iter().position(|p| p == path) {
-        c.pinned_sessions.remove(i);
-    } else {
-        c.pinned_sessions.insert(0, path.to_string());
-    }
+    let now_pinned = oxide_core::db::meta(path).map(|m| m.pinned).unwrap_or(false);
+    oxide_core::db::set_pinned(path, !now_pinned);
+    let c = cfg.read().clone();
+    let _ = &c;
     cfg.set(c.clone());
     if let Ok(s) = toml::to_string(&c) {
         let ws = workspace_of(&c);

@@ -22,6 +22,7 @@ mod index;
 mod hooks;
 mod memory;
 mod sandbox;
+pub mod db;
 mod store;
 mod tools;
 pub use tools::{Routed, ToolRouter};
@@ -387,65 +388,34 @@ pub fn spawn(config: Config) -> anyhow::Result<(EngineHandle, mpsc::Receiver<Eve
 
     // Resume reads the previous session *before* opening the new one.
     let mut history: Vec<Message> = Vec::new();
-    // An explicit session file (tab/history) wins over generic "resume latest".
-    if let Some(p) = config.resume_path.clone() {
-        if let Ok(msgs) = SessionStore::load(&p) {
+    // An explicit session id (tab/history) wins over generic "resume latest".
+    let resume_id: Option<String> = config
+        .resume_path
+        .as_deref()
+        .map(|p| p.display().to_string())
+        .or_else(|| if config.resume { SessionStore::latest(&workspace) } else { None });
+    if let Some(id) = &resume_id {
+        if let Ok(msgs) = SessionStore::load(id) {
             history = msgs
                 .into_iter()
                 .filter(|m| m.role != "meta")
                 .map(|m| Message::new(role_from_str(&m.role), m.content))
                 .collect();
-            tracing::info!(count = history.len(), "resumed session from {}", p.display());
-        }
-    } else if config.resume {
-        if let Some(prev) = SessionStore::latest(&workspace) {
-            if let Ok(msgs) = SessionStore::load(&prev) {
-                history = msgs
-                    .into_iter()
-                    .filter(|m| m.role != "meta")
-                    .map(|m| Message::new(role_from_str(&m.role), m.content))
-                    .collect();
-                tracing::info!(count = history.len(), "resumed prior session");
-            }
+            tracing::info!(count = history.len(), "resumed session {id}");
         }
     }
 
     let session_store = if config.persist {
-        // Resuming an existing session continues ITS file — no new file, no
-        // duplicate meta line, one conversation in one transcript.
-        let attached = config.resume_path.as_deref().and_then(|p| SessionStore::attach(p).ok());
+        // Resuming attaches to the EXISTING session id; otherwise open a fresh
+        // one (its row is created lazily on the first message).
+        let attached = resume_id
+            .as_deref()
+            .and_then(|id| SessionStore::attach(id, &workspace).ok());
         match attached.map(Ok).unwrap_or_else(|| SessionStore::open(&workspace)) {
             Ok(s) => {
-                // Record which provider owns this session (sidebar logos). An
-                // attached file with no real messages yet (only meta lines) is
-                // re-stamped, so switching provider on an empty chat updates the logo.
-                let meta_only = config.resume_path.as_deref().map(|p| {
-                    std::fs::read_to_string(p)
-                        .map(|t| {
-                            t.lines().filter(|l| !l.trim().is_empty()).all(|l| {
-                                serde_json::from_str::<serde_json::Value>(l)
-                                    .ok()
-                                    .and_then(|v| v["role"].as_str().map(|r| r == "meta"))
-                                    .unwrap_or(false)
-                            })
-                        })
-                        .unwrap_or(false)
-                });
-                match meta_only {
-                    None => {
-                        // Lazy: written right before the first real message, so an
-                        // empty chat never creates a file at all.
-                        s.set_meta(&format!("provider={}", config.provider));
-                    }
-                    Some(true) => {
-                        // Attached file with no real messages: re-stamp its provider.
-                        if let Some(p) = config.resume_path.as_deref() {
-                            let _ = std::fs::write(p, "");
-                        }
-                        s.set_meta(&format!("provider={}", config.provider));
-                    }
-                    Some(false) => {}
-                }
+                // Stamp the provider (sidebar logos); applied now if the row
+                // exists, else carried to the first append.
+                s.set_meta(&format!("provider={}", config.provider));
                 Some(s)
             }
             Err(e) => {

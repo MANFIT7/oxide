@@ -7,7 +7,6 @@
 //! can be rewound.
 
 use serde::{Deserialize, Serialize};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -26,134 +25,86 @@ fn now_ms() -> u128 {
         .unwrap_or(0)
 }
 
-/// Append-only JSONL session log. The file is created LAZILY on the first
-/// append, so an empty chat never leaves a session file behind.
+/// Session handle backed by the GLOBAL SQLite db (see `crate::db`). The id is
+/// minted eagerly; the row + messages are created lazily on the first append,
+/// so an empty chat stores nothing.
 pub struct SessionStore {
-    path: PathBuf,
     pub id: String,
-    /// Whether this store has written to (or attached to) its file yet.
-    wrote: std::sync::atomic::AtomicBool,
-    /// Meta line written right before the first real record.
-    meta: std::sync::Mutex<Option<String>>,
+    workspace: PathBuf,
+    provider: std::sync::Mutex<String>,
 }
 
 impl SessionStore {
-    /// Open a fresh session `.oxide/sessions/<id>.jsonl` under `workspace`.
-    /// The file is NOT created until the first append.
+    /// Fresh session in `workspace` (nothing persisted until the first append).
     pub fn open(workspace: &Path) -> std::io::Result<Self> {
-        let dir = workspace.join(".oxide/sessions");
-        std::fs::create_dir_all(&dir)?;
-        // Include the pid so two engines opening in the same millisecond can't
-        // collide on one file (which would interleave their JSONL lines).
-        let id = format!("{}-{}", now_ms(), std::process::id());
-        let path = dir.join(format!("{id}.jsonl"));
         Ok(Self {
-            path,
-            id,
-            wrote: std::sync::atomic::AtomicBool::new(false),
-            meta: std::sync::Mutex::new(None),
+            id: crate::db::new_id(),
+            workspace: workspace.to_path_buf(),
+            provider: std::sync::Mutex::new(String::new()),
         })
     }
 
-    /// Attach to an EXISTING session file (resume) — appends continue it.
-    pub fn attach(path: &Path) -> std::io::Result<Self> {
-        let id = path
-            .file_stem()
-            .and_then(|x| x.to_str())
-            .unwrap_or("session")
-            .to_string();
-        if !path.exists() {
-            return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "session file missing"));
+    /// Attach to an EXISTING session by id — appends continue it.
+    pub fn attach(id: &str, workspace: &Path) -> std::io::Result<Self> {
+        if !crate::db::exists(id) {
+            return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "session not found"));
         }
         Ok(Self {
-            path: path.to_path_buf(),
-            id,
-            wrote: std::sync::atomic::AtomicBool::new(true),
-            meta: std::sync::Mutex::new(None),
+            id: id.to_string(),
+            workspace: workspace.to_path_buf(),
+            provider: std::sync::Mutex::new(String::new()),
         })
     }
 
-    /// Absolute path of this session's JSONL file.
+    /// Stable identifier handed to the UI (was a file path; now the db id).
     pub fn path_str(&self) -> String {
-        self.path.display().to_string()
+        self.id.clone()
     }
 
-    /// Set the meta line (e.g. "provider=claude") to be written lazily before
-    /// the first real record.
+    /// Provider stamp (sidebar logos). Applied immediately if the session
+    /// already exists, and to every future append.
     pub fn set_meta(&self, content: &str) {
-        if let Ok(mut m) = self.meta.lock() {
-            *m = Some(content.to_string());
+        let p = content.strip_prefix("provider=").unwrap_or(content).to_string();
+        if crate::db::exists(&self.id) {
+            crate::db::set_provider(&self.id, &p);
         }
-        // Re-stamp immediately if the file already exists (attached, meta-only).
-        if self.wrote.load(std::sync::atomic::Ordering::Relaxed) && self.path.exists() {
-            let _ = self.write_line("meta", content, false);
+        if let Ok(mut g) = self.provider.lock() {
+            *g = p;
         }
-    }
-
-    fn write_line(&self, role: &str, content: &str, create: bool) -> std::io::Result<()> {
-        let rec = StoredMessage {
-            role: role.to_string(),
-            content: content.to_string(),
-            ts_ms: now_ms(),
-        };
-        let line = serde_json::to_string(&rec).unwrap_or_default();
-        let mut f = std::fs::OpenOptions::new()
-            .create(create)
-            .append(true)
-            .open(&self.path)?;
-        // Write the line and its newline in ONE syscall so concurrent appenders
-        // can't interleave (O_APPEND makes a single write atomic, not a pair).
-        f.write_all(format!("{line}\n").as_bytes())
     }
 
     pub fn append(&self, role: &str, content: &str) -> std::io::Result<()> {
-        // First write creates the file (and leads with the pending meta line);
-        // after that, do NOT recreate it — if the user deleted this session,
-        // stop persisting instead of resurrecting it.
-        let first = !self.wrote.swap(true, std::sync::atomic::Ordering::SeqCst);
-        if first {
-            if let Some(meta) = self.meta.lock().ok().and_then(|mut m| m.take()) {
-                let _ = self.write_line("meta", &meta, true);
-            }
-        }
-        self.write_line(role, content, first)
-    }
-
-    /// Overwrite the whole session file with `msgs` (used by restore-to-message).
-    pub fn rewrite(&self, msgs: &[(String, String)]) -> std::io::Result<()> {
-        let mut body = String::new();
-        for (role, content) in msgs {
-            let rec = StoredMessage { role: role.clone(), content: content.clone(), ts_ms: now_ms() };
-            body.push_str(&serde_json::to_string(&rec).unwrap_or_default());
-            body.push('\n');
-        }
-        std::fs::write(&self.path, body)?;
-        self.wrote.store(true, std::sync::atomic::Ordering::SeqCst);
+        let prov = self.provider.lock().map(|g| g.clone()).unwrap_or_default();
+        crate::db::append(&self.id, &self.workspace, &prov, role, content);
         Ok(())
     }
 
-    /// Load every message from a session file (for resume).
-    pub fn load(path: &Path) -> std::io::Result<Vec<StoredMessage>> {
-        let text = std::fs::read_to_string(path)?;
-        Ok(text
-            .lines()
-            .filter_map(|l| serde_json::from_str::<StoredMessage>(l).ok())
+    /// Replace the whole conversation (restore-to-message).
+    pub fn rewrite(&self, msgs: &[(String, String)]) -> std::io::Result<()> {
+        let prov = self.provider.lock().map(|g| g.clone()).unwrap_or_default();
+        crate::db::rewrite(&self.id, &self.workspace, &prov, msgs);
+        Ok(())
+    }
+
+    /// Load every message of a session id.
+    pub fn load(id: &str) -> std::io::Result<Vec<StoredMessage>> {
+        let rows = crate::db::load(id);
+        if rows.is_empty() && !crate::db::exists(id) {
+            return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "session not found"));
+        }
+        Ok(rows
+            .into_iter()
+            .map(|(role, content)| StoredMessage { role, content, ts_ms: 0 })
             .collect())
     }
 
-    /// Most recently modified session file in the workspace, if any.
-    pub fn latest(workspace: &Path) -> Option<PathBuf> {
-        let dir = workspace.join(".oxide/sessions");
-        let mut entries: Vec<_> = std::fs::read_dir(dir)
-            .ok()?
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl"))
-            .collect();
-        entries.sort();
-        entries.pop()
+    /// Newest active session id in a workspace.
+    pub fn latest(workspace: &Path) -> Option<String> {
+        crate::db::import_workspace(workspace);
+        crate::db::latest(workspace)
     }
 }
+
 
 /// Snapshot of one file's prior state, taken before a mutating tool runs.
 struct FileSnapshot {
