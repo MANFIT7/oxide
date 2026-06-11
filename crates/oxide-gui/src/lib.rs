@@ -22,6 +22,7 @@ use std::sync::OnceLock;
 
 const CSS: &str = include_str!("../assets/style.css");
 const MERMAID_JS: &[u8] = include_bytes!("../assets/vendor/mermaid.min.js");
+const NERD_FONT: &[u8] = include_bytes!("../assets/fonts/SymbolsNerdFontMono-Regular.ttf");
 const LOGO_BYTES: &[u8] = include_bytes!("../assets/logo.png");
 
 fn logo_uri() -> &'static str {
@@ -1764,6 +1765,13 @@ fn app() -> Element {
             responder.respond(resp);
         });
     }
+    dioxus::desktop::use_asset_handler("nerdfont", move |_req, responder| {
+        let resp = dioxus::desktop::wry::http::Response::builder()
+            .header("Content-Type", "font/ttf")
+            .body(std::borrow::Cow::from(NERD_FONT.to_vec()))
+            .unwrap();
+        responder.respond(resp);
+    });
     dioxus::desktop::use_asset_handler("mermaidjs", move |_req, responder| {
         let body = MERMAID_JS.to_vec();
         let resp = dioxus::desktop::wry::http::Response::builder()
@@ -3123,7 +3131,7 @@ fn app() -> Element {
 
                 div { class: if *show_env.read() { "center with-preview" } else { "center" },
                     style: if *show_env.read() { format!("--rpanel:{}px", *rpanel_w.read()) } else { String::new() },
-                    if cfg.read().workspace.is_some() && !*show_env.read() {
+                    if cfg.read().workspace.is_some() && !*show_env.read() && !active_is_tui {
                         {
                             let n_changed = changed_files.read().len();
                             let ta: u32 = changed_files.read().iter().map(|f| f.1).sum();

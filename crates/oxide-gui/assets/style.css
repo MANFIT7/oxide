@@ -1,3 +1,8 @@
+@font-face {
+  font-family: 'Symbols Nerd Font Mono';
+  src: url('/nerdfont/symbols.ttf') format('truetype');
+  font-display: swap;
+}
 * { margin: 0; padding: 0; box-sizing: border-box; }
 
 /* Dark (default) — Synara palette: deep ink, hairline borders */
