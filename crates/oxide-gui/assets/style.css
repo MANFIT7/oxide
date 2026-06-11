@@ -1609,7 +1609,8 @@ details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
 /* ════ CURSOR-CLEAN OVERHAUL · Phase 1 ════════════════════════════
    Flat document-flow chat, elevation via background (not borders),
    sans UI type (mono reserved for code/paths), one calm accent. */
-:root, [data-theme="light"] { --syn-accent: #6e7ff3; }
+:root { --syn-accent: #599CE7; }
+[data-theme="light"], .app[data-theme="light"] { --syn-accent: #3685BF; }
 .app { font-family: -apple-system, 'SF Pro Text', Inter, 'Segoe UI', sans-serif; }
 
 /* chat = document flow: agent text is plain prose, full width, no avatar */
@@ -2083,3 +2084,38 @@ details[open]::details-content { block-size: auto; }
 .mark-swatch { width: 10px; height: 10px; border-radius: 3px; flex-shrink: 0; cursor: pointer; }
 .mark-swatch.c0 { background: #e8c547; } .mark-swatch.c1 { background: #5da9e9; }
 .mark-swatch.c2 { background: #4fcf8f; } .mark-swatch.c3 { background: #e87aa4; }
+
+/* ══ Cursor Glass parity: quiet user block, thinking, pre-token shimmer ══ */
+/* user message: quiet block — border-left accent, 4% fill, small radius */
+.row.user .bubble {
+  background: color-mix(in srgb, var(--text) 4%, transparent);
+  border: none; border-left: 2px solid var(--syn-accent);
+  border-radius: 6px; max-width: 100%; width: 100%;
+  padding: 10px 14px; font-size: 14px;
+}
+/* pre-first-token shimmer: subtle sweep bar (Glass spec), not dots */
+.typing { display: block; width: 100%; max-width: 420px; height: 38px; border-radius: 8px; padding: 0;
+  background: linear-gradient(90deg,
+    color-mix(in srgb, var(--text) 4%, transparent) 25%,
+    color-mix(in srgb, var(--text) 8%, transparent) 50%,
+    color-mix(in srgb, var(--text) 4%, transparent) 75%);
+  background-size: 200% 100%; animation: glass-sweep 1.2s ease-in-out infinite; }
+.typing span { display: none; }
+@keyframes glass-sweep { from { background-position: 180% 0; } to { background-position: -20% 0; } }
+/* thinking block: left border pulse, tertiary text */
+.thinking-box { border-left: 2px solid color-mix(in srgb, var(--text) 37%, transparent);
+  background: color-mix(in srgb, var(--text) 4%, transparent); border-radius: 6px; }
+.col.streaming .thinking-box { animation: think-pulse 1.5s ease-in-out infinite; }
+@keyframes think-pulse { 0%, 100% { border-left-color: color-mix(in srgb, var(--text) 30%, transparent); }
+  50% { border-left-color: color-mix(in srgb, var(--text) 60%, transparent); } }
+.thinking-box .thinking-body { color: color-mix(in srgb, var(--text) 45%, transparent); }
+/* "Thought for Ns" persisted row */
+.thought-row { margin: 2px 8px 6px; }
+.thought-sum { cursor: pointer; list-style: none; color: var(--muted); font-size: 13.5px; font-weight: 600; }
+.thought-sum::-webkit-details-marker { display: none; }
+.thought-sum::after { content: " ⌄"; color: var(--faint); font-weight: 400; }
+.thought-row[open] .thought-sum::after { content: " ⌃"; }
+.thought-body { margin-top: 6px; padding: 8px 12px; color: color-mix(in srgb, var(--text) 45%, transparent);
+  font-size: 13px; line-height: 1.6; border-left: 2px solid color-mix(in srgb, var(--text) 20%, transparent);
+  white-space: pre-wrap; max-height: 280px; overflow-y: auto; }
+@media (prefers-reduced-motion: reduce) { .typing, .col.streaming .thinking-box { animation: none; } }

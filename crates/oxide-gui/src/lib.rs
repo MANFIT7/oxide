@@ -2274,7 +2274,20 @@ fn app() -> Element {
                                     if mw.last().map(|m| m.author == Author::Agent && m.text.is_empty()).unwrap_or(false) {
                                         mw.pop();
                                     }
+                                    // Persist the thinking as a collapsed "Thought for Ns"
+                                    // row above the reply (Cursor Glass style).
+                                    let th = thinking.peek().clone();
+                                    if !th.trim().is_empty() {
+                                        let secs = turn_start.peek().as_ref().map(|t| t.elapsed().as_secs()).unwrap_or(0).max(1);
+                                        let row = ChatMsg { author: Author::Note, text: format!("§thought\t{secs}\t{th}") };
+                                        if let Some(pos) = mw.iter().rposition(|m| m.author == Author::Agent && !m.text.is_empty()) {
+                                            mw.insert(pos, row);
+                                        } else {
+                                            mw.push(row);
+                                        }
+                                    }
                                 }
+                                thinking.set(String::new());
                                 // Cheap contextual follow-up suggestions (Claude Code-style).
                                 {
                                     let had_error = messages.peek().iter().rev().take(6)
@@ -4101,6 +4114,18 @@ fn app() -> Element {
                                                                     }
                                                                 }
                                                             }
+                                                            _ if m.author == Author::Note && m.text.starts_with("§thought\t") => {
+                                                                let mut parts = m.text.splitn(3, '\t');
+                                                                let _ = parts.next();
+                                                                let secs = parts.next().unwrap_or("1").to_string();
+                                                                let body = parts.next().unwrap_or("").to_string();
+                                                                rsx! {
+                                                                    details { class: "thought-row",
+                                                                        summary { class: "thought-sum", "Thought for {secs}s" }
+                                                                        div { class: "thought-body", "{body}" }
+                                                                    }
+                                                                }
+                                                            }
                                                             _ => {
                                                                 let is_live = *streaming.read() && m.author == Author::Agent && i + 1 == messages.read().len();
                                                                 let pin_snip: String = m.text.lines().find(|l| !l.trim().is_empty()).unwrap_or("").chars().take(64).collect();
@@ -4333,6 +4358,7 @@ fn app() -> Element {
                                 }
                             }
                             Composer { streaming, engine, cfg, model_label, bypass,
+                                       followup: !messages.read().is_empty(),
                                        project: project.clone(), branch: branch.clone(),
                                        context_used: ctx_used, context_limit: ctx_limit,
                                        workspace: workspace.clone(), plan_mode, pursue_goal, goal_text, queue, picked_element,
@@ -5459,6 +5485,7 @@ fn Composer(
     streaming: Signal<bool>,
     engine: Coroutine<EngineCmd>,
     cfg: Signal<Config>,
+    #[props(default)] followup: bool,
     model_label: String,
     bypass: bool,
     project: String,
@@ -5623,6 +5650,13 @@ fn Composer(
     let ws_kd2 = workspace.clone();
     let ws_btn = workspace.clone();
     let ws_steer = workspace.clone();
+    let ce_placeholder = if *streaming.read() {
+        "Steer the agent (sent mid-run)…"
+    } else if followup {
+        "Add a follow-up"
+    } else {
+        "Do anything"
+    };
 
     rsx! {
         div { class: if *streaming.read() { if cur_effort == "xhigh" || cur_effort == "max" { "composer working ultra" } else { "composer working" } } else { "composer" },
@@ -5732,7 +5766,7 @@ fn Composer(
                 id: "ce-input",
                 contenteditable: "true",
                 "data-empty": "{ce_empty}",
-                "data-ph": if *streaming.read() { "Steer the agent (sent mid-run)…" } else { "Do anything" },
+                "data-ph": "{ce_placeholder}",
                 oninput: move |_| {
                     let ws_oninput = ws_oninput.clone();
                     spawn(async move {
