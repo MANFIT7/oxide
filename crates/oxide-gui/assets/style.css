@@ -2045,3 +2045,15 @@ details[open]::details-content { block-size: auto; }
 .env-card-sep { height: 1px; background: var(--border); margin: 8px 8px; }
 .env-card-label { padding: 0 8px 4px; color: var(--faint); font-size: 11.5px; letter-spacing: .04em; }
 @media (max-width: 980px) { .env-card { display: none; } }
+
+/* env card: running-process dropdown with kill */
+.env-card-anchor { position: relative; }
+.env-procs { margin: 2px 6px 4px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-hi, var(--surface)); padding: 4px; animation: menu-in .12s ease-out; }
+.env-proc { display: flex; align-items: center; gap: 7px; padding: 5px 7px; border-radius: 7px; font-size: 12.5px; }
+.env-proc:hover { background: color-mix(in srgb, var(--text) 5%, transparent); }
+.env-proc-name { font-family: ui-monospace, Menlo, monospace; }
+.env-proc-port { color: var(--faint); font-variant-numeric: tabular-nums; }
+.env-proc-kill { margin-left: auto; background: none; border: none; color: var(--faint); cursor: pointer; font-size: 11px; padding: 2px 4px; border-radius: 5px; }
+.env-proc-kill:hover { color: var(--danger); background: color-mix(in srgb, var(--danger) 12%, transparent); }
+.env-proc-empty { padding: 7px; color: var(--faint); font-size: 12px; }
+.env-proc-open { width: 100%; text-align: left; background: none; border: none; border-top: 1px solid var(--border); margin-top: 3px; padding: 6px 7px 3px; color: var(--syn-accent); font-size: 12px; cursor: pointer; }

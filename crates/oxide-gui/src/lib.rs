@@ -1342,6 +1342,38 @@ fn load_session(path: &Path) -> Vec<ChatMsg> {
 /// Run a git subcommand in the workspace, returning stdout (stderr appended).
 /// Detect localhost servers: listening TCP ports + the owning process name.
 /// macOS/Linux via `lsof`. Returns `(port, "pid/command")` sorted, deduped.
+/// Running listener processes with pids (for the Environment card dropdown's
+/// kill buttons). Same filtering as scan_ports.
+async fn scan_procs() -> Vec<(u16, String, u32)> {
+    let out = match tokio::process::Command::new("lsof")
+        .args(["-nP", "-iTCP", "-sTCP:LISTEN"])
+        .output().await {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
+        Err(_) => return Vec::new(),
+    };
+    const DENY: &[&str] = &[
+        "spotify", "rapportd", "controlce", "sharingd", "identityser", "rapport",
+        "cloudd", "apsd", "trustd", "nsurlsess", "airplay", "wifiagent", "music",
+        "podcasts", "supercond", "remoted", "launchd", "deleted", "syncdefa",
+    ];
+    let mut found: std::collections::BTreeMap<u16, (String, u32)> = std::collections::BTreeMap::new();
+    for line in out.lines().skip(1) {
+        let mut cols = line.split_whitespace();
+        let cmd = cols.next().unwrap_or("").to_string();
+        let pid: u32 = cols.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+        let lc = cmd.to_ascii_lowercase();
+        if DENY.iter().any(|d| lc.starts_with(d)) { continue; }
+        if let Some(addr) = line.split_whitespace().find(|c| c.contains(':') && (c.contains("127.0.0.1") || c.starts_with("*:") || c.contains("[::1]") || c.contains("localhost"))) {
+            if let Some(p) = addr.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()) {
+                if pid > 0 {
+                    found.entry(p).or_insert((cmd, pid));
+                }
+            }
+        }
+    }
+    found.into_iter().map(|(port, (name, pid))| (port, name, pid)).collect()
+}
+
 async fn scan_ports() -> Vec<(u16, String)> {
     let out = match tokio::process::Command::new("lsof")
         .args(["-nP", "-iTCP", "-sTCP:LISTEN"])
@@ -1464,6 +1496,9 @@ fn app() -> Element {
     // Environment pane (right): one tabbed home for Files/Terminals/Preview/Diffs.
     let mut show_env = use_signal(|| false);
     let mut env_tab = use_signal(|| "files".to_string());
+    // Environment card: running-process dropdown (port, name, pid).
+    let mut procs_menu = use_signal(|| false);
+    let mut procs_list = use_signal(Vec::<(u16, String, u32)>::new);
     // Multi-terminal model: (id, title, lines).
     let mut terms = use_signal(|| vec![(1u64, "zsh 1".to_string(), Vec::<String>::new())]);
     let mut term_sel = use_signal(|| 0usize);
@@ -2891,8 +2926,37 @@ fn app() -> Element {
                                     }
                                     div { class: "env-card-sep" }
                                     div { class: "env-card-label", "Sources" }
-                                    button { class: "env-card-row", onclick: move |_| { env_tab.set("term".to_string()); show_env.set(true); },
-                                        Icon { name: "terminal" } span { "Terminals" } span { class: "env-card-badge", "{n_terms}" }
+                                    div { class: "env-card-anchor",
+                                        button { class: "env-card-row", onclick: move |_| {
+                                                let v = *procs_menu.read();
+                                                procs_menu.set(!v);
+                                                if !v { spawn(async move { procs_list.set(scan_procs().await); }); }
+                                            },
+                                            Icon { name: "terminal" } span { "Terminals" } span { class: "env-card-badge", "{n_terms} · ⌄" }
+                                        }
+                                        if *procs_menu.read() {
+                                            div { class: "env-procs",
+                                                if procs_list.read().is_empty() {
+                                                    div { class: "env-proc-empty", "No running processes" }
+                                                }
+                                                for (port, name, pid) in procs_list.read().iter().cloned() {
+                                                    div { class: "env-proc",
+                                                        span { class: "port-dot" }
+                                                        span { class: "env-proc-name", "{name}" }
+                                                        span { class: "env-proc-port", ":{port}" }
+                                                        button { class: "env-proc-kill", title: "Kill process",
+                                                            onclick: move |_| {
+                                                                spawn(async move {
+                                                                    let _ = tokio::process::Command::new("kill").arg("-9").arg(pid.to_string()).output().await;
+                                                                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                                                                    procs_list.set(scan_procs().await);
+                                                                });
+                                                            }, "✕" }
+                                                    }
+                                                }
+                                                button { class: "env-proc-open", onclick: move |_| { procs_menu.set(false); env_tab.set("term".to_string()); show_env.set(true); }, "Open terminals →" }
+                                            }
+                                        }
                                     }
                                     button { class: "env-card-row", onclick: move |_| { env_tab.set("preview".to_string()); show_env.set(true); spawn(async move { preview_ports.set(scan_ports().await); }); },
                                         Icon { name: "browser" } span { "Preview" }
