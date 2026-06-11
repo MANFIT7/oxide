@@ -1108,7 +1108,12 @@ impl Engine {
             sys.push_str(&agents);
         }
         sys.push_str(
-            "\n\n# Persistent memory & self-improvement\n\
+            "\n\n# Diagrams\n\
+When the user asks how something works, the architecture, a flow, a sequence, \
+or relationships, include a Mermaid diagram in a ```mermaid fenced code block \
+(flowchart/sequenceDiagram/stateDiagram-v2/classDiagram/erDiagram) — it renders \
+as a visual in the chat. Keep it focused; add a short prose explanation too.\n\
+\n# Persistent memory & self-improvement\n\
              You have durable memory at .oxide/memory. Use the `remember` tool to store \
              important facts and `save_skill` to capture reusable procedures you discover. \
              Consult what you already know below before acting.",
