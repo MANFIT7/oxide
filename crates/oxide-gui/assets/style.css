@@ -1593,7 +1593,7 @@ details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
 .composer:focus-within { border-color: color-mix(in srgb, var(--syn-accent) 55%, var(--border)); box-shadow: 0 0 0 3px color-mix(in srgb, var(--syn-accent) 14%, transparent), 0 8px 28px -18px color-mix(in srgb, var(--syn-accent) 35%, transparent); transition: box-shadow .18s ease, border-color .18s ease; }
 /* blinking caret on the streaming assistant message */
 @keyframes ox-caret { 0%, 49% { opacity: 1; } 50%, 100% { opacity: 0; } }
-.col.streaming .row.agent:last-of-type .agent-text::after { content: "▍"; margin-left: 2px; color: var(--syn-accent); animation: ox-caret 1s steps(1) infinite; }
+/* streaming caret removed — it rendered as a stray blue block under the text */
 /* springy send button */
 .send { transition: transform .16s cubic-bezier(.34,1.56,.64,1), background .12s ease; }
 .send:hover { transform: scale(1.07); }
