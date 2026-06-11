@@ -1692,6 +1692,8 @@ fn app() -> Element {
             if (!window.__oxkeys) {
               window.__oxkeys = 1;
               document.addEventListener('keydown', function(e){
+                // Don't hijack shortcuts while a terminal/TUI has focus.
+                if (e.target && e.target.closest && e.target.closest('.xterm, .terminal, .term-host')) return;
                 if ((e.metaKey || e.ctrlKey) && (e.key === 'k' || e.key === 'K')) { e.preventDefault(); dioxus.send('palette'); }
                 else if ((e.metaKey || e.ctrlKey) && e.key === '/') { e.preventDefault(); dioxus.send('shortcuts'); }
                 else if ((e.metaKey || e.ctrlKey) && (e.key === 'b' || e.key === 'B')) { e.preventDefault(); dioxus.send('files'); }
@@ -6491,6 +6493,23 @@ fn TerminalView(id: u64, bin: String, ws: String) -> Element {
                 term.open(el);
                 try {{ if (fit) fit.fit(); }} catch (e) {{}}
                 term.focus();
+                // macOS clipboard shortcuts inside the TUI.
+                term.attachCustomKeyEventHandler((e) => {{
+                    if (e.type !== 'keydown' || !(e.metaKey && !e.ctrlKey && !e.altKey)) return true;
+                    const k = (e.key || '').toLowerCase();
+                    if (k === 'c') {{
+                        const sel = term.getSelection();
+                        if (sel) {{ navigator.clipboard.writeText(sel); return false; }}
+                        return true;
+                    }}
+                    if (k === 'v') {{
+                        navigator.clipboard.readText().then(t => {{ if (t) dioxus.send(JSON.stringify({{ inp: t }})); }});
+                        return false;
+                    }}
+                    if (k === 'a') {{ term.selectAll(); return false; }}
+                    if (k === 'k') {{ term.clear(); return false; }}
+                    return false;  // swallow other Cmd combos so app shortcuts don't fire
+                }});
                 term.onData(d => dioxus.send(JSON.stringify({{ inp: d }})));
                 const ro = new ResizeObserver(() => {{ try {{ if (fit) fit.fit(); dioxus.send(JSON.stringify({{ resize: [term.rows, term.cols] }})); }} catch (e) {{}} }});
                 ro.observe(el);
