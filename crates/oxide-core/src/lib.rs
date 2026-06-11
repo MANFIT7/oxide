@@ -455,6 +455,21 @@ pub fn spawn(config: Config) -> anyhow::Result<(EngineHandle, mpsc::Receiver<Eve
     Ok((EngineHandle { op_tx }, event_rx))
 }
 
+/// Stream idle limit per provider. CLI drivers (claude/codex) manage their OWN
+/// timeouts (per-tool bash limits, API retries) and legitimately stay silent
+/// for as long as a build/test runs — so DON'T impose a wall-clock idle cap on
+/// them; the real signal is the child exiting, which closes the stream. The
+/// 180s guard is only for HTTP/SSE providers, where a long silence = a real
+/// stalled connection nothing else will recover.
+fn idle_timeout_for(provider: &str) -> std::time::Duration {
+    match provider {
+        // Effectively "never" (a finite value avoids Instant overflow in
+        // tokio's timer); the child exiting closes the stream and ends the round.
+        "claude" | "codex" => std::time::Duration::from_secs(30 * 24 * 3600),
+        _ => std::time::Duration::from_secs(180),
+    }
+}
+
 fn role_from_str(s: &str) -> Role {
     match s {
         "system" => Role::System,
@@ -977,7 +992,8 @@ impl Engine {
         let mut out = String::new();
         // Idle-timeout like run_turn — a stalled provider must not wedge
         // compaction/orchestration forever (this path can't be interrupted).
-        while let Some(item) = match tokio::time::timeout(std::time::Duration::from_secs(180), rx.recv()).await {
+        let idle = idle_timeout_for(provider_id);
+        while let Some(item) = match tokio::time::timeout(idle, rx.recv()).await {
             Ok(it) => it,
             Err(_) => { task.abort(); None }
         } {
@@ -1295,18 +1311,12 @@ as a visual in the chat. Keep it focused; add a short prose explanation too.\n\
             let mut steered = false;
             loop {
                 tokio::select! {
-                    res = tokio::time::timeout(std::time::Duration::from_secs(180), stream_rx.recv()) => {
-                        // Idle-timeout: if the provider stalls mid-stream (HTTP
-                        // open but no data), don't hang the turn forever — end the
-                        // round so the user isn't stuck on a spinner.
-                        let item = match res {
-                            Ok(it) => it,
-                            Err(_) => {
-                                self.emit(Event::Info { text: "provider stream stalled (no data for 180s) — ending round".into() }).await;
-                                stream_task.abort();
-                                break;
-                            }
-                        };
+                    item = stream_rx.recv() => {
+                        // No engine-side idle cap: each provider manages its own
+                        // timeout. HTTP/SSE clients have a read_timeout (a real
+                        // stall closes the connection → stream ends); CLI drivers
+                        // (claude/codex) run their own tool timeouts and end the
+                        // stream when the child exits. The user can always Interrupt.
                         match item {
                             Some(StreamItem::TextDelta(t)) => {
                                 round_text.push_str(&t);

@@ -4574,33 +4574,9 @@ fn app() -> Element {
                                                     {
                                                         let m = messages.read()[i].clone();
                                                         match &m.author {
-                                                            Author::Diff(path, cp) => {
-                                                                let path = path.clone();
-                                                                let cp = *cp;
-                                                                let diff = m.text.clone();
-                                                                let (adds, dels) = diff_counts(&diff);
-                                                                let is_reverted = reverted.read().contains(&cp);
-                                                                rsx! {
-                                                                    div { class: "row diffrow",
-                                                                        details { class: "diff-card",
-                                                                            summary { class: "diff-head",
-                                                                                // Expanding a diff hides the right inspector so the diff gets the width.
-                                                                                onclick: move |_| { if *show_env.read() && env_tab.read().as_str() == "files" { show_env.set(false); } },
-                                                                                span { class: "diff-caret", Icon { name: "chevron" } }
-                                                                                span { class: "diff-path", "{path}" }
-                                                                                span { class: "diff-adds", "+{adds}" }
-                                                                                span { class: "diff-dels", "−{dels}" }
-                                                                                if is_reverted {
-                                                                                    span { class: "diff-reverted", "✓ Reverted" }
-                                                                                } else if cp != 0 {
-                                                                                    button { class: "diff-revert", onclick: move |e| { e.prevent_default(); let _ = engine.send(EngineCmd::Rewind { id: cp }); reverted.write().insert(cp); }, "Revert" }
-                                                                                }
-                                                                            }
-                                                                            HunkedDiff { ws: workspace.clone(), path: path.clone(), diff }
-                                                                        }
-                                                                    }
-                                                                }
-                                                            }
+                                                            // Standalone diff boxes are consolidated into the
+                                                            // "Edited files" summary card below — render nothing here.
+                                                            Author::Diff(_, _) => rsx! {},
                                                             Author::User => {
                                                                 // Display text may carry pasted images after \u{2} separators —
                                                                 // either inline data URLs or persisted `wsimg:` file refs.
@@ -4895,14 +4871,26 @@ fn app() -> Element {
                                                         }, "Undo ↺" }
                                                     }
                                                 }
-                                                for (path, a, d, _cp, diff) in edits.iter().take(shown).cloned() {
-                                                    details { class: "edits-row-d",
-                                                        summary { class: "edits-row",
-                                                            span { class: "edits-caret", Icon { name: "chevron" } }
-                                                            span { class: "edits-path", "{path}" }
-                                                            span { class: "edits-rowcounts", span { class: "diff-adds", "+{a}" } " " span { class: "diff-dels", "−{d}" } }
+                                                for (path, a, d, cp, diff) in edits.iter().take(shown).cloned() {
+                                                    {
+                                                        let is_reverted = reverted.read().contains(&cp);
+                                                        rsx! {
+                                                            details { class: "edits-row-d",
+                                                                summary { class: "edits-row",
+                                                                    span { class: "edits-caret", Icon { name: "chevron" } }
+                                                                    span { class: "edits-path", "{path}" }
+                                                                    span { class: "edits-rowcounts", span { class: "diff-adds", "+{a}" } " " span { class: "diff-dels", "−{d}" } }
+                                                                    if is_reverted {
+                                                                        span { class: "diff-reverted", "✓ Reverted" }
+                                                                    } else if cp != 0 {
+                                                                        button { class: "edits-row-revert",
+                                                                            onclick: move |e: dioxus::prelude::MouseEvent| { e.prevent_default(); e.stop_propagation(); let _ = engine.send(EngineCmd::Rewind { id: cp }); reverted.write().insert(cp); },
+                                                                            "Revert" }
+                                                                    }
+                                                                }
+                                                                HunkedDiff { ws: workspace.clone(), path: path.clone(), diff }
+                                                            }
                                                         }
-                                                        HunkedDiff { ws: workspace.clone(), path: path.clone(), diff }
                                                     }
                                                 }
                                                 if n > 3 {

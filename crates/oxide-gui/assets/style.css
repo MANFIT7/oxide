@@ -2310,3 +2310,13 @@ details[open]::details-content { block-size: auto; }
 @media (prefers-reduced-motion: reduce) {
   .side-loader, .side-loader::before, .side-loader::after { animation: none; }
 }
+
+/* Per-file Revert inside the "Edited files" card (consolidates the old
+   standalone diff boxes). */
+.edits-row-revert {
+  margin-left: auto; flex-shrink: 0;
+  background: transparent; border: 1px solid var(--border); color: var(--muted);
+  border-radius: 6px; padding: 2px 9px; font-size: 11px; cursor: pointer; font-family: inherit;
+}
+.edits-row-revert:hover { background: rgba(224,145,58,.12); color: var(--danger); border-color: rgba(224,145,58,.4); }
+.edits-row .diff-reverted { margin-left: auto; flex-shrink: 0; }
