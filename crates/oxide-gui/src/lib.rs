@@ -1799,11 +1799,10 @@ fn app() -> Element {
 
     // Auto-scroll the chat to the bottom as content streams in — but only when
     // the user is already near the bottom, so reading scrollback isn't yanked.
-    // Load mermaid from CDN (UMD global) and render any .mermaid block as themed
-    // SVG. A <script src> include is far more reliable than inlining 3MB through
-    // the eval bridge; the app already needs the network for the model. v11
-    // dropped the UMD global (ESM-only), so we pin the latest UMD-compatible
-    // release (v10.9.x) which exposes window.mermaid for injected contexts.
+    // Load mermaid (latest, v11) as an ESM module from CDN — v11 dropped the
+    // UMD global, so we import it in a <script type=module> and stash it on
+    // window. A module import resolves https URLs even from the app origin.
+    // Renders each .mermaid block as themed SVG once it's complete.
     use_future(move || async move {
         let theme = if cfg.peek().theme != "light" { "dark" } else { "default" };
         let js = format!(
@@ -1811,25 +1810,27 @@ fn app() -> Element {
             (function(){{
               if (window.__oxmermaid) return;
               window.__oxmermaid = 1;
-              const start = () => {{
-                if (!window.mermaid) return;
-                try {{ window.mermaid.initialize({{startOnLoad:false,theme:'{theme}',securityLevel:'loose',fontFamily:'inherit'}}); }} catch(e){{}}
+              const sc = document.createElement('script');
+              sc.type = 'module';
+              sc.textContent = `
+                import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+                mermaid.initialize({{ startOnLoad:false, theme:'{theme}', securityLevel:'loose', fontFamily:'inherit' }});
+                window.__oxMermaid = mermaid;
                 const run = () => {{
-                  document.querySelectorAll('.mermaid:not([data-ox-done])').forEach((el)=>{{
-                    const src=(el.textContent||'').trim(); if(!src) return;
+                  document.querySelectorAll('.mermaid:not([data-ox-done])').forEach((el) => {{
+                    const src = (el.textContent || '').trim();
+                    if (!src) return;
                     el.setAttribute('data-ox-done','1');
-                    const id='oxmmd-'+(window.__oxmc=(window.__oxmc||0)+1);
-                    window.mermaid.render(id,src).then(r=>{{el.innerHTML=r.svg;}}).catch(()=>{{el.removeAttribute('data-ox-done');el.classList.add('mermaid-err');}});
+                    const id = 'oxmmd-' + (window.__oxmc = (window.__oxmc||0) + 1);
+                    mermaid.render(id, src).then(r => {{ el.innerHTML = r.svg; }})
+                      .catch(() => {{ el.removeAttribute('data-ox-done'); el.classList.add('mermaid-err'); }});
                   }});
                 }};
                 run();
-                new MutationObserver(run).observe(document.body,{{childList:true,subtree:true}});
-              }};
-              const s=document.createElement('script');
-              s.src='https://cdn.jsdelivr.net/npm/mermaid@10.9.3/dist/mermaid.min.js';
-              s.onload=start;
-              s.onerror=()=>{{ window.__oxmermaid=0; }};
-              document.head.appendChild(s);
+                new MutationObserver(run).observe(document.body, {{ childList:true, subtree:true }});
+              `;
+              sc.onerror = () => {{ window.__oxmermaid = 0; }};
+              document.head.appendChild(sc);
             }})();
             while (true) {{ await new Promise(r => setTimeout(r, 3600000)); }}
             "#
@@ -4109,8 +4110,26 @@ fn app() -> Element {
                                         }
                                         g
                                     };
+                                    // Segment into TURNS so each user prompt sticks only
+                                    // within its own turn (releases when the turn scrolls
+                                    // past — proper per-turn sticky header).
+                                    let turns = {
+                                        let msgs = messages.read();
+                                        let mut ts: Vec<Vec<(bool, Vec<usize>)>> = Vec::new();
+                                        for grp in groups.into_iter() {
+                                            let starts_turn = grp.1.first().map(|&i| msgs[i].author == Author::User).unwrap_or(false);
+                                            if starts_turn || ts.is_empty() {
+                                                ts.push(vec![grp]);
+                                            } else {
+                                                ts.last_mut().unwrap().push(grp);
+                                            }
+                                        }
+                                        ts
+                                    };
                                     rsx! {
-                                        for (is_act, idxs) in groups.into_iter() {
+                                        for turn in turns.into_iter() {
+                                        div { class: "turn",
+                                        for (is_act, idxs) in turn.into_iter() {
                                             if is_act && idxs.len() > 2 {
                                                 {
                                                     let rows: Vec<(String, bool, bool)> = idxs.iter().map(|&i| {
@@ -4175,7 +4194,7 @@ fn app() -> Element {
                                                                 let copy = serde_json::to_string(&strip_scaffold(&m.text)).unwrap_or_default();
                                                                 let edit_text = strip_scaffold(&m.text);
                                                                 let idx = i;
-                                                                let row_cls = if Some(i) == last_user_idx { "row user sticky-turn" } else { "row user" };
+                                                                let _ = last_user_idx; let row_cls = "row user sticky-turn";
                                                                 rsx! {
                                                                     div { class: "{row_cls}",
                                                                         div { class: "bubble",
@@ -4263,6 +4282,8 @@ fn app() -> Element {
                                                     }
                                                 }
                                             }
+                                        }
+                                        }
                                         }
                                     }
                                 }

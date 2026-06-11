@@ -1620,6 +1620,7 @@ details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
 
 /* user message: quiet quoted block instead of a chat bubble */
 .row.user { justify-content: flex-start; }
+.turn { display: flex; flex-direction: column; }
 .row.user.sticky-turn {
   position: sticky; top: 6px; z-index: 3;
 }
