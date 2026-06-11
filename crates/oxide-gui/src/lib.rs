@@ -3137,7 +3137,7 @@ fn app() -> Element {
                                         Icon { name: "file" } span { "Notepad" } span { class: "env-card-badge", if *note_open.read() { "⌃" } else { "⌄" } }
                                     }
                                     if *note_open.read() {
-                                        textarea { class: "env-note-input", placeholder: "Catatan thread ini…", value: "{note_text}",
+                                        textarea { class: "env-note-input", placeholder: "Notes for this thread…", value: "{note_text}",
                                             oninput: move |e| {
                                                 let v = e.value();
                                                 note_text.set(v.clone());
