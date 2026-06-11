@@ -2211,3 +2211,4 @@ details[open]::details-content { block-size: auto; }
 .thread:hover .sess-branch, .thread.active .sess-branch { color: var(--muted); opacity: 1; }
 /* uniform: live tab rows align like sessions (logo + title + spacing) */
 .thread.recent.sub { height: 30px; display: flex; align-items: center; gap: 7px; font-size: 13px; }
+.project-group { display: flex; flex-direction: column; }

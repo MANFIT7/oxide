@@ -2795,6 +2795,7 @@ fn app() -> Element {
                                 let ws_rebuild = workspace.clone();
                                 let pws_switch = pws.clone();
                                 rsx! {
+                                  div { key: "{pkey}", class: "project-group",
                                     div { class: if is_current { "project current" } else { "project" },
                                         title: if is_current { "" } else { "Switch to this project" },
                                         onclick: move |_| { if !is_current { apply_workspace(cfg, ui, engine, pws_switch.clone()); } },
@@ -2940,6 +2941,7 @@ fn app() -> Element {
                                             if e.contains(&pname2) { e.remove(&pname2); } else { e.insert(pname2.clone()); }
                                         }, if expanded { "Show less" } else { "Show more" } }
                                     }
+                                  }
                                 }
                             }
                         }
