@@ -2187,3 +2187,14 @@ details[open]::details-content { block-size: auto; }
 .thread.sub:hover { border-left-color: color-mix(in srgb, var(--syn-accent) 45%, transparent); }
 .sub-ic { display: inline-flex; flex-shrink: 0; color: var(--faint); margin-right: 2px; }
 .thread.sub:hover .sub-ic { color: var(--syn-accent); }
+
+/* project header: hover delete (removes its chats from the list) */
+.project-del { width: 20px; height: 20px; display: flex; align-items: center; justify-content: center;
+  background: transparent; border: none; border-radius: 5px; color: var(--faint); cursor: pointer;
+  opacity: 0; transition: opacity .12s, color .12s, background .12s; margin-left: auto; }
+.project:hover .project-del { opacity: 1; }
+.project-del svg { width: 13px; height: 13px; }
+.project-del:hover { color: var(--danger); background: color-mix(in srgb, var(--danger) 12%, transparent); }
+/* keep the + button next to it (no longer pushed by margin-left:auto on del) */
+.project:hover .project-add { opacity: 1; }
+.project-add { margin-left: 4px; }

@@ -2801,6 +2801,20 @@ fn app() -> Element {
                                         Icon { name: "folder" }
                                         span { class: "project-name", "{pname}" }
                                         if is_current && *streaming.read() { span { class: "syn-spinner", style: "margin-left:6px" } }
+                                        button { class: "project-del", title: "Remove this project's chats from the list",
+                                            onclick: {
+                                                let pdel = pws.clone();
+                                                move |e: dioxus::prelude::MouseEvent| {
+                                                    e.stop_propagation();
+                                                    oxide_core::db::archive_workspace(&pdel);
+                                                    let mut c = cfg.read().clone();
+                                                    c.recent_workspaces.retain(|p| p != &pdel);
+                                                    cfg.set(c);
+                                                    sessions_refresh.set(sessions_refresh() + 1);
+                                                }
+                                            },
+                                            Icon { name: "trash" }
+                                        }
                                         button { class: "project-add", title: "New chat here", onclick: move |e: dioxus::prelude::MouseEvent| {
                                                 e.stop_propagation();
                                                 show_board.set(false);

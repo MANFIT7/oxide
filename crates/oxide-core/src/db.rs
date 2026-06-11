@@ -255,6 +255,15 @@ pub fn pinned() -> Vec<SessionMeta> {
     list_where("archived_at IS NULL AND pinned=1", [], 50)
 }
 
+/// Archive every session of a workspace (removes them from the sidebar).
+pub fn archive_workspace(workspace: &Path) {
+    let c = conn().lock().unwrap();
+    let _ = c.execute(
+        "UPDATE sessions SET archived_at=?2 WHERE workspace=?1 AND archived_at IS NULL",
+        rusqlite::params![workspace.display().to_string(), now_ms()],
+    );
+}
+
 pub fn archive(id: &str) {
     let c = conn().lock().unwrap();
     let _ = c.execute(
