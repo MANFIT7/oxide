@@ -405,6 +405,7 @@ enum EngineCmd {
     Approve { id: u64, decision: ApprovalDecision },
     Answer { id: u64, text: String },
     Rewind { id: u64 },
+    SetHistory(Vec<(String, String)>),
     Interrupt,
 }
 
@@ -2176,6 +2177,11 @@ fn app() -> Element {
                         Some(EngineCmd::Rewind { id }) => {
                             if let Some(h) = &handle {
                                 let _ = h.submit(Op::Rewind { checkpoint_id: id }).await;
+                            }
+                        }
+                        Some(EngineCmd::SetHistory(msgs)) => {
+                            if let Some(h) = &handle {
+                                let _ = h.submit(Op::SetHistory { msgs }).await;
                             }
                         }
                         Some(EngineCmd::Interrupt) => {
@@ -4244,8 +4250,16 @@ fn app() -> Element {
                                                                                         let ids: Vec<u64> = checkpoints.read().iter().map(|(id, _)| *id).filter(|id| *id >= fl).collect();
                                                                                         for id in ids.into_iter().rev() { let _ = engine.send(EngineCmd::Rewind { id }); reverted.write().insert(id); }
                                                                                     }
-                                                                                    // Drop this turn and everything after it…
+                                                                                    // Drop this turn and everything after it (UI)…
                                                                                     messages.write().truncate(idx);
+                                                                                    // …and trim the engine + session history so the
+                                                                                    // model forgets the removed turns (no pile-up).
+                                                                                    let hist: Vec<(String, String)> = messages.read().iter().filter_map(|mm| match mm.author {
+                                                                                        Author::User => Some(("user".to_string(), strip_scaffold(&mm.text))),
+                                                                                        Author::Agent if !mm.text.is_empty() => Some(("assistant".to_string(), mm.text.clone())),
+                                                                                        _ => None,
+                                                                                    }).collect();
+                                                                                    let _ = engine.send(EngineCmd::SetHistory(hist));
                                                                                     // …and load the message back into the composer to edit & resend.
                                                                                     let t = edit_text.clone();
                                                                                     spawn(async move {

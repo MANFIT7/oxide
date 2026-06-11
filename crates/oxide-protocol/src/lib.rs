@@ -40,6 +40,10 @@ pub enum Op {
     Rewind { checkpoint_id: u64 },
     /// Answer a question the agent asked (see [`Event::QuestionAsked`]).
     QuestionAnswer { request_id: u64, answer: String },
+    /// Replace the conversation history (role, content) — used by "restore to
+    /// this message", which trims the transcript so the model forgets the
+    /// removed turns.
+    SetHistory { msgs: Vec<(String, String)> },
     /// Graceful shutdown of the engine task.
     Shutdown,
 }

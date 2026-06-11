@@ -119,6 +119,19 @@ impl SessionStore {
         self.write_line(role, content, first)
     }
 
+    /// Overwrite the whole session file with `msgs` (used by restore-to-message).
+    pub fn rewrite(&self, msgs: &[(String, String)]) -> std::io::Result<()> {
+        let mut body = String::new();
+        for (role, content) in msgs {
+            let rec = StoredMessage { role: role.clone(), content: content.clone(), ts_ms: now_ms() };
+            body.push_str(&serde_json::to_string(&rec).unwrap_or_default());
+            body.push('\n');
+        }
+        std::fs::write(&self.path, body)?;
+        self.wrote.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
     /// Load every message from a session file (for resume).
     pub fn load(path: &Path) -> std::io::Result<Vec<StoredMessage>> {
         let text = std::fs::read_to_string(path)?;

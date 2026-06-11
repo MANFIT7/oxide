@@ -843,6 +843,19 @@ impl Engine {
                     })
                     .await;
                 }
+                Op::SetHistory { msgs } => {
+                    self.session = msgs
+                        .iter()
+                        .map(|(r, c)| Message::new(role_from_str(r), c.clone()))
+                        .collect();
+                    if let Some(store) = &self.session_store {
+                        let meta = format!("provider={}", self.config.provider);
+                        let mut full: Vec<(String, String)> = vec![("meta".into(), meta)];
+                        full.extend(msgs.iter().cloned());
+                        let _ = store.rewrite(&full);
+                    }
+                    self.emit(Event::Info { text: "history trimmed".into() }).await;
+                }
                 Op::Shutdown => break,
             }
         }
