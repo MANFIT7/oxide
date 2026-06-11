@@ -1390,6 +1390,40 @@ fn load_session(path: &Path) -> Vec<ChatMsg> {
 /// macOS/Linux via `lsof`. Returns `(port, "pid/command")` sorted, deduped.
 /// Running listener processes with pids (for the Environment card dropdown's
 /// kill buttons). Same filtering as scan_ports.
+/// Claude subscription usage via the OAuth usage endpoint (token from the
+/// Keychain item Claude Code writes). Returns (plan, 5h_remaining%, weekly_remaining%).
+/// Best-effort; None when not logged in or the call fails. The token is never
+/// logged or persisted.
+async fn fetch_claude_usage() -> Option<(String, u8, u8)> {
+    // Read the OAuth blob from the login Keychain.
+    let kc = tokio::process::Command::new("security")
+        .args(["find-generic-password", "-s", "Claude Code-credentials", "-w"])
+        .output().await.ok()?;
+    if !kc.status.success() { return None; }
+    let blob: serde_json::Value = serde_json::from_slice(&kc.stdout).ok()?;
+    let oauth = &blob["claudeAiOauth"];
+    let token = oauth["accessToken"].as_str()?;
+    if token.is_empty() { return None; }
+    let plan = oauth["subscriptionType"].as_str().unwrap_or("claude").to_string();
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .ok()?;
+    let resp = client
+        .get("https://api.anthropic.com/api/oauth/usage")
+        .header("Authorization", format!("Bearer {token}"))
+        .header("anthropic-beta", "oauth-2025-04-20")
+        .send().await.ok()?;
+    if !resp.status().is_success() { return None; }
+    let v: serde_json::Value = resp.json().await.ok()?;
+    let rem = |x: &serde_json::Value| -> u8 {
+        let u = x["utilization"].as_f64().unwrap_or(0.0);
+        (100.0 - u).clamp(0.0, 100.0).round() as u8
+    };
+    Some((plan, rem(&v["five_hour"]), rem(&v["seven_day"])))
+}
+
 async fn scan_procs() -> Vec<(u16, String, u32)> {
     let out = match tokio::process::Command::new("lsof")
         .args(["-nP", "-iTCP", "-sTCP:LISTEN"])
@@ -1827,6 +1861,19 @@ fn app() -> Element {
             })
             .unwrap_or_default();
         recap_text.set(recap);
+    });
+
+    // Poll Claude subscription usage (CLI/API providers don't stream it).
+    use_future(move || async move {
+        loop {
+            let prov = cfg.peek().provider.clone();
+            if matches!(prov.as_str(), "claude" | "anthropic") {
+                if let Some((plan, r5, rw)) = fetch_claude_usage().await {
+                    usage_info.set(Some((plan, r5, rw, String::new(), String::new())));
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+        }
     });
 
     // Keep the Environment card's change counts fresh per workspace.
