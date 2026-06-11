@@ -2023,3 +2023,25 @@ details[open]::details-content { block-size: auto; }
 .term-tab-x:hover { color: var(--danger); }
 .env-terms .term-body { flex: 1; overflow-y: auto; padding: 10px 14px; font-family: ui-monospace, Menlo, monospace; font-size: 12.5px; }
 .env-terms .term-input-row { display: flex; align-items: center; gap: 8px; padding: 8px 14px; border-top: 1px solid var(--border); flex-shrink: 0; }
+
+/* floating Environment card (synara-style) — quick status + entry points */
+.env-card { position: absolute; top: 14px; right: 16px; width: 230px; z-index: 4;
+  background: color-mix(in srgb, var(--surface) 92%, transparent); backdrop-filter: blur(14px);
+  border: 1px solid var(--border); border-radius: 16px; padding: 12px 8px 10px;
+  box-shadow: 0 14px 38px rgba(0,0,0,.35); animation: menu-in .14s ease-out; }
+.app[data-theme="light"] .env-card { box-shadow: 0 14px 38px rgba(20,20,20,.12); }
+.env-card-head { display: flex; align-items: center; justify-content: space-between; padding: 0 8px 8px; color: var(--muted); font-size: 13px; }
+.env-card-gear { background: none; border: none; color: var(--faint); cursor: pointer; padding: 2px; border-radius: 6px; }
+.env-card-gear:hover { color: var(--text); }
+.env-card-gear svg { width: 14px; height: 14px; }
+.env-card-row { display: flex; align-items: center; gap: 9px; width: 100%; text-align: left;
+  background: none; border: none; color: var(--text); font-size: 13.5px; font-family: inherit;
+  padding: 7px 8px; border-radius: 9px; cursor: pointer; transition: background .12s ease; }
+.env-card-row:hover { background: color-mix(in srgb, var(--text) 6%, transparent); }
+.env-card-row.static { cursor: default; color: var(--muted); }
+.env-card-row.static:hover { background: none; }
+.env-card-row svg { width: 14px; height: 14px; color: var(--muted); flex-shrink: 0; }
+.env-card-badge { margin-left: auto; font-size: 11px; color: var(--faint); font-variant-numeric: tabular-nums; }
+.env-card-sep { height: 1px; background: var(--border); margin: 8px 8px; }
+.env-card-label { padding: 0 8px 4px; color: var(--faint); font-size: 11.5px; letter-spacing: .04em; }
+@media (max-width: 980px) { .env-card { display: none; } }

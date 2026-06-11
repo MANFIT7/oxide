@@ -1706,6 +1706,14 @@ fn app() -> Element {
         ).recv::<String>().await;
     });
 
+    // Keep the Environment card's change counts fresh per workspace.
+    use_effect(move || {
+        let ws = ui.workspace.read().clone();
+        if cfg.read().workspace.is_some() {
+            spawn(async move { changed_files.set(load_changed_files(&ws).await); });
+        }
+    });
+
     // Load the kanban board + recent chat sessions for the active workspace.
     use_effect(move || {
         let ws = ui.workspace.read().clone();
@@ -2857,6 +2865,45 @@ fn app() -> Element {
 
                 div { class: if *show_env.read() { "center with-preview" } else { "center" },
                     style: if *show_env.read() { format!("--rpanel:{}px", *rpanel_w.read()) } else { String::new() },
+                    if cfg.read().workspace.is_some() && !*show_env.read() {
+                        {
+                            let n_changed = changed_files.read().len();
+                            let ta: u32 = changed_files.read().iter().map(|f| f.1).sum();
+                            let td: u32 = changed_files.read().iter().map(|f| f.2).sum();
+                            let n_terms = terms.read().len();
+                            let br = branch.clone();
+                            rsx! {
+                                div { class: "env-card",
+                                    div { class: "env-card-head",
+                                        span { "Environment" }
+                                        button { class: "env-card-gear", title: "Open environment", onclick: move |_| { env_tab.set("files".to_string()); show_env.set(true); }, Icon { name: "settings" } }
+                                    }
+                                    button { class: "env-card-row", onclick: move |_| { env_tab.set("changes".to_string()); show_env.set(true); },
+                                        Icon { name: "branch" } span { "Changes" }
+                                        if n_changed > 0 { span { class: "env-card-badge", "{n_changed} · +{ta} −{td}" } }
+                                    }
+                                    div { class: "env-card-row static", Icon { name: "terminal" } span { "Local" } }
+                                    button { class: "env-card-row", onclick: move |_| { env_tab.set("changes".to_string()); show_env.set(true); },
+                                        Icon { name: "branch" } span { "{br}" }
+                                    }
+                                    button { class: "env-card-row", onclick: move |_| { env_tab.set("changes".to_string()); show_env.set(true); },
+                                        Icon { name: "spark" } span { "Commit or push" }
+                                    }
+                                    div { class: "env-card-sep" }
+                                    div { class: "env-card-label", "Sources" }
+                                    button { class: "env-card-row", onclick: move |_| { env_tab.set("term".to_string()); show_env.set(true); },
+                                        Icon { name: "terminal" } span { "Terminals" } span { class: "env-card-badge", "{n_terms}" }
+                                    }
+                                    button { class: "env-card-row", onclick: move |_| { env_tab.set("preview".to_string()); show_env.set(true); spawn(async move { preview_ports.set(scan_ports().await); }); },
+                                        Icon { name: "browser" } span { "Preview" }
+                                    }
+                                    button { class: "env-card-row", onclick: move |_| { env_tab.set("files".to_string()); show_env.set(true); },
+                                        Icon { name: "plugins" } span { "Files" }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     if *show_env.read() {
                         div { class: "env-panel",
                             div { class: "panel-resizer rp", onmousedown: move |e: dioxus::prelude::MouseEvent| {
