@@ -1259,6 +1259,39 @@ fn push_toast(mut toasts: Signal<Vec<(u64, String, String)>>, mut seq: Signal<u6
     });
 }
 
+/// Stem of the active tab's session file (per-thread storage key).
+fn thread_stem(tabs: &Signal<Vec<AgentTab>>, active_tab: &Signal<usize>) -> String {
+    let cur = *active_tab.peek();
+    tabs.peek()
+        .get(cur)
+        .and_then(|t| t.session.as_ref().and_then(|p| p.file_stem().map(|x| x.to_string_lossy().to_string())))
+        .unwrap_or_else(|| "default".into())
+}
+
+fn thread_json_load<T: serde::de::DeserializeOwned + Default>(ws: &Path, dir: &str, stem: &str) -> T {
+    std::fs::read_to_string(ws.join(format!(".oxide/{dir}/{stem}.json")))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+fn thread_json_save<T: serde::Serialize>(ws: &Path, dir: &str, stem: &str, v: &T) {
+    let d = ws.join(format!(".oxide/{dir}"));
+    let _ = std::fs::create_dir_all(&d);
+    if let Ok(t) = serde_json::to_string(v) {
+        let _ = std::fs::write(d.join(format!("{stem}.json")), t);
+    }
+}
+
+/// Smooth-scroll the transcript to message index `i` and flash it.
+fn jump_to_msg(i: usize) {
+    spawn(async move {
+        let _ = dioxus::document::eval(&format!(
+            "const el=document.getElementById('msg-{i}'); if(el){{ el.scrollIntoView({{behavior:'smooth',block:'center'}}); el.classList.add('flash'); setTimeout(()=>el.classList.remove('flash'),1200); }}"
+        )).await;
+    });
+}
+
 /// Jump the chat scroll to the bottom after the next render tick.
 fn scroll_chat_bottom() {
     spawn(async move {
@@ -1500,10 +1533,15 @@ fn app() -> Element {
     let mut procs_menu = use_signal(|| false);
     let mut procs_list = use_signal(Vec::<(u16, String, u32)>::new);
     // Environment card menus + per-thread extras.
-    let mut editor_menu = use_signal(|| false);
     let mut git_menu = use_signal(|| false);
     let mut branch_menu = use_signal(|| false);
     let mut branches_list = use_signal(Vec::<String>::new);
+    // Pinned messages + markers, per thread: (msg index, snippet, done) /
+    // (msg index, snippet, color, done).
+    let mut pinned_msgs = use_signal(Vec::<(usize, String, bool)>::new);
+    let mut markers = use_signal(Vec::<(usize, String, u8, bool)>::new);
+    let mut pins_open = use_signal(|| true);
+    let mut marks_open = use_signal(|| true);
     let mut note_open = use_signal(|| false);
     let mut note_text = use_signal(String::new);
     let mut recap_open = use_signal(|| false);
@@ -1761,6 +1799,8 @@ fn app() -> Element {
             .unwrap_or_else(|| "default".into());
         let note = std::fs::read_to_string(ws.join(format!(".oxide/notes/{stem}.md"))).unwrap_or_default();
         note_text.set(note);
+        pinned_msgs.set(thread_json_load(&ws, "pins", &stem));
+        markers.set(thread_json_load(&ws, "markers", &stem));
         // Recap = last compaction summary recorded in the session file.
         let recap = sess
             .and_then(|p| std::fs::read_to_string(p).ok())
@@ -2952,7 +2992,42 @@ fn app() -> Element {
                                         Icon { name: "branch" } span { "Changes" }
                                         if n_changed > 0 { span { class: "env-card-badge", "{n_changed} · +{ta} −{td}" } }
                                     }
-                                    div { class: "env-card-row static", Icon { name: "terminal" } span { "Local" } }
+                                    {
+                                        let ws_now = ui.workspace.read().clone();
+                                        let in_wt = ws_now.to_string_lossy().contains("/.oxide/worktrees/env");
+                                        let mode_label = if in_wt { "Worktree" } else { "Local" };
+                                        rsx! {
+                                            button { class: "env-card-row", title: "Switch between the project folder and an isolated git worktree",
+                                                onclick: move |_| {
+                                                    let ws_now = ui.workspace.peek().clone();
+                                                    let in_wt = ws_now.to_string_lossy().contains("/.oxide/worktrees/env");
+                                                    if in_wt {
+                                                        // Back to the real project root.
+                                                        let root = std::path::PathBuf::from(ws_now.to_string_lossy().split("/.oxide/worktrees/env").next().unwrap_or_default());
+                                                        if root.exists() { apply_workspace(cfg, ui, engine, root); push_toast(toasts, toast_seq, "ok", "Back to local project"); }
+                                                    } else {
+                                                        let wt = ws_now.join(".oxide/worktrees/env");
+                                                        spawn(async move {
+                                                            if !wt.exists() {
+                                                                let r = run_cmd(&ws_now, "git", &["worktree", "add", &wt.display().to_string(), "-b", "oxide/env"]).await;
+                                                                if r.contains("fatal") && !r.contains("already exists") {
+                                                                    // branch may exist from before — attach without -b
+                                                                    let _ = run_cmd(&ws_now, "git", &["worktree", "add", &wt.display().to_string(), "oxide/env"]).await;
+                                                                }
+                                                            }
+                                                            if wt.exists() {
+                                                                apply_workspace(cfg, ui, engine, wt);
+                                                                push_toast(toasts, toast_seq, "ok", "Switched to worktree (branch oxide/env)");
+                                                            } else {
+                                                                push_toast(toasts, toast_seq, "err", "Worktree create failed");
+                                                            }
+                                                        });
+                                                    }
+                                                },
+                                                Icon { name: "terminal" } span { "{mode_label}" } span { class: "env-card-badge", "⌄" }
+                                            }
+                                        }
+                                    }
                                     div { class: "env-card-anchor",
                                         button { class: "env-card-row", onclick: move |_| {
                                                 let v = *branch_menu.read(); branch_menu.set(!v);
@@ -3054,35 +3129,6 @@ fn app() -> Element {
                                         },
                                         Icon { name: "browser" } span { "Repository" } span { class: "env-card-badge", "↗" }
                                     }
-                                    div { class: "env-card-anchor",
-                                        button { class: "env-card-row", onclick: move |_| { let v = *editor_menu.read(); editor_menu.set(!v); },
-                                            Icon { name: "file" } span { "Open in {cfg.read().editor_app}" } span { class: "env-card-badge", "⌄" }
-                                        }
-                                        if *editor_menu.read() {
-                                            div { class: "env-procs",
-                                                for app in ["Visual Studio Code", "Cursor", "Zed", "Sublime Text", "Xcode"] {
-                                                    button { class: "env-proc as-btn", onclick: move |_| {
-                                                            editor_menu.set(false);
-                                                            let mut cfg = cfg;
-                                                            let ws = ui.workspace.peek().clone();
-                                                            let mut c = cfg.read().clone();
-                                                            c.editor_app = app.to_string();
-                                                            cfg.set(c.clone());
-                                                            if let Ok(t) = toml::to_string(&c) { let _ = std::fs::write(workspace_of(&c).join("oxide.toml"), &t); }
-                                                            spawn(async move {
-                                                                let r = tokio::process::Command::new("open").arg("-a").arg(app).arg(&ws).output().await;
-                                                                if r.map(|o| !o.status.success()).unwrap_or(true) {
-                                                                    push_toast(toasts, toast_seq, "err", &format!("{app} not found"));
-                                                                }
-                                                            });
-                                                        },
-                                                        span { class: "env-proc-name", "{app}" }
-                                                        if cfg.read().editor_app == app { span { class: "env-card-badge", "✓" } }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
                                     div { class: "env-card-sep" }
                                     div { class: "env-card-label", "Sources" }
                                     div { class: "env-card-anchor",
@@ -3122,6 +3168,52 @@ fn app() -> Element {
                                     }
                                     button { class: "env-card-row", onclick: move |_| { env_tab.set("files".to_string()); show_env.set(true); },
                                         Icon { name: "plugins" } span { "Files" }
+                                    }
+                                    if !pinned_msgs.read().is_empty() {
+                                        div { class: "env-card-sep" }
+                                        button { class: "env-card-row", onclick: move |_| { let v = *pins_open.read(); pins_open.set(!v); },
+                                            Icon { name: "pin" } span { "Pinned" } span { class: "env-card-badge", "{pinned_msgs.read().len()}" }
+                                        }
+                                        if *pins_open.read() {
+                                            for (pi, (mi, snip, done)) in pinned_msgs.read().iter().cloned().enumerate() {
+                                                div { class: if done { "env-pin done" } else { "env-pin" },
+                                                    input { r#type: "checkbox", checked: done,
+                                                        onchange: move |_| {
+                                                            if let Some(p) = pinned_msgs.write().get_mut(pi) { p.2 = !p.2; }
+                                                            thread_json_save(&ui.workspace.peek().clone(), "pins", &thread_stem(&tabs, &active_tab), &*pinned_msgs.read());
+                                                        } }
+                                                    span { class: "env-pin-text", onclick: move |_| jump_to_msg(mi), "{snip}" }
+                                                    button { class: "env-proc-kill", title: "Unpin", onclick: move |_| {
+                                                            pinned_msgs.write().retain(|p| p.0 != mi);
+                                                            thread_json_save(&ui.workspace.peek().clone(), "pins", &thread_stem(&tabs, &active_tab), &*pinned_msgs.read());
+                                                        }, "✕" }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if !markers.read().is_empty() {
+                                        div { class: "env-card-sep" }
+                                        button { class: "env-card-row", onclick: move |_| { let v = *marks_open.read(); marks_open.set(!v); },
+                                            span { class: "mark-swatch c0" } span { "Markers" } span { class: "env-card-badge", "{markers.read().len()}" }
+                                        }
+                                        if *marks_open.read() {
+                                            for (ki, (mi, text, color, done)) in markers.read().iter().cloned().enumerate() {
+                                                div { class: if done { "env-pin done" } else { "env-pin" },
+                                                    span { class: "mark-swatch c{color}", title: "Cycle color",
+                                                        onclick: move |_| {
+                                                            if let Some(m) = markers.write().get_mut(ki) { m.2 = (m.2 + 1) % 4; }
+                                                            thread_json_save(&ui.workspace.peek().clone(), "markers", &thread_stem(&tabs, &active_tab), &*markers.read());
+                                                        } }
+                                                    span { class: "env-pin-text", onclick: move |_| jump_to_msg(mi), "{text}" }
+                                                    button { class: "env-proc-kill", title: "Remove", onclick: move |_| {
+                                                            let mut mv = markers.write();
+                                                            if ki < mv.len() { mv.remove(ki); }
+                                                            drop(mv);
+                                                            thread_json_save(&ui.workspace.peek().clone(), "markers", &thread_stem(&tabs, &active_tab), &*markers.read());
+                                                        }, "✕" }
+                                                }
+                                            }
+                                        }
                                     }
                                     if !recap_text.read().is_empty() {
                                         div { class: "env-card-sep" }
@@ -3976,7 +4068,40 @@ fn app() -> Element {
                                                             }
                                                             _ => {
                                                                 let is_live = *streaming.read() && m.author == Author::Agent && i + 1 == messages.read().len();
-                                                                rsx! { Message { author: m.author.clone(), text: m.text.clone(), live: is_live } }
+                                                                let pin_snip: String = m.text.lines().find(|l| !l.trim().is_empty()).unwrap_or("").chars().take(64).collect();
+                                                                let is_agent = m.author == Author::Agent;
+                                                                let ws_pin = workspace.clone();
+                                                                let ws_mark = workspace.clone();
+                                                                let snip2 = pin_snip.clone();
+                                                                rsx! {
+                                                                    div { id: "msg-{i}", class: "pinwrap",
+                                                                        Message { author: m.author.clone(), text: m.text.clone(), live: is_live }
+                                                                        if is_agent && !is_live {
+                                                                            div { class: "msg-side",
+                                                                                button { class: "msg-pin", title: "Pin message",
+                                                                                    onclick: move |_| {
+                                                                                        if !pinned_msgs.read().iter().any(|p| p.0 == i) {
+                                                                                            pinned_msgs.write().push((i, pin_snip.clone(), false));
+                                                                                            thread_json_save(&ws_pin, "pins", &thread_stem(&tabs, &active_tab), &*pinned_msgs.read());
+                                                                                        }
+                                                                                    }, Icon { name: "pin" } }
+                                                                                button { class: "msg-pin", title: "Mark — highlights selected text (or the message)",
+                                                                                    onclick: move |_| {
+                                                                                        let ws3 = ws_mark.clone();
+                                                                                        let fallback = snip2.clone();
+                                                                                        spawn(async move {
+                                                                                            let sel = dioxus::document::eval("return (window.getSelection()||'').toString();")
+                                                                                                .join::<String>().await.unwrap_or_default();
+                                                                                            let text = if sel.trim().is_empty() { fallback } else { sel.chars().take(80).collect() };
+                                                                                            let color = (markers.peek().len() % 4) as u8;
+                                                                                            markers.write().push((i, text, color, false));
+                                                                                            thread_json_save(&ws3, "markers", &thread_stem(&tabs, &active_tab), &*markers.read());
+                                                                                        });
+                                                                                    }, "🖍" }
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
                                                             }
                                                         }
                                                     }

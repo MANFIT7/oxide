@@ -2064,3 +2064,20 @@ details[open]::details-content { block-size: auto; }
 .env-note-input { margin: 4px 8px 6px; width: calc(100% - 16px); min-height: 90px; resize: vertical; background: color-mix(in srgb, var(--text) 4%, transparent); border: 1px solid var(--border); border-radius: 9px; padding: 8px 10px; font-size: 12.5px; color: var(--text); font-family: inherit; outline: none; }
 .env-note-input:focus { border-color: color-mix(in srgb, var(--syn-accent) 45%, transparent); }
 .env-card { max-height: calc(100% - 28px); overflow-y: auto; }
+
+/* pinned messages + markers */
+.pinwrap { position: relative; }
+.pinwrap.flash > * { outline: 2px solid color-mix(in srgb, var(--syn-accent) 60%, transparent); outline-offset: 4px; border-radius: 8px; transition: outline-color .3s ease; }
+.msg-side { position: absolute; top: 4px; right: -4px; display: flex; gap: 2px; opacity: 0; transition: opacity .12s ease; }
+.pinwrap:hover .msg-side { opacity: 1; }
+.msg-pin { background: none; border: none; color: var(--faint); cursor: pointer; font-size: 11px; padding: 3px; border-radius: 6px; }
+.msg-pin:hover { color: var(--syn-accent); background: color-mix(in srgb, var(--text) 6%, transparent); }
+.msg-pin svg { width: 12px; height: 12px; }
+.env-pin { display: flex; align-items: center; gap: 7px; padding: 4px 10px; font-size: 12px; }
+.env-pin input { accent-color: var(--syn-accent); width: 12px; height: 12px; flex-shrink: 0; }
+.env-pin-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; color: var(--text); }
+.env-pin-text:hover { color: var(--syn-accent); }
+.env-pin.done .env-pin-text { text-decoration: line-through; color: var(--faint); }
+.mark-swatch { width: 10px; height: 10px; border-radius: 3px; flex-shrink: 0; cursor: pointer; }
+.mark-swatch.c0 { background: #e8c547; } .mark-swatch.c1 { background: #5da9e9; }
+.mark-swatch.c2 { background: #4fcf8f; } .mark-swatch.c3 { background: #e87aa4; }
