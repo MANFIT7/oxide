@@ -2251,14 +2251,57 @@ details[open]::details-content { block-size: auto; }
 .bg-x:hover { color: var(--text); }
 @media (prefers-reduced-motion: reduce) { .bg-dot { animation: none; } }
 
-/* Long user prompts collapse (the sticky header stays small). */
-.bubble.clamped {
-  max-height: 88px; overflow: hidden; position: relative;
-  -webkit-mask-image: linear-gradient(to bottom, black 60%, transparent 100%);
-  mask-image: linear-gradient(to bottom, black 60%, transparent 100%);
+/* Long user prompts collapse (the sticky header stays small). Clamp the TEXT
+   with -webkit-line-clamp — reliable, keeps the first lines visible (synara
+   does the same). Masking the whole bubble fought its backdrop-filter and
+   rendered it blank. */
+.user-text { white-space: pre-wrap; word-break: break-word; }
+.user-text.clamped {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  line-clamp: 3;
+  overflow: hidden;
 }
 .bubble-more {
-  background: none; border: 0; padding: 2px 0 0; cursor: pointer;
-  font-size: 11.5px; color: var(--syn-accent, var(--accent));
+  display: block; background: none; border: 0; padding: 4px 0 0; margin-top: 2px;
+  cursor: pointer; font-size: 11.5px; color: var(--syn-accent, var(--accent)); font-weight: 500;
 }
 .bubble-more:hover { text-decoration: underline; }
+
+/* Sidebar progress loader (two-ball rotate) — used for a tab/project that is
+   mid-turn. Scaled down (~20px) to fit a sidebar row. */
+.side-loader {
+  display: inline-block; flex-shrink: 0; position: relative;
+  height: 20px; width: 20px; margin: 0 2px;
+  animation: sl-rotate 1s infinite;
+}
+.side-loader::before, .side-loader::after {
+  border-radius: 50%; content: ""; display: block; height: 8px; width: 8px;
+}
+.side-loader::before {
+  animation: sl-ball1 1s infinite;
+  background-color: #fff; box-shadow: 12px 0 0 #ff3d00; margin-bottom: 4px;
+}
+.side-loader::after {
+  animation: sl-ball2 1s infinite;
+  background-color: #ff3d00; box-shadow: 12px 0 0 #fff;
+}
+@keyframes sl-rotate {
+  0% { transform: rotate(0deg) scale(0.8); }
+  50% { transform: rotate(360deg) scale(1.2); }
+  100% { transform: rotate(720deg) scale(0.8); }
+}
+@keyframes sl-ball1 {
+  0% { box-shadow: 12px 0 0 #ff3d00; }
+  50% { box-shadow: 0 0 0 #ff3d00; margin-bottom: 0; transform: translate(6px, 6px); }
+  100% { box-shadow: 12px 0 0 #ff3d00; margin-bottom: 4px; }
+}
+@keyframes sl-ball2 {
+  0% { box-shadow: 12px 0 0 #fff; }
+  50% { box-shadow: 0 0 0 #fff; margin-top: -8px; transform: translate(6px, 6px); }
+  100% { box-shadow: 12px 0 0 #fff; margin-top: 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .side-loader, .side-loader::before, .side-loader::after { animation: none; }
+}

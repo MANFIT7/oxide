@@ -585,6 +585,34 @@ return true;
 /// Strip the prompt scaffolding the composer injects (context files, MCP/skill
 /// blocks, plan/pursue tags, git context, picked-element, image notes) so a
 /// persisted/resumed user message renders as just the human text + chips.
+/// Write pasted-image data URLs to `<ws>/.oxide/attachments/` and return
+/// `wsimg:<relpath>` markers (kept out of git via the .oxide ignore).
+fn save_attachments(ws: &Path, atts: &[String]) -> Vec<String> {
+    use base64::Engine;
+    let dir = ws.join(".oxide/attachments");
+    let _ = std::fs::create_dir_all(&dir);
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let mut out = Vec::new();
+    for (i, src) in atts.iter().enumerate() {
+        // data:image/png;base64,XXXX
+        let Some(comma) = src.find(',') else { continue };
+        let meta = &src[..comma];
+        let ext = if meta.contains("jpeg") || meta.contains("jpg") { "jpg" }
+            else if meta.contains("gif") { "gif" }
+            else if meta.contains("webp") { "webp" }
+            else { "png" };
+        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(src[comma + 1..].as_bytes()) else { continue };
+        let name = format!("att-{stamp}-{i}.{ext}");
+        if std::fs::write(dir.join(&name), &bytes).is_ok() {
+            out.push(format!("wsimg:.oxide/attachments/{name}"));
+        }
+    }
+    out
+}
+
 /// Human token count: 272_000 → "272k", 1_000_000 → "1M".
 fn fmt_tokens(n: u64) -> String {
     if n >= 1_000_000 {
@@ -822,14 +850,19 @@ why it's wrong, and the concrete fix. If the diff is clean, say so plainly.{}\n\
         picked_element.set(None);
     }
     text.push_str(&body);
-    // Carry the pasted images into the DISPLAY message (after a \u{2}
-    // separator) so the user bubble renders real thumbnails, not "[N images]".
-    let display = if n_imgs > 0 {
-        let atts = attachments.read().join("\u{2}");
-        format!("{body}\u{2}{atts}")
+    // Persist pasted images to files and carry lightweight `wsimg:` refs (NOT
+    // base64) after a \u{2} separator — on BOTH the model text and the display,
+    // so the thumbnails survive a session reload instead of vanishing.
+    let img_markers: Vec<String> = if n_imgs > 0 {
+        save_attachments(&ws, &attachments.read())
     } else {
-        body
+        Vec::new()
     };
+    let marker_suffix: String = img_markers.iter().map(|m| format!("\u{2}{m}")).collect();
+    if !marker_suffix.is_empty() {
+        text.push_str(&marker_suffix); // persisted with the user turn → reload renders them
+    }
+    let display = if marker_suffix.is_empty() { body.clone() } else { format!("{body}{marker_suffix}") };
     attachments.write().clear();
     pasted_blobs.write().clear();
     if !steer && *streaming.read() {
@@ -1286,16 +1319,18 @@ fn open_session_tab(
 ) {
     let loaded = load_session(&path);
     let cur = *active_tab.read();
+    // One metadata fetch for both the workspace and the provider (was two).
+    let meta = oxide_core::db::meta(&sid(&path));
     // A session file lives at <workspace>/.oxide/sessions/<id>.jsonl — the
     // chat MUST run in that workspace, or the engine (in another folder)
     // appends this conversation into the wrong project.
-    let session_ws = oxide_core::db::meta(&sid(&path))
-        .map(|m| PathBuf::from(m.workspace))
+    let session_ws = meta.as_ref()
+        .map(|m| PathBuf::from(&m.workspace))
         .filter(|w| !w.as_os_str().is_empty());
     let mut c = cfg.read().clone();
     // Adopt the session's own provider (a Claude TUI session stays Claude, not
     // whatever the composer was last set to).
-    let sess_provider = oxide_core::db::meta(&sid(&path)).map(|m| m.provider).unwrap_or_default();
+    let sess_provider = meta.as_ref().map(|m| m.provider.clone()).unwrap_or_default();
     if !sess_provider.is_empty() && sess_provider != c.provider {
         c.provider = sess_provider.clone();
         c.model = String::new();
@@ -1332,11 +1367,13 @@ fn open_session_tab(
 /// Load a session transcript into chat messages.
 fn load_session(path: &Path) -> Vec<ChatMsg> {
     let mut rows = oxide_core::db::load(&sid(path));
-    // Very long (imported TUI) transcripts freeze the first paint — show the
-    // last 300 turns; the engine still resumes the full history on continue.
-    let trimmed = rows.len() > 300;
+    // Long / repeatedly-compacted transcripts are expensive to paint (markdown +
+    // syntax highlight per message). Show only the last 20 — the engine still
+    // resumes the FULL history on continue, so nothing is lost from the model.
+    let total = rows.len();
+    let trimmed = total > 20;
     if trimmed {
-        rows = rows.split_off(rows.len() - 300);
+        rows = rows.split_off(total - 20);
     }
     let mut out: Vec<ChatMsg> = rows
         .into_iter()
@@ -1353,7 +1390,8 @@ fn load_session(path: &Path) -> Vec<ChatMsg> {
         })
         .collect();
     if trimmed {
-        out.insert(0, ChatMsg { author: Author::Note, text: "… earlier messages hidden (long session) — continue to keep full context".into() });
+        let hidden = total - 20;
+        out.insert(0, ChatMsg { author: Author::Note, text: format!("… {hidden} earlier messages hidden (long session) — the agent still resumes the full context") });
     }
     out
 }
@@ -1989,24 +2027,34 @@ fn app() -> Element {
         }
         let _ = sessions_refresh.read();
         if cfg.read().workspace.is_some() {
-            board.set(board::Board::load(&ws));
-            // Off the UI thread — sqlite queries + fs checks per workspace.
+            // Off the UI thread — sqlite queries + fs checks per workspace, plus
+            // the board JSON read. Doing these inline added a hitch to each switch.
             {
                 let ws2 = ws.clone();
                 let recents = cfg.read().recent_workspaces.clone();
                 let mut pl = projects_list;
+                let mut board = board;
                 spawn(async move {
-                    let groups = tokio::task::spawn_blocking(move || build_projects(&ws2, &recents))
-                        .await
-                        .unwrap_or_default();
+                    let ws3 = ws2.clone();
+                    let (groups, bd) = tokio::task::spawn_blocking(move || {
+                        (build_projects(&ws2, &recents), board::Board::load(&ws3))
+                    })
+                    .await
+                    .unwrap_or_default();
+                    board.set(bd);
                     pl.set(groups);
                 });
             }
-            // Clean up orphaned pane worktrees from a previous run. `prune` only
-            // drops metadata for already-deleted dirs, so force-remove the
-            // pane-* worktree dirs and their branches that a crash/quit left.
+            // Clean up orphaned pane worktrees from a previous run — ONCE per
+            // workspace per session, not on every tab/folder switch (the git
+            // subprocesses it spawns were adding a hitch to each switch).
             let ws2 = ws.clone();
-            spawn(async move {
+            let do_prune = {
+                use std::sync::{Mutex, OnceLock};
+                static DONE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+                DONE.get_or_init(Default::default).lock().unwrap().insert(ws2.display().to_string())
+            };
+            if do_prune { spawn(async move {
                 if let Ok(rd) = std::fs::read_dir(ws2.join(".oxide/worktrees")) {
                     for e in rd.flatten() {
                         let p = e.path();
@@ -2021,7 +2069,7 @@ fn app() -> Element {
                     }
                 }
                 let _ = tokio::process::Command::new("git").arg("-C").arg(&ws2).args(["worktree", "prune"]).output().await;
-            });
+            }); }
         }
     });
 
@@ -2039,7 +2087,9 @@ fn app() -> Element {
             let needs = tabs.peek().get(cur).map(|t| t.title == provider_title(&t.provider)).unwrap_or(false);
             if needs {
                 let new_title = make_title(&text);
-                if let Some(t) = tabs.write().get_mut(cur) { t.title = new_title; }
+                let mut sess = None;
+                if let Some(t) = tabs.write().get_mut(cur) { t.title = new_title.clone(); sess = t.session.clone(); }
+                if let Some(s) = sess { oxide_core::db::set_title(&sid(&s), &new_title); }
             }
         }
     });
@@ -2542,7 +2592,18 @@ fn app() -> Element {
                                 // engine writes — never guess via newest-file (mixes tabs).
                                 let cur = *active_tab.peek();
                                 let pb = std::path::PathBuf::from(&path);
-                                if let Some(t) = tabs.write().get_mut(cur) { t.session = Some(pb); }
+                                let mut persist: Option<(String, String)> = None;
+                                if let Some(t) = tabs.write().get_mut(cur) {
+                                    t.session = Some(pb);
+                                    // Now the session row exists — save a non-generic tab title
+                                    // to the DB so a later reload shows it (not "Chat").
+                                    if t.title != provider_title(&t.provider) && !t.title.is_empty() {
+                                        persist = Some((path.clone(), t.title.clone()));
+                                    }
+                                }
+                                if let Some((id, title)) = persist {
+                                    oxide_core::db::set_title(&id, &title);
+                                }
                             }
                             Event::TurnStarted { turn } => {
                                 thinking.set(String::new());
@@ -3126,7 +3187,7 @@ fn app() -> Element {
                                         }
                                         Icon { name: "folder" }
                                         span { class: "project-name", "{pname}" }
-                                        if is_current && (*streaming.read() || !busy_tabs.read().is_empty()) { span { class: "syn-spinner", style: "margin-left:6px" } }
+                                        if is_current && (*streaming.read() || !busy_tabs.read().is_empty()) { span { class: "side-loader", style: "margin-left:6px" } }
                                         button { class: "project-del", title: "Remove this project's chats from the list",
                                             onclick: {
                                                 let pdel = pws.clone();
@@ -3173,16 +3234,16 @@ fn app() -> Element {
                                                         onclick: move |_| { show_board.set(false); switch_tab(tabs, active_tab, messages, cfg, engine, i); },
                                                         ondoubleclick: move |_| { rename_text.set(ttl_dc.clone()); renaming_tab.set(Some(id)); },
                                                         span { class: "sess-branch", Icon { name: "branch" } }
-                                                        if busy { span { class: "syn-spinner" } }
+                                                        if busy { span { class: "side-loader" } }
                                                         else if let Some(l) = logo { span { class: "tab-prov", dangerous_inner_html: l } }
                                                         if editing {
                                                             input { class: "rename-input", value: "{rename_text}", autofocus: true,
                                                                 oninput: move |e| rename_text.set(e.value()),
                                                                 onkeydown: move |e| {
-                                                                    if e.key() == Key::Enter { e.prevent_default(); let n = rename_text.read().trim().to_string(); if !n.is_empty() { if let Some(t) = tabs.write().iter_mut().find(|t| t.id == id) { t.title = n; } } renaming_tab.set(None); }
+                                                                    if e.key() == Key::Enter { e.prevent_default(); let n = rename_text.read().trim().to_string(); if !n.is_empty() { rename_tab_title(tabs, id, &n); } renaming_tab.set(None); }
                                                                     else if e.key() == Key::Escape { renaming_tab.set(None); }
                                                                 },
-                                                                onblur: move |_| { let n = rename_text.read().trim().to_string(); if !n.is_empty() { if let Some(t) = tabs.write().iter_mut().find(|t| t.id == id) { t.title = n; } } renaming_tab.set(None); },
+                                                                onblur: move |_| { let n = rename_text.read().trim().to_string(); if !n.is_empty() { rename_tab_title(tabs, id, &n); } renaming_tab.set(None); },
                                                                 onclick: move |e| e.stop_propagation(),
                                                             }
                                                         } else {
@@ -4541,22 +4602,30 @@ fn app() -> Element {
                                                                 }
                                                             }
                                                             Author::User => {
-                                                                // Display text may carry pasted images after \u{2} separators.
+                                                                // Display text may carry pasted images after \u{2} separators —
+                                                                // either inline data URLs or persisted `wsimg:` file refs.
                                                                 let imgs: Vec<String> = m.text.split('\u{2}').skip(1)
-                                                                    .filter(|s| s.starts_with("data:image"))
-                                                                    .map(str::to_string).collect();
+                                                                    .filter_map(|s| {
+                                                                        if let Some(rel) = s.strip_prefix("wsimg:") {
+                                                                            Some(format!("/wsimg/{rel}"))
+                                                                        } else if s.starts_with("data:image") {
+                                                                            Some(s.to_string())
+                                                                        } else { None }
+                                                                    }).collect();
                                                                 let segs = user_segments(&m.text);
                                                                 let copy = serde_json::to_string(&strip_scaffold(&m.text)).unwrap_or_default();
                                                                 let edit_text = strip_scaffold(&m.text);
                                                                 let idx = i;
                                                                 let _ = last_user_idx; let row_cls = "row user sticky-turn";
-                                                                // Clamp long prompts (esp. while sticky) — expandable.
-                                                                let long = edit_text.chars().count() > 280 || edit_text.lines().count() > 4;
+                                                                // Clamp long prompts (esp. while sticky) — expandable. Clamp the
+                                                                // TEXT only (line-clamp), never the bubble itself; masking the
+                                                                // bubble fights its backdrop-filter and renders it blank.
+                                                                let long = edit_text.chars().count() > 240 || edit_text.lines().count() > 3;
                                                                 let expanded = expanded_user.read().contains(&idx);
-                                                                let bubble_cls = if long && !expanded { "bubble clamped" } else { "bubble" };
+                                                                let text_cls = if long && !expanded { "user-text clamped" } else { "user-text" };
                                                                 rsx! {
                                                                     div { class: "{row_cls}",
-                                                                        div { class: "{bubble_cls}",
+                                                                        div { class: "bubble",
                                                                             if !imgs.is_empty() {
                                                                                 div { class: "msg-imgs",
                                                                                     for src in imgs {
@@ -4565,17 +4634,19 @@ fn app() -> Element {
                                                                                     }
                                                                                 }
                                                                             }
-                                                                            for (is_m, s) in segs {
-                                                                                if is_m { span { class: "inline-chip", "{s}" } } else { "{s}" }
+                                                                            div { class: "{text_cls}",
+                                                                                for (is_m, s) in segs {
+                                                                                    if is_m { span { class: "inline-chip", "{s}" } } else { "{s}" }
+                                                                                }
                                                                             }
-                                                                        }
-                                                                        if long {
-                                                                            button { class: "bubble-more",
-                                                                                onclick: move |_| {
-                                                                                    let mut e = expanded_user.write();
-                                                                                    if !e.insert(idx) { e.remove(&idx); }
-                                                                                },
-                                                                                if expanded { "show less" } else { "show more" }
+                                                                            if long {
+                                                                                button { class: "bubble-more",
+                                                                                    onclick: move |_| {
+                                                                                        let mut e = expanded_user.write();
+                                                                                        if !e.insert(idx) { e.remove(&idx); }
+                                                                                    },
+                                                                                    if expanded { "show less" } else { "show more" }
+                                                                                }
                                                                             }
                                                                         }
                                                                         div { class: "msg-actions",
@@ -5346,6 +5417,18 @@ fn close_tab(
     let mut active = active_tab;
     active.set(usize::MAX);
     switch_tab(tabs_w, active, messages, cfg, engine, new_idx);
+}
+
+/// Rename a tab in memory AND persist to the session's DB row (survives reload).
+fn rename_tab_title(mut tabs: Signal<Vec<AgentTab>>, id: u64, name: &str) {
+    let mut sess = None;
+    if let Some(t) = tabs.write().iter_mut().find(|t| t.id == id) {
+        t.title = name.to_string();
+        sess = t.session.clone();
+    }
+    if let Some(s) = sess {
+        oxide_core::db::set_title(&sid(&s), name);
+    }
 }
 
 /// Short tab title from the first user message.
@@ -6479,14 +6562,26 @@ fn Composer(
                                         show_plus.set(false);
                                         spawn(async move {
                                             if let Some(file) = rfd::AsyncFileDialog::new().pick_file().await {
-                                                let tok = file.path().display().to_string();
-                                                let label = mention_label(&tok);
-                                                let js = format!(
-                                                    "const ed=document.getElementById('ce-input'); if(ed){{ed.focus(); const c=document.createElement('span'); c.className='ce-chip'; c.setAttribute('contenteditable','false'); c.dataset.token={}; c.textContent={}; ed.appendChild(c); ed.appendChild(document.createTextNode(' '));}} return true;",
-                                                    serde_json::to_string(&tok).unwrap(), serde_json::to_string(&label).unwrap()
-                                                );
-                                                let _ = dioxus::document::eval(&js).join::<bool>().await;
-                                                ce_empty.set(false);
+                                                let path = file.path().to_path_buf();
+                                                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+                                                // Images become thumbnail attachments (like paste),
+                                                // not a text path — they preview inside the chat.
+                                                if matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp") {
+                                                    use base64::Engine;
+                                                    let bytes = file.read().await;
+                                                    let mime = match ext.as_str() { "jpg" | "jpeg" => "image/jpeg", "gif" => "image/gif", "webp" => "image/webp", _ => "image/png" };
+                                                    let url = format!("data:{};base64,{}", mime, base64::engine::general_purpose::STANDARD.encode(&bytes));
+                                                    attachments.write().push(url);
+                                                } else {
+                                                    let tok = path.display().to_string();
+                                                    let label = mention_label(&tok);
+                                                    let js = format!(
+                                                        "const ed=document.getElementById('ce-input'); if(ed){{ed.focus(); const c=document.createElement('span'); c.className='ce-chip'; c.setAttribute('contenteditable','false'); c.dataset.token={}; c.textContent={}; ed.appendChild(c); ed.appendChild(document.createTextNode(' '));}} return true;",
+                                                        serde_json::to_string(&tok).unwrap(), serde_json::to_string(&label).unwrap()
+                                                    );
+                                                    let _ = dioxus::document::eval(&js).join::<bool>().await;
+                                                    ce_empty.set(false);
+                                                }
                                             }
                                         });
                                     },
