@@ -3156,9 +3156,9 @@ fn app() -> Element {
                                         }
                                     }
                                     if let Some((plan, pct5, pctw, _, _)) = usage_info.read().clone() {
-                                        div { class: "env-card-row static",
-                                            Icon { name: "spark" } span { "Usage · {plan}" }
-                                            span { class: "env-card-badge", "5h {pct5}% · wk {pctw}%" }
+                                        div { class: "env-card-row static usage", title: "Plan: {plan} — sisa kuota 5 jam / mingguan",
+                                            Icon { name: "spark" } span { "Usage" }
+                                            span { class: "env-card-badge nowrap", "5h {pct5}% · wk {pctw}%" }
                                         }
                                     }
                                     button { class: "env-card-row", onclick: move |_| {

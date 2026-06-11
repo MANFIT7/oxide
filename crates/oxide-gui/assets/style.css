@@ -2112,3 +2112,8 @@ details[open]::details-content { block-size: auto; }
   font-size: 13px; line-height: 1.6; border-left: 2px solid color-mix(in srgb, var(--text) 20%, transparent);
   white-space: pre-wrap; max-height: 280px; overflow-y: auto; }
 @media (prefers-reduced-motion: reduce) { .typing, .col.streaming .thinking-box { animation: none; } }
+
+/* env card usage row: never wrap */
+.env-card-row { white-space: nowrap; }
+.env-card-row > span:first-of-type { overflow: hidden; text-overflow: ellipsis; }
+.env-card-badge.nowrap { white-space: nowrap; flex-shrink: 0; }
