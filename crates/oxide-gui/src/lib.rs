@@ -2746,6 +2746,7 @@ fn app() -> Element {
                 }
                 if cfg.read().workspace.is_some() {
                     div { class: "agent-tabs",
+                        div { class: "agent-tabs-scroll",
                         for (i, t) in tabs.read().iter().enumerate() {
                             {
                                 let i = i;
@@ -2781,6 +2782,7 @@ fn app() -> Element {
                                     }
                                 }
                             }
+                        }
                         }
                         div { class: "newtab-anchor",
                             button { class: "agent-tab-add", onclick: move |_| { let v = *show_newtab.read(); show_newtab.set(!v); },

@@ -1892,8 +1892,9 @@ details[open]::details-content { block-size: auto; }
   details::details-content { transition: none; }
 }
 /* tab strip overflow: scroll instead of pushing actions off-screen */
-.agent-tabs { overflow-x: auto; scrollbar-width: none; }
-.agent-tabs::-webkit-scrollbar { display: none; }
+.agent-tabs { overflow: visible; }
+.agent-tabs-scroll { display: flex; align-items: center; gap: 4px; min-width: 0; overflow-x: auto; scrollbar-width: none; }
+.agent-tabs-scroll::-webkit-scrollbar { display: none; }
 .agent-tab { flex: 0 1 auto; min-width: 64px; }
 .tab-actions { margin-left: auto; flex-shrink: 0; }
 
