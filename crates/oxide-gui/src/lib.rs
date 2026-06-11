@@ -2807,6 +2807,7 @@ fn app() -> Element {
                                                 move |e: dioxus::prelude::MouseEvent| {
                                                     e.stop_propagation();
                                                     oxide_core::db::archive_workspace(&pdel);
+                                                    let mut cfg = cfg;
                                                     let mut c = cfg.read().clone();
                                                     c.recent_workspaces.retain(|p| p != &pdel);
                                                     cfg.set(c);
