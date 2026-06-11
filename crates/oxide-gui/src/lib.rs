@@ -2104,7 +2104,16 @@ fn app() -> Element {
                                         }
                                     };
                                     let row = format!("{icon}\t{verb}\t{detail}");
-                                    messages.write().push(ChatMsg { author: Author::Activity { running: false, ok: true }, text: row });
+                                    {
+                                        let mut mw = messages.write();
+                                        // The Submit placeholder bubble stays empty while a CLI
+                                        // runs tools — pop it so typing dots don't sit stuck
+                                        // above the activity trail (deltas reopen a bubble).
+                                        if mw.last().map(|m| m.author == Author::Agent && m.text.is_empty()).unwrap_or(false) {
+                                            mw.pop();
+                                        }
+                                        mw.push(ChatMsg { author: Author::Activity { running: false, ok: true }, text: row });
+                                    }
                                 } else if text.starts_with(['🧭','🔍','🤖','🧩','🔁','✓','⚠']) {
                                     // pipeline stage → live animated status, not a chat note
                                     status.set(text);
@@ -2247,6 +2256,12 @@ fn app() -> Element {
                             Event::TurnFinished { .. } => {
                                 streaming.set(false);
                                 status.set(String::new());
+                                {
+                                    let mut mw = messages.write();
+                                    if mw.last().map(|m| m.author == Author::Agent && m.text.is_empty()).unwrap_or(false) {
+                                        mw.pop();
+                                    }
+                                }
                                 // Cheap contextual follow-up suggestions (Claude Code-style).
                                 {
                                     let had_error = messages.peek().iter().rev().take(6)
@@ -2990,7 +3005,14 @@ fn app() -> Element {
                                     }
                                     button { class: "env-card-row", onclick: move |_| { env_tab.set("changes".to_string()); show_env.set(true); },
                                         Icon { name: "branch" } span { "Changes" }
-                                        if n_changed > 0 { span { class: "env-card-badge", "{n_changed} · +{ta} −{td}" } }
+                                        if n_changed > 0 {
+                                            span { class: "env-card-badge",
+                                                "{n_changed} · "
+                                                span { class: "diff-adds", "+{ta}" }
+                                                " "
+                                                span { class: "diff-dels", "−{td}" }
+                                            }
+                                        }
                                     }
                                     {
                                         let ws_now = ui.workspace.read().clone();
