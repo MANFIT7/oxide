@@ -1499,6 +1499,15 @@ fn app() -> Element {
     // Environment card: running-process dropdown (port, name, pid).
     let mut procs_menu = use_signal(|| false);
     let mut procs_list = use_signal(Vec::<(u16, String, u32)>::new);
+    // Environment card menus + per-thread extras.
+    let mut editor_menu = use_signal(|| false);
+    let mut git_menu = use_signal(|| false);
+    let mut branch_menu = use_signal(|| false);
+    let mut branches_list = use_signal(Vec::<String>::new);
+    let mut note_open = use_signal(|| false);
+    let mut note_text = use_signal(String::new);
+    let mut recap_open = use_signal(|| false);
+    let mut recap_text = use_signal(String::new);
     // Multi-terminal model: (id, title, lines).
     let mut terms = use_signal(|| vec![(1u64, "zsh 1".to_string(), Vec::<String>::new())]);
     let mut term_sel = use_signal(|| 0usize);
@@ -1739,6 +1748,32 @@ fn app() -> Element {
             while (true) { await new Promise(r => setTimeout(r, 3600000)); }
             "#,
         ).recv::<String>().await;
+    });
+
+    // Per-thread notepad + recap: reload when the active tab's session changes.
+    use_effect(move || {
+        let cur = *active_tab.read();
+        let sess = tabs.read().get(cur).and_then(|t| t.session.clone());
+        let ws = ui.workspace.peek().clone();
+        let stem = sess
+            .as_ref()
+            .and_then(|p| p.file_stem().map(|x| x.to_string_lossy().to_string()))
+            .unwrap_or_else(|| "default".into());
+        let note = std::fs::read_to_string(ws.join(format!(".oxide/notes/{stem}.md"))).unwrap_or_default();
+        note_text.set(note);
+        // Recap = last compaction summary recorded in the session file.
+        let recap = sess
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .map(|t| {
+                t.lines()
+                    .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                    .filter(|v| v["role"].as_str() == Some("summary"))
+                    .last()
+                    .and_then(|v| v["content"].as_str().map(str::to_string))
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+        recap_text.set(recap);
     });
 
     // Keep the Environment card's change counts fresh per workspace.
@@ -2918,11 +2953,135 @@ fn app() -> Element {
                                         if n_changed > 0 { span { class: "env-card-badge", "{n_changed} · +{ta} −{td}" } }
                                     }
                                     div { class: "env-card-row static", Icon { name: "terminal" } span { "Local" } }
-                                    button { class: "env-card-row", onclick: move |_| { env_tab.set("changes".to_string()); show_env.set(true); },
-                                        Icon { name: "branch" } span { "{br}" }
+                                    div { class: "env-card-anchor",
+                                        button { class: "env-card-row", onclick: move |_| {
+                                                let v = *branch_menu.read(); branch_menu.set(!v);
+                                                if !v {
+                                                    let ws = ui.workspace.peek().clone();
+                                                    spawn(async move {
+                                                        let out = run_cmd(&ws, "git", &["branch", "--format=%(refname:short)"]).await;
+                                                        branches_list.set(out.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect());
+                                                    });
+                                                }
+                                            },
+                                            Icon { name: "branch" } span { "{br}" } span { class: "env-card-badge", "⌄" }
+                                        }
+                                        if *branch_menu.read() {
+                                            div { class: "env-procs",
+                                                for b in branches_list.read().iter().cloned() {
+                                                    {
+                                                        let cur_b = br.clone();
+                                                        rsx! {
+                                                            button { class: "env-proc as-btn", onclick: move |_| {
+                                                                    branch_menu.set(false);
+                                                                    let ws = ui.workspace.peek().clone();
+                                                                    let b2 = b.clone();
+                                                                    spawn(async move {
+                                                                        let out = run_cmd(&ws, "git", &["checkout", &b2]).await;
+                                                                        let ok = !out.contains("error") && !out.contains("fatal");
+                                                                        let msg = if ok { format!("Switched to {b2}") } else { "Checkout failed".to_string() };
+                                                                        push_toast(toasts, toast_seq, if ok { "ok" } else { "err" }, &msg);
+                                                                        changed_files.set(load_changed_files(&ws).await);
+                                                                    });
+                                                                },
+                                                                span { class: "env-proc-name", "{b}" }
+                                                                if b == cur_b { span { class: "env-card-badge", "✓" } }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
-                                    button { class: "env-card-row", onclick: move |_| { env_tab.set("changes".to_string()); show_env.set(true); },
-                                        Icon { name: "spark" } span { "Commit or push" }
+                                    div { class: "env-card-anchor",
+                                        button { class: "env-card-row", onclick: move |_| { let v = *git_menu.read(); git_menu.set(!v); },
+                                            Icon { name: "spark" } span { "Commit or push" } span { class: "env-card-badge", "⌄" }
+                                        }
+                                        if *git_menu.read() {
+                                            div { class: "env-procs",
+                                                button { class: "env-proc as-btn", onclick: move |_| {
+                                                        git_menu.set(false);
+                                                        let ws = ui.workspace.peek().clone();
+                                                        spawn(async move {
+                                                            let _ = run_cmd(&ws, "git", &["add", "-A"]).await;
+                                                            let r = run_cmd(&ws, "git", &["commit", "-m", "wip: changes from Oxide"]).await;
+                                                            let ok = !r.contains("error") && !r.contains("fatal");
+                                                            push_toast(toasts, toast_seq, if ok { "ok" } else { "err" }, if ok { "Committed" } else { "Commit failed" });
+                                                            changed_files.set(load_changed_files(&ws).await);
+                                                        });
+                                                    }, span { class: "env-proc-name", "Commit all" } }
+                                                button { class: "env-proc as-btn", onclick: move |_| {
+                                                        git_menu.set(false);
+                                                        let ws = ui.workspace.peek().clone();
+                                                        spawn(async move {
+                                                            let r = run_cmd(&ws, "git", &["push"]).await;
+                                                            let ok = !r.contains("error") && !r.contains("fatal") && !r.contains("rejected");
+                                                            push_toast(toasts, toast_seq, if ok { "ok" } else { "err" }, if ok { "Pushed" } else { "Push failed" });
+                                                        });
+                                                    }, span { class: "env-proc-name", "Push" } }
+                                                button { class: "env-proc as-btn", onclick: move |_| {
+                                                        git_menu.set(false);
+                                                        let ws = ui.workspace.peek().clone();
+                                                        spawn(async move {
+                                                            let r = run_cmd(&ws, "git", &["pull", "--ff-only"]).await;
+                                                            let ok = !r.contains("error") && !r.contains("fatal");
+                                                            push_toast(toasts, toast_seq, if ok { "ok" } else { "err" }, if ok { "Pulled" } else { "Pull failed" });
+                                                        });
+                                                    }, span { class: "env-proc-name", "Pull (ff-only)" } }
+                                                button { class: "env-proc-open", onclick: move |_| { git_menu.set(false); env_tab.set("changes".to_string()); show_env.set(true); }, "Open diffs / PR →" }
+                                            }
+                                        }
+                                    }
+                                    if let Some((plan, pct5, pctw, _, _)) = usage_info.read().clone() {
+                                        div { class: "env-card-row static",
+                                            Icon { name: "spark" } span { "Usage · {plan}" }
+                                            span { class: "env-card-badge", "5h {pct5}% · wk {pctw}%" }
+                                        }
+                                    }
+                                    button { class: "env-card-row", onclick: move |_| {
+                                            let ws = ui.workspace.peek().clone();
+                                            spawn(async move {
+                                                let url = run_cmd(&ws, "git", &["remote", "get-url", "origin"]).await;
+                                                let url = url.trim().to_string();
+                                                if url.is_empty() { return; }
+                                                let https = if let Some(rest) = url.strip_prefix("git@") {
+                                                    format!("https://{}", rest.replacen(':', "/", 1)).trim_end_matches(".git").to_string()
+                                                } else {
+                                                    url.trim_end_matches(".git").to_string()
+                                                };
+                                                let _ = tokio::process::Command::new("open").arg(&https).output().await;
+                                            });
+                                        },
+                                        Icon { name: "browser" } span { "Repository" } span { class: "env-card-badge", "↗" }
+                                    }
+                                    div { class: "env-card-anchor",
+                                        button { class: "env-card-row", onclick: move |_| { let v = *editor_menu.read(); editor_menu.set(!v); },
+                                            Icon { name: "file" } span { "Open in {cfg.read().editor_app}" } span { class: "env-card-badge", "⌄" }
+                                        }
+                                        if *editor_menu.read() {
+                                            div { class: "env-procs",
+                                                for app in ["Visual Studio Code", "Cursor", "Zed", "Sublime Text", "Xcode"] {
+                                                    button { class: "env-proc as-btn", onclick: move |_| {
+                                                            editor_menu.set(false);
+                                                            let mut cfg = cfg;
+                                                            let ws = ui.workspace.peek().clone();
+                                                            let mut c = cfg.read().clone();
+                                                            c.editor_app = app.to_string();
+                                                            cfg.set(c.clone());
+                                                            if let Ok(t) = toml::to_string(&c) { let _ = std::fs::write(workspace_of(&c).join("oxide.toml"), &t); }
+                                                            spawn(async move {
+                                                                let r = tokio::process::Command::new("open").arg("-a").arg(app).arg(&ws).output().await;
+                                                                if r.map(|o| !o.status.success()).unwrap_or(true) {
+                                                                    push_toast(toasts, toast_seq, "err", &format!("{app} not found"));
+                                                                }
+                                                            });
+                                                        },
+                                                        span { class: "env-proc-name", "{app}" }
+                                                        if cfg.read().editor_app == app { span { class: "env-card-badge", "✓" } }
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
                                     div { class: "env-card-sep" }
                                     div { class: "env-card-label", "Sources" }
@@ -2963,6 +3122,36 @@ fn app() -> Element {
                                     }
                                     button { class: "env-card-row", onclick: move |_| { env_tab.set("files".to_string()); show_env.set(true); },
                                         Icon { name: "plugins" } span { "Files" }
+                                    }
+                                    if !recap_text.read().is_empty() {
+                                        div { class: "env-card-sep" }
+                                        button { class: "env-card-row", onclick: move |_| { let v = *recap_open.read(); recap_open.set(!v); },
+                                            Icon { name: "brain" } span { "Recap" } span { class: "env-card-badge", if *recap_open.read() { "⌃" } else { "⌄" } }
+                                        }
+                                        if *recap_open.read() {
+                                            div { class: "env-note recap", "{recap_text}" }
+                                        }
+                                    }
+                                    div { class: "env-card-sep" }
+                                    button { class: "env-card-row", onclick: move |_| { let v = *note_open.read(); note_open.set(!v); },
+                                        Icon { name: "file" } span { "Notepad" } span { class: "env-card-badge", if *note_open.read() { "⌃" } else { "⌄" } }
+                                    }
+                                    if *note_open.read() {
+                                        textarea { class: "env-note-input", placeholder: "Catatan thread ini…", value: "{note_text}",
+                                            oninput: move |e| {
+                                                let v = e.value();
+                                                note_text.set(v.clone());
+                                                // Autosave per thread under .oxide/notes/<session>.md
+                                                let ws = ui.workspace.peek().clone();
+                                                let cur = *active_tab.peek();
+                                                let stem = tabs.peek().get(cur)
+                                                    .and_then(|t| t.session.as_ref().and_then(|p| p.file_stem().map(|x| x.to_string_lossy().to_string())))
+                                                    .unwrap_or_else(|| "default".into());
+                                                let dir = ws.join(".oxide/notes");
+                                                let _ = std::fs::create_dir_all(&dir);
+                                                let _ = std::fs::write(dir.join(format!("{stem}.md")), v.chars().take(20_000).collect::<String>());
+                                            },
+                                        }
                                     }
                                 }
                             }

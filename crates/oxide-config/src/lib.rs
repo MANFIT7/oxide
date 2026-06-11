@@ -97,7 +97,12 @@ pub struct Config {
     /// Persisted Environment panel width (px).
     #[serde(default = "default_env_w")]
     pub env_width: f64,
+    /// Preferred external editor app (macOS app name for `open -a`).
+    #[serde(default = "default_editor")]
+    pub editor_app: String,
 }
+
+fn default_editor() -> String { "Visual Studio Code".to_string() }
 
 fn default_env_w() -> f64 { 560.0 }
 
@@ -183,6 +188,7 @@ impl Default for Config {
             sidebar_width: 250.0,
             inspector_width: 280.0,
             env_width: 560.0,
+            editor_app: default_editor(),
         }
     }
 }
