@@ -316,7 +316,7 @@ pub fn run(config: Config) -> anyhow::Result<()> {
         .with_transparent(true)
         .with_inner_size(dioxus::desktop::tao::dpi::LogicalSize::new(1280.0, 820.0));
     LaunchBuilder::desktop()
-        .with_cfg(DesktopConfig::new().with_window(window))
+        .with_cfg(DesktopConfig::new().with_window(window).with_background_color((0, 0, 0, 0)))
         .with_context(config)
         .launch(app);
     Ok(())
@@ -2659,10 +2659,6 @@ fn app() -> Element {
                         button { class: "menu-item", onclick: move |_| { set_theme(cfg, "dark"); show_theme_menu.set(false); },
                             Icon { name: "target" } span { class: "menu-name", "Dark" }
                             if cfg.read().theme == "dark" { span { class: "menu-check", "✓" } }
-                        }
-                        button { class: "menu-item", onclick: move |_| { set_theme(cfg, "ara"); show_theme_menu.set(false); },
-                            Icon { name: "spark" } span { class: "menu-name", "Liquid Glass" }
-                            if cfg.read().theme == "ara" { span { class: "menu-check", "✓" } }
                         }
                         button { class: "menu-item", onclick: move |_| { set_theme(cfg, "system"); show_theme_menu.set(false); },
                             Icon { name: "settings" } span { class: "menu-name", "System" }

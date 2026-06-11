@@ -2,28 +2,41 @@
 
 /* Dark (default) — Synara palette: deep ink, hairline borders */
 :root {
-  --bg: #0e0e0e;
-  --sidebar: #0b0b0b;
-  --surface: #181818;
-  --surface-hi: #232323;
-  --border: rgba(255,255,255,.06);
-  --text: #f5f5f5;
-  --muted: #a3a3a3;
-  --faint: #6e6e6e;
-  --accent: #ededf0;
-  --on-accent: #161618;
-  --danger: #fa423e;
-  --composer: #161616;
-  --menu-bg: #161616;
-  --menu-border: rgba(255,255,255,.08);
-  --syn-accent: #6073cc;
-  --ok: #7ee7c0; --ok-strong: #3ad29f; --del-soft: #f1a3a3;
-  --ctx-text: #b8bcc4; --hunk-text: var(--syn-accent); --pre-text: #cdd0d6;
+  --bg: #0d0c0b;                       /* warm near-black, darker */
+  --sidebar: rgba(24, 22, 19, 0.42);   /* glass tint — vibrancy blurs behind */
+  --surface: #17150f;
+  --surface-hi: #211e17;
+  --border: rgba(240, 232, 220, .07);
+  --text: #ece7df;                     /* warm light */
+  --muted: #a59c8e;
+  --faint: #6f675b;
+  --accent: #ece7df;
+  --on-accent: #0d0c0b;
+  --danger: #e8624a;
+  --composer: rgba(24, 21, 16, 0.72);
+  --menu-bg: rgba(26, 23, 18, 0.9);
+  --menu-border: rgba(240, 232, 220, .1);
+  --syn-accent: #c2895f;               /* muted warm amber — not bright orange */
+  --ok: #86ddb0; --ok-strong: #43c285; --del-soft: #e8a087;
+  --ctx-text: #c4bbac; --hunk-text: var(--syn-accent); --pre-text: #d4cbbb;
+}
+/* window is transparent; only the sidebar reveals the macOS vibrancy. */
+.app { background: transparent; }
+.app .main { background: var(--bg); }
+.sidebar {
+  background: var(--sidebar);
+  /* glass sheen: top/left highlight edge + soft inner depth (the native
+     vibrancy provides the actual blur — backdrop-filter can't reach it). */
+  box-shadow: inset 1px 1px 0 rgba(255,248,238,.06),
+              inset -1px 0 0 rgba(0,0,0,.25),
+              1px 0 24px -12px rgba(0,0,0,.5);
+  border-right: 1px solid rgba(240,232,220,.06);
 }
 
 /* Light — Synara palette */
 .app[data-theme="light"] {
   --bg: #fcfcfc;
+  background: var(--bg) !important;
   --sidebar: #f4f4f5;
   --surface: #ffffff;
   --surface-hi: #f0f0f1;
@@ -63,7 +76,7 @@
 
 html, body {
   height: 100%;
-  background: var(--bg);
+  background: transparent;
   color: var(--text);
   font-family: -apple-system, "SF Pro Text", "Inter", "Segoe UI", system-ui, sans-serif;
   font-size: 15px;
@@ -1701,7 +1714,8 @@ svg { stroke-width: 1.6; }
 
 /* ── Cursor 3.0 light palette (exact hexes, ink-alpha layering) ── */
 .app[data-theme="light"] {
-  --bg: #fcfcfc; --sidebar: #f3f3f3; --surface: #ffffff; --surface-hi: #f0f0f1;
+  --bg: #fcfcfc;
+  background: var(--bg) !important; --sidebar: #f3f3f3; --surface: #ffffff; --surface-hi: #f0f0f1;
   --composer: #ffffff; --menu-bg: #ffffff;
   --border: rgba(20,20,20,.08); --menu-border: rgba(20,20,20,.10);
   --text: rgba(20,20,20,.92); --muted: rgba(20,20,20,.68); --faint: rgba(20,20,20,.48);
@@ -1712,6 +1726,8 @@ svg { stroke-width: 1.6; }
 .app[data-theme="light"] .dl.add { background: rgba(31,138,101,.12); }
 .app[data-theme="light"] .dl.del { background: rgba(207,45,86,.10); }
 .app[data-theme="light"] .row.user .bubble { background: rgba(20,20,20,.04); }
+.app[data-theme="light"] .sidebar { background: var(--sidebar); box-shadow: none; }
+.app[data-theme="light"] { --sidebar: #f4f4f5; }
 .app[data-theme="light"] .composer { box-shadow: 0 2px 14px -8px rgba(20,20,20,.18); }
 @media (prefers-color-scheme: light) {
   .app[data-theme="system"] {
@@ -2139,49 +2155,3 @@ details[open]::details-content { block-size: auto; }
 /* images in agent replies */
 .agent-md img { max-width: 100%; height: auto; border-radius: 8px; margin: 8px 0; display: block; border: 1px solid var(--border); }
 
-/* ══ Ara — liquid-glass dark theme (ara.so palette + macOS vibrancy) ══ */
-.app[data-theme="ara"] {
-  --bg: #16140f;           /* warm near-black */
-  --sidebar: rgba(28, 25, 20, 0.55);
-  --surface: #1c1915;
-  --surface-hi: #262119;
-  --border: rgba(255, 240, 220, .08);
-  --text: #efe9e0;         /* warm light */
-  --muted: #b3a99b;
-  --faint: #7a7166;
-  --accent: #efe9e0;
-  --on-accent: #16140f;
-  --danger: #f0654a;
-  --composer: rgba(30, 26, 20, 0.72);
-  --menu-bg: rgba(30, 26, 20, 0.86);
-  --menu-border: rgba(255, 240, 220, .1);
-  --syn-accent: #e8915a;   /* ara warm orange */
-  --ok: #8fe3b8; --ok-strong: #46c98a; --del-soft: #f0a58c;
-  --ctx-text: #c9bfb0; --hunk-text: var(--syn-accent); --pre-text: #d8cfc0;
-  background: transparent;
-}
-/* the window is transparent — only the sidebar reveals the vibrancy; the rest
-   of the app stays solid so text and code are readable. */
-.app[data-theme="ara"] { background: transparent !important; }
-.app[data-theme="ara"] .sidebar {
-  background: var(--sidebar);
-  backdrop-filter: blur(30px) saturate(180%);
-  -webkit-backdrop-filter: blur(30px) saturate(180%);
-  border-right: 1px solid rgba(255,240,220,.07);
-}
-/* everything that isn't the sidebar must be opaque (vibrancy is behind all) */
-.app[data-theme="ara"] .main,
-.app[data-theme="ara"] .center,
-.app[data-theme="ara"] .env-panel,
-.app[data-theme="ara"] .terminal,
-.app[data-theme="ara"] .agent-tabs,
-.app[data-theme="ara"] .files-panel {
-  background: var(--bg);
-}
-.app[data-theme="ara"] .composer {
-  background: color-mix(in srgb, var(--composer) 92%, transparent);
-  backdrop-filter: blur(18px) saturate(160%);
-}
-/* glassy floating env card + menus pick up the warm translucency automatically
-   via --menu-bg / --surface */
-.app[data-theme="ara"] .env-card { backdrop-filter: blur(22px) saturate(180%); }
