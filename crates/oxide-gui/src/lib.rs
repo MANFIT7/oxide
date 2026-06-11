@@ -1964,16 +1964,26 @@ fn app() -> Element {
                                 } else if text.starts_with('⚙') {
                                     // CLI-driver tool activity: live shimmer + an activity
                                     // trail row in the chat (synara-style).
-                                    let label = text.trim_start_matches('⚙').trim().to_string();
+                                    let mut label = text.trim_start_matches('⚙').trim().to_string();
+                                    // "mcp__server__tool …" → "tool · server (MCP)".
+                                    if let Some(rest) = label.strip_prefix("mcp__") {
+                                        let (srv, tail) = rest.split_once("__").unwrap_or(("", rest));
+                                        let (tool, args) = tail.split_once(' ').unwrap_or((tail, ""));
+                                        label = format!("{tool} {srv} (MCP){}{args}", if args.is_empty() { "" } else { " " });
+                                    }
                                     status.set(label.clone());
                                     // ActivityRow parses "icon\tverb\tdetail".
                                     let (verb, detail) = label.split_once(' ').unwrap_or((label.as_str(), ""));
-                                    let icon = match verb.to_ascii_lowercase().as_str() {
-                                        "bash" | "shell" | "running" => "terminal",
-                                        "read" | "write" | "edit" | "editing" | "multiedit" => "file",
-                                        "grep" | "glob" | "search" | "searching" | "websearch" => "search",
-                                        "task" | "agent" => "spark",
-                                        _ => "spark",
+                                    let icon = if detail.contains("(MCP)") {
+                                        "plugins"
+                                    } else {
+                                        match verb.to_ascii_lowercase().as_str() {
+                                            "bash" | "shell" | "running" => "terminal",
+                                            "read" | "write" | "edit" | "editing" | "multiedit" => "file",
+                                            "grep" | "glob" | "search" | "searching" | "websearch" => "search",
+                                            "task" | "agent" => "spark",
+                                            _ => "spark",
+                                        }
                                     };
                                     let row = format!("{icon}\t{verb}\t{detail}");
                                     messages.write().push(ChatMsg { author: Author::Activity { running: false, ok: true }, text: row });
