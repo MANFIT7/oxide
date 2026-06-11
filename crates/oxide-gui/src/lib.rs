@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 const CSS: &str = include_str!("../assets/style.css");
+const MERMAID_JS: &[u8] = include_bytes!("../assets/vendor/mermaid.min.js");
 const LOGO_BYTES: &[u8] = include_bytes!("../assets/logo.png");
 
 fn logo_uri() -> &'static str {
@@ -1799,10 +1800,42 @@ fn app() -> Element {
 
     // Auto-scroll the chat to the bottom as content streams in — but only when
     // the user is already near the bottom, so reading scrollback isn't yanked.
-    // Load mermaid (latest, v11) as an ESM module from CDN — v11 dropped the
-    // UMD global, so we import it in a <script type=module> and stash it on
-    // window. A module import resolves https URLs even from the app origin.
-    // Renders each .mermaid block as themed SVG once it's complete.
+    // Serve the bundled mermaid lib from the app's OWN origin (custom-scheme
+    // origins block remote/module script loads — same-origin is allowed).
+    // Serve workspace-local images so the agent's ![](path) screenshots render.
+    {
+        let ws_sig = ui.workspace;
+        dioxus::desktop::use_asset_handler("wsimg", move |req, responder| {
+            let rel = req.uri().path().trim_start_matches("/wsimg/").to_string();
+            let rel = percent_decode(&rel);
+            let ws = ws_sig.peek().clone();
+            let path = if rel.starts_with('/') { std::path::PathBuf::from(&rel) } else { ws.join(&rel) };
+            // Confine to the workspace; refuse traversal outside it.
+            let ok = path.canonicalize().ok().map(|c| c.starts_with(&ws) || rel.starts_with('/')).unwrap_or(false);
+            let body = if ok { std::fs::read(&path).unwrap_or_default() } else { Vec::new() };
+            let ct = match path.extension().and_then(|e| e.to_str()) {
+                Some("png") => "image/png", Some("jpg") | Some("jpeg") => "image/jpeg",
+                Some("gif") => "image/gif", Some("svg") => "image/svg+xml",
+                Some("webp") => "image/webp", _ => "application/octet-stream",
+            };
+            let resp = dioxus::desktop::wry::http::Response::builder()
+                .header("Content-Type", ct)
+                .body(std::borrow::Cow::from(body))
+                .unwrap();
+            responder.respond(resp);
+        });
+    }
+    dioxus::desktop::use_asset_handler("mermaidjs", move |_req, responder| {
+        let body = MERMAID_JS.to_vec();
+        let resp = dioxus::desktop::wry::http::Response::builder()
+            .header("Content-Type", "text/javascript")
+            .header("Access-Control-Allow-Origin", "*")
+            .body(std::borrow::Cow::from(body))
+            .unwrap();
+        responder.respond(resp);
+    });
+
+    // Load mermaid (v11, bundled) from the same-origin asset handler.
     use_future(move || async move {
         let theme = if cfg.peek().theme != "light" { "dark" } else { "default" };
         let js = format!(
@@ -1810,27 +1843,25 @@ fn app() -> Element {
             (function(){{
               if (window.__oxmermaid) return;
               window.__oxmermaid = 1;
-              const sc = document.createElement('script');
-              sc.type = 'module';
-              sc.textContent = `
-                import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
-                mermaid.initialize({{ startOnLoad:false, theme:'{theme}', securityLevel:'loose', fontFamily:'inherit' }});
-                window.__oxMermaid = mermaid;
+              const boot = () => {{
+                const M = window.mermaid; if (!M) return;
+                try {{ M.initialize({{startOnLoad:false,theme:'{theme}',securityLevel:'loose',fontFamily:'inherit'}}); }} catch(e){{}}
                 const run = () => {{
-                  document.querySelectorAll('.mermaid:not([data-ox-done])').forEach((el) => {{
-                    const src = (el.textContent || '').trim();
-                    if (!src) return;
+                  document.querySelectorAll('.mermaid:not([data-ox-done])').forEach((el)=>{{
+                    const src=(el.textContent||'').trim(); if(!src) return;
                     el.setAttribute('data-ox-done','1');
-                    const id = 'oxmmd-' + (window.__oxmc = (window.__oxmc||0) + 1);
-                    mermaid.render(id, src).then(r => {{ el.innerHTML = r.svg; }})
-                      .catch(() => {{ el.removeAttribute('data-ox-done'); el.classList.add('mermaid-err'); }});
+                    const id='oxmmd-'+(window.__oxmc=(window.__oxmc||0)+1);
+                    M.render(id,src).then(r=>{{el.innerHTML=r.svg;}}).catch(()=>{{el.removeAttribute('data-ox-done');el.classList.add('mermaid-err');}});
                   }});
                 }};
                 run();
-                new MutationObserver(run).observe(document.body, {{ childList:true, subtree:true }});
-              `;
-              sc.onerror = () => {{ window.__oxmermaid = 0; }};
-              document.head.appendChild(sc);
+                new MutationObserver(run).observe(document.body,{{childList:true,subtree:true}});
+              }};
+              const s=document.createElement('script');
+              s.src='/mermaidjs/mermaid.min.js';
+              s.onload=boot;
+              s.onerror=()=>{{ window.__oxmermaid=0; }};
+              document.head.appendChild(s);
             }})();
             while (true) {{ await new Promise(r => setTimeout(r, 3600000)); }}
             "#
@@ -5071,6 +5102,26 @@ fn git_worktrees(ws: &Path) -> Vec<(PathBuf, String)> {
 
 /// Class-based syntax highlight for one code block (theme colors come from CSS,
 /// so dark/light both work). Falls back to escaped plain text.
+/// Minimal percent-decoding for asset-handler request paths.
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            let h = |c: u8| (c as char).to_digit(16);
+            if let (Some(a), Some(c)) = (h(b[i + 1]), h(b[i + 2])) {
+                out.push((a * 16 + c) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
 fn highlight_code(code: &str, lang: &str) -> String {
     use syntect::html::{ClassedHTMLGenerator, ClassStyle};
     use syntect::parsing::SyntaxSet;
@@ -5144,6 +5195,11 @@ fn md_to_html(src: &str, live: bool) -> String {
         }
     }
     pulldown_cmark::html::push_html(&mut html, seg.drain(..));
+    // Point local image sources at the workspace asset handler so they load.
+    let html = html
+        .replace("<img src=\"./", "<img loading=\"lazy\" src=\"/wsimg/")
+        .replace("<img src=\"/", "<img loading=\"lazy\" src=\"/wsimg/");
+
     html
 }
 

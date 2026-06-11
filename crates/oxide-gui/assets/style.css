@@ -2130,3 +2130,6 @@ details[open]::details-content { block-size: auto; }
 .agent-md .mermaid svg { max-width: 100%; height: auto; }
 .agent-md .mermaid:not([data-ox-done]) { font-family: ui-monospace, Menlo, monospace; font-size: 12px; color: var(--muted); white-space: pre; padding: 10px 12px; border: 1px dashed var(--border); border-radius: 8px; }
 .agent-md .mermaid.mermaid-err { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 40%, transparent); }
+
+/* images in agent replies */
+.agent-md img { max-width: 100%; height: auto; border-radius: 8px; margin: 8px 0; display: block; border: 1px solid var(--border); }
