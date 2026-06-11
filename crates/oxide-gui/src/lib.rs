@@ -2381,6 +2381,13 @@ fn app() -> Element {
                                     followups.set(f);
                                 }
                                 sessions_refresh.set(sessions_refresh() + 1);
+                                {
+                                    let mut sr = sessions_refresh;
+                                    spawn(async move {
+                                        tokio::time::sleep(std::time::Duration::from_millis(2600)).await;
+                                        sr.set(sr() + 1);
+                                    });
+                                }
                                 // New/updated sessions show up right away
                                 // (fs walk off the event thread).
                                 {

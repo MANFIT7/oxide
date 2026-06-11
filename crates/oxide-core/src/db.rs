@@ -120,7 +120,11 @@ pub fn append(id: &str, workspace: &Path, provider: &str, role: &str, content: &
     );
     // First user line becomes the title.
     if role == "user" {
-        let first = content.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+        let first = content
+            .lines()
+            .map(|l| l.trim())
+            .find(|l| !l.is_empty() && !l.starts_with("Context files") && !l.starts_with('[') && !l.starts_with('@') && !l.starts_with("<system-reminder>"))
+            .unwrap_or_else(|| content.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim());
         let title: String = first.chars().take(60).collect();
         let _ = c.execute(
             "UPDATE sessions SET title=?2 WHERE id=?1 AND title=''",
@@ -130,6 +134,19 @@ pub fn append(id: &str, workspace: &Path, provider: &str, role: &str, content: &
 }
 
 /// Update the provider stamp (model/provider switch on a live session).
+/// Overwrite a session title (LLM-generated summary, or a cleaned first line).
+pub fn set_title(id: &str, title: &str) {
+    let t: String = title.trim().chars().take(60).collect();
+    if t.is_empty() { return; }
+    let c = conn().lock().unwrap();
+    let _ = c.execute("UPDATE sessions SET title=?2 WHERE id=?1", rusqlite::params![id, t]);
+}
+
+/// Current title (empty if unset).
+pub fn title_of(id: &str) -> String {
+    meta(id).map(|m| m.title).unwrap_or_default()
+}
+
 pub fn set_provider(id: &str, provider: &str) {
     let c = conn().lock().unwrap();
     let _ = c.execute(

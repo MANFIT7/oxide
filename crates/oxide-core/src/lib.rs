@@ -1547,6 +1547,8 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
                 .find(|m| m.role == Role::Assistant && !m.content.trim().is_empty())
                 .map(|m| m.content.chars().take(1500).collect::<String>())
                 .unwrap_or_default();
+            let last_user_t = last_user.clone();
+            let last_reply_t = last_reply.clone();
             if !last_reply.is_empty() {
                 let provider_id = self.config.provider.clone();
                 let model = {
@@ -1589,6 +1591,61 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
                         let _ = tx.send(Event::Followups { items }).await;
                     }
                 });
+            }
+
+            // Auto-title the chat from what it's about — once, while the title
+            // is still the raw first line / "Chat" placeholder.
+            let last_user = last_user_t;
+            let last_reply = last_reply_t;
+            let sid = self.session_store.as_ref().map(|s| s.id.clone());
+            if let Some(sid) = sid {
+                let cur = crate::db::title_of(&sid);
+                let needs = cur.is_empty()
+                    || cur.eq_ignore_ascii_case("chat")
+                    || cur.starts_with("Context files")
+                    || cur.starts_with('[')
+                    || cur.starts_with('@');
+                if needs && !last_reply.is_empty() {
+                    let provider_id = self.config.provider.clone();
+                    let model = {
+                        let mut c = self.config.clone();
+                        c.fast_mode = true;
+                        c.effective_model()
+                    };
+                    let lu = last_user.clone();
+                    let lr = last_reply.chars().take(800).collect::<String>();
+                    tokio::spawn(async move {
+                        let provider = oxide_providers::build(&provider_id);
+                        let req = TurnRequest {
+                            model,
+                            reasoning_effort: "low".into(),
+                            temperature: 0.4,
+                            messages: vec![
+                                Message::new(Role::System, "Give a SHORT title (3-6 words, the user's language) describing what this chat is about. Output ONLY the title — no quotes, no period, no prefix."),
+                                Message::new(Role::User, format!("User asked:\n{lu}\n\nAgent replied:\n{lr}")),
+                            ],
+                            tools: Vec::new(),
+                            cwd: String::new(),
+                            conversation_id: String::new(),
+                        };
+                        let (stx, mut srx) = mpsc::channel::<StreamItem>(64);
+                        let task = tokio::spawn(async move { provider.stream(req, stx).await });
+                        let mut out = String::new();
+                        while let Ok(Some(item)) = tokio::time::timeout(std::time::Duration::from_secs(15), srx.recv()).await {
+                            match item {
+                                StreamItem::TextDelta(t) => out.push_str(&t),
+                                StreamItem::Done => break,
+                                _ => {}
+                            }
+                        }
+                        task.abort();
+                        let title = out.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim()
+                            .trim_matches(['"', '\'', '.', '*']).trim().to_string();
+                        if !title.is_empty() {
+                            crate::db::set_title(&sid, &title);
+                        }
+                    });
+                }
             }
         }
     }
