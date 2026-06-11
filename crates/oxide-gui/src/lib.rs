@@ -1799,37 +1799,42 @@ fn app() -> Element {
 
     // Auto-scroll the chat to the bottom as content streams in — but only when
     // the user is already near the bottom, so reading scrollback isn't yanked.
-    // Load mermaid once (inline-injected like xterm.js) and render any .mermaid
-    // blocks as themed SVG. Same-origin script (no file:// / CORS issues).
+    // Load mermaid from CDN (UMD global) and render any .mermaid block as themed
+    // SVG. A <script src> include is far more reliable than inlining 3MB through
+    // the eval bridge; the app already needs the network for the model. v11
+    // dropped the UMD global (ESM-only), so we pin the latest UMD-compatible
+    // release (v10.9.x) which exposes window.mermaid for injected contexts.
     use_future(move || async move {
-        let dark = cfg.peek().theme != "light";
-        let theme = if dark { "dark" } else { "default" };
-        let boot = format!(
-            r#"window.__oxmermaid=1;(function(){{
-              try {{
-                window.mermaid.initialize({{startOnLoad:false,theme:'{theme}',securityLevel:'loose',fontFamily:'inherit'}});
-              }} catch(e) {{}}
-              const run=()=>{{
-                if(!window.mermaid) return;
-                document.querySelectorAll('.mermaid:not([data-ox-done])').forEach((el)=>{{
-                  const src=(el.textContent||'').trim(); if(!src) return;
-                  el.setAttribute('data-ox-done','1');
-                  const id='oxmmd-'+(window.__oxmc=(window.__oxmc||0)+1);
-                  window.mermaid.render(id,src).then(r=>{{el.innerHTML=r.svg;}}).catch(()=>{{el.removeAttribute('data-ox-done');el.classList.add('mermaid-err');}});
-                }});
+        let theme = if cfg.peek().theme != "light" { "dark" } else { "default" };
+        let js = format!(
+            r#"
+            (function(){{
+              if (window.__oxmermaid) return;
+              window.__oxmermaid = 1;
+              const start = () => {{
+                if (!window.mermaid) return;
+                try {{ window.mermaid.initialize({{startOnLoad:false,theme:'{theme}',securityLevel:'loose',fontFamily:'inherit'}}); }} catch(e){{}}
+                const run = () => {{
+                  document.querySelectorAll('.mermaid:not([data-ox-done])').forEach((el)=>{{
+                    const src=(el.textContent||'').trim(); if(!src) return;
+                    el.setAttribute('data-ox-done','1');
+                    const id='oxmmd-'+(window.__oxmc=(window.__oxmc||0)+1);
+                    window.mermaid.render(id,src).then(r=>{{el.innerHTML=r.svg;}}).catch(()=>{{el.removeAttribute('data-ox-done');el.classList.add('mermaid-err');}});
+                  }});
+                }};
+                run();
+                new MutationObserver(run).observe(document.body,{{childList:true,subtree:true}});
               }};
-              run();
-              new MutationObserver(run).observe(document.body,{{childList:true,subtree:true}});
-            }})();"#
+              const s=document.createElement('script');
+              s.src='https://cdn.jsdelivr.net/npm/mermaid@10.9.3/dist/mermaid.min.js';
+              s.onload=start;
+              s.onerror=()=>{{ window.__oxmermaid=0; }};
+              document.head.appendChild(s);
+            }})();
+            while (true) {{ await new Promise(r => setTimeout(r, 3600000)); }}
+            "#
         );
-        if dioxus::document::eval(&format!("return typeof window.__oxmermaid;")).join::<String>().await.map(|v| v.contains("undefined")).unwrap_or(true) {
-            // Inject the library, then bootstrap once it has parsed.
-            let js = format!("{MERMAID_JS}
-;
-{boot}
-return 'ok';");
-            let _ = dioxus::document::eval(&js).join::<String>().await;
-        }
+        let _ = dioxus::document::eval(&js).recv::<String>().await;
     });
 
     // Autoscroll via ONE persistent MutationObserver (installed once) instead of
@@ -4088,6 +4093,7 @@ return 'ok';");
                             div { class: if *streaming.read() { "col streaming" } else { "col" },
                                 {
                                     // Group consecutive tool-activity rows so they collapse into one dropdown.
+                                    let last_user_idx = messages.read().iter().rposition(|m| m.author == Author::User);
                                     let groups = {
                                         let msgs = messages.read();
                                         let mut g: Vec<(bool, Vec<usize>)> = Vec::new();
@@ -4169,8 +4175,9 @@ return 'ok';");
                                                                 let copy = serde_json::to_string(&strip_scaffold(&m.text)).unwrap_or_default();
                                                                 let edit_text = strip_scaffold(&m.text);
                                                                 let idx = i;
+                                                                let row_cls = if Some(i) == last_user_idx { "row user sticky-turn" } else { "row user" };
                                                                 rsx! {
-                                                                    div { class: "row user",
+                                                                    div { class: "{row_cls}",
                                                                         div { class: "bubble",
                                                                             for (is_m, s) in segs {
                                                                                 if is_m { span { class: "inline-chip", "{s}" } } else { "{s}" }
@@ -5043,8 +5050,6 @@ fn git_worktrees(ws: &Path) -> Vec<(PathBuf, String)> {
 
 /// Class-based syntax highlight for one code block (theme colors come from CSS,
 /// so dark/light both work). Falls back to escaped plain text.
-const MERMAID_JS: &str = include_str!("../assets/vendor/mermaid.min.js");
-
 fn highlight_code(code: &str, lang: &str) -> String {
     use syntect::html::{ClassedHTMLGenerator, ClassStyle};
     use syntect::parsing::SyntaxSet;
