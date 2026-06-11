@@ -6486,7 +6486,7 @@ fn TerminalView(id: u64, bin: String, ws: String) -> Element {
                 const el = document.getElementById("{host}");
                 if (!el || !window.Terminal) return;
                 el.innerHTML = "";
-                const term = new window.Terminal({{ fontSize: 12.5, fontFamily: "'MesloLGS NF', 'JetBrainsMono Nerd Font', 'JetBrainsMono Nerd Font Mono', 'Hack Nerd Font', 'FiraCode Nerd Font', 'CaskaydiaCove Nerd Font', 'Symbols Nerd Font Mono', 'Symbols Nerd Font', ui-monospace, Menlo, monospace", cursorBlink: true, theme: (function(){{ const cs=getComputedStyle(document.querySelector('.app')); const bg=(cs.getPropertyValue('--composer')||'#0e0e10').trim(); const fg=(cs.getPropertyValue('--text')||'#cdd0d6').trim(); return {{ background: bg, foreground: fg, cursor: fg }}; }})() }});
+                const term = new window.Terminal({{ fontSize: 12.5, macOptionIsMeta: true, fontFamily: "'MesloLGS NF', 'JetBrainsMono Nerd Font', 'JetBrainsMono Nerd Font Mono', 'Hack Nerd Font', 'FiraCode Nerd Font', 'CaskaydiaCove Nerd Font', 'Symbols Nerd Font Mono', 'Symbols Nerd Font', ui-monospace, Menlo, monospace", cursorBlink: true, theme: (function(){{ const cs=getComputedStyle(document.querySelector('.app')); const bg=(cs.getPropertyValue('--composer')||'#0e0e10').trim(); const fg=(cs.getPropertyValue('--text')||'#cdd0d6').trim(); return {{ background: bg, foreground: fg, cursor: fg }}; }})() }});
                 let fit = null;
                 try {{ fit = new window.FitAddon.FitAddon(); term.loadAddon(fit); }} catch (e) {{}}
                 try {{ if (document.fonts && document.fonts.ready) await document.fonts.ready; }} catch (e) {{}}
@@ -6508,6 +6508,10 @@ fn TerminalView(id: u64, bin: String, ws: String) -> Element {
                     }}
                     if (k === 'a') {{ term.selectAll(); return false; }}
                     if (k === 'k') {{ term.clear(); return false; }}
+                    // macOS line editing → send the readline control sequence.
+                    if (e.key === 'Backspace') {{ dioxus.send(JSON.stringify({{ inp: '\x15' }})); return false; }}  // ⌘⌫ delete to line start
+                    if (e.key === 'ArrowLeft') {{ dioxus.send(JSON.stringify({{ inp: '\x01' }})); return false; }}  // ⌘← line start
+                    if (e.key === 'ArrowRight') {{ dioxus.send(JSON.stringify({{ inp: '\x05' }})); return false; }} // ⌘→ line end
                     return false;  // swallow other Cmd combos so app shortcuts don't fire
                 }});
                 term.onData(d => dioxus.send(JSON.stringify({{ inp: d }})));
