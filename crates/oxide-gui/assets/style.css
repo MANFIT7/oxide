@@ -4,7 +4,7 @@
 :root {
   --bg: #0d0c0b;                       /* warm near-black, darker */
   --sidebar: rgba(24, 22, 19, 0.42);   /* glass tint — vibrancy blurs behind */
-  --surface: #17150f;
+  --surface: #181510;
   --surface-hi: #211e17;
   --border: rgba(240, 232, 220, .07);
   --text: #ece7df;                     /* warm light */
@@ -13,8 +13,8 @@
   --accent: #ece7df;
   --on-accent: #0d0c0b;
   --danger: #e8624a;
-  --composer: rgba(24, 21, 16, 0.72);
-  --menu-bg: rgba(26, 23, 18, 0.9);
+  --composer: #161310;
+  --menu-bg: #1a1713;
   --menu-border: rgba(240, 232, 220, .1);
   --syn-accent: #c2895f;               /* muted warm amber — not bright orange */
   --ok: #86ddb0; --ok-strong: #43c285; --del-soft: #e8a087;
@@ -2155,3 +2155,29 @@ details[open]::details-content { block-size: auto; }
 /* images in agent replies */
 .agent-md img { max-width: 100%; height: auto; border-radius: 8px; margin: 8px 0; display: block; border: 1px solid var(--border); }
 
+
+/* ══ Glass audit: ONLY the sidebar is liquid glass — every other surface is
+   solid (modals, menus, composer, cards were inheriting translucency). ══ */
+.composer { background: var(--composer); backdrop-filter: none; -webkit-backdrop-filter: none; }
+.theme-menu, .pane-mode-menu, .model-menu, .plus-menu, .pal
+/* ══ Glass scope: ONLY the sidebar reveals vibrancy — everything else opaque ══ */
+.app:not([data-theme="light"]) .modal,
+.app:not([data-theme="light"]) .modal-overlay,
+.app:not([data-theme="light"]) .settings-modal,
+.app:not([data-theme="light"]) .model-menu,
+.app:not([data-theme="light"]) .effort-menu,
+.app:not([data-theme="light"]) .plus-menu,
+.app:not([data-theme="light"]) .sel-menu,
+.app:not([data-theme="light"]) .access-menu,
+.app:not([data-theme="light"]) .theme-menu,
+.app:not([data-theme="light"]) .mention-menu,
+.app:not([data-theme="light"]) .palette,
+.app:not([data-theme="light"]) .pane-mode-menu,
+.app:not([data-theme="light"]) .env-card,
+.app:not([data-theme="light"]) .composer {
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+.app:not([data-theme="light"]) .modal { background: var(--menu-bg); }
+.app:not([data-theme="light"]) .composer { background: var(--composer); }
+.app:not([data-theme="light"]) .env-card { background: var(--surface); }
