@@ -1906,7 +1906,18 @@ fn app() -> Element {
         let _ = sessions_refresh.read();
         if cfg.read().workspace.is_some() {
             board.set(board::Board::load(&ws));
-            projects_list.set(build_projects(&ws, &cfg.read().recent_workspaces));
+            // Off the UI thread — sqlite queries + fs checks per workspace.
+            {
+                let ws2 = ws.clone();
+                let recents = cfg.read().recent_workspaces.clone();
+                let mut pl = projects_list;
+                spawn(async move {
+                    let groups = tokio::task::spawn_blocking(move || build_projects(&ws2, &recents))
+                        .await
+                        .unwrap_or_default();
+                    pl.set(groups);
+                });
+            }
             // Clean up orphaned pane worktrees from a previous run. `prune` only
             // drops metadata for already-deleted dirs, so force-remove the
             // pane-* worktree dirs and their branches that a crash/quit left.
@@ -2839,6 +2850,11 @@ fn app() -> Element {
                                             }
                                         }
                                     }
+                                    {
+                                        // One pinned-id query per project render, not per row.
+                                        let pinned_ids: std::collections::HashSet<String> =
+                                            oxide_core::db::pinned().into_iter().map(|m| m.id).collect();
+                                        rsx! {
                                     for (path, title, reltime, sprov) in sessions.iter()
                                         .filter(|(p, _, _, _)| !is_current || !tabs.read().iter().any(|t| t.session.as_deref() == Some(p.as_path())))
                                         .take(if collapsed { 0 } else { shown }).cloned() {
@@ -2856,7 +2872,7 @@ fn app() -> Element {
                                             let ws_d2 = ws_rebuild.clone();
                                             let ws_ar2 = ws_rebuild.clone();
                                             let path_str = path.display().to_string();
-                                            let is_pinned = oxide_core::db::meta(&path_str).map(|m| m.pinned).unwrap_or(false);
+                                            let is_pinned = pinned_ids.contains(&path_str);
                                             rsx! {
                                                 div { class: "thread-anchor",
                                                     div { class: "row-actions",
@@ -2889,6 +2905,8 @@ fn app() -> Element {
                                                     }
                                                 }
                                             }
+                                        }
+                                    }
                                         }
                                     }
                                     if total > 5 && !collapsed {
@@ -5096,6 +5114,34 @@ fn highlight_code(code: &str, lang: &str) -> String {
 /// first (so injection is impossible), then markdown is converted. Fenced code
 /// blocks get class-based syntax highlighting.
 fn md_to_html(src: &str, live: bool) -> String {
+    // Render cache: re-renders (tab switches, scroll-driven updates) hit the
+    // cache instead of re-running pulldown+syntect on every message again.
+    thread_local! {
+        static CACHE: std::cell::RefCell<std::collections::HashMap<u64, String>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    let key = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        src.hash(&mut h);
+        live.hash(&mut h);
+        h.finish()
+    };
+    if let Some(hit) = CACHE.with(|c| c.borrow().get(&key).cloned()) {
+        return hit;
+    }
+    let out = md_to_html_uncached(src, live);
+    CACHE.with(|c| {
+        let mut m = c.borrow_mut();
+        if m.len() > 512 {
+            m.clear();
+        }
+        m.insert(key, out.clone());
+    });
+    out
+}
+
+fn md_to_html_uncached(src: &str, live: bool) -> String {
     use pulldown_cmark::{CodeBlockKind, Event as MdEvent, Options, Parser, Tag, TagEnd};
     let escaped = src.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
     let mut opts = Options::empty();

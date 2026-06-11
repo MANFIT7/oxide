@@ -250,6 +250,15 @@ pub fn delete(id: &str) {
 /// Import legacy per-workspace JSONL sessions (idempotent — skips ids that are
 /// already in the DB). Files are left in place, renamed to `.imported`.
 pub fn import_workspace(ws: &Path) {
+    // Once per workspace per process — this is called from list paths that can
+    // run per render; the dir scan must not repeat.
+    static DONE: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    {
+        let mut g = DONE.get_or_init(Default::default).lock().unwrap();
+        if !g.insert(ws.display().to_string()) {
+            return;
+        }
+    }
     let dir = ws.join(".oxide/sessions");
     let Ok(rd) = std::fs::read_dir(&dir) else { return };
     for e in rd.flatten() {
