@@ -1267,6 +1267,14 @@ fn open_session_tab(
         .map(|m| PathBuf::from(m.workspace))
         .filter(|w| !w.as_os_str().is_empty());
     let mut c = cfg.read().clone();
+    // Adopt the session's own provider (a Claude TUI session stays Claude, not
+    // whatever the composer was last set to).
+    let sess_provider = oxide_core::db::meta(&sid(&path)).map(|m| m.provider).unwrap_or_default();
+    if !sess_provider.is_empty() && sess_provider != c.provider {
+        c.provider = sess_provider.clone();
+        c.model = String::new();
+        if let Some(t) = tabs.write().get_mut(cur) { t.provider = sess_provider; t.model = String::new(); }
+    }
     if let Some(ws) = session_ws {
         if c.workspace.as_deref() != Some(ws.as_path()) {
             ui.workspace.set(ws.clone());
@@ -1293,7 +1301,14 @@ fn open_session_tab(
 
 /// Load a session transcript into chat messages.
 fn load_session(path: &Path) -> Vec<ChatMsg> {
-    oxide_core::db::load(&sid(path))
+    let mut rows = oxide_core::db::load(&sid(path));
+    // Very long (imported TUI) transcripts freeze the first paint — show the
+    // last 300 turns; the engine still resumes the full history on continue.
+    let trimmed = rows.len() > 300;
+    if trimmed {
+        rows = rows.split_off(rows.len() - 300);
+    }
+    let mut out: Vec<ChatMsg> = rows
         .into_iter()
         .filter_map(|(role, content)| {
             if role == "meta" || role == "tool" || role == "system" {
@@ -1306,7 +1321,11 @@ fn load_session(path: &Path) -> Vec<ChatMsg> {
             };
             Some(ChatMsg { author, text: content })
         })
-        .collect()
+        .collect();
+    if trimmed {
+        out.insert(0, ChatMsg { author: Author::Note, text: "… earlier messages hidden (long session) — continue to keep full context".into() });
+    }
+    out
 }
 
 /// Run a git subcommand in the workspace, returning stdout (stderr appended).

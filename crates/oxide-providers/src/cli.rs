@@ -348,7 +348,10 @@ impl Provider for ClaudeCliProvider {
     async fn stream(&self, req: TurnRequest, sink: mpsc::Sender<StreamItem>) -> anyhow::Result<()> {
         let prompt = last_user_prompt(&req);
         let skey = session_key(&self.bin, &req.conversation_id, &req.cwd);
-        let resume = session_get(&skey);
+        // Continuing an imported Claude TUI session ("claude-<uuid>") resumes
+        // claude's OWN native session by that uuid → full context, no replay.
+        let resume = session_get(&skey)
+            .or_else(|| req.conversation_id.strip_prefix("claude-").map(str::to_string));
         let mut args = vec![
             "-p".to_string(),
             prompt,
