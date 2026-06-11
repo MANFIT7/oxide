@@ -1799,6 +1799,41 @@ fn app() -> Element {
 
     // Auto-scroll the chat to the bottom as content streams in — but only when
     // the user is already near the bottom, so reading scrollback isn't yanked.
+    // Load mermaid once and render any .mermaid blocks as themed SVG.
+    use_future(move || async move {
+        let dark = cfg.peek().theme != "light";
+        let js = format!(
+            r#"
+            (function(){{
+              if (window.__oxmermaid) return;
+              window.__oxmermaid = 1;
+              const boot = () => {{
+                if (!window.mermaid) return;
+                window.mermaid.initialize({{ startOnLoad:false, theme: {theme}, securityLevel:'strict', fontFamily:'inherit' }});
+                const run = () => {{
+                  document.querySelectorAll('.mermaid:not([data-ox-done])').forEach((el,i)=>{{
+                    el.setAttribute('data-ox-done','1');
+                    const src = el.textContent;
+                    const id = 'oxmmd-'+Date.now()+'-'+i;
+                    window.mermaid.render(id, src).then(r=>{{ el.innerHTML = r.svg; }}).catch(e=>{{ el.setAttribute('data-ox-done',''); el.classList.add('mermaid-err'); }});
+                  }});
+                }};
+                run();
+                new MutationObserver(()=>run()).observe(document.body,{{childList:true,subtree:true}});
+              }};
+              const s = document.createElement('script');
+              s.textContent = {lib};
+              document.head.appendChild(s);
+              boot();
+            }})();
+            while (true) {{ await new Promise(r => setTimeout(r, 3600000)); }}
+            "#,
+            theme = if dark { "'dark'" } else { "'default'" },
+            lib = serde_json::to_string(MERMAID_JS).unwrap_or_default(),
+        );
+        let _ = dioxus::document::eval(&js).recv::<String>().await;
+    });
+
     // Autoscroll via ONE persistent MutationObserver (installed once) instead of
     // a JS eval round-trip per streaming delta.
     use_future(move || async move {
@@ -5001,6 +5036,8 @@ fn git_worktrees(ws: &Path) -> Vec<(PathBuf, String)> {
 
 /// Class-based syntax highlight for one code block (theme colors come from CSS,
 /// so dark/light both work). Falls back to escaped plain text.
+const MERMAID_JS: &str = include_str!("../assets/vendor/mermaid.min.js");
+
 fn highlight_code(code: &str, lang: &str) -> String {
     use syntect::html::{ClassedHTMLGenerator, ClassStyle};
     use syntect::parsing::SyntaxSet;
@@ -5055,12 +5092,18 @@ fn md_to_html(src: &str, live: bool) -> String {
                 // The source was pre-escaped; un-escape so syntect sees real code,
                 // its output re-escapes safely.
                 let raw = code.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&");
-                let body = if live {
-                    raw.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+                if lang == "mermaid" && !live {
+                    // Render the diagram once the fence closes (never partial).
+                    let esc = raw.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+                    html.push_str(&format!("<div class=\"mermaid\">{esc}</div>"));
                 } else {
-                    highlight_code(&raw, &lang)
-                };
-                html.push_str(&format!("<pre><code class=\"hl\">{body}</code></pre>"));
+                    let body = if live || lang == "mermaid" {
+                        raw.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+                    } else {
+                        highlight_code(&raw, &lang)
+                    };
+                    html.push_str(&format!("<pre><code class=\"hl\">{body}</code></pre>"));
+                }
             }
             MdEvent::Text(t) if in_code => code.push_str(&t),
             other if !in_code => seg.push(other),

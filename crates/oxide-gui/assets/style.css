@@ -2117,3 +2117,9 @@ details[open]::details-content { block-size: auto; }
 .env-card-row { white-space: nowrap; }
 .env-card-row > span:first-of-type { overflow: hidden; text-overflow: ellipsis; }
 .env-card-badge.nowrap { white-space: nowrap; flex-shrink: 0; }
+
+/* mermaid diagrams in chat */
+.agent-md .mermaid { margin: 10px 0; overflow-x: auto; text-align: center; }
+.agent-md .mermaid svg { max-width: 100%; height: auto; }
+.agent-md .mermaid:not([data-ox-done]) { font-family: ui-monospace, Menlo, monospace; font-size: 12px; color: var(--muted); white-space: pre; padding: 10px 12px; border: 1px dashed var(--border); border-radius: 8px; }
+.agent-md .mermaid.mermaid-err { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 40%, transparent); }
