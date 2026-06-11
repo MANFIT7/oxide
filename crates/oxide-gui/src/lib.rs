@@ -1648,6 +1648,9 @@ fn app() -> Element {
     let mut memory_text = use_signal(String::new);
     let mut thinking = use_signal(String::new);
     let mut queue = use_signal(Vec::<String>::new);
+    // Background tasks the CLI agent started ("running in background") — their
+    // result won't stream back, so we surface what they are as persistent chips.
+    let mut bg_jobs = use_signal(Vec::<String>::new);
     let mut questions = use_signal(Vec::<(u64, String, Vec<String>)>::new);
     let mut q_answer = use_signal(String::new);
     let mut reverted = use_signal(HashSet::<u64>::new);
@@ -2234,6 +2237,24 @@ fn app() -> Element {
                             Event::Info { text } => {
                                 if text.starts_with("session") || text.starts_with("mcp ") || text.starts_with("mcp '") {
                                     // internal/MCP noise — status shown in the MCP manager, not chat
+                                } else if text.starts_with('⏳') {
+                                    // Background task the agent started. Surface it as a
+                                    // persistent chip + activity row so the user sees what's
+                                    // running (its result won't stream back this turn).
+                                    let label = text.trim_start_matches('⏳').trim().to_string();
+                                    if !label.is_empty() && !bg_jobs.read().iter().any(|j| *j == label) {
+                                        bg_jobs.write().push(label.clone());
+                                    }
+                                    status.set(format!("Background · {label}"));
+                                    let (verb, detail) = label.split_once(' ').unwrap_or((label.as_str(), ""));
+                                    let row = format!("terminal\t⏳ {verb}\t{detail}");
+                                    {
+                                        let mut mw = messages.write();
+                                        if mw.last().map(|m| m.author == Author::Agent && m.text.is_empty()).unwrap_or(false) {
+                                            mw.pop();
+                                        }
+                                        mw.push(ChatMsg { author: Author::Activity { running: false, ok: true }, text: row });
+                                    }
                                 } else if text.starts_with('⚙') {
                                     // CLI-driver tool activity: live shimmer + an activity
                                     // trail row in the chat (synara-style).
@@ -2311,6 +2332,7 @@ fn app() -> Element {
                                 turn_start.set(Some(std::time::Instant::now()));
                                 elapsed_s.set(0);
                                 turn_edits.write().clear();
+                                bg_jobs.write().clear();
                                 todos.write().clear();
                                 edits_expanded.set(false);
                                 edits_undone.set(false);
@@ -2476,6 +2498,13 @@ fn app() -> Element {
                                     for c in m.iter_mut() {
                                         if let Author::Activity { running, .. } = &mut c.author { *running = false; }
                                     }
+                                }
+                                // Background tasks the agent kicked off won't stream their
+                                // result back this turn — tell the user plainly so the
+                                // "I'll let you know when done" never silently dangles.
+                                if !bg_jobs.peek().is_empty() {
+                                    let jobs = bg_jobs.peek().join(", ");
+                                    messages.write().push(ChatMsg { author: Author::Note, text: format!("⏳ Background task(s) still running: {jobs} — the result won't return automatically. Ask the agent to check the output, or check the Environment → Terminals panel.") });
                                 }
                                 if let Some(start) = turn_start.write().take() {
                                     let secs = start.elapsed().as_secs();
@@ -4416,6 +4445,18 @@ fn app() -> Element {
                                         span { class: "status-shimmer", "{status}" }
                                         if *elapsed_s.read() >= 3 {
                                             span { class: "status-elapsed", "· {elapsed_s}s" }
+                                        }
+                                    }
+                                }
+                                if !bg_jobs.read().is_empty() {
+                                    div { class: "bg-bar",
+                                        span { class: "bg-label", "⏳ Background" }
+                                        for (bi, job) in bg_jobs.read().iter().cloned().enumerate() {
+                                            span { class: "bg-chip", title: "Running in background — result won't auto-return",
+                                                span { class: "bg-dot" }
+                                                span { class: "bg-chip-text", "{job}" }
+                                                button { class: "bg-x", title: "Dismiss", onclick: move |_| { let mut v = bg_jobs.write(); if bi < v.len() { v.remove(bi); } }, "✕" }
+                                            }
                                         }
                                     }
                                 }

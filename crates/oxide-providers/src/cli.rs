@@ -433,7 +433,17 @@ impl Provider for ClaudeCliProvider {
                                         .find_map(|k| input[k].as_str())
                                         .unwrap_or("");
                                     let detail: String = detail.chars().take(80).collect();
-                                    let label = if detail.is_empty() { format!("⚙ {name}") } else { format!("⚙ {name} {detail}") };
+                                    // A backgrounded command ("I'll let you know when done")
+                                    // won't stream its result back — surface WHAT it's doing
+                                    // with a distinct ⏳ marker so the UI can show it persistently.
+                                    let bg = input["run_in_background"].as_bool() == Some(true);
+                                    let label = if bg {
+                                        if detail.is_empty() { format!("⏳ {name}") } else { format!("⏳ {name} {detail}") }
+                                    } else if detail.is_empty() {
+                                        format!("⚙ {name}")
+                                    } else {
+                                        format!("⚙ {name} {detail}")
+                                    };
                                     send(sink, StreamItem::Notice(label));
                                     if matches!(name, "Edit" | "Write" | "MultiEdit" | "NotebookEdit") {
                                         if let Some(p) = input["file_path"].as_str() {
