@@ -2255,12 +2255,17 @@ details[open]::details-content { block-size: auto; }
    text div with max-height + a fade mask — the mask is safe here (no
    backdrop-filter on this element; masking the bubble itself blanked it).
    Text feathers out at the cut ("blur kepotong") and never disappears. */
-.user-text { white-space: pre-wrap; word-break: break-word; }
+.user-text {
+  white-space: pre-wrap; word-break: break-word;
+  overflow: hidden; max-height: 4000px;
+  transition: max-height .3s cubic-bezier(.4, 0, .2, 1);
+}
 .user-text.clamped {
-  max-height: 78px; overflow: hidden;
+  max-height: 78px;
   -webkit-mask-image: linear-gradient(to bottom, #000 52%, transparent 100%);
   mask-image: linear-gradient(to bottom, #000 52%, transparent 100%);
 }
+@media (prefers-reduced-motion: reduce) { .user-text { transition: none; } }
 /* show more / less — centered under the faded cut. */
 .bubble-more {
   display: block; margin: 1px auto 0; padding: 2px 10px;

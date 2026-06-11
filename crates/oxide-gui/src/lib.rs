@@ -3187,7 +3187,7 @@ fn app() -> Element {
                                         }
                                         Icon { name: "folder" }
                                         span { class: "project-name", "{pname}" }
-                                        if is_current && (*streaming.read() || !busy_tabs.read().is_empty()) { span { class: "side-loader", style: "margin-left:6px" } }
+                                        if is_current && (*streaming.read() || !busy_tabs.read().is_empty()) { span { class: "syn-spinner", style: "margin-left:6px" } }
                                         button { class: "project-del", title: "Remove this project's chats from the list",
                                             onclick: {
                                                 let pdel = pws.clone();
@@ -3234,7 +3234,7 @@ fn app() -> Element {
                                                         onclick: move |_| { show_board.set(false); switch_tab(tabs, active_tab, messages, cfg, engine, i); },
                                                         ondoubleclick: move |_| { rename_text.set(ttl_dc.clone()); renaming_tab.set(Some(id)); },
                                                         span { class: "sess-branch", Icon { name: "branch" } }
-                                                        if busy { span { class: "side-loader" } }
+                                                        if busy { span { class: "syn-spinner" } }
                                                         else if let Some(l) = logo { span { class: "tab-prov", dangerous_inner_html: l } }
                                                         if editing {
                                                             input { class: "rename-input", value: "{rename_text}", autofocus: true,
@@ -6208,8 +6208,8 @@ fn Composer(
     use_future(move || async move {
         let mut eval = dioxus::document::eval(
             r#"
-            const el = document.getElementById('ce-input');
-            if (el && !el.__oxpaste) {
+            const attach = function(el){
+              if (!el || el.__oxpaste) return;
               el.__oxpaste = true;
               el.addEventListener('paste', function(ev){
                 const cd = ev.clipboardData || window.clipboardData;
@@ -6238,8 +6238,14 @@ fn Composer(
                   }
                 }
               });
+            };
+            // Self-healing: the composer remounts (hero <-> chat) and replaces the
+            // #ce-input element, which silently dropped the paste listener. Keep
+            // re-attaching to whatever element currently holds the id.
+            while (true) {
+              attach(document.getElementById('ce-input'));
+              await new Promise(r => setTimeout(r, 700));
             }
-            while (true) { await new Promise(r => setTimeout(r, 3600000)); }
             "#,
         );
         loop {
