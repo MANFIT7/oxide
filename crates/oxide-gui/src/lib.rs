@@ -1165,10 +1165,11 @@ fn relative_time(t: std::time::SystemTime) -> String {
 fn build_projects(current: &Path, recents: &[PathBuf]) -> Vec<(PathBuf, String, Vec<(PathBuf, String, String, String)>)> {
     let mut seen = HashSet::new();
     let mut wss: Vec<PathBuf> = Vec::new();
-    // Current + recents + EVERY workspace the db knows has sessions, so a
-    // project never falls off the sidebar (the SQLite index is the source).
+    // STABLE order: db recency first (only changes when you actually chat, not
+    // when you click to switch), then the current workspace + recents as a
+    // fallback so a brand-new project still appears. Clicking never reorders.
     let db_ws: Vec<PathBuf> = oxide_core::db::workspaces().into_iter().map(PathBuf::from).collect();
-    for w in std::iter::once(current.to_path_buf()).chain(recents.iter().cloned()).chain(db_ws) {
+    for w in db_ws.into_iter().chain(std::iter::once(current.to_path_buf())).chain(recents.iter().cloned()) {
         if !w.as_os_str().is_empty() && w.exists() && seen.insert(w.clone()) {
             wss.push(w);
         }
@@ -2903,12 +2904,6 @@ fn app() -> Element {
                                                             move |e: dioxus::prelude::MouseEvent| { e.prevent_default(); e.stop_propagation(); show_theme_menu.set(false); session_menu.set(Some(p.clone())); }
                                                         },
                                                         ondoubleclick: move |_| { let cur = session_menu.read().clone(); session_menu.set(if cur.as_ref() == Some(&p_dbl) { None } else { Some(p_dbl.clone()) }); },
-                                                        span { class: "sub-ic",
-                                                            svg { view_box: "0 0 16 16", width: "12", height: "12", fill: "none", stroke: "currentColor", stroke_width: "1.4", stroke_linecap: "round", stroke_linejoin: "round",
-                                                                path { d: "M4 3v5a3 3 0 0 0 3 3h5" }
-                                                                path { d: "M9 8l3 3-3 3" }
-                                                            }
-                                                        }
                                                         if let Some(l) = provider_logo(&sprov) { span { class: "sess-logo prov-logo", dangerous_inner_html: l } }
                                                     span { class: "thread-title", title: "{title}", "{title}" }
                                                         span { class: "thread-time", "{reltime}" }

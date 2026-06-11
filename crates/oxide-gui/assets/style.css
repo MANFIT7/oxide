@@ -2183,10 +2183,8 @@ details[open]::details-content { block-size: auto; }
 .app:not([data-theme="light"]) .env-card { background: var(--surface); }
 
 /* session rows read as SUB-items of their project: indent + ↳ enter icon */
-.thread.sub { padding-left: 10px; margin-left: 14px; border-left: 1px solid color-mix(in srgb, var(--text) 8%, transparent); border-radius: 0 7px 7px 0; }
-.thread.sub:hover { border-left-color: color-mix(in srgb, var(--syn-accent) 45%, transparent); }
-.sub-ic { display: inline-flex; flex-shrink: 0; color: var(--faint); margin-right: 2px; }
-.thread.sub:hover .sub-ic { color: var(--syn-accent); }
+.thread.sub { padding-left: 14px; margin-left: 12px; border-left: 1px solid color-mix(in srgb, var(--text) 9%, transparent); border-radius: 0; }
+.thread.sub:hover { border-left-color: color-mix(in srgb, var(--syn-accent) 50%, transparent); }
 
 /* project header: hover delete (removes its chats from the list) */
 .project-del { width: 20px; height: 20px; display: flex; align-items: center; justify-content: center;
