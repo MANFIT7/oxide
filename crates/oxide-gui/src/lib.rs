@@ -6235,7 +6235,7 @@ fn Message(author: Author, text: String, #[props(default)] live: bool) -> Elemen
                 div { class: "row agent",
                     img { class: "avatar", src: logo_uri() }
                     if text.is_empty() {
-                        div { class: "typing", span {} span {} span {} }
+                        // No placeholder bar — the status pill already shows progress.
                     } else {
                         div { class: "agent-text agent-md", dangerous_inner_html: md_to_html(&text, live) }
                         button { class: "msg-copy", title: "Copy message", onclick: move |_| { let c = copy.clone(); spawn(async move { let _ = document::eval(&format!("navigator.clipboard.writeText({c})")).await; }); }, "⧉" }
