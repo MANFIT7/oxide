@@ -591,6 +591,9 @@ fn strip_scaffold(text: &str) -> String {
         "[Pursue goal]", "(user attached", "- selector:", "- component:",
         "- source:", "- text:", "- html:", "Selected UI element",
     ];
+    // Display messages may carry image data-URLs after a \u{2} separator —
+    // those are render-only; never let them leak into copies/history/titles.
+    let text = text.split('\u{2}').next().unwrap_or(text);
     let mut keep = Vec::new();
     let mut in_diff_fence = false;
     for line in text.lines() {
@@ -799,8 +802,11 @@ why it's wrong, and the concrete fix. If the diff is clean, say so plainly.{}\n\
         picked_element.set(None);
     }
     text.push_str(&body);
+    // Carry the pasted images into the DISPLAY message (after a \u{2}
+    // separator) so the user bubble renders real thumbnails, not "[N images]".
     let display = if n_imgs > 0 {
-        format!("{body} [{n_imgs} image{}]", if n_imgs == 1 { "" } else { "s" })
+        let atts = attachments.read().join("\u{2}");
+        format!("{body}\u{2}{atts}")
     } else {
         body
     };
@@ -1652,6 +1658,8 @@ fn app() -> Element {
     let mut edits_undone = use_signal(|| false);
     // Two-click confirm for the destructive restore-checkpoint hover button.
     let mut confirm_restore = use_signal(|| None::<usize>);
+    // Full-screen preview for an image attached to a sent message.
+    let mut chat_img = use_signal(|| None::<String>);
     // User override for the thinking-box open state (None = follow streaming).
     let mut think_open = use_signal(|| None::<bool>);
     // Per activity-group open state (keyed by first row index). Defaults to the
@@ -1903,15 +1911,25 @@ fn app() -> Element {
     });
 
     // Poll Claude subscription usage (CLI/API providers don't stream it).
+    // Fetches immediately when the provider becomes claude/anthropic (no 120s
+    // wait after a switch), then refreshes every 120s while it stays claude.
     use_future(move || async move {
+        let mut last: Option<std::time::Instant> = None;
+        let mut last_prov = String::new();
         loop {
             let prov = cfg.peek().provider.clone();
-            if matches!(prov.as_str(), "claude" | "anthropic") {
+            let is_claude = matches!(prov.as_str(), "claude" | "anthropic");
+            let switched = prov != last_prov;
+            last_prov = prov;
+            if is_claude
+                && (switched || last.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(120)))
+            {
                 if let Some((plan, r5, rw)) = fetch_claude_usage().await {
                     usage_info.set(Some((plan, r5, rw, String::new(), String::new())));
                 }
+                last = Some(std::time::Instant::now());
             }
-            tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(8)).await;
         }
     });
 
@@ -2072,6 +2090,13 @@ fn app() -> Element {
                             // Effort must fit the (possibly new) provider's range.
                             let mut conf = conf;
                             conf.reasoning_effort = clamp_effort(&conf.provider, &conf.reasoning_effort);
+                            // Provider the active tab had BEFORE this reconfigure — used to
+                            // drop stale usage when the quota source changes (e.g. ChatGPT→Claude).
+                            let prev_provider = tabs
+                                .peek()
+                                .get(*active_tab.peek())
+                                .map(|t| t.provider.clone())
+                                .unwrap_or_default();
                             // Persist the new config (provider/model/effort/fast/…) so it survives restart.
                             let ws = workspace_of(&conf);
                             if let Ok(s) = toml::to_string(&conf) {
@@ -2113,6 +2138,20 @@ fn app() -> Element {
                                     } else if t.mode == "gui" {
                                         t.model = conf.model.clone();
                                     }
+                                }
+                            }
+                            // Usage card belongs to one provider's quota. When the source
+                            // family changes, drop the old value so the card never shows the
+                            // previous provider's numbers (the claude poll / chatgpt RateLimit
+                            // event repopulates it for the new provider).
+                            {
+                                let fam = |p: &str| match p {
+                                    "chatgpt" | "codex" | "openai" => 1u8,
+                                    "claude" | "anthropic" => 2,
+                                    _ => 0,
+                                };
+                                if fam(&prev_provider) != fam(&conf.provider) {
+                                    usage_info.set(None);
                                 }
                             }
                             approvals.write().clear();
@@ -4241,6 +4280,10 @@ fn app() -> Element {
                                                                 }
                                                             }
                                                             Author::User => {
+                                                                // Display text may carry pasted images after \u{2} separators.
+                                                                let imgs: Vec<String> = m.text.split('\u{2}').skip(1)
+                                                                    .filter(|s| s.starts_with("data:image"))
+                                                                    .map(str::to_string).collect();
                                                                 let segs = user_segments(&m.text);
                                                                 let copy = serde_json::to_string(&strip_scaffold(&m.text)).unwrap_or_default();
                                                                 let edit_text = strip_scaffold(&m.text);
@@ -4248,6 +4291,14 @@ fn app() -> Element {
                                                                 let _ = last_user_idx; let row_cls = "row user sticky-turn";
                                                                 rsx! {
                                                                     div { class: "{row_cls}",
+                                                                        if !imgs.is_empty() {
+                                                                            div { class: "msg-imgs",
+                                                                                for src in imgs {
+                                                                                    img { class: "msg-img", src: "{src}",
+                                                                                        onclick: { let s = src.clone(); move |_| chat_img.set(Some(s.clone())) } }
+                                                                                }
+                                                                            }
+                                                                        }
                                                                         div { class: "bubble",
                                                                             for (is_m, s) in segs {
                                                                                 if is_m { span { class: "inline-chip", "{s}" } } else { "{s}" }
@@ -4303,7 +4354,7 @@ fn app() -> Element {
                                                             _ => {
                                                                 let is_live = *streaming.read() && m.author == Author::Agent && i + 1 == messages.read().len();
                                                                 let pin_snip: String = m.text.lines().find(|l| !l.trim().is_empty()).unwrap_or("").chars().take(64).collect();
-                                                                let is_agent = m.author == Author::Agent;
+                                                                let is_agent = m.author == Author::Agent && !m.text.is_empty();
                                                                 let ws_pin = workspace.clone();
                                                                 let ws_mark = workspace.clone();
                                                                 let snip2 = pin_snip.clone();
@@ -4566,6 +4617,13 @@ fn app() -> Element {
                         span { class: "toast-dot" }
                         span { "{text}" }
                     }
+                }
+            }
+            // Lightbox for images attached to sent messages.
+            if let Some(src) = chat_img.read().clone() {
+                div { class: "img-lightbox", onclick: move |_| chat_img.set(None),
+                    button { class: "img-lightbox-x", onclick: move |_| chat_img.set(None), "✕" }
+                    img { class: "img-lightbox-img", src: "{src}", onclick: move |e| e.stop_propagation() }
                 }
             }
             if *show_shortcuts.read() {
@@ -6463,16 +6521,18 @@ fn Message(author: Author, text: String, #[props(default)] live: bool) -> Elemen
             }
         }
         Author::Agent => {
+            // An empty agent bubble (placeholder before the first token, or a
+            // stray one left after a turn) renders nothing — no lone avatar row.
+            // Progress is shown by the status pill instead.
+            if text.is_empty() {
+                return rsx! {};
+            }
             let copy = serde_json::to_string(&text).unwrap_or_default();
             rsx! {
                 div { class: "row agent",
                     img { class: "avatar", src: logo_uri() }
-                    if text.is_empty() {
-                        // No placeholder bar — the status pill already shows progress.
-                    } else {
-                        div { class: "agent-text agent-md", dangerous_inner_html: md_to_html(&text, live) }
-                        button { class: "msg-copy", title: "Copy message", onclick: move |_| { let c = copy.clone(); spawn(async move { let _ = document::eval(&format!("navigator.clipboard.writeText({c})")).await; }); }, "⧉" }
-                    }
+                    div { class: "agent-text agent-md", dangerous_inner_html: md_to_html(&text, live) }
+                    button { class: "msg-copy", title: "Copy message", onclick: move |_| { let c = copy.clone(); spawn(async move { let _ = document::eval(&format!("navigator.clipboard.writeText({c})")).await; }); }, "⧉" }
                 }
             }
         },

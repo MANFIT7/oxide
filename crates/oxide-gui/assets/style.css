@@ -2222,3 +2222,12 @@ details[open]::details-content { block-size: auto; }
 /* uniform: live tab rows align like sessions (logo + title + spacing) */
 .thread.recent.sub { height: 30px; display: flex; align-items: center; gap: 7px; font-size: 13px; }
 .project-group { display: flex; flex-direction: column; }
+
+/* Images attached to a sent message — thumbnails above the bubble. */
+.msg-imgs { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 6px; }
+.msg-img {
+  max-width: 180px; max-height: 130px; border-radius: 8px;
+  border: 1px solid var(--border); object-fit: cover; cursor: zoom-in;
+  transition: filter .12s ease;
+}
+.msg-img:hover { filter: brightness(1.08); }
