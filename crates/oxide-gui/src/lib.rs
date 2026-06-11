@@ -4119,7 +4119,7 @@ fn app() -> Element {
                                                                                             markers.write().push((i, text, color, false));
                                                                                             thread_json_save(&ws3, "markers", &thread_stem(&tabs, &active_tab), &*markers.read());
                                                                                         });
-                                                                                    }, "🖍" }
+                                                                                    }, span { class: "mark-swatch c0" } }
                                                                             }
                                                                         }
                                                                     }

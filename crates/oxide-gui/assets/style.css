@@ -2068,7 +2068,9 @@ details[open]::details-content { block-size: auto; }
 /* pinned messages + markers */
 .pinwrap { position: relative; }
 .pinwrap.flash > * { outline: 2px solid color-mix(in srgb, var(--syn-accent) 60%, transparent); outline-offset: 4px; border-radius: 8px; transition: outline-color .3s ease; }
-.msg-side { position: absolute; top: 4px; right: -4px; display: flex; gap: 2px; opacity: 0; transition: opacity .12s ease; }
+.msg-side { position: absolute; top: -12px; right: 8px; display: flex; gap: 2px; align-items: center;
+  background: var(--surface-hi, var(--surface)); border: 1px solid var(--border); border-radius: 8px;
+  padding: 2px 4px; box-shadow: 0 4px 14px rgba(0,0,0,.18); opacity: 0; transition: opacity .12s ease; z-index: 3; }
 .pinwrap:hover .msg-side { opacity: 1; }
 .msg-pin { background: none; border: none; color: var(--faint); cursor: pointer; font-size: 11px; padding: 3px; border-radius: 6px; }
 .msg-pin:hover { color: var(--syn-accent); background: color-mix(in srgb, var(--text) 6%, transparent); }
