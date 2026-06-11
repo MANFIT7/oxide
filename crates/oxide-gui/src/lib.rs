@@ -401,9 +401,11 @@ enum EngineCmd {
     /// is the clean bubble text.
     Submit { engine: String, display: String },
     Reconfigure(Config),
-    /// Switch to another agent tab: reconfigure the engine to `0` and restore
-    /// that tab's transcript `1` (without the message-clearing Reconfigure does).
-    SwitchTab(Config, Vec<ChatMsg>),
+    /// Activate tab `id`: swap the VIEW to its transcript/config. Engines are
+    /// per-tab — the tab being left keeps its turn running in the background.
+    SwitchTab { id: u64, conf: Config, msgs: Vec<ChatMsg> },
+    /// Stop and drop tab `id`'s engine (tab closed, or its session replaced).
+    CloseTab(u64),
     Approve { id: u64, decision: ApprovalDecision },
     Answer { id: u64, text: String },
     Rewind { id: u64 },
@@ -583,6 +585,24 @@ return true;
 /// Strip the prompt scaffolding the composer injects (context files, MCP/skill
 /// blocks, plan/pursue tags, git context, picked-element, image notes) so a
 /// persisted/resumed user message renders as just the human text + chips.
+/// Human token count: 272_000 → "272k", 1_000_000 → "1M".
+fn fmt_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        if n % 1_000_000 == 0 { format!("{}M", n / 1_000_000) } else { format!("{:.1}M", n as f64 / 1_000_000.0) }
+    } else {
+        format!("{}k", n / 1000)
+    }
+}
+
+/// Which subscription quota a provider draws from ("gpt", "claude", or "").
+fn provider_family(p: &str) -> &'static str {
+    match p {
+        "chatgpt" | "codex" | "openai" => "gpt",
+        "claude" | "anthropic" => "claude",
+        _ => "",
+    }
+}
+
 fn strip_scaffold(text: &str) -> String {
     const DROP_PREFIX: &[&str] = &[
         "Context files:", "Use these MCP servers", "- `", "## Skill:",
@@ -1294,6 +1314,7 @@ fn open_session_tab(
     }
     // Open in the CURRENT tab (synara-style) — a sidebar click navigates, it
     // doesn't multiply tabs. New tabs come from the + button.
+    let tab_id = tabs.read().get(cur).map(|t| t.id).unwrap_or(0);
     if let Some(t) = tabs.write().get_mut(cur) {
         t.title = title;
         t.messages = loaded.clone();
@@ -1301,7 +1322,10 @@ fn open_session_tab(
     }
     c.resume_path = Some(path);
     cfg.set(c.clone());
-    let _ = engine.send(EngineCmd::SwitchTab(c, loaded));
+    // The tab's CONTENT changed (different session) — its old engine, if any,
+    // holds the old history. Drop it; a fresh one resumes this session lazily.
+    let _ = engine.send(EngineCmd::CloseTab(tab_id));
+    let _ = engine.send(EngineCmd::SwitchTab { id: tab_id, conf: c, msgs: loaded });
     scroll_chat_bottom();
 }
 
@@ -1570,7 +1594,9 @@ fn app() -> Element {
     let win = dioxus::desktop::use_window();
     let mut mcp_status = use_signal(std::collections::HashMap::<String, String>::new);
     // ChatGPT subscription usage: (plan, 5h %, weekly %, 5h reset s, weekly reset s).
-    let mut usage_info = use_signal(|| None::<(String, u8, u8, String, String)>);
+    // (family "gpt"/"claude", plan, 5h-remaining %, weekly-remaining %, 5h reset, weekly reset).
+    // Family-tagged so the card never shows one provider's quota while another is active.
+    let mut usage_info = use_signal(|| None::<(String, String, u8, u8, String, String)>);
     // Tiling split-view (each pane its own live engine).
     let mut show_split = use_signal(|| false);
     // Right-hand Changes panel (Cursor-style): repo-wide diff + commit/PR.
@@ -1651,6 +1677,9 @@ fn app() -> Element {
     // Background tasks the CLI agent started ("running in background") — their
     // result won't stream back, so we surface what they are as persistent chips.
     let mut bg_jobs = use_signal(Vec::<String>::new);
+    // Tab ids whose engine is mid-turn. Engines are per-tab: leaving a tab no
+    // longer kills its turn — this drives the sidebar spinners + view state.
+    let mut busy_tabs = use_signal(HashSet::<u64>::new);
     let mut questions = use_signal(Vec::<(u64, String, Vec<String>)>::new);
     let mut q_answer = use_signal(String::new);
     let mut reverted = use_signal(HashSet::<u64>::new);
@@ -1663,6 +1692,9 @@ fn app() -> Element {
     let mut confirm_restore = use_signal(|| None::<usize>);
     // Full-screen preview for an image attached to a sent message.
     let mut chat_img = use_signal(|| None::<String>);
+    // Long user prompts render clamped (the sticky header would otherwise eat
+    // half the viewport); indices here are user-expanded.
+    let mut expanded_user = use_signal(HashSet::<usize>::new);
     // User override for the thinking-box open state (None = follow streaming).
     let mut think_open = use_signal(|| None::<bool>);
     // Per activity-group open state (keyed by first row index). Defaults to the
@@ -1739,7 +1771,7 @@ fn app() -> Element {
                 Ok(k) if k == "palette" => { let v = !*show_palette.read(); show_palette.set(v); palette_query.set(String::new()); palette_sel.set(0); }
                 Ok(k) if k == "files" => { if *show_env.read() && env_tab.read().as_str() == "files" { show_env.set(false); } else { env_tab.set("files".to_string()); show_env.set(true); } }
                 Ok(k) if k == "shortcuts" => { let v = !*show_shortcuts.read(); show_shortcuts.set(v); }
-                Ok(k) if k == "esc" => { show_palette.set(false); show_shortcuts.set(false); }
+                Ok(k) if k == "esc" => { show_palette.set(false); show_shortcuts.set(false); chat_img.set(None); }
                 Ok(_) => {}
                 Err(_) => break,
             }
@@ -1928,7 +1960,7 @@ fn app() -> Element {
                 && (switched || last.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(120)))
             {
                 if let Some((plan, r5, rw)) = fetch_claude_usage().await {
-                    usage_info.set(Some((plan, r5, rw, String::new(), String::new())));
+                    usage_info.set(Some(("claude".into(), plan, r5, rw, String::new(), String::new())));
                 }
                 last = Some(std::time::Instant::now());
             }
@@ -2032,28 +2064,40 @@ fn app() -> Element {
     let engine = use_coroutine(move |mut rx: UnboundedReceiver<EngineCmd>| {
         let initial = initial.clone();
         async move {
-            let (ev_tx, mut ev_rx) = tokio::sync::mpsc::channel::<Event>(256);
-            let mut handle: Option<EngineHandle> = None;
-            let mut forwarder: Option<tokio::task::JoinHandle<()>> = None;
+            // One engine PER TAB. Events are tagged (tab id, generation) so a
+            // single loop serves all engines without cross-tab bleed; a stale
+            // generation (engine replaced) is simply dropped.
+            let (ev_tx, mut ev_rx) = tokio::sync::mpsc::channel::<(u64, u64, Event)>(256);
+            let mut handles: std::collections::HashMap<u64, EngineHandle> = std::collections::HashMap::new();
+            let mut fwds: std::collections::HashMap<u64, tokio::task::JoinHandle<()>> = std::collections::HashMap::new();
+            let mut gens: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+            let mut gen_seq: u64 = 0;
+            // Approvals/questions that arrived while their tab was backgrounded —
+            // replayed into the view when the user returns to that tab.
+            let mut parked_appr: std::collections::HashMap<u64, Vec<(u64, String, String)>> = std::collections::HashMap::new();
+            let mut parked_q: std::collections::HashMap<u64, Vec<(u64, String, Vec<String>)>> = std::collections::HashMap::new();
 
-            // Spawn helper expanded inline (avoids closure borrow issues).
-            macro_rules! start_engine {
-                ($conf:expr) => {{
-                    // Stop the old agent first — otherwise its in-flight tool calls
-                    // keep mutating the workspace invisibly after the switch.
-                    if let Some(h) = &handle {
+            // (Re)spawn the engine for one tab. Replaces any previous engine of
+            // that tab (its turn is interrupted — same-tab reconfigure semantics).
+            macro_rules! spawn_tab_engine {
+                ($tid:expr, $conf:expr) => {{
+                    let tid: u64 = $tid;
+                    if let Some(h) = handles.remove(&tid) {
                         let _ = h.submit(Op::Interrupt).await;
                     }
-                    if let Some(f) = forwarder.take() {
+                    if let Some(f) = fwds.remove(&tid) {
                         f.abort();
                     }
+                    gen_seq += 1;
+                    let g = gen_seq;
+                    gens.insert(tid, g);
                     match oxide_core::spawn($conf) {
                         Ok((h, mut events)) => {
-                            handle = Some(h);
+                            handles.insert(tid, h);
                             let tx = ev_tx.clone();
-                            forwarder = Some(tokio::spawn(async move {
+                            fwds.insert(tid, tokio::spawn(async move {
                                 while let Some(e) = events.recv().await {
-                                    if tx.send(e).await.is_err() {
+                                    if tx.send((tid, g, e)).await.is_err() {
                                         break;
                                     }
                                 }
@@ -2061,16 +2105,29 @@ fn app() -> Element {
                         }
                         Err(e) => {
                             let _ = ev_tx
-                                .send(Event::Error {
+                                .send((tid, g, Event::Error {
                                     message: format!("engine: {e}"),
-                                })
+                                }))
                                 .await;
                         }
                     }
                 }};
             }
 
-            start_engine!(initial);
+            // The id of the tab currently shown — events from other tabs go to
+            // their buffered transcripts instead of the live view.
+            macro_rules! active_id {
+                () => {
+                    tabs.peek().get(*active_tab.peek()).map(|t| t.id)
+                };
+            }
+
+            let first_id = tabs.peek().first().map(|t| t.id).unwrap_or(0);
+            spawn_tab_engine!(first_id, initial);
+            // The tab the VIEW is bound to. Updated when the SwitchTab command is
+            // PROCESSED (not when the click lands) so events racing in between are
+            // routed to the right transcript, never the outgoing one.
+            let mut view_tab: u64 = first_id;
             let mut cur_ws = workspace_of(&{ cfg.peek().clone() });
 
             loop {
@@ -2078,10 +2135,19 @@ fn app() -> Element {
                     cmd = rx.next() => match cmd {
                         Some(EngineCmd::Submit { engine: eng, display }) => {
                             followups.write().clear();
-                            if let Some(h) = &handle {
+                            let aid = active_id!().unwrap_or(0);
+                            if !handles.contains_key(&aid) {
+                                // Lazy spawn: a fresh tab / reopened session gets its
+                                // engine on first send (resuming its own transcript).
+                                let mut conf = cfg.peek().clone();
+                                conf.resume_path = tabs.peek().iter().find(|t| t.id == aid).and_then(|t| t.session.clone());
+                                spawn_tab_engine!(aid, conf);
+                            }
+                            if let Some(h) = handles.get(&aid) {
                                 messages.write().push(ChatMsg { author: Author::User, text: display });
                                 messages.write().push(ChatMsg { author: Author::Agent, text: String::new() });
                                 streaming.set(true);
+                                busy_tabs.write().insert(aid);
                                 let _ = h.submit(Op::UserTurn { text: eng }).await;
                             } else {
                                 // Engine failed to start — don't eat the message silently.
@@ -2101,8 +2167,14 @@ fn app() -> Element {
                                 .map(|t| t.provider.clone())
                                 .unwrap_or_default();
                             // Persist the new config (provider/model/effort/fast/…) so it survives restart.
+                            // resume_path is a RUNTIME session pointer, not a setting — persisting
+                            // it makes a later launch (possibly in another folder) silently
+                            // continue an old session instead of starting clean.
                             let ws = workspace_of(&conf);
-                            if let Ok(s) = toml::to_string(&conf) {
+                            let mut persist = conf.clone();
+                            persist.resume_path = None;
+                            persist.resume = false;
+                            if let Ok(s) = toml::to_string(&persist) {
                                 let _ = std::fs::write(ws.join("oxide.toml"), &s);
                                 // Also persist globally so the packaged app remembers across launches.
                                 if let Some(home) = std::env::var_os("HOME") {
@@ -2124,6 +2196,15 @@ fn app() -> Element {
                             if same_ws {
                                 let cur = *active_tab.peek();
                                 conf.resume_path = tabs.peek().get(cur).and_then(|t| t.session.clone());
+                            } else {
+                                // New project = clean slate. A stale resume id from the
+                                // previous folder must never leak into this engine, or the
+                                // new chat continues (and appends to) another folder's session.
+                                conf.resume_path = None;
+                                conf.resume = false;
+                                if let Some(t) = tabs.write().get_mut(*active_tab.peek()) {
+                                    t.session = None;
+                                }
                             }
                             // Keep the active tab's provider/logo/title in sync with
                             // the picker — switching ChatGPT→Claude must restyle the tab.
@@ -2147,27 +2228,32 @@ fn app() -> Element {
                             // family changes, drop the old value so the card never shows the
                             // previous provider's numbers (the claude poll / chatgpt RateLimit
                             // event repopulates it for the new provider).
-                            {
-                                let fam = |p: &str| match p {
-                                    "chatgpt" | "codex" | "openai" => 1u8,
-                                    "claude" | "anthropic" => 2,
-                                    _ => 0,
-                                };
-                                if fam(&prev_provider) != fam(&conf.provider) {
-                                    usage_info.set(None);
-                                }
+                            if provider_family(&prev_provider) != provider_family(&conf.provider) {
+                                usage_info.set(None);
                             }
                             approvals.write().clear();
                             checkpoints.write().clear();
                             timeline.write().clear();
                             streaming.set(false);
-                            start_engine!(conf);
-                            while ev_rx.try_recv().is_ok() {}
+                            let aid = active_id!().unwrap_or(0);
+                            busy_tabs.write().remove(&aid);
+                            // Stale events from the replaced engine are dropped by the
+                            // generation guard — no channel drain needed.
+                            spawn_tab_engine!(aid, conf);
                             messages.set(kept);
                         }
-                        Some(EngineCmd::SwitchTab(conf, tab_msgs)) => {
-                            // Keep the project tracker in sync — opening a session
-                            // from another folder switches workspace through here.
+                        Some(EngineCmd::SwitchTab { id, conf, msgs }) => {
+                            // VIEW switch only — the tab being left keeps its engine
+                            // (and any in-flight turn) running in the background.
+                            // Save the outgoing view first — deltas may have landed after
+                            // the caller's click-time snapshot.
+                            if view_tab != id {
+                                let snap = messages.peek().clone();
+                                if let Some(t) = tabs.write().iter_mut().find(|t| t.id == view_tab) {
+                                    t.messages = snap;
+                                }
+                            }
+                            view_tab = id;
                             cur_ws = workspace_of(&conf);
                             approvals.write().clear();
                             checkpoints.write().clear();
@@ -2176,45 +2262,177 @@ fn app() -> Element {
                             questions.write().clear();
                             followups.write().clear();
                             thinking.set(String::new());
-                            streaming.set(false);
-                            start_engine!(conf);
-                            // Drain events buffered from the OLD engine so they don't
-                            // bleed into the new tab's transcript.
-                            while ev_rx.try_recv().is_ok() {}
-                            *messages.write() = tab_msgs; // restore this tab's transcript
+                            bg_jobs.write().clear();
+                            // Prefer the tab's CURRENT buffer — background events may have
+                            // landed after the caller cloned `msgs`.
+                            let cur_msgs = tabs.peek().iter().find(|t| t.id == id).map(|t| t.messages.clone()).unwrap_or(msgs);
+                            *messages.write() = cur_msgs; // this tab's transcript
+                            let busy = busy_tabs.peek().contains(&id);
+                            streaming.set(busy);
+                            status.set(if busy { "Working…".to_string() } else { String::new() });
+                            turn_start.set(None);
+                            elapsed_s.set(0);
+                            // Replay approvals/questions that arrived while backgrounded.
+                            if let Some(v) = parked_appr.remove(&id) {
+                                approvals.write().extend(v);
+                            }
+                            if let Some(v) = parked_q.remove(&id) {
+                                questions.write().extend(v);
+                            }
+                        }
+                        Some(EngineCmd::CloseTab(id)) => {
+                            if let Some(h) = handles.remove(&id) {
+                                let _ = h.submit(Op::Interrupt).await;
+                            }
+                            if let Some(f) = fwds.remove(&id) {
+                                f.abort();
+                            }
+                            gens.remove(&id);
+                            parked_appr.remove(&id);
+                            parked_q.remove(&id);
+                            busy_tabs.write().remove(&id);
                         }
                         Some(EngineCmd::Answer { id, text }) => {
-                            if let Some(h) = &handle {
+                            if let Some(h) = active_id!().and_then(|t| handles.get(&t)) {
                                 let _ = h.submit(Op::QuestionAnswer { request_id: id, answer: text.clone() }).await;
                             }
                             questions.write().retain(|(qid, _, _)| *qid != id);
                             messages.write().push(ChatMsg { author: Author::User, text });
                         }
                         Some(EngineCmd::Approve { id, decision }) => {
-                            if let Some(h) = &handle {
+                            if let Some(h) = active_id!().and_then(|t| handles.get(&t)) {
                                 let _ = h.submit(Op::ApprovalResponse { request_id: id, decision }).await;
                             }
                             approvals.write().retain(|(aid, _, _)| *aid != id);
                         }
                         Some(EngineCmd::Rewind { id }) => {
-                            if let Some(h) = &handle {
+                            if let Some(h) = active_id!().and_then(|t| handles.get(&t)) {
                                 let _ = h.submit(Op::Rewind { checkpoint_id: id }).await;
                             }
                         }
                         Some(EngineCmd::SetHistory(msgs)) => {
-                            if let Some(h) = &handle {
+                            if let Some(h) = active_id!().and_then(|t| handles.get(&t)) {
                                 let _ = h.submit(Op::SetHistory { msgs }).await;
                             }
                         }
                         Some(EngineCmd::Interrupt) => {
-                            if let Some(h) = &handle {
+                            let aid = active_id!();
+                            if let Some(h) = aid.and_then(|t| handles.get(&t)) {
                                 let _ = h.submit(Op::Interrupt).await;
+                            }
+                            if let Some(t) = aid {
+                                busy_tabs.write().remove(&t);
                             }
                             streaming.set(false);
                         }
                         None => break,
                     },
-                    Some(ev) = ev_rx.recv() => {
+                    Some((ev_tid, ev_gen, ev)) = ev_rx.recv() => {
+                        // Drop events from a replaced engine (stale generation).
+                        if gens.get(&ev_tid).copied() != Some(ev_gen) {
+                            continue;
+                        }
+                        // Per-tab busy bookkeeping (drives sidebar spinners).
+                        match &ev {
+                            Event::TurnStarted { .. } => { busy_tabs.write().insert(ev_tid); }
+                            Event::TurnFinished { .. } | Event::Error { .. } => { busy_tabs.write().remove(&ev_tid); }
+                            _ => {}
+                        }
+                        // Events from a BACKGROUND tab go to its buffered transcript;
+                        // only the view-bound tab writes to the live view below.
+                        if ev_tid != view_tab {
+                            match ev {
+                                Event::AgentMessageDelta { text, .. } => {
+                                    let mut tw = tabs.write();
+                                    if let Some(t) = tw.iter_mut().find(|t| t.id == ev_tid) {
+                                        match t.messages.last_mut() {
+                                            Some(l) if l.author == Author::Agent => l.text.push_str(&text),
+                                            _ => t.messages.push(ChatMsg { author: Author::Agent, text }),
+                                        }
+                                    }
+                                }
+                                Event::Info { text } => {
+                                    if text.starts_with("session") || text.starts_with("mcp ") || text.starts_with("mcp '") {
+                                        // noise
+                                    } else if let Some(label) = text.strip_prefix('⚙').or_else(|| text.strip_prefix('⏳')) {
+                                        let label = label.trim().to_string();
+                                        let (verb, detail) = label.split_once(' ').unwrap_or((label.as_str(), ""));
+                                        let row = format!("spark\t{verb}\t{detail}");
+                                        let mut tw = tabs.write();
+                                        if let Some(t) = tw.iter_mut().find(|t| t.id == ev_tid) {
+                                            if t.messages.last().map(|m| m.author == Author::Agent && m.text.is_empty()).unwrap_or(false) {
+                                                t.messages.pop();
+                                            }
+                                            t.messages.push(ChatMsg { author: Author::Activity { running: false, ok: true }, text: row });
+                                        }
+                                    } else if text.starts_with(['🧭','🔍','🤖','🧩','🔁','✓','⚠']) {
+                                        // live stage info — meaningless once backgrounded
+                                    } else {
+                                        let mut tw = tabs.write();
+                                        if let Some(t) = tw.iter_mut().find(|t| t.id == ev_tid) {
+                                            t.messages.push(ChatMsg { author: Author::Note, text });
+                                        }
+                                    }
+                                }
+                                Event::FileDiff { path, diff, checkpoint, .. } => {
+                                    let mut tw = tabs.write();
+                                    if let Some(t) = tw.iter_mut().find(|t| t.id == ev_tid) {
+                                        t.messages.push(ChatMsg { author: Author::Diff(path, checkpoint), text: diff });
+                                    }
+                                }
+                                Event::SessionPath { path } => {
+                                    let pb = std::path::PathBuf::from(&path);
+                                    let mut tw = tabs.write();
+                                    if let Some(t) = tw.iter_mut().find(|t| t.id == ev_tid) {
+                                        t.session = Some(pb);
+                                    }
+                                }
+                                Event::ApprovalRequested { request_id, tool, summary } => {
+                                    parked_appr.entry(ev_tid).or_default().push((request_id, tool.clone(), summary));
+                                    let mut tw = tabs.write();
+                                    if let Some(t) = tw.iter_mut().find(|t| t.id == ev_tid) {
+                                        t.messages.push(ChatMsg { author: Author::Note, text: format!("⏸ waiting for approval ({tool}) — open this tab to respond") });
+                                    }
+                                }
+                                Event::QuestionAsked { request_id, question, options } => {
+                                    parked_q.entry(ev_tid).or_default().push((request_id, question.clone(), options));
+                                    let mut tw = tabs.write();
+                                    if let Some(t) = tw.iter_mut().find(|t| t.id == ev_tid) {
+                                        t.messages.push(ChatMsg { author: Author::Note, text: format!("❓ {question} — open this tab to answer") });
+                                    }
+                                }
+                                Event::TurnFinished { .. } => {
+                                    let mut title = String::new();
+                                    {
+                                        let mut tw = tabs.write();
+                                        if let Some(t) = tw.iter_mut().find(|t| t.id == ev_tid) {
+                                            title = t.title.clone();
+                                            if t.messages.last().map(|m| m.author == Author::Agent && m.text.is_empty()).unwrap_or(false) {
+                                                t.messages.pop();
+                                            }
+                                            for c in t.messages.iter_mut() {
+                                                if let Author::Activity { running, .. } = &mut c.author { *running = false; }
+                                            }
+                                            t.messages.push(ChatMsg { author: Author::Note, text: "✓ Done".into() });
+                                        }
+                                    }
+                                    if !title.is_empty() {
+                                        push_toast(toasts, toast_seq, "ok", &format!("{title} — finished"));
+                                    }
+                                }
+                                Event::Error { message } => {
+                                    if !message.starts_with("mcp '") {
+                                        let mut tw = tabs.write();
+                                        if let Some(t) = tw.iter_mut().find(|t| t.id == ev_tid) {
+                                            t.messages.push(ChatMsg { author: Author::Note, text: format!("error: {message}") });
+                                        }
+                                        push_toast(toasts, toast_seq, "err", &message.chars().take(120).collect::<String>());
+                                    }
+                                }
+                                _ => {}
+                            }
+                            continue;
+                        }
                         match ev {
                             Event::AgentMessageDelta { text, .. } => {
                                 if status.peek().as_str() != "Writing…" {
@@ -2412,7 +2630,7 @@ fn app() -> Element {
                                     let lv: serde_json::Value = serde_json::from_str(&labels).unwrap_or(serde_json::Value::Null);
                                     let pl = lv["p"].as_str().unwrap_or("").to_string();
                                     let sl = lv["s"].as_str().unwrap_or("").to_string();
-                                    usage_info.set(Some((plan, p_rem, s_rem, pl, sl)));
+                                    usage_info.set(Some(("gpt".into(), plan, p_rem, s_rem, pl, sl)));
                                 });
                             }
                             Event::CheckpointCreated { id, label, .. } => {
@@ -2520,11 +2738,12 @@ fn app() -> Element {
                                 // Submit the next queued message as a fresh turn.
                                 let next = { let mut q = queue.write(); if q.is_empty() { None } else { Some(q.remove(0)) } };
                                 if let Some(text) = next {
-                                    if let Some(h) = &handle {
+                                    if let Some(h) = handles.get(&ev_tid) {
                                         followups.write().clear();
                                         messages.write().push(ChatMsg { author: Author::User, text: text.clone() });
                                         messages.write().push(ChatMsg { author: Author::Agent, text: String::new() });
                                         streaming.set(true);
+                                        busy_tabs.write().insert(ev_tid);
                                         let _ = h.submit(Op::UserTurn { text }).await;
                                     }
                                 }
@@ -2634,7 +2853,7 @@ fn app() -> Element {
         });
     // Effort is shown by its own pill — keep the model label clean.
     let model_label = match *context_limit.read() {
-        Some(limit) => format!("{model_name} · {}k", limit / 1000),
+        Some(limit) => format!("{model_name} · {}", fmt_tokens(limit)),
         None => model_name.clone(),
     };
     let ctx_used = usage.read().0;
@@ -2907,7 +3126,7 @@ fn app() -> Element {
                                         }
                                         Icon { name: "folder" }
                                         span { class: "project-name", "{pname}" }
-                                        if is_current && *streaming.read() { span { class: "syn-spinner", style: "margin-left:6px" } }
+                                        if is_current && (*streaming.read() || !busy_tabs.read().is_empty()) { span { class: "syn-spinner", style: "margin-left:6px" } }
                                         button { class: "project-del", title: "Remove this project's chats from the list",
                                             onclick: {
                                                 let pdel = pws.clone();
@@ -2943,7 +3162,8 @@ fn app() -> Element {
                                                 let id = t.id;
                                                 let ttl = if t.title.is_empty() { "New chat".to_string() } else { t.title.clone() };
                                                 let is_active = i == *active_tab.read();
-                                                let busy = is_active && *streaming.read();
+                                                // Per-tab: a backgrounded tab keeps its spinner while its turn runs.
+                                                let busy = busy_tabs.read().contains(&id) || (is_active && *streaming.read());
                                                 let prov = t.provider.clone();
                                                 let logo = provider_logo(&prov);
                                                 let editing = *renaming_tab.read() == Some(id);
@@ -3045,20 +3265,30 @@ fn app() -> Element {
                         }
                     }
                 }
-                if let Some((plan, p, s, p_reset, s_reset)) = usage_info.read().clone() {
-                    div { class: "usage-chip", title: "ChatGPT subscription — shared with Codex",
-                        div { class: "usage-head", "Usage remaining" }
-                        div { class: "usage-row",
-                            span { class: "usage-k", "5h" }
-                            span { class: "usage-bar", span { class: "usage-fill", style: "width:{p}%" } }
-                            span { class: "usage-v", "{p}% · {p_reset}" }
+                if let Some((fam, plan, p, s, p_reset, s_reset)) = usage_info.read().clone() {
+                    // Only show the quota of the provider that's actually active.
+                    if fam == provider_family(&cfg.read().provider) {
+                        {
+                            let brand = if fam == "claude" { "Claude" } else { "ChatGPT" };
+                            let pv = if p_reset.is_empty() { format!("{p}%") } else { format!("{p}% · {p_reset}") };
+                            let sv = if s_reset.is_empty() { format!("{s}%") } else { format!("{s}% · {s_reset}") };
+                            rsx! {
+                                div { class: "usage-chip", title: "{brand} subscription quota",
+                                    div { class: "usage-head", "Usage remaining" }
+                                    div { class: "usage-row",
+                                        span { class: "usage-k", "5h" }
+                                        span { class: "usage-bar", span { class: "usage-fill", style: "width:{p}%" } }
+                                        span { class: "usage-v", "{pv}" }
+                                    }
+                                    div { class: "usage-row",
+                                        span { class: "usage-k", "wk" }
+                                        span { class: "usage-bar", span { class: "usage-fill", style: "width:{s}%" } }
+                                        span { class: "usage-v", "{sv}" }
+                                    }
+                                    div { class: "usage-plan", "{brand} {plan}" }
+                                }
+                            }
                         }
-                        div { class: "usage-row",
-                            span { class: "usage-k", "wk" }
-                            span { class: "usage-bar", span { class: "usage-fill", style: "width:{s}%" } }
-                            span { class: "usage-v", "{s}% · {s_reset}" }
-                        }
-                        div { class: "usage-plan", "ChatGPT {plan}" }
                     }
                 }
                 button { class: "settings-btn", onclick: move |_| show_settings.set(true),
@@ -3360,10 +3590,12 @@ fn app() -> Element {
                                             }
                                         }
                                     }
-                                    if let Some((plan, pct5, pctw, _, _)) = usage_info.read().clone() {
-                                        div { class: "env-card-row static usage", title: "Plan: {plan} — sisa kuota 5 jam / mingguan",
-                                            Icon { name: "spark" } span { "Usage" }
-                                            span { class: "env-card-badge nowrap", "5h {pct5}% · wk {pctw}%" }
+                                    if let Some((fam, plan, pct5, pctw, _, _)) = usage_info.read().clone() {
+                                        if fam == provider_family(&cfg.read().provider) {
+                                            div { class: "env-card-row static usage", title: "Plan: {plan} — sisa kuota 5 jam / mingguan",
+                                                Icon { name: "spark" } span { "Usage" }
+                                                span { class: "env-card-badge nowrap", "5h {pct5}% · wk {pctw}%" }
+                                            }
                                         }
                                     }
                                     button { class: "env-card-row", onclick: move |_| {
@@ -4001,7 +4233,7 @@ fn app() -> Element {
                                                 }
                                                 if limit > 0 {
                                                     div { class: "usage-bar-wrap",
-                                                        div { class: "usage-bar-label", "context · {tin/1000}k / {limit/1000}k" }
+                                                        div { class: "usage-bar-label", "context · {fmt_tokens(tin)} / {fmt_tokens(limit)}" }
                                                         div { class: "usage-bar", div { class: "usage-bar-fill", style: "width: {pct}%" } }
                                                     }
                                                 }
@@ -4318,19 +4550,32 @@ fn app() -> Element {
                                                                 let edit_text = strip_scaffold(&m.text);
                                                                 let idx = i;
                                                                 let _ = last_user_idx; let row_cls = "row user sticky-turn";
+                                                                // Clamp long prompts (esp. while sticky) — expandable.
+                                                                let long = edit_text.chars().count() > 280 || edit_text.lines().count() > 4;
+                                                                let expanded = expanded_user.read().contains(&idx);
+                                                                let bubble_cls = if long && !expanded { "bubble clamped" } else { "bubble" };
                                                                 rsx! {
                                                                     div { class: "{row_cls}",
-                                                                        if !imgs.is_empty() {
-                                                                            div { class: "msg-imgs",
-                                                                                for src in imgs {
-                                                                                    img { class: "msg-img", src: "{src}",
-                                                                                        onclick: { let s = src.clone(); move |_| chat_img.set(Some(s.clone())) } }
+                                                                        div { class: "{bubble_cls}",
+                                                                            if !imgs.is_empty() {
+                                                                                div { class: "msg-imgs",
+                                                                                    for src in imgs {
+                                                                                        img { class: "msg-img", src: "{src}",
+                                                                                            onclick: { let s = src.clone(); move |_| chat_img.set(Some(s.clone())) } }
+                                                                                    }
                                                                                 }
                                                                             }
-                                                                        }
-                                                                        div { class: "bubble",
                                                                             for (is_m, s) in segs {
                                                                                 if is_m { span { class: "inline-chip", "{s}" } } else { "{s}" }
+                                                                            }
+                                                                        }
+                                                                        if long {
+                                                                            button { class: "bubble-more",
+                                                                                onclick: move |_| {
+                                                                                    let mut e = expanded_user.write();
+                                                                                    if !e.insert(idx) { e.remove(&idx); }
+                                                                                },
+                                                                                if expanded { "show less" } else { "show more" }
                                                                             }
                                                                         }
                                                                         div { class: "msg-actions",
@@ -4444,7 +4689,18 @@ fn app() -> Element {
                                         span { class: "status-spinner" }
                                         span { class: "status-shimmer", "{status}" }
                                         if *elapsed_s.read() >= 3 {
-                                            span { class: "status-elapsed", "· {elapsed_s}s" }
+                                            {
+                                                // Long turns read as "6m 10s" / "1h 5m", not "370s".
+                                                let el = *elapsed_s.read();
+                                                let txt = if el >= 3600 {
+                                                    format!("{}h {}m", el / 3600, (el % 3600) / 60)
+                                                } else if el >= 60 {
+                                                    format!("{}m {}s", el / 60, el % 60)
+                                                } else {
+                                                    format!("{el}s")
+                                                };
+                                                rsx! { span { class: "status-elapsed", "· {txt}" } }
+                                            }
                                         }
                                     }
                                 }
@@ -4979,7 +5235,7 @@ fn switch_tab(
     c.model = t.model.clone();
     c.resume_path = t.session.clone();
     cfg.set(c.clone());
-    let _ = engine.send(EngineCmd::SwitchTab(c, t.messages.clone()));
+    let _ = engine.send(EngineCmd::SwitchTab { id: t.id, conf: c, msgs: t.messages.clone() });
     scroll_chat_bottom();
 }
 
@@ -5016,8 +5272,11 @@ fn new_agent_tab(
     let mut c = cfg.read().clone();
     c.provider = provider.to_string();
     c.model = model.to_string();
+    // Fresh tab = fresh conversation — never inherit another tab's session.
+    c.resume_path = None;
+    c.resume = false;
     cfg.set(c.clone());
-    let _ = engine.send(EngineCmd::SwitchTab(c, Vec::new()));
+    let _ = engine.send(EngineCmd::SwitchTab { id, conf: c, msgs: Vec::new() });
 }
 
 /// Open an embedded-TUI tab running `bin` (codex/claude) in a PTY.
@@ -5070,6 +5329,9 @@ fn close_tab(
     if let Some(t) = tabs_w.write().get_mut(cur) {
         t.messages = messages.read().clone();
     }
+    // Stop the closed tab's own engine (engines are per-tab now).
+    let closed_id = tabs_w.read().get(idx).map(|t| t.id).unwrap_or(0);
+    let _ = engine.send(EngineCmd::CloseTab(closed_id));
     tabs_w.write().remove(idx);
     let len_after = tabs_w.read().len();
     if idx != cur {
@@ -5951,10 +6213,10 @@ fn Composer(
     let ring_num = format!("{}", ring_pct.round() as u64);
     let ring_title = if context_limit > 0 {
         format!(
-            "{}% context used · {}k / {}k tokens",
+            "{}% context used · {} / {} tokens",
             ring_pct.round() as u64,
-            context_used / 1000,
-            context_limit / 1000
+            fmt_tokens(context_used),
+            fmt_tokens(context_limit)
         )
     } else {
         "context usage — send a message to populate".to_string()
@@ -6065,7 +6327,12 @@ fn Composer(
                 }
             }
             if let Some(src) = preview_img.read().clone() {
-                div { class: "img-lightbox", onclick: move |_| preview_img.set(None),
+                div { class: "img-lightbox", tabindex: "0",
+                    onclick: move |_| preview_img.set(None),
+                    onkeydown: move |e: dioxus::prelude::KeyboardEvent| {
+                        if e.key() == dioxus::prelude::Key::Escape { preview_img.set(None); }
+                    },
+                    onmounted: move |el| { spawn(async move { let _ = el.set_focus(true).await; }); },
                     button { class: "img-lightbox-x", onclick: move |_| preview_img.set(None), "✕" }
                     img { class: "img-lightbox-img", src: "{src}", onclick: move |e| e.stop_propagation() }
                 }
