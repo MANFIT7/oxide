@@ -1306,18 +1306,57 @@ fn scroll_chat_bottom() {
 }
 
 /// Open a saved session transcript in a new tab (view).
+#[allow(clippy::too_many_arguments)]
 fn open_session_tab(
     mut tabs: Signal<Vec<AgentTab>>,
-    active_tab: Signal<usize>,
+    mut active_tab: Signal<usize>,
     messages: Signal<Vec<ChatMsg>>,
-    _next_id: Signal<u64>,
+    mut next_id: Signal<u64>,
     mut cfg: Signal<Config>,
     mut ui: Ui,
     engine: Coroutine<EngineCmd>,
+    busy_tabs: Signal<HashSet<u64>>,
     path: PathBuf,
     title: String,
 ) {
     let loaded = load_session(&path);
+    // If the current tab is mid-turn, NEVER replace it (that would kill its
+    // engine and abort the running task). Open the session in a NEW tab instead
+    // so folder A keeps working while you go look at folder B — synara-style.
+    {
+        let cur = *active_tab.peek();
+        let cur_busy = tabs.peek().get(cur).map(|t| busy_tabs.peek().contains(&t.id)).unwrap_or(false);
+        if cur_busy {
+            // Save the live transcript into the busy tab before leaving it.
+            if let Some(t) = tabs.write().get_mut(cur) { t.messages = messages.peek().clone(); }
+            let meta = oxide_core::db::meta(&sid(&path));
+            let prov = meta.as_ref().map(|m| m.provider.clone()).filter(|p| !p.is_empty())
+                .unwrap_or_else(|| cfg.peek().provider.clone());
+            let id = *next_id.peek(); next_id.set(id + 1);
+            tabs.write().push(AgentTab {
+                id, title: title.clone(), provider: prov.clone(), model: String::new(),
+                messages: loaded.clone(), mode: "gui".into(), bin: String::new(),
+                session: Some(path.clone()),
+            });
+            let idx = tabs.peek().len() - 1;
+            active_tab.set(idx);
+            let mut c = cfg.peek().clone();
+            c.provider = prov;
+            c.model = String::new();
+            if let Some(ws) = oxide_core::db::meta(&sid(&path)).map(|m| PathBuf::from(m.workspace)).filter(|w| !w.as_os_str().is_empty()) {
+                ui.workspace.set(ws.clone());
+                c.recent_workspaces.retain(|p| p != &ws);
+                c.recent_workspaces.insert(0, ws.clone());
+                c.recent_workspaces.truncate(8);
+                c.workspace = Some(ws);
+            }
+            c.resume_path = Some(path);
+            cfg.set(c.clone());
+            let _ = engine.send(EngineCmd::SwitchTab { id, conf: c, msgs: loaded });
+            scroll_chat_bottom();
+            return;
+        }
+    }
     let cur = *active_tab.read();
     // One metadata fetch for both the workspace and the provider (was two).
     let meta = oxide_core::db::meta(&sid(&path));
@@ -2667,14 +2706,21 @@ fn app() -> Element {
                             }
                             Event::FileDiff { path, diff, checkpoint, .. } => {
                                 let (adds, dels) = diff_counts(&diff);
-                                // Upsert: a provisional "editing…" row (added live when the
-                                // CLI touched the file) is replaced by the real diff.
+                                // Upsert: replace the provisional "editing…" row with the
+                                // real diff. The pending path may be ABSOLUTE (claude's tool
+                                // input) while this one is workspace-relative (git diff), so
+                                // match exact first, then any pending row by file name.
                                 {
+                                    let base = |p: &str| p.rsplit('/').next().unwrap_or(p).to_string();
+                                    let nb = base(&path);
+                                    let real = (path.clone(), adds, dels, checkpoint, diff.clone());
                                     let mut te = turn_edits.write();
                                     if let Some(e) = te.iter_mut().find(|e| e.0 == path) {
-                                        *e = (path.clone(), adds, dels, checkpoint, diff.clone());
+                                        *e = real;
+                                    } else if let Some(e) = te.iter_mut().find(|e| e.4.is_empty() && e.3 == 0 && base(&e.0) == nb) {
+                                        *e = real;
                                     } else {
-                                        te.push((path.clone(), adds, dels, checkpoint, diff.clone()));
+                                        te.push(real);
                                     }
                                 }
                                 messages.write().push(ChatMsg { author: Author::Diff(path, checkpoint), text: diff });
@@ -2730,6 +2776,10 @@ fn app() -> Element {
                             Event::TurnFinished { .. } => {
                                 streaming.set(false);
                                 status.set(String::new());
+                                // Drop any "editing…" rows that never got a real diff (e.g.
+                                // a read that was mislabeled, or a path that didn't match) so
+                                // no spinner lingers after the turn is done.
+                                turn_edits.write().retain(|e| !(e.4.is_empty() && e.3 == 0));
                                 {
                                     let mut mw = messages.write();
                                     if mw.last().map(|m| m.author == Author::Agent && m.text.is_empty()).unwrap_or(false) {
@@ -3167,7 +3217,7 @@ fn app() -> Element {
                                                         button { class: "row-act-btn pinned", title: "Unpin", onclick: move |e: dioxus::prelude::MouseEvent| { e.stop_propagation(); toggle_pin(cfg, &p_str); sessions_refresh.set(sessions_refresh() + 1); }, Icon { name: "pin" } }
                                                     }
                                                     div { class: "thread recent",
-                                                        onclick: move |_| { show_board.set(false); open_session_tab(tabs, active_tab, messages, next_tab_id, cfg, ui, engine, p_open.clone(), t_open.clone()); },
+                                                        onclick: move |_| { show_board.set(false); open_session_tab(tabs, active_tab, messages, next_tab_id, cfg, ui, engine, busy_tabs, p_open.clone(), t_open.clone()); },
                                                         span { class: "thread-title", title: "{title}", "{title}" }
                                                     }
                                                 }
@@ -3304,7 +3354,7 @@ fn app() -> Element {
                                                         button { class: "row-act-btn danger", title: "Delete", onclick: move |e: dioxus::prelude::MouseEvent| { e.stop_propagation(); delete_session(&p_del2); sessions_refresh.set(sessions_refresh() + 1); projects_list.set(build_projects(&ws_d2, &cfg.read().recent_workspaces)); }, "✕" }
                                                     }
                                                     div { class: "thread recent sub", title: "right-click / double-click for options",
-                                                        onclick: move |_| { show_board.set(false); open_session_tab(tabs, active_tab, messages, next_tab_id, cfg, ui, engine, p_open.clone(), t_open.clone()); },
+                                                        onclick: move |_| { show_board.set(false); open_session_tab(tabs, active_tab, messages, next_tab_id, cfg, ui, engine, busy_tabs, p_open.clone(), t_open.clone()); },
                                                         oncontextmenu: {
                                                             let p = p_dbl.clone();
                                                             move |e: dioxus::prelude::MouseEvent| { e.prevent_default(); e.stop_propagation(); show_theme_menu.set(false); session_menu.set(Some(p.clone())); }
@@ -5120,7 +5170,7 @@ fn app() -> Element {
                                                             let t2 = title.clone();
                                                             rsx! {
                                                                 button { class: "palette-item",
-                                                                    onclick: move |_| { show_palette.set(false); show_board.set(false); open_session_tab(tabs, active_tab, messages, next_tab_id, cfg, ui, engine, p2.clone(), t2.clone()); },
+                                                                    onclick: move |_| { show_palette.set(false); show_board.set(false); open_session_tab(tabs, active_tab, messages, next_tab_id, cfg, ui, engine, busy_tabs, p2.clone(), t2.clone()); },
                                                                     Icon { name: "file" } span { class: "palette-label", "{title}" }
                                                                 }
                                                             }
