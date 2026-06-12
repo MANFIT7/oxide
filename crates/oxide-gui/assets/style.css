@@ -29,11 +29,16 @@
   --syn-accent: #c2895f;               /* muted warm amber — not bright orange */
   --ok: #86ddb0; --ok-strong: #43c285; --del-soft: #e8a087;
   --ctx-text: #c4bbac; --hunk-text: var(--syn-accent); --pre-text: #d4cbbb;
+  --dur-instant: .08s;
   --dur-fast: .12s;
   --dur-med: .18s;
+  --dur-slow: .26s;
   --dur-rise: .3s;
+  --ease-standard: cubic-bezier(.2, 0, 0, 1);
   --ease-out: cubic-bezier(.22, 1, .36, 1);
-  --ease-spring: cubic-bezier(.34, 1.28, .64, 1);
+  --ease-spring: cubic-bezier(.34, 1.22, .64, 1);
+  --ease-enter: cubic-bezier(.16, 1, .3, 1);
+  --ease-exit: cubic-bezier(.7, 0, .84, 0);
 }
 /* window is transparent; only the sidebar reveals the macOS vibrancy. */
 .app { background: transparent; }
@@ -1522,7 +1527,6 @@ details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
 *::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--text) 12%, transparent); border: 2px solid transparent; background-clip: padding-box; border-radius: 999px; }
 /* message slide-in */
 @keyframes synara-msg-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
-.row { animation: synara-msg-in .22s cubic-bezier(.2,.8,.2,1); }
 /* subtle accent border while the agent works (no rainbow) */
 .composer.working { border-color: color-mix(in srgb, var(--syn-accent) 45%, var(--border)); }
 
@@ -1537,7 +1541,7 @@ details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
   -webkit-mask-composite: xor; mask-composite: exclude;
   animation: ultrathink-rainbow 10s linear infinite;
 }
-@media (prefers-reduced-motion: reduce) { .row, .composer.ultra::after { animation: none; } }
+@media (prefers-reduced-motion: reduce) { .composer.ultra::after { animation: none; } }
 
 /* ── Synara sidebar: dense rows, status spinner, hover actions ── */
 .thread { height: 28px; padding: 0 8px; gap: 8px; border-radius: 6px; display: flex; align-items: center; font-size: 13px; color: color-mix(in srgb, var(--text) 89%, transparent); }
@@ -2075,12 +2079,7 @@ details[open]::details-content { block-size: auto; }
 .scroll.smooth { scroll-behavior: smooth; }
 /* composer grows smoothly with multi-line input (progressive enhancement) */
 .composer, #ce-input { interpolate-size: allow-keywords; transition: block-size .15s ease; }
-/* transcript rows cascade in when a session opens */
-.row { animation: synara-msg-in .18s cubic-bezier(.22,1,.36,1) both; }
-.row:nth-child(2) { animation-delay: .02s; } .row:nth-child(3) { animation-delay: .04s; }
-.row:nth-child(4) { animation-delay: .06s; } .row:nth-child(5) { animation-delay: .08s; }
-.row:nth-child(6) { animation-delay: .10s; } .row:nth-child(7) { animation-delay: .12s; }
-.row:nth-child(8) { animation-delay: .14s; }
+/* Rows animate only through the canonical motion layer at the end of the file. */
 @media (prefers-reduced-motion: reduce) {
   .toast, .diff-card .dl, .row { animation: none; }
   .scroll.smooth { scroll-behavior: auto; }
@@ -2467,10 +2466,11 @@ details[open]::details-content { block-size: auto; }
   60%  { opacity: 1; }
   100% { opacity: 1; transform: translateY(0) translateZ(0); }
 }
-.row { animation: oxide-rise .34s var(--ease-spring) both; }
+.row { animation: none; }
+.col > .row:last-child { animation: oxide-rise .24s var(--ease-enter) both; }
 .question-card, .approval-card, .edits-card, .todo-card, .queue-bar,
 .thinking-box, .attach-card, .elem-chip, .bg-bar {
-  animation: oxide-rise var(--dur-rise) var(--ease-spring) both;
+  animation: oxide-rise var(--dur-rise) var(--ease-enter) both;
 }
 
 /* Markdown layout stability — stop reflow jank while content streams in. */
@@ -2498,7 +2498,119 @@ details[open]::details-content { block-size: auto; }
 .bg-chip-text, .thread-time { font-variant-numeric: tabular-nums; }
 
 @media (prefers-reduced-motion: reduce) {
-  .row, .agent-md pre, .col.streaming .row.agent:last-of-type .agent-md,
+  .row, .col > .row:last-child, .agent-md pre, .col.streaming .row.agent:last-of-type .agent-md,
   .question-card, .approval-card, .edits-card, .todo-card, .queue-bar,
   .thinking-box, .attach-card, .elem-chip, .bg-bar, .composer-live-changes { animation: none; }
+}
+
+/* ── Motion system pass: calm, transform-only, accessibility-first ─────── */
+@keyframes oxide-scale-in {
+  from { opacity: 0; transform: translateY(4px) scale(.985); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes oxide-item-in {
+  from { opacity: 0; transform: translateY(5px); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes oxide-panel-content {
+  from { opacity: 0; transform: translateX(4px); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes oxide-queue-in {
+  from { opacity: 0; transform: translateY(4px) scale(.96); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes oxide-toast-life {
+  0% { opacity: 0; transform: translateY(10px) scale(.97); }
+  5%, 88% { opacity: 1; transform: none; }
+  100% { opacity: 0; transform: translateY(6px) scale(.98); }
+}
+@keyframes oxide-status-pop {
+  from { opacity: 0; transform: scale(.86); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes oxide-restore-flash {
+  0% { background: color-mix(in srgb, var(--syn-accent) 20%, transparent); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--syn-accent) 38%, transparent); }
+  70% { background: color-mix(in srgb, var(--syn-accent) 10%, transparent); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--syn-accent) 20%, transparent); }
+  100% { background: transparent; box-shadow: inset 0 0 0 1px transparent; }
+}
+
+.palette {
+  transform-origin: top center;
+  animation: oxide-scale-in var(--dur-slow) var(--ease-enter) both;
+}
+.palette-list .palette-item {
+  animation: oxide-item-in var(--dur-med) var(--ease-enter) both;
+  transition: background var(--dur-fast) var(--ease-standard), color var(--dur-fast) var(--ease-standard), transform var(--dur-fast) var(--ease-standard);
+}
+.palette-list .palette-item:hover { transform: translateX(2px); }
+.palette-list .palette-item:nth-of-type(2) { animation-delay: .012s; }
+.palette-list .palette-item:nth-of-type(3) { animation-delay: .024s; }
+.palette-list .palette-item:nth-of-type(4) { animation-delay: .036s; }
+.palette-list .palette-item:nth-of-type(5) { animation-delay: .048s; }
+.palette-list .palette-item:nth-of-type(6) { animation-delay: .060s; }
+.palette-list .palette-item:nth-of-type(7) { animation-delay: .072s; }
+.palette-list .palette-item:nth-of-type(8) { animation-delay: .084s; }
+
+.env-panel { animation: panel-in var(--dur-med) var(--ease-enter); }
+.env-body > * { animation: oxide-panel-content var(--dur-med) var(--ease-enter) both; }
+.env-tab {
+  position: relative;
+  transition: background var(--dur-fast) var(--ease-standard), color var(--dur-fast) var(--ease-standard), transform var(--dur-fast) var(--ease-standard);
+}
+.env-tab:hover { transform: translateY(-1px); }
+.env-tab.on::after {
+  content: "";
+  position: absolute;
+  left: 10px;
+  right: 10px;
+  bottom: -6px;
+  height: 2px;
+  border-radius: 2px;
+  background: var(--syn-accent);
+  transform-origin: center;
+  animation: underline-in var(--dur-med) var(--ease-enter);
+}
+
+.agent-tab {
+  transition: background var(--dur-fast) var(--ease-standard), color var(--dur-fast) var(--ease-standard), transform var(--dur-fast) var(--ease-standard);
+}
+.agent-tab:hover { transform: translateY(-1px); }
+.agent-tab.active { transform: none; }
+.tab-state, .palette-status { animation: oxide-status-pop var(--dur-med) var(--ease-enter) both; }
+
+.queue-chip {
+  animation: oxide-queue-in var(--dur-med) var(--ease-enter) both;
+  transition: background var(--dur-fast) var(--ease-standard), border-color var(--dur-fast) var(--ease-standard), color var(--dur-fast) var(--ease-standard), transform var(--dur-fast) var(--ease-standard);
+}
+.queue-chip:hover {
+  transform: translateY(-1px);
+  border-color: color-mix(in srgb, var(--syn-accent) 26%, var(--border));
+}
+.queue-chip:active { transform: translateY(0) scale(.99); }
+.queue-clear { transition: background var(--dur-fast) var(--ease-standard), border-color var(--dur-fast) var(--ease-standard), color var(--dur-fast) var(--ease-standard); }
+
+.toast {
+  animation: oxide-toast-life 4s var(--ease-enter) both;
+  transform-origin: bottom right;
+}
+.toast.has-action { animation-duration: 8s; }
+.toast-action {
+  transition: background var(--dur-fast) var(--ease-standard), border-color var(--dur-fast) var(--ease-standard), transform var(--dur-fast) var(--ease-standard);
+}
+.toast-action:active { transform: scale(.97); }
+.thread-anchor.restored .thread {
+  animation: oxide-restore-flash 1.45s var(--ease-out) both;
+}
+.thread-anchor.restored .thread.sub::before,
+.thread-anchor.restored .thread.sub::after {
+  border-color: color-mix(in srgb, var(--syn-accent) 55%, transparent);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation: none !important;
+    transition: none !important;
+    scroll-behavior: auto !important;
+  }
 }

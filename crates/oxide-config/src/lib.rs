@@ -66,6 +66,9 @@ pub struct Config {
     /// Run the automation browser headless (background, no window).
     #[serde(default = "default_true")]
     pub browser_headless: bool,
+    /// Play a short notification sound when a turn finishes.
+    #[serde(default = "default_true")]
+    pub notification_sound: bool,
     /// UI theme: "dark", "light", or "system".
     #[serde(default = "default_theme")]
     pub theme: String,
@@ -178,6 +181,7 @@ impl Default for Config {
             github_repo: default_github_repo(),
             default_tab_mode: default_tab_mode(),
             browser_headless: true,
+            notification_sound: true,
             theme: default_theme(),
             accent_color: String::new(),
             density: default_density(),

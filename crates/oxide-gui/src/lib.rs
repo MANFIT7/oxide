@@ -24,6 +24,7 @@ const CSS: &str = include_str!("../assets/style.css");
 const MERMAID_JS: &[u8] = include_bytes!("../assets/vendor/mermaid.min.js");
 const NERD_FONT: &[u8] = include_bytes!("../assets/fonts/JetBrainsMonoNerdFontMono-Regular.ttf");
 const LOGO_BYTES: &[u8] = include_bytes!("../assets/logo.png");
+const DONE_SOUND: &[u8] = include_bytes!("../../../sound/mixkit-software-interface-back-2575.wav");
 
 fn logo_uri() -> &'static str {
     static URI: OnceLock<String> = OnceLock::new();
@@ -1480,6 +1481,46 @@ fn push_action_toast(
     });
 }
 
+fn play_notification_sound(cfg: Signal<Config>) {
+    if !cfg.peek().notification_sound {
+        return;
+    }
+    spawn(async move {
+        let js = r#"
+            try {
+              const url = '/notify-sound/done.wav';
+              const audio = window.__oxideDoneAudio || new Audio(url);
+              window.__oxideDoneAudio = audio;
+              audio.volume = 0.48;
+              audio.currentTime = 0;
+              const p = audio.play();
+              if (p && p.catch) p.catch(() => {});
+            } catch (_) {}
+            return true;
+        "#;
+        let _ = dioxus::document::eval(js).join::<bool>().await;
+    });
+}
+
+fn flash_restored_sessions(mut restored_sessions: Signal<HashSet<String>>, ids: Vec<String>) {
+    if ids.is_empty() {
+        return;
+    }
+    {
+        let mut set = restored_sessions.write();
+        for id in &ids {
+            set.insert(id.clone());
+        }
+    }
+    spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(1600)).await;
+        let mut set = restored_sessions.write();
+        for id in ids {
+            set.remove(&id);
+        }
+    });
+}
+
 fn tab_status_class(status: &TabStatus) -> &'static str {
     match status {
         TabStatus::Running => "running",
@@ -1995,6 +2036,7 @@ fn app() -> Element {
     let mut sessions_refresh = use_signal(|| 0u64);
     let mut confirm_delete_session = use_signal(|| None::<String>);
     let mut confirm_archive_workspace = use_signal(|| None::<String>);
+    let restored_sessions = use_signal(HashSet::<String>::new);
     // Tab currently animating closed.
     let mut closing_tab = use_signal(|| None::<u64>);
     // Suggested follow-up prompts shown above the composer after a turn.
@@ -2209,6 +2251,14 @@ fn app() -> Element {
             .unwrap();
         responder.respond(resp);
     });
+    dioxus::desktop::use_asset_handler("notify-sound", move |_req, responder| {
+        let resp = dioxus::desktop::wry::http::Response::builder()
+            .header("Content-Type", "audio/wav")
+            .header("Cache-Control", "public, max-age=31536000")
+            .body(std::borrow::Cow::from(DONE_SOUND.to_vec()))
+            .unwrap();
+        responder.respond(resp);
+    });
     dioxus::desktop::use_asset_handler("mermaidjs", move |_req, responder| {
         let body = MERMAID_JS.to_vec();
         let resp = dioxus::desktop::wry::http::Response::builder()
@@ -2217,6 +2267,43 @@ fn app() -> Element {
             .body(std::borrow::Cow::from(body))
             .unwrap();
         responder.respond(resp);
+    });
+
+    use_future(move || async move {
+        let js = r#"
+            if (!window.__oxideSoundBoot) {
+              window.__oxideSoundBoot = true;
+              const ensure = () => {
+                const audio = window.__oxideDoneAudio || new Audio('/notify-sound/done.wav');
+                window.__oxideDoneAudio = audio;
+                audio.preload = 'auto';
+                audio.volume = 0.48;
+                audio.load();
+                return audio;
+              };
+              ensure();
+              const unlock = () => {
+                try {
+                  const audio = ensure();
+                  audio.muted = true;
+                  const p = audio.play();
+                  if (p && p.then) {
+                    p.then(() => {
+                      audio.pause();
+                      audio.currentTime = 0;
+                      audio.muted = false;
+                    }).catch(() => { audio.muted = false; });
+                  } else {
+                    audio.muted = false;
+                  }
+                } catch (_) {}
+              };
+              document.addEventListener('pointerdown', unlock, { once: true, capture: true });
+              document.addEventListener('keydown', unlock, { once: true, capture: true });
+            }
+            return true;
+        "#;
+        let _ = dioxus::document::eval(js).join::<bool>().await;
     });
 
     // Load mermaid (v11, bundled) from the same-origin asset handler.
@@ -2897,6 +2984,7 @@ fn app() -> Element {
                                     if !title.is_empty() {
                                         push_toast(toasts, toast_seq, "ok", &format!("{title} — finished"));
                                     }
+                                    play_notification_sound(cfg);
                                 }
                                 Event::Error { message } => {
                                     if !message.starts_with("mcp '") {
@@ -3266,6 +3354,9 @@ fn app() -> Element {
                                 turn_done = true;
                                 // Submit the next queued message as a fresh turn.
                                 let next = { let mut q = queue.write(); if q.is_empty() { None } else { Some(q.remove(0)) } };
+                                if next.is_none() {
+                                    play_notification_sound(cfg);
+                                }
                                 if let Some(text) = next {
                                     if let Some(h) = handles.get(&ev_tid) {
                                         followups.write().clear();
@@ -3612,10 +3703,12 @@ fn app() -> Element {
                                             let p_open = p.clone();
                                             let t_open = title.clone();
                                             let p_str = p.display().to_string();
+                                            let p_pin = p_str.clone();
+                                            let anchor_class = if restored_sessions.read().contains(&p_str) { "thread-anchor restored" } else { "thread-anchor" };
                                             rsx! {
-                                                div { class: "thread-anchor",
+                                                div { class: "{anchor_class}",
                                                     div { class: "row-actions",
-                                                        button { class: "row-act-btn pinned", title: "Unpin", onclick: move |e: dioxus::prelude::MouseEvent| { e.stop_propagation(); toggle_pin(cfg, &p_str); sessions_refresh.set(sessions_refresh() + 1); }, Icon { name: "pin" } }
+                                                        button { class: "row-act-btn pinned", title: "Unpin", onclick: move |e: dioxus::prelude::MouseEvent| { e.stop_propagation(); toggle_pin(cfg, &p_pin); sessions_refresh.set(sessions_refresh() + 1); }, Icon { name: "pin" } }
                                                     }
                                                     div { class: "thread recent",
                                                         onclick: move |_| { show_board.set(false); open_session_tab(tabs, active_tab, messages, next_tab_id, cfg, ui, engine, busy_tabs, p_open.clone(), t_open.clone()); },
@@ -3778,8 +3871,9 @@ fn app() -> Element {
                                             let path_str_menu_archive = path_str.clone();
                                             let path_str_menu_delete = path_str.clone();
                                             let is_pinned = pinned_ids.contains(&path_str);
+                                            let anchor_class = if restored_sessions.read().contains(&path_str) { "thread-anchor restored" } else { "thread-anchor" };
                                             rsx! {
-                                                div { class: "thread-anchor",
+                                                div { class: "{anchor_class}",
                                                     div { class: "row-actions",
                                                         button { class: if is_pinned { "row-act-btn pinned" } else { "row-act-btn" }, title: if is_pinned { "Unpin" } else { "Pin" },
                                                             onclick: move |e: dioxus::prelude::MouseEvent| { e.stop_propagation(); toggle_pin(cfg, &path_str_pin); sessions_refresh.set(sessions_refresh() + 1); }, Icon { name: "pin" } }
@@ -5648,8 +5742,13 @@ fn app() -> Element {
                         let text = toast.text.clone();
                         let action_label = toast.action_label.clone();
                         let action = toast.action.clone();
+                        let toast_class = if action_label.is_some() {
+                            format!("toast {kind} has-action")
+                        } else {
+                            format!("toast {kind}")
+                        };
                         rsx! {
-                            div { key: "{tid}", class: "toast {kind}",
+                            div { key: "{tid}", class: "{toast_class}",
                                 onclick: move |_| { toasts.clone().write().retain(|t| t.id != tid); },
                                 span { class: "toast-dot" }
                                 span { "{text}" }
@@ -5660,12 +5759,15 @@ fn app() -> Element {
                                             e.stop_propagation();
                                             match action.clone() {
                                                 ToastAction::RestoreSessions(ids) => {
-                                                    for id in ids {
-                                                        oxide_core::db::restore(&id);
+                                                    for id in &ids {
+                                                        oxide_core::db::restore(id);
                                                     }
+                                                    flash_restored_sessions(restored_sessions, ids);
                                                 }
                                                 ToastAction::RestoreDeletedSession(spec) => {
+                                                    let restored_id = spec.id.clone();
                                                     restore_deleted_session(&spec);
+                                                    flash_restored_sessions(restored_sessions, vec![restored_id]);
                                                 }
                                             }
                                             toasts.clone().write().retain(|t| t.id != tid);
@@ -6646,6 +6748,7 @@ fn SettingsModal(
     let mut upd_status = use_signal(|| "Up to date".to_string());
     let mut tab_mode = use_signal(|| base.default_tab_mode.clone());
     let mut browser_headless = use_signal(|| base.browser_headless);
+    let mut notification_sound = use_signal(|| base.notification_sound);
 
     let providers = ["chatgpt", "codex", "claude", "openai", "anthropic", "echo", "mock"];
 
@@ -6664,6 +6767,7 @@ fn SettingsModal(
         c.github_repo = gh_repo.read().clone();
         c.default_tab_mode = tab_mode.read().clone();
         c.browser_headless = *browser_headless.read();
+        c.notification_sound = *notification_sound.read();
         c.approval_policy = if *bypass.read() {
             ApprovalPolicy::Never
         } else {
@@ -6869,6 +6973,11 @@ fn SettingsModal(
                         input { r#type: "checkbox", checked: *browser_headless.read(),
                             onchange: move |e| browser_headless.set(e.checked()) }
                         span { class: "field-label", "Browser automation runs headless (background)" }
+                    }
+                    label { class: "field toggle-field",
+                        input { r#type: "checkbox", checked: *notification_sound.read(),
+                            onchange: move |e| notification_sound.set(e.checked()) }
+                        span { class: "field-label", "Play sound when a turn finishes" }
                     }
                     label { class: "field",
                         span { class: "field-label", "Default mode (new tabs / next launch)" }
