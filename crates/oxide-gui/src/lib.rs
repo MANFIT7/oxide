@@ -2250,6 +2250,22 @@ fn app() -> Element {
             // streaming-UI practice).
             let mut agent_buf = String::new();
             let mut last_paint = std::time::Instant::now();
+            // True between a turn's "✓ Done" note and the next TurnStarted. A late
+            // activity arriving in this window is inserted ABOVE the Done note so
+            // it never dangles below the summary.
+            let mut turn_done = false;
+            // Insert an activity row, keeping it above a trailing "✓ Done" note.
+            macro_rules! push_activity {
+                ($msg:expr) => {{
+                    let mut m = messages.write();
+                    if turn_done && m.last().map(|x| matches!(x.author, Author::Note) && x.text.starts_with("✓ Done")).unwrap_or(false) {
+                        let at = m.len() - 1;
+                        m.insert(at, $msg);
+                    } else {
+                        m.push($msg);
+                    }
+                }};
+            }
             macro_rules! flush_agent {
                 () => {{
                     if !agent_buf.is_empty() {
@@ -2640,8 +2656,8 @@ fn app() -> Element {
                                         if mw.last().map(|m| m.author == Author::Agent && m.text.is_empty()).unwrap_or(false) {
                                             mw.pop();
                                         }
-                                        mw.push(ChatMsg { author: Author::Activity { running: false, ok: true }, text: row });
                                     }
+                                    push_activity!(ChatMsg { author: Author::Activity { running: false, ok: true }, text: row });
                                     // CLI edits compute their real diff at turn end — show the
                                     // file in the "Edited files" card NOW as a pending row
                                     // (synara-style live), replaced by the diff when it lands.
@@ -2699,6 +2715,7 @@ fn app() -> Element {
                                 }
                             }
                             Event::TurnStarted { turn } => {
+                                turn_done = false;
                                 thinking.set(String::new());
                                 status.set("Working…".to_string());
                                 turn_start.set(Some(std::time::Instant::now()));
@@ -2721,7 +2738,7 @@ fn app() -> Element {
                                 // not just a generic verb.
                                 status.set(activity_label(&tool, &args));
                                 if tool != "ask_user" {
-                                    messages.write().push(ChatMsg { author: Author::Activity { running: true, ok: true }, text: activity_label(&tool, &args) });
+                                    push_activity!(ChatMsg { author: Author::Activity { running: true, ok: true }, text: activity_label(&tool, &args) });
                                 }
                             }
                             Event::ToolCallEnd { tool, output, ok, .. } => {
@@ -2750,25 +2767,31 @@ fn app() -> Element {
                                 git_refresh.set(v + 1); // trigger git-tab auto-refresh
                             }
                             Event::FileDiff { path, diff, checkpoint, .. } => {
-                                let (adds, dels) = diff_counts(&diff);
-                                // Upsert: replace the provisional "editing…" row with the
-                                // real diff. The pending path may be ABSOLUTE (claude's tool
-                                // input) while this one is workspace-relative (git diff), so
-                                // match exact first, then any pending row by file name.
-                                {
-                                    let base = |p: &str| p.rsplit('/').next().unwrap_or(p).to_string();
-                                    let nb = base(&path);
-                                    let real = (path.clone(), adds, dels, checkpoint, diff.clone());
-                                    let mut te = turn_edits.write();
-                                    if let Some(e) = te.iter_mut().find(|e| e.0 == path) {
-                                        *e = real;
-                                    } else if let Some(e) = te.iter_mut().find(|e| e.4.is_empty() && e.3 == 0 && base(&e.0) == nb) {
-                                        *e = real;
-                                    } else {
-                                        te.push(real);
+                                let base = |p: &str| p.rsplit('/').next().unwrap_or(p).to_string();
+                                let nb = base(&path);
+                                if diff.trim().is_empty() {
+                                    // Touched but no textual change → drop the pending
+                                    // "editing…" row so its spinner doesn't linger.
+                                    turn_edits.write().retain(|e| !(e.4.is_empty() && e.3 == 0 && base(&e.0) == nb));
+                                } else {
+                                    let (adds, dels) = diff_counts(&diff);
+                                    // Upsert: replace the provisional "editing…" row with the
+                                    // real diff. The pending path may be ABSOLUTE (claude's tool
+                                    // input) while this one is workspace-relative (git diff), so
+                                    // match exact first, then any pending row by file name.
+                                    {
+                                        let real = (path.clone(), adds, dels, checkpoint, diff.clone());
+                                        let mut te = turn_edits.write();
+                                        if let Some(e) = te.iter_mut().find(|e| e.0 == path) {
+                                            *e = real;
+                                        } else if let Some(e) = te.iter_mut().find(|e| e.4.is_empty() && e.3 == 0 && base(&e.0) == nb) {
+                                            *e = real;
+                                        } else {
+                                            te.push(real);
+                                        }
                                     }
+                                    messages.write().push(ChatMsg { author: Author::Diff(path, checkpoint), text: diff });
                                 }
-                                messages.write().push(ChatMsg { author: Author::Diff(path, checkpoint), text: diff });
                             }
                             Event::HookFired { hook, command, blocked } => {
                                 timeline.write().push(TimelineItem {
@@ -2909,6 +2932,8 @@ fn app() -> Element {
                                     let sum = if nf > 0 { format!("✓ Done · {dur} · {nf} file(s) +{ta} −{td}") } else { format!("✓ Done · {dur}") };
                                     messages.write().push(ChatMsg { author: Author::Note, text: sum });
                                 }
+                                // From here, late activities slot above the Done note.
+                                turn_done = true;
                                 // Submit the next queued message as a fresh turn.
                                 let next = { let mut q = queue.write(); if q.is_empty() { None } else { Some(q.remove(0)) } };
                                 if let Some(text) = next {

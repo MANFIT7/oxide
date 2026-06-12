@@ -1540,6 +1540,11 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
                     .await;
                 }
                 self.emit(Event::FileDiff { turn, path: rel, diff, checkpoint }).await;
+            } else {
+                // Touched but no textual change (identical write / already
+                // committed). Emit an EMPTY FileDiff so the frontend can clear
+                // its pending "editing…" row instead of spinning forever.
+                self.emit(Event::FileDiff { turn, path: rel, diff: String::new(), checkpoint: 0 }).await;
             }
         }
         self.fire_hooks("stop", serde_json::json!({})).await;
