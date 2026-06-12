@@ -334,6 +334,53 @@ enum Author {
     Activity { running: bool, ok: bool },
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ActivityKind {
+    Command,
+    FileRead,
+    FileChange,
+    Search,
+    Web,
+    Memory,
+    Generic,
+}
+
+impl ActivityKind {
+    fn class_name(self) -> &'static str {
+        match self {
+            ActivityKind::Command => "command",
+            ActivityKind::FileRead => "file-read",
+            ActivityKind::FileChange => "file-change",
+            ActivityKind::Search => "search",
+            ActivityKind::Web => "web",
+            ActivityKind::Memory => "memory",
+            ActivityKind::Generic => "generic",
+        }
+    }
+}
+
+#[derive(Clone, PartialEq)]
+struct ActivityView {
+    icon: String,
+    verb: String,
+    detail: String,
+    output: String,
+    kind: ActivityKind,
+}
+
+#[derive(Clone, PartialEq)]
+struct TranscriptGroup {
+    activity: bool,
+    indices: Vec<usize>,
+    key: usize,
+    live: bool,
+}
+
+#[derive(Clone, PartialEq)]
+struct TranscriptTurn {
+    groups: Vec<TranscriptGroup>,
+}
+
 /// Count added/removed lines in a unified diff (excludes the +++/--- headers).
 fn diff_counts(diff: &str) -> (u32, u32) {
     let mut adds = 0;
@@ -351,19 +398,111 @@ fn diff_counts(diff: &str) -> (u32, u32) {
     (adds, dels)
 }
 
-/// Coarse, human status verb for the live pill (opencode-style).
-fn status_verb(tool: &str) -> &'static str {
-    match tool {
-        "shell" => "Running commands",
-        "search" | "codebase_search" => "Searching the codebase",
-        "read_file" => "Reading files",
-        "write_file" | "edit" => "Making edits",
-        "remember" | "save_skill" => "Saving to memory",
-        "web_search" | "fetch_url" => "Searching the web",
-        "ask_user" => "Asking you",
-        t if t.starts_with("browser_") => "Browsing",
-        t if t.starts_with("mcp__") => "Using tools",
-        _ => "Working",
+fn activity_kind(icon: &str, verb: &str, detail: &str) -> ActivityKind {
+    let v = verb.to_ascii_lowercase();
+    let d = detail.to_ascii_lowercase();
+    match icon {
+        "terminal" => ActivityKind::Command,
+        "edit" => ActivityKind::FileChange,
+        "file" => ActivityKind::FileRead,
+        "search" => ActivityKind::Search,
+        "globe" => ActivityKind::Web,
+        "brain" => ActivityKind::Memory,
+        _ if v.contains("edit") || v.contains("write") || v.contains("patch") => ActivityKind::FileChange,
+        _ if v.contains("read") || d.ends_with(".rs") || d.ends_with(".ts") || d.ends_with(".tsx") => ActivityKind::FileRead,
+        _ if v.contains("search") || v.contains("find") => ActivityKind::Search,
+        _ if v.contains("web") || v.contains("fetch") || d.starts_with("http") => ActivityKind::Web,
+        _ => ActivityKind::Generic,
+    }
+}
+
+fn activity_view(text: &str) -> ActivityView {
+    let mut parts = text.splitn(4, '\t');
+    let icon = parts.next().unwrap_or("spark").to_string();
+    let verb = parts.next().unwrap_or("").to_string();
+    let detail = parts.next().unwrap_or("").to_string();
+    let output = parts.next().unwrap_or("").to_string();
+    let kind = activity_kind(&icon, &verb, &detail);
+    ActivityView { icon, verb, detail, output, kind }
+}
+
+fn build_transcript_turns(messages: &[ChatMsg]) -> Vec<TranscriptTurn> {
+    let mut groups: Vec<TranscriptGroup> = Vec::new();
+    let mut i = 0;
+    while i < messages.len() {
+        if matches!(messages[i].author, Author::Activity { .. }) {
+            let start = i;
+            let mut live = false;
+            while i < messages.len() {
+                match messages[i].author {
+                    Author::Activity { running, .. } => {
+                        live |= running;
+                        i += 1;
+                    }
+                    _ => break,
+                }
+            }
+            groups.push(TranscriptGroup {
+                activity: true,
+                indices: (start..i).collect(),
+                key: start,
+                live,
+            });
+        } else {
+            groups.push(TranscriptGroup {
+                activity: false,
+                indices: vec![i],
+                key: i,
+                live: false,
+            });
+            i += 1;
+        }
+    }
+
+    let mut turns: Vec<TranscriptTurn> = Vec::new();
+    for group in groups {
+        let starts_turn = group.indices.first().map(|&idx| messages[idx].author == Author::User).unwrap_or(false);
+        if starts_turn || turns.is_empty() {
+            turns.push(TranscriptTurn { groups: vec![group] });
+        } else if let Some(turn) = turns.last_mut() {
+            turn.groups.push(group);
+        }
+    }
+    turns
+}
+
+fn activity_group_label(rows: &[(String, bool, bool)]) -> String {
+    let n = rows.len();
+    let done = rows.iter().filter(|(_, running, _)| !*running).count();
+    let running = rows.iter().any(|(_, running, _)| *running);
+    let mut edits = 0;
+    let mut commands = 0;
+    let mut searches = 0;
+    let mut web = 0;
+    for (text, _, _) in rows {
+        match activity_view(text).kind {
+            ActivityKind::FileChange => edits += 1,
+            ActivityKind::Command => commands += 1,
+            ActivityKind::Search => searches += 1,
+            ActivityKind::Web => web += 1,
+            _ => {}
+        }
+    }
+
+    if running && edits > 0 {
+        format!("✎ Editing files… {done}/{n}")
+    } else if running {
+        format!("⚙ Working… {done}/{n}")
+    } else if edits > 0 && edits >= commands + searches + web {
+        format!("✎ {edits} file changes · {n} actions")
+    } else if commands > 0 && commands >= searches + web {
+        format!("⌘ {commands} commands · {n} actions")
+    } else if searches > 0 {
+        format!("🔎 {searches} searches · {n} actions")
+    } else if web > 0 {
+        format!("🌐 {web} web actions · {n} actions")
+    } else {
+        format!("⚙ {n} actions")
     }
 }
 
@@ -1168,24 +1307,6 @@ fn delete_session(path: &Path) {
 
 fn archive_session(path: &Path) {
     oxide_core::db::archive(&sid(path));
-}
-
-/// First user line of a session as its title (from the db).
-fn session_title(path: &Path) -> String {
-    oxide_core::db::meta(&sid(path))
-        .map(|m| m.title)
-        .filter(|t| !t.trim().is_empty())
-        .unwrap_or_else(|| "Chat".to_string())
-}
-
-/// Read only the first ~8KB of a file — enough for a session title without
-/// slurping multi-MB transcripts on every sidebar/palette render.
-fn read_prefix(path: &Path, cap: usize) -> String {
-    use std::io::Read;
-    let Ok(f) = std::fs::File::open(path) else { return String::new() };
-    let mut buf = String::new();
-    let _ = f.take(cap as u64).read_to_string(&mut buf);
-    buf
 }
 
 /// Recent non-empty sessions `(path, title, msg_count)`, newest first. Deletes
@@ -4643,62 +4764,36 @@ fn app() -> Element {
                             }
                             div { class: if *streaming.read() { "col streaming" } else { "col" },
                                 {
-                                    // Group consecutive tool-activity rows so they collapse into one dropdown.
                                     let last_user_idx = messages.read().iter().rposition(|m| m.author == Author::User);
-                                    let groups = {
-                                        let msgs = messages.read();
-                                        let mut g: Vec<(bool, Vec<usize>)> = Vec::new();
-                                        for (i, m) in msgs.iter().enumerate() {
-                                            if matches!(m.author, Author::Activity { .. }) {
-                                                match g.last_mut() {
-                                                    Some(last) if last.0 => last.1.push(i),
-                                                    _ => g.push((true, vec![i])),
-                                                }
-                                            } else {
-                                                g.push((false, vec![i]));
-                                            }
-                                        }
-                                        g
-                                    };
-                                    // Segment into TURNS so each user prompt sticks only
-                                    // within its own turn (releases when the turn scrolls
-                                    // past — proper per-turn sticky header).
                                     let turns = {
                                         let msgs = messages.read();
-                                        let mut ts: Vec<Vec<(bool, Vec<usize>)>> = Vec::new();
-                                        for grp in groups.into_iter() {
-                                            let starts_turn = grp.1.first().map(|&i| msgs[i].author == Author::User).unwrap_or(false);
-                                            if starts_turn || ts.is_empty() {
-                                                ts.push(vec![grp]);
-                                            } else {
-                                                ts.last_mut().unwrap().push(grp);
-                                            }
-                                        }
-                                        ts
+                                        build_transcript_turns(&msgs)
                                     };
                                     rsx! {
                                         for turn in turns.into_iter() {
                                         div { class: "turn",
-                                        for (is_act, idxs) in turn.into_iter() {
+                                        for group in turn.groups.into_iter() {
+                                            {
+                                                let is_act = group.activity;
+                                                let idxs = group.indices;
+                                                let group_key = group.key;
+                                                let group_live = group.live;
+                                                rsx! {
                                             if is_act && idxs.len() > 2 {
                                                 {
                                                     let rows: Vec<(String, bool, bool)> = idxs.iter().map(|&i| {
                                                         let m = &messages.read()[i];
                                                         if let Author::Activity { running, ok } = m.author { (m.text.clone(), running, ok) } else { (m.text.clone(), false, true) }
                                                     }).collect();
-                                                    let running = rows.iter().any(|r| r.1);
-                                                    let n = rows.len();
-                                                    let done = rows.iter().filter(|r| !r.1).count();
-                                                    let label = if running { format!("⚙ Working… {done}/{n}") } else { format!("⚙ {n} actions") };
-                                                    let key = idxs[0];
-                                                    let is_open = act_open.read().get(&key).copied().unwrap_or(running);
+                                                    let label = activity_group_label(&rows);
+                                                    let is_open = act_open.read().get(&group_key).copied().unwrap_or(group_live);
                                                     rsx! {
                                                         details { class: "act-group", open: is_open,
                                                             summary { class: "act-group-head",
                                                                 onclick: move |e: dioxus::prelude::MouseEvent| {
                                                                     e.prevent_default();
-                                                                    let cur = act_open.read().get(&key).copied().unwrap_or(running);
-                                                                    act_open.write().insert(key, !cur);
+                                                                    let cur = act_open.read().get(&group_key).copied().unwrap_or(group_live);
+                                                                    act_open.write().insert(group_key, !cur);
                                                                 },
                                                                 span { class: "diff-caret", Icon { name: "chevron" } }
                                                                 "{label}"
@@ -4842,13 +4937,15 @@ fn app() -> Element {
                                                                                             thread_json_save(&ws3, "markers", &thread_stem(&tabs, &active_tab), &*markers.read());
                                                                                         });
                                                                                     }, span { class: "mark-swatch c0" } }
-                                                                            }
-                                                                        }
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
                                                     }
+                                                }
+                                            }
+                                            }
+                                        }
+                                        }
+                                        }
+                                    }
+                                }
                                                 }
                                             }
                                         }
@@ -4983,7 +5080,7 @@ fn app() -> Element {
                                         }
                                     }
                                 }
-                                if !turn_edits.read().is_empty() {
+                                if !*streaming.read() && !turn_edits.read().is_empty() {
                                     {
                                         let edits = turn_edits.read().clone();
                                         let n = edits.len();
@@ -5078,6 +5175,72 @@ fn app() -> Element {
                             }
                         }
                         div { class: "composer-dock",
+                            if *streaming.read() && !turn_edits.read().is_empty() {
+                                {
+                                    let edits = turn_edits.read().clone();
+                                    let n = edits.len();
+                                    let total_add: u32 = edits.iter().map(|e| e.1).sum();
+                                    let total_del: u32 = edits.iter().map(|e| e.2).sum();
+                                    let pending = edits.iter().filter(|e| e.4.is_empty() && e.3 == 0).count();
+                                    let plural = if n == 1 { "" } else { "s" };
+                                    let shown = n.min(3);
+                                    let more = n.saturating_sub(shown);
+                                    let subtitle = if pending > 0 {
+                                        format!("{pending} live · diffs settle after the turn")
+                                    } else {
+                                        "Diffs ready for review".to_string()
+                                    };
+                                    rsx! {
+                                        div { class: "composer-live-changes",
+                                            div { class: "live-changes-head",
+                                                span { class: "live-changes-icon", Icon { name: "edit" } }
+                                                div { class: "live-changes-copy",
+                                                    span { class: "live-changes-title", "Changing {n} file{plural}" }
+                                                    span { class: "live-changes-sub", "{subtitle}" }
+                                                }
+                                                if total_add + total_del > 0 {
+                                                    span { class: "live-changes-counts",
+                                                        span { class: "diff-adds", "+{total_add}" }
+                                                        span { class: "diff-dels", "−{total_del}" }
+                                                    }
+                                                } else {
+                                                    span { class: "live-changes-skeleton" }
+                                                }
+                                                button { class: "live-changes-review", title: "Open diffs",
+                                                    onclick: move |_| {
+                                                        edits_expanded.set(true);
+                                                        env_tab.set("changes".to_string());
+                                                        show_env.set(true);
+                                                    },
+                                                    Icon { name: "branch" }
+                                                }
+                                            }
+                                            div { class: "live-changes-files",
+                                                for (path, a, d, cp, diff) in edits.iter().take(shown).cloned() {
+                                                    {
+                                                        let row_pending = diff.is_empty() && cp == 0;
+                                                        let row_cls = if row_pending { "live-change-file pending" } else { "live-change-file" };
+                                                        rsx! {
+                                                            div { class: "{row_cls}",
+                                                                if row_pending { span { class: "syn-spinner" } } else { span { class: "live-change-ready", "✓" } }
+                                                                span { class: "live-change-path", "{path}" }
+                                                                if row_pending {
+                                                                    span { class: "live-change-state shimmer", "editing…" }
+                                                                } else {
+                                                                    span { class: "live-change-state", span { class: "diff-adds", "+{a}" } " " span { class: "diff-dels", "−{d}" } }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                if more > 0 {
+                                                    div { class: "live-change-more", "+{more} more" }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             if !*streaming.read() && !followups.read().is_empty() && !messages.read().is_empty() {
                                 div { class: "followups",
                                     for f in followups.read().iter().cloned() {
@@ -5755,6 +5918,10 @@ fn highlight_code(code: &str, lang: &str) -> String {
 /// first (so injection is impossible), then markdown is converted. Fenced code
 /// blocks get class-based syntax highlighting.
 fn md_to_html(src: &str, live: bool) -> String {
+    if live {
+        return md_live_html(src);
+    }
+
     // Render cache: re-renders (tab switches, scroll-driven updates) hit the
     // cache instead of re-running pulldown+syntect on every message again.
     thread_local! {
@@ -5780,6 +5947,41 @@ fn md_to_html(src: &str, live: bool) -> String {
         m.insert(key, out.clone());
     });
     out
+}
+
+fn md_live_html(src: &str) -> String {
+    let mut html = String::with_capacity(src.len() + 128);
+    let mut in_code = false;
+    html.push_str("<div class=\"live-md\">");
+    for line in src.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") {
+            if in_code {
+                html.push_str("</code></pre>");
+            } else {
+                html.push_str("<pre class=\"live-code\"><code>");
+            }
+            in_code = !in_code;
+            continue;
+        }
+
+        if in_code {
+            html.push_str(&esc(line));
+            html.push('\n');
+        } else if trimmed.is_empty() {
+            html.push_str("<div class=\"live-gap\"></div>");
+        } else {
+            html.push_str("<div class=\"live-line\">");
+            html.push_str(&esc(line));
+            html.push_str("</div>");
+        }
+    }
+
+    if in_code {
+        html.push_str("</code></pre>");
+    }
+    html.push_str("</div>");
+    html
 }
 
 fn md_to_html_uncached(src: &str, live: bool) -> String {
@@ -5875,36 +6077,6 @@ fn material_icon(name: &str, is_dir: bool) -> &'static str {
     }
 }
 
-/// VSCode Material-style file badge: `(label, color)` by extension.
-fn file_badge(name: &str) -> (&'static str, &'static str) {
-    let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
-    match ext.as_str() {
-        "rs" => ("RS", "#dea584"),
-        "ts" | "mts" | "cts" => ("TS", "#3178c6"),
-        "tsx" => ("TX", "#3178c6"),
-        "js" | "mjs" | "cjs" => ("JS", "#f1dd35"),
-        "jsx" => ("JX", "#f1dd35"),
-        "json" | "jsonc" => ("{}", "#f1dd35"),
-        "md" => ("MD", "#42a5f5"),
-        "css" | "scss" | "less" => ("#", "#42a5f5"),
-        "html" | "htm" => ("<>", "#e44d26"),
-        "py" => ("PY", "#3572a5"),
-        "go" => ("GO", "#00add8"),
-        "toml" | "yaml" | "yml" | "ini" => ("⚙", "#9e9e9e"),
-        "sh" | "bash" | "zsh" => ("$_", "#89e051"),
-        "sql" => ("DB", "#ffca28"),
-        "vue" => ("V", "#41b883"),
-        "svelte" => ("S", "#ff3e00"),
-        "swift" => ("SW", "#f05138"),
-        "java" | "kt" => ("JV", "#b07219"),
-        "c" | "h" => ("C", "#555fbb"),
-        "cpp" | "hpp" | "cc" => ("C+", "#f34b7d"),
-        "png" | "jpg" | "jpeg" | "gif" | "svg" | "webp" | "ico" => ("◍", "#26a69a"),
-        "lock" => ("🔒", "#9e9e9e"),
-        _ => ("·", "#8a8a8a"),
-    }
-}
-
 #[component]
 fn FileNode(path: PathBuf, depth: usize, is_root: bool) -> Element {
     let ui = use_context::<Ui>();
@@ -5920,7 +6092,6 @@ fn FileNode(path: PathBuf, depth: usize, is_root: bool) -> Element {
     let pad = format!("padding-left: {}px", 8 + depth * 14);
     let is_open = ui.open_path.read().as_ref() == Some(&path);
     let node_cls = if is_open { "node open" } else { "node" };
-    let icon_name = if is_dir { "folder" } else { "file" };
     let caret = if !is_dir {
         " "
     } else if expanded {
@@ -7077,11 +7248,14 @@ fn Message(author: Author, text: String, #[props(default)] live: bool) -> Elemen
                 return rsx! {};
             }
             let copy = serde_json::to_string(&text).unwrap_or_default();
+            let body_cls = if live { "agent-text agent-md live" } else { "agent-text agent-md" };
             rsx! {
                 div { class: "row agent",
                     img { class: "avatar", src: logo_uri() }
-                    div { class: "agent-text agent-md", dangerous_inner_html: md_to_html(&text, live) }
-                    button { class: "msg-copy", title: "Copy message", onclick: move |_| { let c = copy.clone(); spawn(async move { let _ = document::eval(&format!("navigator.clipboard.writeText({c})")).await; }); }, "⧉" }
+                    div { class: "{body_cls}", dangerous_inner_html: md_to_html(&text, live) }
+                    if !live {
+                        button { class: "msg-copy", title: "Copy message", onclick: move |_| { let c = copy.clone(); spawn(async move { let _ = document::eval(&format!("navigator.clipboard.writeText({c})")).await; }); }, "⧉" }
+                    }
                 }
             }
         },
@@ -7316,36 +7490,32 @@ fn tile_leaves(node: &Tile, out: &mut Vec<u64>) {
 
 #[component]
 fn ActivityRow(text: String, running: bool, ok: bool) -> Element {
-    let cls = if running { "activity-card running" } else if ok { "activity-card done" } else { "activity-card fail" };
-    // text is "icon\tverb\tdetail[\toutput]"
-    let mut parts = text.splitn(4, '\t');
-    let icon = parts.next().unwrap_or("spark").to_string();
-    let verb = parts.next().unwrap_or("").to_string();
-    let detail = parts.next().unwrap_or("").to_string();
-    let output = parts.next().unwrap_or("").to_string();
-    let lines = if output.is_empty() { 0 } else { output.lines().count() };
+    let view = activity_view(&text);
+    let state = if running { "running" } else if ok { "done" } else { "fail" };
+    let cls = format!("activity-card {state} activity-{}", view.kind.class_name());
+    let lines = if view.output.is_empty() { 0 } else { view.output.lines().count() };
     rsx! {
         div { class: "row activity",
-            if output.is_empty() {
+            if view.output.is_empty() {
                 div { class: "{cls}",
-                    span { class: "activity-tic", Icon { name: icon_static(&icon) } }
+                    span { class: "activity-tic", Icon { name: icon_static(&view.icon) } }
                     if running { span { class: "activity-spin" } }
                     else if ok { span { class: "activity-ic ok", "✓" } }
                     else { span { class: "activity-ic fail", "✕" } }
-                    span { class: "activity-verb", "{verb}" }
-                    if !detail.is_empty() { span { class: "activity-text", "{detail}" } }
+                    span { class: "activity-verb", "{view.verb}" }
+                    if !view.detail.is_empty() { span { class: "activity-text", "{view.detail}" } }
                 }
             } else {
                 details { class: "{cls} has-out",
                     summary { class: "activity-sum",
-                        span { class: "activity-tic", Icon { name: icon_static(&icon) } }
+                        span { class: "activity-tic", Icon { name: icon_static(&view.icon) } }
                         if ok { span { class: "activity-ic ok", "✓" } } else { span { class: "activity-ic fail", "✕" } }
-                        span { class: "activity-verb", "{verb}" }
-                        if !detail.is_empty() { span { class: "activity-text", "{detail}" } }
+                        span { class: "activity-verb", "{view.verb}" }
+                        if !view.detail.is_empty() { span { class: "activity-text", "{view.detail}" } }
                         span { class: "activity-out-n", "{lines} lines" }
                         button { class: "copy-btn", title: "Copy output",
                             onclick: {
-                                let out = output.clone();
+                                let out = view.output.clone();
                                 move |e: dioxus::prelude::MouseEvent| {
                                     e.stop_propagation();
                                     let js = format!("navigator.clipboard.writeText({});", serde_json::to_string(&out).unwrap_or_default());
@@ -7355,7 +7525,7 @@ fn ActivityRow(text: String, running: bool, ok: bool) -> Element {
                             "⧉"
                         }
                     }
-                    pre { class: "activity-out", "{output}" }
+                    pre { class: "activity-out", "{view.output}" }
                 }
             }
         }

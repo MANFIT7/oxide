@@ -8,7 +8,6 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// One persisted conversation message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -16,13 +15,6 @@ pub struct StoredMessage {
     pub role: String,
     pub content: String,
     pub ts_ms: u128,
-}
-
-fn now_ms() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0)
 }
 
 /// Session handle backed by the GLOBAL SQLite db (see `crate::db`). The id is
