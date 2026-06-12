@@ -171,6 +171,19 @@ pub fn load(id: &str) -> Vec<(String, String)> {
     out
 }
 
+/// Count user-visible messages without materializing the whole transcript.
+pub fn message_count(id: &str) -> usize {
+    let c = conn().lock().unwrap();
+    c.query_row(
+        "SELECT COUNT(*) FROM messages
+         WHERE session_id=?1 AND role NOT IN ('meta', 'tool', 'system')",
+        [id],
+        |r| r.get::<_, i64>(0),
+    )
+    .map(|n| n.max(0) as usize)
+    .unwrap_or(0)
+}
+
 /// Replace the whole conversation (restore-to-message).
 pub fn rewrite(id: &str, workspace: &Path, provider: &str, msgs: &[(String, String)]) {
     {
@@ -286,6 +299,14 @@ pub fn archive(id: &str) {
     let _ = c.execute(
         "UPDATE sessions SET archived_at=?2 WHERE id=?1",
         rusqlite::params![id, now_ms()],
+    );
+}
+
+pub fn restore(id: &str) {
+    let c = conn().lock().unwrap();
+    let _ = c.execute(
+        "UPDATE sessions SET archived_at=NULL WHERE id=?1",
+        rusqlite::params![id],
     );
 }
 

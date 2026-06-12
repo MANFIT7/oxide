@@ -16,7 +16,7 @@ use futures::StreamExt;
 use oxide_config::Config;
 use oxide_core::EngineHandle;
 use oxide_protocol::{ApprovalDecision, ApprovalPolicy, Event, Op, SandboxPolicy};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -567,6 +567,52 @@ struct AgentTab {
     /// Session file backing this tab's model context (resume on switch).
     session: Option<PathBuf>,
 }
+
+const SESSION_RENDER_MESSAGE_LIMIT: usize = 20;
+
+#[derive(Clone, PartialEq, Eq)]
+enum TabStatus {
+    Running,
+    WaitingApproval,
+    WaitingInput,
+    Failed,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct DeletedSessionSpec {
+    id: String,
+    workspace: String,
+    provider: String,
+    title: String,
+    pinned: bool,
+    messages: Vec<(String, String)>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum ToastAction {
+    RestoreSessions(Vec<String>),
+    RestoreDeletedSession(DeletedSessionSpec),
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct ToastSpec {
+    id: u64,
+    kind: String,
+    text: String,
+    action_label: Option<String>,
+    action: Option<ToastAction>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct SessionListItem {
+    id: String,
+    title: String,
+    count: usize,
+    path: PathBuf,
+    provider: String,
+}
+
+type ProjectGroup = (PathBuf, String, Vec<(PathBuf, String, String, String)>);
 
 /// One row in the inspector Timeline.
 #[derive(Clone, PartialEq)]
@@ -1269,30 +1315,25 @@ fn all_mention_items(ws: &Path, query: &str) -> Vec<String> {
     v
 }
 
-/// List persisted sessions (id, message count, path) newest first.
-fn list_sessions(ws: &Path) -> Vec<(String, usize, PathBuf)> {
-    let dir = ws.join(".oxide/sessions");
-    let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)
+/// List persisted sessions from the global DB, matching the sidebar source.
+fn list_sessions(ws: &Path) -> Vec<SessionListItem> {
+    oxide_core::db::import_workspace(ws);
+    oxide_core::db::import_claude_sessions(ws);
+    oxide_core::db::list(ws, 50)
         .into_iter()
-        .flatten()
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("jsonl"))
-        .collect();
-    paths.sort();
-    paths.reverse();
-    paths
-        .into_iter()
-        .take(50)
-        .map(|p| {
-            let id = p
-                .file_stem()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_default();
-            let count = std::fs::read_to_string(&p)
-                .map(|t| t.lines().filter(|l| !l.trim().is_empty()).count())
-                .unwrap_or(0);
-            (id, count, p)
+        .map(|m| {
+            let title = {
+                let clean = strip_scaffold(&m.title);
+                clean.lines().find(|x| !x.trim().is_empty()).unwrap_or("Chat").chars().take(52).collect::<String>()
+            };
+            let count = oxide_core::db::message_count(&m.id);
+            SessionListItem {
+                path: PathBuf::from(&m.id),
+                id: m.id,
+                title,
+                count,
+                provider: m.provider,
+            }
         })
         .collect()
 }
@@ -1307,6 +1348,33 @@ fn delete_session(path: &Path) {
 
 fn archive_session(path: &Path) {
     oxide_core::db::archive(&sid(path));
+}
+
+fn capture_deleted_session(path: &Path) -> Option<DeletedSessionSpec> {
+    let id = sid(path);
+    let meta = oxide_core::db::meta(&id)?;
+    let messages = oxide_core::db::load(&id);
+    if messages.is_empty() {
+        return None;
+    }
+    Some(DeletedSessionSpec {
+        id,
+        workspace: meta.workspace,
+        provider: meta.provider,
+        title: meta.title,
+        pinned: meta.pinned,
+        messages,
+    })
+}
+
+fn restore_deleted_session(spec: &DeletedSessionSpec) {
+    let workspace = PathBuf::from(&spec.workspace);
+    oxide_core::db::rewrite(&spec.id, &workspace, &spec.provider, &spec.messages);
+    if !spec.title.trim().is_empty() {
+        oxide_core::db::set_title(&spec.id, &spec.title);
+    }
+    oxide_core::db::set_pinned(&spec.id, spec.pinned);
+    oxide_core::db::restore(&spec.id);
 }
 
 /// Recent non-empty sessions `(path, title, msg_count)`, newest first. Deletes
@@ -1344,7 +1412,7 @@ fn relative_time(t: std::time::SystemTime) -> String {
 }
 
 /// Group recent sessions by project: `(workspace, name, [(path, title, reltime)])`.
-fn build_projects(current: &Path, recents: &[PathBuf]) -> Vec<(PathBuf, String, Vec<(PathBuf, String, String, String)>)> {
+fn build_projects(current: &Path, recents: &[PathBuf]) -> Vec<ProjectGroup> {
     let mut seen = HashSet::new();
     let mut wss: Vec<PathBuf> = Vec::new();
     // STABLE order: db recency first (only changes when you actually chat, not
@@ -1373,14 +1441,117 @@ fn build_projects(current: &Path, recents: &[PathBuf]) -> Vec<(PathBuf, String, 
 }
 
 /// Push a toast (kind: "ok" | "err" | "info") that auto-dismisses after 4s.
-fn push_toast(mut toasts: Signal<Vec<(u64, String, String)>>, mut seq: Signal<u64>, kind: &str, text: &str) {
+fn push_toast(mut toasts: Signal<Vec<ToastSpec>>, mut seq: Signal<u64>, kind: &str, text: &str) {
     let id = *seq.peek() + 1;
     seq.set(id);
-    toasts.write().push((id, kind.to_string(), text.to_string()));
+    toasts.write().push(ToastSpec {
+        id,
+        kind: kind.to_string(),
+        text: text.to_string(),
+        action_label: None,
+        action: None,
+    });
     spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(4)).await;
-        toasts.write().retain(|t| t.0 != id);
+        toasts.write().retain(|t| t.id != id);
     });
+}
+
+fn push_action_toast(
+    mut toasts: Signal<Vec<ToastSpec>>,
+    mut seq: Signal<u64>,
+    kind: &str,
+    text: &str,
+    action_label: &str,
+    action: ToastAction,
+) {
+    let id = *seq.peek() + 1;
+    seq.set(id);
+    toasts.write().push(ToastSpec {
+        id,
+        kind: kind.to_string(),
+        text: text.to_string(),
+        action_label: Some(action_label.to_string()),
+        action: Some(action),
+    });
+    spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+        toasts.write().retain(|t| t.id != id);
+    });
+}
+
+fn tab_status_class(status: &TabStatus) -> &'static str {
+    match status {
+        TabStatus::Running => "running",
+        TabStatus::WaitingApproval => "approval",
+        TabStatus::WaitingInput => "input",
+        TabStatus::Failed => "failed",
+    }
+}
+
+fn tab_status_label(status: &TabStatus) -> &'static str {
+    match status {
+        TabStatus::Running => "run",
+        TabStatus::WaitingApproval => "approve",
+        TabStatus::WaitingInput => "input",
+        TabStatus::Failed => "error",
+    }
+}
+
+fn refresh_projects_list(mut projects_list: Signal<Vec<ProjectGroup>>, cfg: Signal<Config>) {
+    let c = cfg.peek().clone();
+    spawn(async move {
+        let groups = tokio::task::spawn_blocking(move || {
+            build_projects(&workspace_of(&c), &c.recent_workspaces)
+        }).await.unwrap_or_default();
+        projects_list.set(groups);
+    });
+}
+
+fn active_tab_id(tabs: Signal<Vec<AgentTab>>, active_tab: Signal<usize>) -> Option<u64> {
+    tabs.peek().get(*active_tab.peek()).map(|t| t.id)
+}
+
+fn select_env_tab(
+    mut env_tab: Signal<String>,
+    mut show_env: Signal<bool>,
+    mut env_tab_by_tab: Signal<HashMap<u64, String>>,
+    tabs: Signal<Vec<AgentTab>>,
+    active_tab: Signal<usize>,
+    tab: &str,
+    toggle: bool,
+) {
+    if toggle && *show_env.peek() && env_tab.peek().as_str() == tab {
+        show_env.set(false);
+        return;
+    }
+    let next = tab.to_string();
+    env_tab.set(next.clone());
+    if let Some(id) = active_tab_id(tabs, active_tab) {
+        env_tab_by_tab.write().insert(id, next);
+    }
+    show_env.set(true);
+}
+
+fn queue_preview(text: &str) -> String {
+    let clean = strip_scaffold(text);
+    if clean.starts_with("Act as Bugbot.") {
+        return "/review (Bugbot)".to_string();
+    }
+    clean
+        .lines()
+        .map(str::trim)
+        .find(|line| {
+            !line.is_empty()
+                && !line.starts_with("## ")
+                && !line.starts_with("Context files:")
+                && !line.starts_with("[Plan mode]")
+                && !line.starts_with("[Pursue goal]")
+        })
+        .unwrap_or("queued prompt")
+        .chars()
+        .take(54)
+        .collect()
 }
 
 /// Stem of the active tab's session file (per-thread storage key).
@@ -1528,12 +1699,12 @@ fn open_session_tab(
 fn load_session(path: &Path) -> Vec<ChatMsg> {
     let mut rows = oxide_core::db::load(&sid(path));
     // Long / repeatedly-compacted transcripts are expensive to paint (markdown +
-    // syntax highlight per message). Show only the last 20 — the engine still
+    // syntax highlight per message). Show only the tail — the engine still
     // resumes the FULL history on continue, so nothing is lost from the model.
     let total = rows.len();
-    let trimmed = total > 20;
+    let trimmed = total > SESSION_RENDER_MESSAGE_LIMIT;
     if trimmed {
-        rows = rows.split_off(total - 20);
+        rows = rows.split_off(total - SESSION_RENDER_MESSAGE_LIMIT);
     }
     let mut out: Vec<ChatMsg> = rows
         .into_iter()
@@ -1550,7 +1721,7 @@ fn load_session(path: &Path) -> Vec<ChatMsg> {
         })
         .collect();
     if trimmed {
-        let hidden = total - 20;
+        let hidden = total - SESSION_RENDER_MESSAGE_LIMIT;
         out.insert(0, ChatMsg { author: Author::Note, text: format!("… {hidden} earlier messages hidden (long session) — the agent still resumes the full context") });
     }
     out
@@ -1747,6 +1918,7 @@ fn app() -> Element {
     // Environment pane (right): one tabbed home for Files/Terminals/Preview/Diffs.
     let mut show_env = use_signal(|| false);
     let mut env_tab = use_signal(|| "files".to_string());
+    let env_tab_by_tab = use_signal(HashMap::<u64, String>::new);
     // Environment card: running-process dropdown (port, name, pid).
     let mut procs_menu = use_signal(|| false);
     let mut procs_list = use_signal(Vec::<(u16, String, u32)>::new);
@@ -1814,20 +1986,21 @@ fn app() -> Element {
     let mut show_board = use_signal(|| false);
     let mut board = use_signal(board::Board::default);
     let mut new_card_title = use_signal(String::new);
-    type ProjGroup = (PathBuf, String, Vec<(PathBuf, String, String, String)>);
-    let mut projects_list = use_signal(Vec::<ProjGroup>::new);
+    let mut projects_list = use_signal(Vec::<ProjectGroup>::new);
     let mut session_menu = use_signal(|| None::<PathBuf>);
     let mut expanded_projects = use_signal(HashSet::<String>::new);
     // Projects whose chat list is collapsed (click the caret on the header).
     let mut collapsed_projects = use_signal(HashSet::<String>::new);
     // Bump to force the sidebar (pins/projects) to re-read the session db.
     let mut sessions_refresh = use_signal(|| 0u64);
+    let mut confirm_delete_session = use_signal(|| None::<String>);
+    let mut confirm_archive_workspace = use_signal(|| None::<String>);
     // Tab currently animating closed.
     let mut closing_tab = use_signal(|| None::<u64>);
     // Suggested follow-up prompts shown above the composer after a turn.
     let mut followups = use_signal(Vec::<String>::new);
     // Toast notifications (bottom-right stack, auto-dismiss).
-    let toasts = use_signal(Vec::<(u64, String, String)>::new);
+    let toasts = use_signal(Vec::<ToastSpec>::new);
     let toast_seq = use_signal(|| 0u64);
     // Agent tabs (multiple agent sessions in one workspace).
     let initial_provider = cfg.read().provider.clone();
@@ -1878,6 +2051,7 @@ fn app() -> Element {
     // Tab ids whose engine is mid-turn. Engines are per-tab: leaving a tab no
     // longer kills its turn — this drives the sidebar spinners + view state.
     let mut busy_tabs = use_signal(HashSet::<u64>::new);
+    let mut tab_statuses = use_signal(HashMap::<u64, TabStatus>::new);
     let mut questions = use_signal(Vec::<(u64, String, Vec<String>)>::new);
     let mut q_answer = use_signal(String::new);
     let mut reverted = use_signal(HashSet::<u64>::new);
@@ -1967,7 +2141,7 @@ fn app() -> Element {
         loop {
             match eval.recv::<String>().await {
                 Ok(k) if k == "palette" => { let v = !*show_palette.read(); show_palette.set(v); palette_query.set(String::new()); palette_sel.set(0); }
-                Ok(k) if k == "files" => { if *show_env.read() && env_tab.read().as_str() == "files" { show_env.set(false); } else { env_tab.set("files".to_string()); show_env.set(true); } }
+                Ok(k) if k == "files" => select_env_tab(env_tab, show_env, env_tab_by_tab, tabs, active_tab, "files", true),
                 Ok(k) if k == "shortcuts" => { let v = !*show_shortcuts.read(); show_shortcuts.set(v); }
                 Ok(k) if k == "esc" => { show_palette.set(false); show_shortcuts.set(false); chat_img.set(None); }
                 Ok(_) => {}
@@ -2422,6 +2596,7 @@ fn app() -> Element {
                                 messages.write().push(ChatMsg { author: Author::Agent, text: String::new() });
                                 streaming.set(true);
                                 busy_tabs.write().insert(aid);
+                                tab_statuses.write().insert(aid, TabStatus::Running);
                                 let _ = h.submit(Op::UserTurn { text: eng }).await;
                             } else {
                                 // Engine failed to start — don't eat the message silently.
@@ -2511,6 +2686,7 @@ fn app() -> Element {
                             streaming.set(false);
                             let aid = active_id!().unwrap_or(0);
                             busy_tabs.write().remove(&aid);
+                            tab_statuses.write().remove(&aid);
                             // Stale events from the replaced engine are dropped by the
                             // generation guard — no channel drain needed.
                             spawn_tab_engine!(aid, conf);
@@ -2538,6 +2714,9 @@ fn app() -> Element {
                                 }
                             }
                             view_tab = id;
+                            if let Some(saved_env_tab) = env_tab_by_tab.peek().get(&id).cloned() {
+                                env_tab.set(saved_env_tab);
+                            }
                             cur_ws = workspace_of(&conf);
                             approvals.write().clear();
                             checkpoints.write().clear();
@@ -2580,17 +2759,26 @@ fn app() -> Element {
                             parked_q.remove(&id);
                             bg_buffers.remove(&id);
                             busy_tabs.write().remove(&id);
+                            tab_statuses.write().remove(&id);
                         }
                         Some(EngineCmd::Answer { id, text }) => {
-                            if let Some(h) = active_id!().and_then(|t| handles.get(&t)) {
-                                let _ = h.submit(Op::QuestionAnswer { request_id: id, answer: text.clone() }).await;
+                            if let Some(tid) = active_id!() {
+                                if let Some(h) = handles.get(&tid) {
+                                    busy_tabs.write().insert(tid);
+                                    tab_statuses.write().insert(tid, TabStatus::Running);
+                                    let _ = h.submit(Op::QuestionAnswer { request_id: id, answer: text.clone() }).await;
+                                }
                             }
                             questions.write().retain(|(qid, _, _)| *qid != id);
                             messages.write().push(ChatMsg { author: Author::User, text });
                         }
                         Some(EngineCmd::Approve { id, decision }) => {
-                            if let Some(h) = active_id!().and_then(|t| handles.get(&t)) {
-                                let _ = h.submit(Op::ApprovalResponse { request_id: id, decision }).await;
+                            if let Some(tid) = active_id!() {
+                                if let Some(h) = handles.get(&tid) {
+                                    busy_tabs.write().insert(tid);
+                                    tab_statuses.write().insert(tid, TabStatus::Running);
+                                    let _ = h.submit(Op::ApprovalResponse { request_id: id, decision }).await;
+                                }
                             }
                             approvals.write().retain(|(aid, _, _)| *aid != id);
                         }
@@ -2611,6 +2799,7 @@ fn app() -> Element {
                             }
                             if let Some(t) = aid {
                                 busy_tabs.write().remove(&t);
+                                tab_statuses.write().remove(&t);
                             }
                             streaming.set(false);
                         }
@@ -2624,8 +2813,28 @@ fn app() -> Element {
                         }
                         // Per-tab busy bookkeeping (drives sidebar spinners).
                         match &ev {
-                            Event::TurnStarted { .. } => { busy_tabs.write().insert(ev_tid); }
-                            Event::TurnFinished { .. } | Event::Error { .. } => { busy_tabs.write().remove(&ev_tid); }
+                            Event::TurnStarted { .. } => {
+                                busy_tabs.write().insert(ev_tid);
+                                tab_statuses.write().insert(ev_tid, TabStatus::Running);
+                            }
+                            Event::ApprovalRequested { .. } => {
+                                tab_statuses.write().insert(ev_tid, TabStatus::WaitingApproval);
+                            }
+                            Event::QuestionAsked { .. } => {
+                                tab_statuses.write().insert(ev_tid, TabStatus::WaitingInput);
+                            }
+                            Event::TurnFinished { .. } => {
+                                busy_tabs.write().remove(&ev_tid);
+                                tab_statuses.write().remove(&ev_tid);
+                            }
+                            Event::Error { message } => {
+                                busy_tabs.write().remove(&ev_tid);
+                                if message.starts_with("mcp '") {
+                                    tab_statuses.write().remove(&ev_tid);
+                                } else {
+                                    tab_statuses.write().insert(ev_tid, TabStatus::Failed);
+                                }
+                            }
                             _ => {}
                         }
                         // Events from a BACKGROUND tab go to its buffered transcript;
@@ -3064,6 +3273,7 @@ fn app() -> Element {
                                         messages.write().push(ChatMsg { author: Author::Agent, text: String::new() });
                                         streaming.set(true);
                                         busy_tabs.write().insert(ev_tid);
+                                        tab_statuses.write().insert(ev_tid, TabStatus::Running);
                                         let _ = h.submit(Op::UserTurn { text }).await;
                                     }
                                 }
@@ -3429,7 +3639,6 @@ fn app() -> Element {
                                 let expanded = expanded_projects.read().contains(&pkey);
                                 let shown = if expanded { sessions.len() } else { sessions.len().min(5) };
                                 let total = sessions.len();
-                                let ws_rebuild = workspace.clone();
                                 let pws_switch = pws.clone();
                                 rsx! {
                                   div { key: "{pkey}", class: "project-group",
@@ -3452,12 +3661,34 @@ fn app() -> Element {
                                                 let pdel = pws.clone();
                                                 move |e: dioxus::prelude::MouseEvent| {
                                                     e.stop_propagation();
+                                                    let key = pdel.display().to_string();
+                                                    if confirm_archive_workspace.peek().as_deref() != Some(key.as_str()) {
+                                                        confirm_archive_workspace.set(Some(key));
+                                                        push_toast(toasts, toast_seq, "info", "Click project trash again to hide its chats");
+                                                        return;
+                                                    }
+                                                    confirm_archive_workspace.set(None);
+                                                    let restore_ids: Vec<String> = oxide_core::db::list(&pdel, 500)
+                                                        .into_iter()
+                                                        .map(|m| m.id)
+                                                        .collect();
                                                     oxide_core::db::archive_workspace(&pdel);
                                                     let mut cfg = cfg;
                                                     let mut c = cfg.read().clone();
                                                     c.recent_workspaces.retain(|p| p != &pdel);
                                                     cfg.set(c);
                                                     sessions_refresh.set(sessions_refresh() + 1);
+                                                    refresh_projects_list(projects_list, cfg);
+                                                    if !restore_ids.is_empty() {
+                                                        push_action_toast(
+                                                            toasts,
+                                                            toast_seq,
+                                                            "info",
+                                                            "Project chats hidden",
+                                                            "Restore",
+                                                            ToastAction::RestoreSessions(restore_ids),
+                                                        );
+                                                    }
                                                 }
                                             },
                                             Icon { name: "trash" }
@@ -3486,6 +3717,9 @@ fn app() -> Element {
                                                 let busy = busy_tabs.read().contains(&id) || (is_active && *streaming.read());
                                                 let prov = t.provider.clone();
                                                 let logo = provider_logo(&prov);
+                                                let tab_status = tab_statuses.read().get(&id).cloned();
+                                                let tab_status_class_name = tab_status.as_ref().map(tab_status_class).unwrap_or("");
+                                                let tab_status_label_text = tab_status.as_ref().map(tab_status_label).unwrap_or("");
                                                 let editing = *renaming_tab.read() == Some(id);
                                                 let ttl_dc = ttl.clone();
                                                 rsx! {
@@ -3507,6 +3741,13 @@ fn app() -> Element {
                                                             }
                                                         } else {
                                                             span { class: "thread-title", title: "{ttl}", "{ttl}" }
+                                                        }
+                                                        if tab_status.is_some() {
+                                                            span {
+                                                                class: "tab-state {tab_status_class_name}",
+                                                                title: "{tab_status_label_text}",
+                                                                "{tab_status_label_text}"
+                                                            }
                                                         }
                                                     }
                                                 }
@@ -3530,19 +3771,57 @@ fn app() -> Element {
                                             let p_arch2 = path.clone();
                                             let t_open = title.clone();
                                             let menu_open = session_menu.read().as_ref() == Some(&path);
-                                            let ws_d = ws_rebuild.clone();
-                                            let ws_ar = ws_rebuild.clone();
-                                            let ws_d2 = ws_rebuild.clone();
-                                            let ws_ar2 = ws_rebuild.clone();
                                             let path_str = path.display().to_string();
+                                            let path_str_pin = path_str.clone();
+                                            let path_str_archive = path_str.clone();
+                                            let path_str_delete = path_str.clone();
+                                            let path_str_menu_archive = path_str.clone();
+                                            let path_str_menu_delete = path_str.clone();
                                             let is_pinned = pinned_ids.contains(&path_str);
                                             rsx! {
                                                 div { class: "thread-anchor",
                                                     div { class: "row-actions",
                                                         button { class: if is_pinned { "row-act-btn pinned" } else { "row-act-btn" }, title: if is_pinned { "Unpin" } else { "Pin" },
-                                                            onclick: move |e: dioxus::prelude::MouseEvent| { e.stop_propagation(); toggle_pin(cfg, &path_str); sessions_refresh.set(sessions_refresh() + 1); }, Icon { name: "pin" } }
-                                                        button { class: "row-act-btn", title: "Archive", onclick: move |e: dioxus::prelude::MouseEvent| { e.stop_propagation(); archive_session(&p_arch2); sessions_refresh.set(sessions_refresh() + 1); projects_list.set(build_projects(&ws_ar2, &cfg.read().recent_workspaces)); }, "⊟" }
-                                                        button { class: "row-act-btn danger", title: "Delete", onclick: move |e: dioxus::prelude::MouseEvent| { e.stop_propagation(); delete_session(&p_del2); sessions_refresh.set(sessions_refresh() + 1); projects_list.set(build_projects(&ws_d2, &cfg.read().recent_workspaces)); }, "✕" }
+                                                            onclick: move |e: dioxus::prelude::MouseEvent| { e.stop_propagation(); toggle_pin(cfg, &path_str_pin); sessions_refresh.set(sessions_refresh() + 1); }, Icon { name: "pin" } }
+                                                        button { class: "row-act-btn", title: "Archive", onclick: move |e: dioxus::prelude::MouseEvent| {
+                                                            e.stop_propagation();
+                                                            archive_session(&p_arch2);
+                                                            sessions_refresh.set(sessions_refresh() + 1);
+                                                            refresh_projects_list(projects_list, cfg);
+                                                            push_action_toast(
+                                                                toasts,
+                                                                toast_seq,
+                                                                "info",
+                                                                "Session archived",
+                                                                "Restore",
+                                                                ToastAction::RestoreSessions(vec![path_str_archive.clone()]),
+                                                            );
+                                                        }, "⊟" }
+                                                        button { class: "row-act-btn danger", title: "Delete", onclick: move |e: dioxus::prelude::MouseEvent| {
+                                                            e.stop_propagation();
+                                                            if confirm_delete_session.peek().as_deref() != Some(path_str_delete.as_str()) {
+                                                                confirm_delete_session.set(Some(path_str_delete.clone()));
+                                                                push_toast(toasts, toast_seq, "info", "Click delete again to remove this session");
+                                                                return;
+                                                            }
+                                                            confirm_delete_session.set(None);
+                                                            let restore = capture_deleted_session(&p_del2);
+                                                            delete_session(&p_del2);
+                                                            sessions_refresh.set(sessions_refresh() + 1);
+                                                            refresh_projects_list(projects_list, cfg);
+                                                            if let Some(spec) = restore {
+                                                                push_action_toast(
+                                                                    toasts,
+                                                                    toast_seq,
+                                                                    "ok",
+                                                                    "Session deleted",
+                                                                    "Restore",
+                                                                    ToastAction::RestoreDeletedSession(spec),
+                                                                );
+                                                            } else {
+                                                                push_toast(toasts, toast_seq, "ok", "Session deleted");
+                                                            }
+                                                        }, "✕" }
                                                     }
                                                     div { class: "thread recent sub", title: "right-click / double-click for options",
                                                         onclick: move |_| { show_board.set(false); open_session_tab(tabs, active_tab, messages, next_tab_id, cfg, ui, engine, busy_tabs, p_open.clone(), t_open.clone()); },
@@ -3559,10 +3838,47 @@ fn app() -> Element {
                                                     if menu_open {
                                                         div { class: "menu-backdrop", onclick: move |_| session_menu.set(None) }
                                                         div { class: "thread-menu",
-                                                            button { class: "menu-item", onclick: move |_| { archive_session(&p_arch); session_menu.set(None); projects_list.set(build_projects(&ws_ar, &cfg.read().recent_workspaces)); },
+                                                            button { class: "menu-item", onclick: move |_| {
+                                                                archive_session(&p_arch);
+                                                                session_menu.set(None);
+                                                                sessions_refresh.set(sessions_refresh() + 1);
+                                                                refresh_projects_list(projects_list, cfg);
+                                                                push_action_toast(
+                                                                    toasts,
+                                                                    toast_seq,
+                                                                    "info",
+                                                                    "Session archived",
+                                                                    "Restore",
+                                                                    ToastAction::RestoreSessions(vec![path_str_menu_archive.clone()]),
+                                                                );
+                                                            },
                                                                 Icon { name: "folder" } span { class: "menu-name", "Archive" }
                                                             }
-                                                            button { class: "menu-item danger", onclick: move |_| { delete_session(&p_del); session_menu.set(None); projects_list.set(build_projects(&ws_d, &cfg.read().recent_workspaces)); },
+                                                            button { class: "menu-item danger", onclick: move |_| {
+                                                                if confirm_delete_session.peek().as_deref() != Some(path_str_menu_delete.as_str()) {
+                                                                    confirm_delete_session.set(Some(path_str_menu_delete.clone()));
+                                                                    push_toast(toasts, toast_seq, "info", "Click Delete again to remove this session");
+                                                                    return;
+                                                                }
+                                                                confirm_delete_session.set(None);
+                                                                let restore = capture_deleted_session(&p_del);
+                                                                delete_session(&p_del);
+                                                                session_menu.set(None);
+                                                                sessions_refresh.set(sessions_refresh() + 1);
+                                                                refresh_projects_list(projects_list, cfg);
+                                                                if let Some(spec) = restore {
+                                                                    push_action_toast(
+                                                                        toasts,
+                                                                        toast_seq,
+                                                                        "ok",
+                                                                        "Session deleted",
+                                                                        "Restore",
+                                                                        ToastAction::RestoreDeletedSession(spec),
+                                                                    );
+                                                                } else {
+                                                                    push_toast(toasts, toast_seq, "ok", "Session deleted");
+                                                                }
+                                                            },
                                                                 Icon { name: "trash" } span { class: "menu-name", "Delete" }
                                                             }
                                                         }
@@ -3667,6 +3983,9 @@ fn app() -> Element {
                                 let id = t.id;
                                 let title = t.title.clone();
                                 let logo = provider_logo(&t.provider);
+                                let tab_status = tab_statuses.read().get(&id).cloned();
+                                let tab_status_class_name = tab_status.as_ref().map(tab_status_class).unwrap_or("");
+                                let tab_status_label_text = tab_status.as_ref().map(tab_status_label).unwrap_or("");
                                 let is_active = i == *active_tab.read();
                                 let many = tabs.read().len() > 1;
                                 let tab_class = if *closing_tab.read() == Some(id) {
@@ -3681,6 +4000,13 @@ fn app() -> Element {
                                         onclick: move |_| switch_tab(tabs, active_tab, messages, cfg, engine, i),
                                         if let Some(l) = logo { span { class: "agent-tab-logo prov-logo", dangerous_inner_html: l } }
                                         span { class: "agent-tab-title", "{title}" }
+                                        if tab_status.is_some() {
+                                            span {
+                                                class: "tab-state {tab_status_class_name}",
+                                                title: "{tab_status_label_text}",
+                                                "{tab_status_label_text}"
+                                            }
+                                        }
                                         if many {
                                             button { class: "agent-tab-x", onclick: move |e| {
                                                 e.stop_propagation();
@@ -3727,20 +4053,26 @@ fn app() -> Element {
                                 }
                             }
                         }
+                        {
+                            let open_tabs = tabs.read().len();
+                            rsx! {
+                                if open_tabs > 1 {
+                                    span { class: "agent-tab-count", title: "Open agent tabs", "{open_tabs} open" }
+                                }
+                            }
+                        }
                         div { class: "tab-actions",
                             button { class: "top-btn", onclick: move |_| open_folder(cfg, ui, engine),
                                 Icon { name: "folder" } "Open folder"
                             }
                             button { class: if *show_env.read() && env_tab.read().as_str() == "files" { "top-btn on" } else { "top-btn" },
                                 onclick: move |_| {
-                                    if *show_env.read() && env_tab.read().as_str() == "files" { show_env.set(false); }
-                                    else { env_tab.set("files".to_string()); show_env.set(true); }
+                                    select_env_tab(env_tab, show_env, env_tab_by_tab, tabs, active_tab, "files", true);
                                 }, Icon { name: "plugins" } "Files"
                             }
                             button { class: if *show_env.read() && env_tab.read().as_str() == "term" { "top-btn on" } else { "top-btn" },
                                 onclick: move |_| {
-                                    if *show_env.read() && env_tab.read().as_str() == "term" { show_env.set(false); }
-                                    else { env_tab.set("term".to_string()); show_env.set(true); }
+                                    select_env_tab(env_tab, show_env, env_tab_by_tab, tabs, active_tab, "term", true);
                                 }, Icon { name: "terminal" } "Terminal"
                             }
                             button { class: if *show_split.read() { "top-btn on" } else { "top-btn" },
@@ -3748,18 +4080,18 @@ fn app() -> Element {
                             }
                             button { class: if *show_env.read() && env_tab.read().as_str() == "preview" { "top-btn on" } else { "top-btn" },
                                 onclick: move |_| {
-                                    if *show_env.read() && env_tab.read().as_str() == "preview" { show_env.set(false); }
-                                    else {
-                                        env_tab.set("preview".to_string()); show_env.set(true);
+                                    let was_open = *show_env.read() && env_tab.read().as_str() == "preview";
+                                    select_env_tab(env_tab, show_env, env_tab_by_tab, tabs, active_tab, "preview", true);
+                                    if !was_open {
                                         spawn(async move { preview_ports.set(scan_ports().await); });
                                     }
                                 }, Icon { name: "browser" } "Preview"
                             }
                             button { class: if *show_env.read() && env_tab.read().as_str() == "changes" { "top-btn on" } else { "top-btn" },
                                 onclick: move |_| {
-                                    if *show_env.read() && env_tab.read().as_str() == "changes" { show_env.set(false); }
-                                    else {
-                                        env_tab.set("changes".to_string()); show_env.set(true);
+                                    let was_open = *show_env.read() && env_tab.read().as_str() == "changes";
+                                    select_env_tab(env_tab, show_env, env_tab_by_tab, tabs, active_tab, "changes", true);
+                                    if !was_open {
                                         let ws = ws_changes.clone();
                                         spawn(async move { changed_files.set(load_changed_files(&ws).await); });
                                     }
@@ -3782,9 +4114,9 @@ fn app() -> Element {
                                 div { class: "env-card",
                                     div { class: "env-card-head",
                                         span { "Environment" }
-                                        button { class: "env-card-gear", title: "Open environment", onclick: move |_| { env_tab.set("files".to_string()); show_env.set(true); }, Icon { name: "settings" } }
+                                        button { class: "env-card-gear", title: "Open environment", onclick: move |_| select_env_tab(env_tab, show_env, env_tab_by_tab, tabs, active_tab, "files", false), Icon { name: "settings" } }
                                     }
-                                    button { class: "env-card-row", onclick: move |_| { env_tab.set("changes".to_string()); show_env.set(true); },
+                                    button { class: "env-card-row", onclick: move |_| select_env_tab(env_tab, show_env, env_tab_by_tab, tabs, active_tab, "changes", false),
                                         Icon { name: "branch" } span { "Changes" }
                                         if n_changed > 0 {
                                             span { class: "env-card-badge",
@@ -3906,7 +4238,7 @@ fn app() -> Element {
                                                             push_toast(toasts, toast_seq, if ok { "ok" } else { "err" }, if ok { "Pulled" } else { "Pull failed" });
                                                         });
                                                     }, span { class: "env-proc-name", "Pull (ff-only)" } }
-                                                button { class: "env-proc-open", onclick: move |_| { git_menu.set(false); env_tab.set("changes".to_string()); show_env.set(true); }, "Open diffs / PR →" }
+                                                button { class: "env-proc-open", onclick: move |_| { git_menu.set(false); select_env_tab(env_tab, show_env, env_tab_by_tab, tabs, active_tab, "changes", false); }, "Open diffs / PR →" }
                                             }
                                         }
                                     }
@@ -3964,14 +4296,14 @@ fn app() -> Element {
                                                             }, "✕" }
                                                     }
                                                 }
-                                                button { class: "env-proc-open", onclick: move |_| { procs_menu.set(false); env_tab.set("term".to_string()); show_env.set(true); }, "Open terminals →" }
+                                                button { class: "env-proc-open", onclick: move |_| { procs_menu.set(false); select_env_tab(env_tab, show_env, env_tab_by_tab, tabs, active_tab, "term", false); }, "Open terminals →" }
                                             }
                                         }
                                     }
-                                    button { class: "env-card-row", onclick: move |_| { env_tab.set("preview".to_string()); show_env.set(true); spawn(async move { preview_ports.set(scan_ports().await); }); },
+                                    button { class: "env-card-row", onclick: move |_| { select_env_tab(env_tab, show_env, env_tab_by_tab, tabs, active_tab, "preview", false); spawn(async move { preview_ports.set(scan_ports().await); }); },
                                         Icon { name: "browser" } span { "Preview" }
                                     }
-                                    button { class: "env-card-row", onclick: move |_| { env_tab.set("files".to_string()); show_env.set(true); },
+                                    button { class: "env-card-row", onclick: move |_| select_env_tab(env_tab, show_env, env_tab_by_tab, tabs, active_tab, "files", false),
                                         Icon { name: "plugins" } span { "Files" }
                                     }
                                     if !pinned_msgs.read().is_empty() {
@@ -4063,7 +4395,7 @@ fn app() -> Element {
                             div { class: "env-tabs",
                                 for (tid, label, ic) in [("files", "Files", "plugins"), ("term", "Terminals", "terminal"), ("preview", "Preview", "spark"), ("changes", "Diffs", "branch")] {
                                     button { class: if env_tab.read().as_str() == tid { "env-tab on" } else { "env-tab" },
-                                        onclick: move |_| env_tab.set(tid.to_string()),
+                                        onclick: move |_| select_env_tab(env_tab, show_env, env_tab_by_tab, tabs, active_tab, tid, false),
                                         Icon { name: ic } span { "{label}" }
                                     }
                                 }
@@ -4352,17 +4684,41 @@ fn app() -> Element {
                                             let sessions = list_sessions(&workspace);
                                             rsx! {
                                                 if sessions.is_empty() {
-                                                    div { class: "insp-empty", "No saved sessions yet. Conversations persist to .oxide/sessions." }
+                                                    div { class: "insp-empty", "No saved sessions yet. Conversations persist to the Oxide session database." }
                                                 }
-                                                for (id, count, path) in sessions {
-                                                    div { class: "insp-card",
-                                                        div { class: "insp-card-title", "session {id}" }
-                                                        div { class: "insp-card-sub", "{count} message(s)" }
-                                                        div { class: "insp-card-actions",
-                                                            button { class: "ed-save", onclick: move |_| {
-                                                                let msgs = load_session(&path);
-                                                                messages.set(msgs);
-                                                            }, "Open transcript" }
+                                                for session in sessions {
+                                                    {
+                                                        let id = session.id.clone();
+                                                        let title = session.title.clone();
+                                                        let provider = session.provider.clone();
+                                                        let count = session.count;
+                                                        let path = session.path.clone();
+                                                        let open_path = path.clone();
+                                                        let open_title = title.clone();
+                                                        rsx! {
+                                                            div { class: "insp-card",
+                                                                div { class: "insp-card-title",
+                                                                    if let Some(l) = provider_logo(&provider) { span { class: "sess-logo prov-logo", dangerous_inner_html: l } }
+                                                                    span { "{title}" }
+                                                                }
+                                                                div { class: "insp-card-sub", "{count} message(s) · {id}" }
+                                                                div { class: "insp-card-actions",
+                                                                    button { class: "ed-save", onclick: move |_| {
+                                                                        open_session_tab(
+                                                                            tabs,
+                                                                            active_tab,
+                                                                            messages,
+                                                                            next_tab_id,
+                                                                            cfg,
+                                                                            ui,
+                                                                            engine,
+                                                                            busy_tabs,
+                                                                            open_path.clone(),
+                                                                            open_title.clone(),
+                                                                        );
+                                                                    }, "Open" }
+                                                                }
+                                                            }
                                                         }
                                                     }
                                                 }
@@ -5005,7 +5361,7 @@ fn app() -> Element {
                                         for (qi, q) in queue.read().iter().enumerate() {
                                             {
                                                 let qi = qi;
-                                                let preview: String = q.lines().last().unwrap_or("").chars().take(48).collect();
+                                                let preview = queue_preview(q);
                                                 let full = q.clone();
                                                 rsx! {
                                                     span { class: "queue-chip", title: "Click to edit this queued message",
@@ -5018,8 +5374,9 @@ fn app() -> Element {
                                                                 "const e=document.getElementById('ce-input'); if(e){{ e.textContent={}; e.focus(); const r=document.createRange(); r.selectNodeContents(e); r.collapse(false); const s=window.getSelection(); s.removeAllRanges(); s.addRange(r); }} return true;",
                                                                 serde_json::to_string(&full).unwrap_or_default()
                                                             );
-                                                            spawn(async move { let _ = dioxus::document::eval(&js).join::<bool>().await; });
+                                                                spawn(async move { let _ = dioxus::document::eval(&js).join::<bool>().await; });
                                                         },
+                                                        span { class: "queue-index", "{qi + 1}" }
                                                         "{preview}"
                                                         button { class: "queue-steer", title: "Steer now — inject into the running turn instead of waiting",
                                                             onclick: move |e: dioxus::prelude::MouseEvent| {
@@ -5037,6 +5394,9 @@ fn app() -> Element {
                                                     }
                                                 }
                                             }
+                                        }
+                                        if queue.read().len() > 1 {
+                                            button { class: "queue-clear", title: "Clear queued prompts", onclick: move |_| queue.write().clear(), "Clear" }
                                         }
                                     }
                                 }
@@ -5209,8 +5569,7 @@ fn app() -> Element {
                                                 button { class: "live-changes-review", title: "Open diffs",
                                                     onclick: move |_| {
                                                         edits_expanded.set(true);
-                                                        env_tab.set("changes".to_string());
-                                                        show_env.set(true);
+                                                        select_env_tab(env_tab, show_env, env_tab_by_tab, tabs, active_tab, "changes", false);
                                                     },
                                                     Icon { name: "branch" }
                                                 }
@@ -5282,11 +5641,43 @@ fn app() -> Element {
                 McpModal { cfg, engine, status: mcp_status, on_close: move |_| show_mcp.set(false) }
             }
             div { class: "toasts",
-                for (tid, kind, text) in toasts.read().iter().cloned() {
-                    div { key: "{tid}", class: "toast {kind}",
-                        onclick: move |_| { toasts.clone().write().retain(|t| t.0 != tid); },
-                        span { class: "toast-dot" }
-                        span { "{text}" }
+                for toast in toasts.read().iter().cloned() {
+                    {
+                        let tid = toast.id;
+                        let kind = toast.kind.clone();
+                        let text = toast.text.clone();
+                        let action_label = toast.action_label.clone();
+                        let action = toast.action.clone();
+                        rsx! {
+                            div { key: "{tid}", class: "toast {kind}",
+                                onclick: move |_| { toasts.clone().write().retain(|t| t.id != tid); },
+                                span { class: "toast-dot" }
+                                span { "{text}" }
+                                if let (Some(label), Some(action)) = (action_label.clone(), action.clone()) {
+                                    button {
+                                        class: "toast-action",
+                                        onclick: move |e: dioxus::prelude::MouseEvent| {
+                                            e.stop_propagation();
+                                            match action.clone() {
+                                                ToastAction::RestoreSessions(ids) => {
+                                                    for id in ids {
+                                                        oxide_core::db::restore(&id);
+                                                    }
+                                                }
+                                                ToastAction::RestoreDeletedSession(spec) => {
+                                                    restore_deleted_session(&spec);
+                                                }
+                                            }
+                                            toasts.clone().write().retain(|t| t.id != tid);
+                                            sessions_refresh.set(sessions_refresh() + 1);
+                                            refresh_projects_list(projects_list, cfg);
+                                            push_toast(toasts, toast_seq, "ok", "Restored");
+                                        },
+                                        "{label}"
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -5344,8 +5735,8 @@ fn app() -> Element {
                             "MCP servers" => show_mcp.set(true),
                             "Skills" => show_skills.set(true),
                             "Board" => { show_board.set(true); }
-                            "Files panel" => { if *show_env.read() && env_tab.read().as_str() == "files" { show_env.set(false); } else { env_tab.set("files".to_string()); show_env.set(true); } }
-                            "Terminal" => { if *show_env.read() && env_tab.read().as_str() == "term" { show_env.set(false); } else { env_tab.set("term".to_string()); show_env.set(true); } }
+                            "Files panel" => select_env_tab(env_tab, show_env, env_tab_by_tab, tabs, active_tab, "files", true),
+                            "Terminal" => select_env_tab(env_tab, show_env, env_tab_by_tab, tabs, active_tab, "term", true),
                             "Settings…" => show_settings.set(true),
                             "Theme: Light" => set_theme(cfg, "light"),
                             "Theme: Dark" => set_theme(cfg, "dark"),
@@ -5365,6 +5756,23 @@ fn app() -> Element {
                     let filtered: Vec<(&str, &str)> = actions.into_iter().filter(|(_, l)| q.is_empty() || l.to_lowercase().contains(&q)).collect();
                     let sel = if filtered.is_empty() { 0 } else { (*palette_sel.read()).min(filtered.len() - 1) };
                     let f2 = filtered.clone();
+                    let status_map = tab_statuses.read().clone();
+                    let open_tabs: Vec<(usize, u64, String, String, Option<TabStatus>)> = tabs
+                        .read()
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(idx, tab)| {
+                            let title = if tab.title.trim().is_empty() { "New chat".to_string() } else { tab.title.clone() };
+                            let status = status_map.get(&tab.id).cloned();
+                            let status_text = status.as_ref().map(tab_status_label).unwrap_or("");
+                            let hay = format!("{title} {} {status_text}", tab.provider).to_lowercase();
+                            if q.is_empty() || hay.contains(&q) {
+                                Some((idx, tab.id, title, tab.provider.clone(), status))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
                     rsx! {
                         div { class: "modal-overlay palette-overlay", onclick: move |_| show_palette.set(false),
                             div { class: "palette", onclick: move |e| e.stop_propagation(),
@@ -5387,6 +5795,38 @@ fn app() -> Element {
                                             onmouseenter: move |_| palette_sel.set(i),
                                             onclick: move |_| { let mut run = run; run(label); },
                                             Icon { name: icon } span { class: "palette-label", "{label}" }
+                                        }
+                                    }
+                                    if !open_tabs.is_empty() {
+                                        div { class: "menu-label palette-section", "Tabs" }
+                                        for (idx, id, title, provider, status) in open_tabs {
+                                            {
+                                                let is_active = tabs.read().get(*active_tab.read()).map(|tab| tab.id == id).unwrap_or(false);
+                                                let status_label = status.as_ref().map(tab_status_label).unwrap_or("");
+                                                let status_class = status.as_ref().map(tab_status_class).unwrap_or("");
+                                                let meta = if status_label.is_empty() {
+                                                    provider.clone()
+                                                } else {
+                                                    format!("{provider} · {status_label}")
+                                                };
+                                                rsx! {
+                                                    button { class: if is_active { "palette-item sel" } else { "palette-item" },
+                                                        onclick: move |_| {
+                                                            show_palette.set(false);
+                                                            show_board.set(false);
+                                                            switch_tab(tabs, active_tab, messages, cfg, engine, idx);
+                                                        },
+                                                        Icon { name: "branch" }
+                                                        span { class: "palette-copy",
+                                                            span { class: "palette-label", "{title}" }
+                                                            span { class: "palette-meta", "{meta}" }
+                                                        }
+                                                        if !status_label.is_empty() {
+                                                            span { class: "palette-status {status_class}", "{status_label}" }
+                                                        }
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                     if !q.is_empty() {
