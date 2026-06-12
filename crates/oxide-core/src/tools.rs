@@ -16,6 +16,10 @@ pub struct ToolRouter {
     specs: HashMap<String, ToolSpec>,
     /// Tools the user approved for the whole session.
     session_approved: std::collections::HashSet<String>,
+    /// The CURRENT call was explicitly user-approved — run it unsandboxed
+    /// (codex semantics: approval lifts the sandbox, otherwise `git commit`
+    /// or `git push` still dies on the .git/network deny even after a Yes).
+    approved: bool,
 }
 
 /// Outcome of routing a tool call.
@@ -42,11 +46,17 @@ impl ToolRouter {
             workspace,
             specs,
             session_approved: Default::default(),
+            approved: false,
         }
     }
 
     pub fn approve_for_session(&mut self, tool: &str) {
         self.session_approved.insert(tool.to_string());
+    }
+
+    /// Mark the current call as explicitly user-approved (runs unsandboxed).
+    pub fn set_approved(&mut self, v: bool) {
+        self.approved = v;
     }
 
     pub fn is_session_approved(&self, tool: &str) -> bool {
@@ -286,18 +296,24 @@ impl ToolRouter {
 
     #[cfg(target_os = "macos")]
     fn build_shell_command(&self, command: &str) -> tokio::process::Command {
-        if matches!(self.sandbox, SandboxPolicy::DangerFullAccess) {
+        // Explicit user approval lifts the sandbox for THIS call — that's what
+        // the approval is for (e.g. an approved `git commit`/`git push` must
+        // not still die on the .git/network deny).
+        let mut c = if self.approved || matches!(self.sandbox, SandboxPolicy::DangerFullAccess) {
             let mut c = tokio::process::Command::new("/bin/sh");
             c.arg("-c").arg(command);
-            return c;
-        }
-        let profile = sandbox::seatbelt_profile(self.sandbox, &self.workspace);
-        let mut c = tokio::process::Command::new("/usr/bin/sandbox-exec");
-        c.arg("-p")
-            .arg(profile)
-            .arg("/bin/sh")
-            .arg("-c")
-            .arg(command);
+            c
+        } else {
+            let profile = sandbox::seatbelt_profile(self.sandbox, &self.workspace);
+            let mut c = tokio::process::Command::new("/usr/bin/sandbox-exec");
+            c.arg("-p")
+                .arg(profile)
+                .arg("/bin/sh")
+                .arg("-c")
+                .arg(command);
+            c
+        };
+        augment_shell_env(&mut c);
         c
     }
 
@@ -309,6 +325,64 @@ impl ToolRouter {
         c.arg("-c").arg(command);
         c
     }
+}
+
+/// Give shell commands a usable login-ish environment. A GUI app launched from
+/// Finder inherits a MINIMAL env: a short PATH (no Homebrew / ~/.local/bin /
+/// gh) and no `SSH_AUTH_SOCK` — so `git push` (ssh) and `gh` fail with
+/// "permission denied / not logged in" even under Full access. Prepend the
+/// common bin dirs and recover the launchd ssh-agent socket so auth works the
+/// same as it does from a terminal.
+fn augment_shell_env(cmd: &mut tokio::process::Command) {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let mut dirs = vec![
+        format!("{home}/.local/bin"),
+        "/opt/homebrew/bin".into(),
+        "/opt/homebrew/sbin".into(),
+        "/usr/local/bin".into(),
+        format!("{home}/.cargo/bin"),
+        format!("{home}/.bun/bin"),
+        format!("{home}/.superconductor/bin"),
+        "/usr/bin".into(),
+        "/bin".into(),
+        "/usr/sbin".into(),
+        "/sbin".into(),
+    ];
+    if let Ok(p) = std::env::var("PATH") {
+        for seg in p.split(':') {
+            if !seg.is_empty() && !dirs.iter().any(|d| d == seg) {
+                dirs.push(seg.to_string());
+            }
+        }
+    }
+    cmd.env("PATH", dirs.join(":"));
+    // SSH auth: if the inherited env has no agent socket, ask launchd (macOS
+    // keeps it per-session). Cached so we don't spawn launchctl per command.
+    if std::env::var_os("SSH_AUTH_SOCK").is_none() {
+        if let Some(sock) = launchd_ssh_auth_sock() {
+            cmd.env("SSH_AUTH_SOCK", sock);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn launchd_ssh_auth_sock() -> Option<String> {
+    use std::sync::OnceLock;
+    static SOCK: OnceLock<Option<String>> = OnceLock::new();
+    SOCK.get_or_init(|| {
+        let out = std::process::Command::new("/bin/launchctl")
+            .args(["getenv", "SSH_AUTH_SOCK"])
+            .output()
+            .ok()?;
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if s.is_empty() { None } else { Some(s) }
+    })
+    .clone()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn launchd_ssh_auth_sock() -> Option<String> {
+    None
 }
 
 fn is_supported_browser_url(url: &str) -> bool {

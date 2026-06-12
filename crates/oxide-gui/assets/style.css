@@ -2320,3 +2320,15 @@ details[open]::details-content { block-size: auto; }
 }
 .edits-row-revert:hover { background: rgba(224,145,58,.12); color: var(--danger); border-color: rgba(224,145,58,.4); }
 .edits-row .diff-reverted { margin-left: auto; flex-shrink: 0; }
+
+/* Pending row in the Edited-files card (CLI mid-edit; diff lands at turn end). */
+.edits-row.pending { gap: 8px; cursor: default; }
+.edits-row.pending .edits-rowcounts.shimmer {
+  font-size: 11.5px; font-weight: 500;
+  background: linear-gradient(90deg, var(--muted) 30%, var(--text) 50%, var(--muted) 70%);
+  background-size: 200% 100%;
+  -webkit-background-clip: text; background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: shimmer 1.8s linear infinite;
+}
+@media (prefers-reduced-motion: reduce) { .edits-row.pending .edits-rowcounts.shimmer { animation: none; } }

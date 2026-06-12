@@ -1820,7 +1820,13 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
                 .await;
                 return false;
             }
-            Routed::Run => {}
+            Routed::Run => {
+                // Run came from a prior "Always" — that consent lifts the
+                // sandbox for this tool too.
+                if router.is_session_approved(&name) {
+                    router.set_approved(true);
+                }
+            }
             Routed::NeedsApproval => {
                 let request_id = self.next_approval;
                 self.next_approval += 1;
@@ -1851,9 +1857,13 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
                             }
                             ApprovalDecision::ApproveForSession => {
                                 self.session_approved.insert(name.clone());
+                                router.set_approved(true);
                                 break;
                             }
-                            ApprovalDecision::Approve => break,
+                            ApprovalDecision::Approve => {
+                                router.set_approved(true);
+                                break;
+                            }
                         },
                         Some(Op::Interrupt) | Some(Op::Shutdown) | None => {
                             self.session.push(Message::tool_result("interrupted before approval", call_id));

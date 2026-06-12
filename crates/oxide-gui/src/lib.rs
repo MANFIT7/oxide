@@ -2558,6 +2558,15 @@ fn app() -> Element {
                                         }
                                         mw.push(ChatMsg { author: Author::Activity { running: false, ok: true }, text: row });
                                     }
+                                    // CLI edits compute their real diff at turn end — show the
+                                    // file in the "Edited files" card NOW as a pending row
+                                    // (synara-style live), replaced by the diff when it lands.
+                                    if matches!(verb.to_ascii_lowercase().as_str(), "edit" | "editing" | "write" | "multiedit" | "notebookedit") && !detail.is_empty() {
+                                        let p = detail.split_whitespace().next().unwrap_or("").to_string();
+                                        if !p.is_empty() && !turn_edits.peek().iter().any(|e| e.0 == p) {
+                                            turn_edits.write().push((p, 0, 0, 0, String::new()));
+                                        }
+                                    }
                                 } else if text.starts_with(['🧭','🔍','🤖','🧩','🔁','✓','⚠']) {
                                     // pipeline stage → live animated status, not a chat note
                                     status.set(text);
@@ -2658,7 +2667,16 @@ fn app() -> Element {
                             }
                             Event::FileDiff { path, diff, checkpoint, .. } => {
                                 let (adds, dels) = diff_counts(&diff);
-                                turn_edits.write().push((path.clone(), adds, dels, checkpoint, diff.clone()));
+                                // Upsert: a provisional "editing…" row (added live when the
+                                // CLI touched the file) is replaced by the real diff.
+                                {
+                                    let mut te = turn_edits.write();
+                                    if let Some(e) = te.iter_mut().find(|e| e.0 == path) {
+                                        *e = (path.clone(), adds, dels, checkpoint, diff.clone());
+                                    } else {
+                                        te.push((path.clone(), adds, dels, checkpoint, diff.clone()));
+                                    }
+                                }
                                 messages.write().push(ChatMsg { author: Author::Diff(path, checkpoint), text: diff });
                             }
                             Event::HookFired { hook, command, blocked } => {
@@ -4874,21 +4892,34 @@ fn app() -> Element {
                                                 for (path, a, d, cp, diff) in edits.iter().take(shown).cloned() {
                                                     {
                                                         let is_reverted = reverted.read().contains(&cp);
-                                                        rsx! {
-                                                            details { class: "edits-row-d",
-                                                                summary { class: "edits-row",
-                                                                    span { class: "edits-caret", Icon { name: "chevron" } }
+                                                        let pending = diff.is_empty() && cp == 0;
+                                                        if pending {
+                                                            // Live row: the CLI is editing this file right now;
+                                                            // the diff lands at the end of the turn.
+                                                            rsx! {
+                                                                div { class: "edits-row pending",
+                                                                    span { class: "syn-spinner" }
                                                                     span { class: "edits-path", "{path}" }
-                                                                    span { class: "edits-rowcounts", span { class: "diff-adds", "+{a}" } " " span { class: "diff-dels", "−{d}" } }
-                                                                    if is_reverted {
-                                                                        span { class: "diff-reverted", "✓ Reverted" }
-                                                                    } else if cp != 0 {
-                                                                        button { class: "edits-row-revert",
-                                                                            onclick: move |e: dioxus::prelude::MouseEvent| { e.prevent_default(); e.stop_propagation(); let _ = engine.send(EngineCmd::Rewind { id: cp }); reverted.write().insert(cp); },
-                                                                            "Revert" }
-                                                                    }
+                                                                    span { class: "edits-rowcounts shimmer", "editing…" }
                                                                 }
-                                                                HunkedDiff { ws: workspace.clone(), path: path.clone(), diff }
+                                                            }
+                                                        } else {
+                                                            rsx! {
+                                                                details { class: "edits-row-d",
+                                                                    summary { class: "edits-row",
+                                                                        span { class: "edits-caret", Icon { name: "chevron" } }
+                                                                        span { class: "edits-path", "{path}" }
+                                                                        span { class: "edits-rowcounts", span { class: "diff-adds", "+{a}" } " " span { class: "diff-dels", "−{d}" } }
+                                                                        if is_reverted {
+                                                                            span { class: "diff-reverted", "✓ Reverted" }
+                                                                        } else if cp != 0 {
+                                                                            button { class: "edits-row-revert",
+                                                                                onclick: move |e: dioxus::prelude::MouseEvent| { e.prevent_default(); e.stop_propagation(); let _ = engine.send(EngineCmd::Rewind { id: cp }); reverted.write().insert(cp); },
+                                                                                "Revert" }
+                                                                        }
+                                                                    }
+                                                                    HunkedDiff { ws: workspace.clone(), path: path.clone(), diff }
+                                                                }
                                                             }
                                                         }
                                                     }
@@ -6330,7 +6361,7 @@ fn Composer(
     };
 
     rsx! {
-        div { class: if *streaming.read() { if cur_effort == "xhigh" || cur_effort == "max" { "composer working ultra" } else { "composer working" } } else { "composer" },
+        div { class: if *streaming.read() { "composer working" } else { "composer" },
             if !slash_items.is_empty() {
                 div { class: "mention-menu",
                     div { class: "menu-label", "Commands" }
