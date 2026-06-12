@@ -1,0 +1,74 @@
+name: Release
+
+# Build the signed dmg + OTA binary on a real macOS runner and attach them to
+# the GitHub release. Triggered by pushing a version tag (e.g. `git tag v0.0.49
+# && git push --tags`) — no more flaky local uploads.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build/release (e.g. v0.0.49)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-14 # Apple silicon (arm64)
+    env:
+      # Job-level so the import step's `if` can see it (secrets aren't allowed
+      # directly in `if:` conditions).
+      OXIDE_CERT_P12: ${{ secrets.OXIDE_CERT_P12 }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve tag
+        id: tag
+        run: echo "tag=${GITHUB_REF_NAME:-${{ github.event.inputs.tag }}}" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # Optional: import the stable "Oxide Dev" signing identity so OTA updates
+      # don't re-trigger macOS Allow prompts. Set repo secrets OXIDE_CERT_P12
+      # (base64 of the .p12) and OXIDE_CERT_PASSWORD. Without them the build is
+      # ad-hoc signed (still works; just prompts on each update).
+      - name: Import signing certificate
+        if: ${{ env.OXIDE_CERT_P12 != '' }}
+        env:
+          OXIDE_CERT_PASSWORD: ${{ secrets.OXIDE_CERT_PASSWORD }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/build.keychain"
+          PW="ci-$RANDOM"
+          security create-keychain -p "$PW" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$PW" "$KEYCHAIN"
+          echo "$OXIDE_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$OXIDE_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$PW" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | sed s/\"//g)
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+      - name: Build dmg
+        run: bash scripts/make-dmg.sh
+
+      - name: Package OTA binary (gzip)
+        run: gzip -9 -c target/release/oxide > oxide-macos-arm64.gz
+
+      - name: Attach assets to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.tag }}
+          files: |
+            dist/Oxide.dmg
+            oxide-macos-arm64.gz
+          fail_on_unmatched_files: true
