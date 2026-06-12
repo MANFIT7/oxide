@@ -2247,6 +2247,16 @@ details[open]::details-content { block-size: auto; }
   background: var(--warn, #c2895f); animation: bg-pulse 1.2s ease-in-out infinite;
 }
 @keyframes bg-pulse { 0%,100% { opacity: .35; } 50% { opacity: 1; } }
+/* Animated background-task indicator: a comet-tail ring sweeping around. */
+.bg-orbit {
+  width: 14px; height: 14px; border-radius: 50%; flex-shrink: 0;
+  background: conic-gradient(from 0deg, transparent 0%, transparent 25%, var(--warn, #c2895f) 100%);
+  -webkit-mask: radial-gradient(farthest-side, #0000 calc(100% - 2.2px), #000 calc(100% - 2.2px));
+          mask: radial-gradient(farthest-side, #0000 calc(100% - 2.2px), #000 calc(100% - 2.2px));
+  animation: bg-orbit-rot .85s linear infinite;
+}
+@keyframes bg-orbit-rot { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .bg-orbit { animation: none; } }
 .bg-x { background: none; border: 0; color: var(--faint); cursor: pointer; font-size: 11px; padding: 0 2px; }
 .bg-x:hover { color: var(--text); }
 @media (prefers-reduced-motion: reduce) { .bg-dot { animation: none; } }

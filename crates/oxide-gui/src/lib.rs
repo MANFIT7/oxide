@@ -2554,7 +2554,7 @@ fn app() -> Element {
                                     }
                                     status.set(format!("Background · {label}"));
                                     let (verb, detail) = label.split_once(' ').unwrap_or((label.as_str(), ""));
-                                    let row = format!("terminal\t⏳ {verb}\t{detail}");
+                                    let row = format!("terminal\tBackground {verb}\t{detail}");
                                     {
                                         let mut mw = messages.write();
                                         if mw.last().map(|m| m.author == Author::Agent && m.text.is_empty()).unwrap_or(false) {
@@ -4821,7 +4821,8 @@ fn app() -> Element {
                                 }
                                 if !bg_jobs.read().is_empty() {
                                     div { class: "bg-bar",
-                                        span { class: "bg-label", "⏳ Background" }
+                                        span { class: "bg-orbit" }
+                                        span { class: "bg-label", "Background" }
                                         for (bi, job) in bg_jobs.read().iter().cloned().enumerate() {
                                             span { class: "bg-chip", title: "Running in background — result won't auto-return",
                                                 span { class: "bg-dot" }
