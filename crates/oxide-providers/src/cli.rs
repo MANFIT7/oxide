@@ -74,6 +74,37 @@ fn last_user_prompt(req: &TurnRequest) -> String {
         .unwrap_or_default()
 }
 
+/// Split the latest user prompt into clean text + absolute image paths. Pasted
+/// images ride as `\u{2}wsimg:<relpath>` markers (relative to the workspace);
+/// the "(user attached … NOT visible)" note that API providers get is dropped
+/// because the CLI is handed the real files.
+fn extract_cli_images(req: &TurnRequest) -> (String, Vec<String>) {
+    let raw = last_user_prompt(req);
+    let mut parts = raw.split('\u{2}');
+    let mut prompt = parts.next().unwrap_or("").to_string();
+    let ws = std::path::Path::new(&req.cwd);
+    let mut imgs = Vec::new();
+    for seg in parts {
+        if let Some(rel) = seg.strip_prefix("wsimg:") {
+            let p = if rel.starts_with('/') {
+                std::path::PathBuf::from(rel)
+            } else {
+                ws.join(rel)
+            };
+            if p.exists() {
+                imgs.push(p.display().to_string());
+            }
+        }
+    }
+    if !imgs.is_empty() {
+        if let Some(idx) = prompt.find("(user attached ") {
+            let end = prompt[idx..].find('\n').map(|e| idx + e).unwrap_or(prompt.len());
+            prompt.replace_range(idx..end, "");
+        }
+    }
+    (prompt.trim().to_string(), imgs)
+}
+
 /// Spawn `program args...` and stream its stdout lines to `on_line`, closing
 /// stdin so the CLI doesn't block waiting for piped input.
 async fn run_jsonl<F>(
@@ -188,7 +219,7 @@ impl Provider for CodexCliProvider {
     }
 
     async fn stream(&self, req: TurnRequest, sink: mpsc::Sender<StreamItem>) -> anyhow::Result<()> {
-        let prompt = last_user_prompt(&req);
+        let (prompt, images) = extract_cli_images(&req);
         let skey = session_key(&self.bin, &req.conversation_id, &req.cwd);
         let resume = session_get(&skey);
         let mut args = vec!["exec".to_string()];
@@ -214,6 +245,11 @@ impl Provider for CodexCliProvider {
                 "model_reasoning_effort=\"{}\"",
                 codex_effort(&req.reasoning_effort)
             ));
+        }
+        // Pasted/attached images → native codex attachments (one -i per file).
+        for img in &images {
+            args.push("-i".to_string());
+            args.push(img.clone());
         }
         args.push(prompt);
 
@@ -346,7 +382,15 @@ impl Provider for ClaudeCliProvider {
     }
 
     async fn stream(&self, req: TurnRequest, sink: mpsc::Sender<StreamItem>) -> anyhow::Result<()> {
-        let prompt = last_user_prompt(&req);
+        let (mut prompt, images) = extract_cli_images(&req);
+        // claude -p has no --image flag; hand it the file paths so its own Read
+        // tool (which renders images) loads them.
+        if !images.is_empty() {
+            prompt.push_str("\n\nAttached image file(s) — use your Read tool to view:\n");
+            for img in &images {
+                prompt.push_str(&format!("- {img}\n"));
+            }
+        }
         let skey = session_key(&self.bin, &req.conversation_id, &req.cwd);
         // Continuing an imported Claude TUI session ("claude-<uuid>") resumes
         // claude's OWN native session by that uuid → full context, no replay.

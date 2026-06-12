@@ -2112,6 +2112,27 @@ fn app() -> Element {
         }
     });
 
+    // Catch-all: whenever streaming stops (turn done, error, interrupt, or a
+    // dead engine), settle any activity row still showing a spinner. This is
+    // the single place that covers every termination path, so no "bash"/"edit"
+    // spinner lingers after the turn ends.
+    use_effect(move || {
+        if !*streaming.read() {
+            let has_running = messages.peek().iter()
+                .any(|c| matches!(c.author, Author::Activity { running: true, .. }));
+            if has_running {
+                for c in messages.write().iter_mut() {
+                    if let Author::Activity { running, .. } = &mut c.author { *running = false; }
+                }
+            }
+            // Drop any "editing…" pending row (empty diff, no checkpoint) that
+            // never resolved — its spinner must not outlive the turn.
+            if turn_edits.peek().iter().any(|e| e.4.is_empty() && e.3 == 0) {
+                turn_edits.write().retain(|e| !(e.4.is_empty() && e.3 == 0));
+            }
+        }
+    });
+
     // Auto-rename the active tab from its first user message.
     use_effect(move || {
         let snippet = messages
@@ -2163,6 +2184,11 @@ fn app() -> Element {
             let mut gen_seq: u64 = 0;
             // Approvals/questions that arrived while their tab was backgrounded —
             // replayed into the view when the user returns to that tab.
+            // Background-tab transcripts accumulate HERE (a plain map), not in the
+            // `tabs` signal — so a backgrounded turn's token stream doesn't dirty
+            // the UI signal (and re-schedule the sidebar) on every delta. Merged
+            // back into the tab when the user switches to it.
+            let mut bg_buffers: std::collections::HashMap<u64, Vec<ChatMsg>> = std::collections::HashMap::new();
             let mut parked_appr: std::collections::HashMap<u64, Vec<(u64, String, String)>> = std::collections::HashMap::new();
             let mut parked_q: std::collections::HashMap<u64, Vec<(u64, String, Vec<String>)>> = std::collections::HashMap::new();
 
@@ -2218,10 +2244,32 @@ fn app() -> Element {
             // routed to the right transcript, never the outgoing one.
             let mut view_tab: u64 = first_id;
             let mut cur_ws = workspace_of(&{ cfg.peek().clone() });
+            // Streaming text coalescing: appending the live agent bubble re-runs
+            // markdown+syntax-highlight on the WHOLE message per token, which janks
+            // on fast streams. Buffer deltas and paint at ~30fps instead (modern
+            // streaming-UI practice).
+            let mut agent_buf = String::new();
+            let mut last_paint = std::time::Instant::now();
+            macro_rules! flush_agent {
+                () => {{
+                    if !agent_buf.is_empty() {
+                        let chunk = std::mem::take(&mut agent_buf);
+                        let mut m = messages.write();
+                        match m.last_mut() {
+                            Some(last) if last.author == Author::Agent => last.text.push_str(&chunk),
+                            _ => m.push(ChatMsg { author: Author::Agent, text: chunk }),
+                        }
+                        last_paint = std::time::Instant::now();
+                    }
+                }};
+            }
 
             loop {
                 tokio::select! {
-                    cmd = rx.next() => match cmd {
+                    cmd = rx.next() => {
+                      // Land buffered streaming text before any view change.
+                      flush_agent!();
+                      match cmd {
                         Some(EngineCmd::Submit { engine: eng, display }) => {
                             followups.write().clear();
                             let aid = active_id!().unwrap_or(0);
@@ -2335,9 +2383,19 @@ fn app() -> Element {
                             // VIEW switch only — the tab being left keeps its engine
                             // (and any in-flight turn) running in the background.
                             // Save the outgoing view first — deltas may have landed after
-                            // the caller's click-time snapshot.
+                            // the caller's click-time snapshot. If it's still streaming,
+                            // hand its trailing agent bubble to the bg buffer so further
+                            // tokens continue it there (no signal write per token).
                             if view_tab != id {
-                                let snap = messages.peek().clone();
+                                let mut snap = messages.peek().clone();
+                                if busy_tabs.peek().contains(&view_tab) {
+                                    let seed = if matches!(snap.last().map(|m| &m.author), Some(Author::Agent)) {
+                                        snap.pop()
+                                    } else { None };
+                                    if let Some(s) = seed {
+                                        bg_buffers.entry(view_tab).or_default().insert(0, s);
+                                    }
+                                }
                                 if let Some(t) = tabs.write().iter_mut().find(|t| t.id == view_tab) {
                                     t.messages = snap;
                                 }
@@ -2352,9 +2410,13 @@ fn app() -> Element {
                             followups.write().clear();
                             thinking.set(String::new());
                             bg_jobs.write().clear();
-                            // Prefer the tab's CURRENT buffer — background events may have
-                            // landed after the caller cloned `msgs`.
-                            let cur_msgs = tabs.peek().iter().find(|t| t.id == id).map(|t| t.messages.clone()).unwrap_or(msgs);
+                            // The tab's snapshot + anything that streamed while it was
+                            // backgrounded (drained from the bg buffer in one write).
+                            let mut cur_msgs = tabs.peek().iter().find(|t| t.id == id).map(|t| t.messages.clone()).unwrap_or(msgs);
+                            if let Some(buf) = bg_buffers.remove(&id) {
+                                cur_msgs.extend(buf);
+                            }
+                            if let Some(t) = tabs.write().iter_mut().find(|t| t.id == id) { t.messages = cur_msgs.clone(); }
                             *messages.write() = cur_msgs; // this tab's transcript
                             let busy = busy_tabs.peek().contains(&id);
                             streaming.set(busy);
@@ -2379,6 +2441,7 @@ fn app() -> Element {
                             gens.remove(&id);
                             parked_appr.remove(&id);
                             parked_q.remove(&id);
+                            bg_buffers.remove(&id);
                             busy_tabs.write().remove(&id);
                         }
                         Some(EngineCmd::Answer { id, text }) => {
@@ -2415,6 +2478,7 @@ fn app() -> Element {
                             streaming.set(false);
                         }
                         None => break,
+                      }
                     },
                     Some((ev_tid, ev_gen, ev)) = ev_rx.recv() => {
                         // Drop events from a replaced engine (stale generation).
@@ -2430,14 +2494,14 @@ fn app() -> Element {
                         // Events from a BACKGROUND tab go to its buffered transcript;
                         // only the view-bound tab writes to the live view below.
                         if ev_tid != view_tab {
+                            // Append to the plain bg buffer — NO `tabs` signal write, so a
+                            // backgrounded tab's token stream never re-schedules the UI.
+                            let buf = bg_buffers.entry(ev_tid).or_default();
                             match ev {
                                 Event::AgentMessageDelta { text, .. } => {
-                                    let mut tw = tabs.write();
-                                    if let Some(t) = tw.iter_mut().find(|t| t.id == ev_tid) {
-                                        match t.messages.last_mut() {
-                                            Some(l) if l.author == Author::Agent => l.text.push_str(&text),
-                                            _ => t.messages.push(ChatMsg { author: Author::Agent, text }),
-                                        }
+                                    match buf.last_mut() {
+                                        Some(l) if l.author == Author::Agent => l.text.push_str(&text),
+                                        _ => buf.push(ChatMsg { author: Author::Agent, text }),
                                     }
                                 }
                                 Event::Info { text } => {
@@ -2447,74 +2511,50 @@ fn app() -> Element {
                                         let label = label.trim().to_string();
                                         let (verb, detail) = label.split_once(' ').unwrap_or((label.as_str(), ""));
                                         let row = format!("spark\t{verb}\t{detail}");
-                                        let mut tw = tabs.write();
-                                        if let Some(t) = tw.iter_mut().find(|t| t.id == ev_tid) {
-                                            if t.messages.last().map(|m| m.author == Author::Agent && m.text.is_empty()).unwrap_or(false) {
-                                                t.messages.pop();
-                                            }
-                                            t.messages.push(ChatMsg { author: Author::Activity { running: false, ok: true }, text: row });
+                                        if buf.last().map(|m| m.author == Author::Agent && m.text.is_empty()).unwrap_or(false) {
+                                            buf.pop();
                                         }
+                                        buf.push(ChatMsg { author: Author::Activity { running: false, ok: true }, text: row });
                                     } else if text.starts_with(['🧭','🔍','🤖','🧩','🔁','✓','⚠']) {
                                         // live stage info — meaningless once backgrounded
                                     } else {
-                                        let mut tw = tabs.write();
-                                        if let Some(t) = tw.iter_mut().find(|t| t.id == ev_tid) {
-                                            t.messages.push(ChatMsg { author: Author::Note, text });
-                                        }
+                                        buf.push(ChatMsg { author: Author::Note, text });
                                     }
                                 }
                                 Event::FileDiff { path, diff, checkpoint, .. } => {
-                                    let mut tw = tabs.write();
-                                    if let Some(t) = tw.iter_mut().find(|t| t.id == ev_tid) {
-                                        t.messages.push(ChatMsg { author: Author::Diff(path, checkpoint), text: diff });
-                                    }
+                                    buf.push(ChatMsg { author: Author::Diff(path, checkpoint), text: diff });
                                 }
                                 Event::SessionPath { path } => {
+                                    // Session binding is rare (once) — keep it on the tab itself.
                                     let pb = std::path::PathBuf::from(&path);
-                                    let mut tw = tabs.write();
-                                    if let Some(t) = tw.iter_mut().find(|t| t.id == ev_tid) {
+                                    if let Some(t) = tabs.write().iter_mut().find(|t| t.id == ev_tid) {
                                         t.session = Some(pb);
                                     }
                                 }
                                 Event::ApprovalRequested { request_id, tool, summary } => {
                                     parked_appr.entry(ev_tid).or_default().push((request_id, tool.clone(), summary));
-                                    let mut tw = tabs.write();
-                                    if let Some(t) = tw.iter_mut().find(|t| t.id == ev_tid) {
-                                        t.messages.push(ChatMsg { author: Author::Note, text: format!("⏸ waiting for approval ({tool}) — open this tab to respond") });
-                                    }
+                                    buf.push(ChatMsg { author: Author::Note, text: format!("⏸ waiting for approval ({tool}) — open this tab to respond") });
                                 }
                                 Event::QuestionAsked { request_id, question, options } => {
                                     parked_q.entry(ev_tid).or_default().push((request_id, question.clone(), options));
-                                    let mut tw = tabs.write();
-                                    if let Some(t) = tw.iter_mut().find(|t| t.id == ev_tid) {
-                                        t.messages.push(ChatMsg { author: Author::Note, text: format!("❓ {question} — open this tab to answer") });
-                                    }
+                                    buf.push(ChatMsg { author: Author::Note, text: format!("❓ {question} — open this tab to answer") });
                                 }
                                 Event::TurnFinished { .. } => {
-                                    let mut title = String::new();
-                                    {
-                                        let mut tw = tabs.write();
-                                        if let Some(t) = tw.iter_mut().find(|t| t.id == ev_tid) {
-                                            title = t.title.clone();
-                                            if t.messages.last().map(|m| m.author == Author::Agent && m.text.is_empty()).unwrap_or(false) {
-                                                t.messages.pop();
-                                            }
-                                            for c in t.messages.iter_mut() {
-                                                if let Author::Activity { running, .. } = &mut c.author { *running = false; }
-                                            }
-                                            t.messages.push(ChatMsg { author: Author::Note, text: "✓ Done".into() });
-                                        }
+                                    if buf.last().map(|m| m.author == Author::Agent && m.text.is_empty()).unwrap_or(false) {
+                                        buf.pop();
                                     }
+                                    for c in buf.iter_mut() {
+                                        if let Author::Activity { running, .. } = &mut c.author { *running = false; }
+                                    }
+                                    buf.push(ChatMsg { author: Author::Note, text: "✓ Done".into() });
+                                    let title = tabs.peek().iter().find(|t| t.id == ev_tid).map(|t| t.title.clone()).unwrap_or_default();
                                     if !title.is_empty() {
                                         push_toast(toasts, toast_seq, "ok", &format!("{title} — finished"));
                                     }
                                 }
                                 Event::Error { message } => {
                                     if !message.starts_with("mcp '") {
-                                        let mut tw = tabs.write();
-                                        if let Some(t) = tw.iter_mut().find(|t| t.id == ev_tid) {
-                                            t.messages.push(ChatMsg { author: Author::Note, text: format!("error: {message}") });
-                                        }
+                                        buf.push(ChatMsg { author: Author::Note, text: format!("error: {message}") });
                                         push_toast(toasts, toast_seq, "err", &message.chars().take(120).collect::<String>());
                                     }
                                 }
@@ -2522,17 +2562,22 @@ fn app() -> Element {
                             }
                             continue;
                         }
+                        // Land any buffered streaming text before a structural event
+                        // (tool/diff/finish) so transcript order is preserved.
+                        if !matches!(ev, Event::AgentMessageDelta { .. }) {
+                            flush_agent!();
+                        }
                         match ev {
                             Event::AgentMessageDelta { text, .. } => {
                                 if status.peek().as_str() != "Writing…" {
                                     status.set("Writing…".to_string());
                                 }
-                                let mut m = messages.write();
-                                match m.last_mut() {
-                                    // Append to the open agent bubble; but if tools/diffs came after it,
-                                    // start a NEW bubble so the answer shows below them (not lost).
-                                    Some(last) if last.author == Author::Agent => last.text.push_str(&text),
-                                    _ => m.push(ChatMsg { author: Author::Agent, text }),
+                                agent_buf.push_str(&text);
+                                // Paint at ~30fps or when a sizable chunk has built up.
+                                if last_paint.elapsed() >= std::time::Duration::from_millis(33)
+                                    || agent_buf.len() > 800
+                                {
+                                    flush_agent!();
                                 }
                             }
                             Event::ReasoningDelta { text, .. } => {

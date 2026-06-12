@@ -2342,3 +2342,37 @@ details[open]::details-content { block-size: auto; }
   animation: shimmer 1.8s linear infinite;
 }
 @media (prefers-reduced-motion: reduce) { .edits-row.pending .edits-rowcounts.shimmer { animation: none; } }
+
+/* ── 2026 streaming / animation polish ─────────────────────────────── */
+/* Spring-overshoot entrance for chat rows + cards (organic, not linear). */
+@keyframes oxide-rise {
+  0%   { opacity: 0; transform: translateY(10px) translateZ(0); }
+  60%  { opacity: 1; }
+  100% { opacity: 1; transform: translateY(0) translateZ(0); }
+}
+.row { animation: oxide-rise .34s cubic-bezier(.34, 1.28, .64, 1) both; }
+.question-card, .approval-card, .edits-card, .todo-card, .queue-bar,
+.thinking-box, .attach-card, .elem-chip, .bg-bar {
+  animation: oxide-rise .3s cubic-bezier(.34, 1.28, .64, 1) both;
+}
+
+/* Markdown layout stability — stop reflow jank while content streams in. */
+.agent-md { contain: layout style; }
+.agent-md table { table-layout: fixed; width: 100%; }
+.agent-md td, .agent-md th { overflow-wrap: anywhere; }
+/* Code blocks rise+fade in instead of a hard pop. */
+.agent-md pre { animation: oxide-rise .3s cubic-bezier(.22, 1, .36, 1) both; }
+
+/* Streaming bubble: soft blur-to-sharp on first paint (focus-pull feel). */
+@keyframes oxide-focus-in { from { opacity: 0; filter: blur(6px); } to { opacity: 1; filter: blur(0); } }
+.col.streaming .row.agent:last-of-type .agent-md { animation: oxide-focus-in .42s ease-out both; }
+
+/* Tabular numerals so counts/elapsed don't jiggle width as they tick. */
+.diff-adds, .diff-dels, .status-elapsed, .usage-v, .edits-counts,
+.bg-chip-text, .thread-time { font-variant-numeric: tabular-nums; }
+
+@media (prefers-reduced-motion: reduce) {
+  .row, .agent-md pre, .col.streaming .row.agent:last-of-type .agent-md,
+  .question-card, .approval-card, .edits-card, .todo-card, .queue-bar,
+  .thinking-box, .attach-card, .elem-chip, .bg-bar { animation: none; }
+}
