@@ -867,9 +867,9 @@ svg { width: 17px; height: 17px; flex-shrink: 0; }
   width: 13px; height: 13px; border-radius: 50%;
   border: 2px solid #3a3a42; border-top-color: var(--accent);
   animation: spin .7s linear infinite; flex-shrink: 0;
-  will-change: transform; transform: translateZ(0);
+  will-change: transform;
 }
-@keyframes spin { to { transform: rotate(360deg); } }
+@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
 .status-shimmer {
   font-size: 13px; font-weight: 500;
   background: linear-gradient(90deg, var(--muted) 30%, #fff 50%, var(--muted) 70%);
@@ -1160,7 +1160,7 @@ svg { width: 17px; height: 17px; flex-shrink: 0; }
 .activity-card.fail { border-color: rgba(239,93,93,.4); }
 .activity-text { font-family: ui-monospace, Menlo, monospace; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; flex: 1 1 auto; }
 .activity-card.running .activity-text { color: var(--text); }
-.activity-spin { width: 12px; height: 12px; border-radius: 50%; border: 2px solid #3a3a42; border-top-color: var(--accent); animation: spin .7s linear infinite; flex-shrink: 0; will-change: transform; transform: translateZ(0); }
+.activity-spin { width: 12px; height: 12px; border-radius: 50%; border: 2px solid #3a3a42; border-top-color: var(--accent); animation: spin .7s linear infinite; flex-shrink: 0; will-change: transform; }
 .activity-ic { font-size: 11px; font-weight: 700; flex-shrink: 0; }
 .activity-ic.ok { color: var(--ok); }
 .activity-ic.fail { color: var(--danger); }
@@ -1558,7 +1558,7 @@ details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
 .sidebar-icon-chip { background: var(--sidebar); box-shadow: 0 0 0 1px var(--border), 0 1px 2px rgba(0,0,0,.05); }
 
 /* the 1.6s conic-gradient status spinner (Working) */
-@keyframes syn-spin { to { transform: rotate(360deg); } }
+@keyframes syn-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
 .syn-spinner { width: 12px; height: 12px; flex-shrink: 0; border-radius: 50%;
   background: conic-gradient(from 0deg, transparent 25%, var(--syn-accent));
   -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 1.5px), #000 calc(100% - 1.5px));
@@ -2373,7 +2373,8 @@ details[open]::details-content { block-size: auto; }
   will-change: transform;
 }
 @keyframes bg-orbit-rot { from { transform: rotate(0); } to { transform: rotate(360deg); } }
-@media (prefers-reduced-motion: reduce) { .bg-orbit { animation: none; } }
+/* .bg-orbit is a functional loading spinner — keep it rotating under
+   reduce-motion (a frozen spinner reads as a hung task). */
 .bg-x { background: none; border: 0; color: var(--faint); cursor: pointer; font-size: 11px; padding: 0 2px; }
 .bg-x:hover { color: var(--text); }
 @media (prefers-reduced-motion: reduce) { .bg-dot { animation: none; } }
@@ -2609,8 +2610,12 @@ details[open]::details-content { block-size: auto; }
 }
 
 @media (prefers-reduced-motion: reduce) {
+  /* NOTE: deliberately NOT a blanket `* { animation: none }`. That killed every
+     functional loading spinner (status pill, activity, sidebar) under macOS
+     Reduce Motion — a frozen spinner reads as a hung UI. Decorative motion is
+     disabled by the specific reduce-motion blocks throughout this file; here we
+     only drop transitions + smooth scroll globally. */
   *, *::before, *::after {
-    animation: none !important;
     transition: none !important;
     scroll-behavior: auto !important;
   }
