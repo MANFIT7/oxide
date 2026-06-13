@@ -1481,24 +1481,38 @@ fn push_action_toast(
     });
 }
 
-fn play_notification_sound(cfg: Signal<Config>) {
-    if !cfg.peek().notification_sound {
+/// Play the turn-done chime. `force` = always play (a background tab finished
+/// while you're looking elsewhere). When false (the foreground turn you're
+/// watching finished) the chime is suppressed if the window is focused — no
+/// point dinging while you're already staring at the result. Volume is
+/// user-configurable; simultaneous chimes overlap via a cloned element.
+fn play_notification_sound(cfg: Signal<Config>, force: bool) {
+    let c = cfg.peek();
+    if !c.notification_sound {
         return;
     }
+    let vol = c.notification_volume.clamp(0.0, 1.0);
+    drop(c);
     spawn(async move {
-        let js = r#"
-            try {
+        let js = format!(
+            r#"
+            try {{
+              if (!{force} && document.hasFocus()) return true;
               const url = '/notify-sound/done.wav';
-              const audio = window.__oxideDoneAudio || new Audio(url);
-              window.__oxideDoneAudio = audio;
-              audio.volume = 0.48;
-              audio.currentTime = 0;
-              const p = audio.play();
-              if (p && p.catch) p.catch(() => {});
-            } catch (_) {}
+              const base = window.__oxideDoneAudio || new Audio(url);
+              window.__oxideDoneAudio = base;
+              // Overlap simultaneous chimes: if the shared element is mid-play,
+              // ring a throwaway clone so neither one is cut short.
+              const a = (!base.paused && base.currentTime > 0) ? base.cloneNode() : base;
+              a.volume = {vol};
+              a.currentTime = 0;
+              const p = a.play();
+              if (p && p.catch) p.catch(() => {{}});
+            }} catch (_) {{}}
             return true;
-        "#;
-        let _ = dioxus::document::eval(js).join::<bool>().await;
+        "#
+        );
+        let _ = dioxus::document::eval(&js).join::<bool>().await;
     });
 }
 
@@ -2788,6 +2802,14 @@ fn app() -> Element {
                             // tokens continue it there (no signal write per token).
                             if view_tab != id {
                                 let mut snap = messages.peek().clone();
+                                // Settle any spinner in the outgoing view: once this tab
+                                // is backgrounded its tool's ToolCallEnd routes to the bg
+                                // buffer (which has no End handler) and never reaches this
+                                // saved snapshot — so a running:true row would spin forever
+                                // until the tab is reopened. Mark them done at switch-out.
+                                for c in snap.iter_mut() {
+                                    if let Author::Activity { running, .. } = &mut c.author { *running = false; }
+                                }
                                 if busy_tabs.peek().contains(&view_tab) {
                                     let seed = if matches!(snap.last().map(|m| &m.author), Some(Author::Agent)) {
                                         snap.pop()
@@ -2984,7 +3006,8 @@ fn app() -> Element {
                                     if !title.is_empty() {
                                         push_toast(toasts, toast_seq, "ok", &format!("{title} — finished"));
                                     }
-                                    play_notification_sound(cfg);
+                                    // Background tab done — you're looking elsewhere, always chime.
+                                    play_notification_sound(cfg, true);
                                 }
                                 Event::Error { message } => {
                                     if !message.starts_with("mcp '") {
@@ -3355,7 +3378,9 @@ fn app() -> Element {
                                 // Submit the next queued message as a fresh turn.
                                 let next = { let mut q = queue.write(); if q.is_empty() { None } else { Some(q.remove(0)) } };
                                 if next.is_none() {
-                                    play_notification_sound(cfg);
+                                    // Foreground turn done — only chime if the window isn't
+                                    // focused (you stepped away); no ding while you're watching.
+                                    play_notification_sound(cfg, false);
                                 }
                                 if let Some(text) = next {
                                     if let Some(h) = handles.get(&ev_tid) {
@@ -6749,6 +6774,7 @@ fn SettingsModal(
     let mut tab_mode = use_signal(|| base.default_tab_mode.clone());
     let mut browser_headless = use_signal(|| base.browser_headless);
     let mut notification_sound = use_signal(|| base.notification_sound);
+    let mut notification_volume = use_signal(|| base.notification_volume);
 
     let providers = ["chatgpt", "codex", "claude", "openai", "anthropic", "echo", "mock"];
 
@@ -6768,6 +6794,7 @@ fn SettingsModal(
         c.default_tab_mode = tab_mode.read().clone();
         c.browser_headless = *browser_headless.read();
         c.notification_sound = *notification_sound.read();
+        c.notification_volume = *notification_volume.read();
         c.approval_policy = if *bypass.read() {
             ApprovalPolicy::Never
         } else {
@@ -6977,7 +7004,29 @@ fn SettingsModal(
                     label { class: "field toggle-field",
                         input { r#type: "checkbox", checked: *notification_sound.read(),
                             onchange: move |e| notification_sound.set(e.checked()) }
-                        span { class: "field-label", "Play sound when a turn finishes" }
+                        span { class: "field-label", "Play sound when a turn finishes (only when the window isn't focused)" }
+                    }
+                    if *notification_sound.read() {
+                        label { class: "field",
+                            span { class: "field-label", "Notification volume · {(*notification_volume.read() * 100.0).round() as i32}%" }
+                            input { r#type: "range", class: "field-input", min: "0", max: "100", step: "1",
+                                value: "{(*notification_volume.read() * 100.0).round() as i32}",
+                                oninput: move |e| {
+                                    let v = e.value().parse::<f32>().unwrap_or(48.0) / 100.0;
+                                    notification_volume.set(v);
+                                },
+                                onchange: move |e| {
+                                    // Preview the chime at the chosen volume on release.
+                                    let v = e.value().parse::<f32>().unwrap_or(48.0) / 100.0;
+                                    spawn(async move {
+                                        let js = format!(
+                                            r#"try {{ const a=(window.__oxideDoneAudio||new Audio('/notify-sound/done.wav')); window.__oxideDoneAudio=a; const c=(!a.paused&&a.currentTime>0)?a.cloneNode():a; c.volume={v}; c.currentTime=0; const p=c.play(); if(p&&p.catch)p.catch(()=>{{}}); }} catch(_){{}} return true;"#
+                                        );
+                                        let _ = dioxus::document::eval(&js).join::<bool>().await;
+                                    });
+                                },
+                            }
+                        }
                     }
                     label { class: "field",
                         span { class: "field-label", "Default mode (new tabs / next launch)" }

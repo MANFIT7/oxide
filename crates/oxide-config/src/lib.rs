@@ -69,6 +69,9 @@ pub struct Config {
     /// Play a short notification sound when a turn finishes.
     #[serde(default = "default_true")]
     pub notification_sound: bool,
+    /// Notification sound volume (0.0–1.0).
+    #[serde(default = "default_notify_volume")]
+    pub notification_volume: f32,
     /// UI theme: "dark", "light", or "system".
     #[serde(default = "default_theme")]
     pub theme: String,
@@ -114,6 +117,10 @@ fn default_insp_w() -> f64 { 280.0 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_notify_volume() -> f32 {
+    0.48
 }
 
 fn default_tab_mode() -> String {
@@ -182,6 +189,7 @@ impl Default for Config {
             default_tab_mode: default_tab_mode(),
             browser_headless: true,
             notification_sound: true,
+            notification_volume: default_notify_volume(),
             theme: default_theme(),
             accent_color: String::new(),
             density: default_density(),

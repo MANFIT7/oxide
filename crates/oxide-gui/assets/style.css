@@ -1159,7 +1159,7 @@ svg { width: 17px; height: 17px; flex-shrink: 0; }
 .activity-card.fail { border-color: rgba(239,93,93,.4); }
 .activity-text { font-family: ui-monospace, Menlo, monospace; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; flex: 1 1 auto; }
 .activity-card.running .activity-text { color: var(--text); }
-.activity-spin { width: 12px; height: 12px; border-radius: 50%; border: 2px solid #3a3a42; border-top-color: var(--accent); animation: spin .7s linear infinite; flex-shrink: 0; }
+.activity-spin { width: 12px; height: 12px; border-radius: 50%; border: 2px solid #3a3a42; border-top-color: var(--accent); animation: spin .7s linear infinite; flex-shrink: 0; will-change: transform; transform: translateZ(0); }
 .activity-ic { font-size: 11px; font-weight: 700; flex-shrink: 0; }
 .activity-ic.ok { color: var(--ok); }
 .activity-ic.fail { color: var(--danger); }
