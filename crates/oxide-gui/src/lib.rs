@@ -5441,10 +5441,19 @@ fn app() -> Element {
                                         div { class: "thinking-body", "{thinking}" }
                                     }
                                 }
-                                if *streaming.read() && !status.read().is_empty() {
+                                if *streaming.read() {
+                                    // Keep the pill mounted for the WHOLE turn — gating it on a
+                                    // non-empty status made it unmount/remount whenever `status`
+                                    // momentarily emptied between events, restarting the spinner's
+                                    // CSS animation each time (it looked frozen/stuck). A stable
+                                    // key + always-mounted pill lets the spin run continuously.
                                     div { class: "status-pill",
-                                        span { class: "status-spinner" }
-                                        span { class: "status-shimmer", "{status}" }
+                                        span { key: "status-spin", class: "status-spinner" }
+                                        {
+                                            let s = status.read();
+                                            let label = if s.is_empty() { "Working…".to_string() } else { s.clone() };
+                                            rsx! { span { class: "status-shimmer", "{label}" } }
+                                        }
                                         if *elapsed_s.read() >= 3 {
                                             {
                                                 // Long turns read as "6m 10s" / "1h 5m", not "370s".
