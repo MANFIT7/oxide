@@ -605,6 +605,14 @@ struct ToastSpec {
 }
 
 #[derive(Clone, PartialEq, Eq)]
+struct TextAttachment {
+    name: String,
+    rel_path: String,
+    lines: usize,
+    chars: usize,
+}
+
+#[derive(Clone, PartialEq, Eq)]
 struct SessionListItem {
     id: String,
     title: String,
@@ -766,45 +774,17 @@ return true;
     )
 }
 
-/// JS to insert a token chip at the current caret, falling back to appending.
-fn ce_insert_chip_js(token: &str, label: &str) -> String {
-    let token = serde_json::to_string(token).unwrap_or_else(|_| "\"\"".into());
-    let label = serde_json::to_string(label).unwrap_or_else(|_| "\"\"".into());
+fn ce_insert_plain_text_js(text: &str) -> String {
+    let text = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".into());
     format!(
         r#"
 const ed=document.getElementById('ce-input'); if(!ed) return false;
-const chip=document.createElement('span');
-chip.className='ce-chip'; chip.setAttribute('contenteditable','false');
-chip.dataset.token={token}; chip.textContent={label};
-const sp=document.createTextNode(' ');
-const frag=document.createDocumentFragment();
-frag.appendChild(chip); frag.appendChild(sp);
-const sel=window.getSelection();
-let inserted=false;
-if(sel && sel.rangeCount){{
-  const r=sel.getRangeAt(0);
-  const root=r.commonAncestorContainer.nodeType===1 ? r.commonAncestorContainer : r.commonAncestorContainer.parentNode;
-  if(root && ed.contains(root)){{
-    r.deleteContents();
-    r.insertNode(frag);
-    const nr=document.createRange(); nr.setStartAfter(sp); nr.collapse(true);
-    sel.removeAllRanges(); sel.addRange(nr);
-    inserted=true;
-  }}
-}}
-if(!inserted){{
-  ed.appendChild(chip); ed.appendChild(sp);
-  if(sel){{
-    const nr=document.createRange(); nr.setStartAfter(sp); nr.collapse(true);
-    sel.removeAllRanges(); sel.addRange(nr);
-  }}
-}}
 ed.focus();
+document.execCommand('insertText', false, {text});
 ed.dispatchEvent(new InputEvent('input',{{bubbles:true}}));
 return true;
 "#,
-        token = token,
-        label = label
+        text = text
     )
 }
 
@@ -839,6 +819,39 @@ fn save_attachments(ws: &Path, atts: &[String]) -> Vec<String> {
         }
     }
     out
+}
+
+fn save_pasted_text_attachment(ws: &Path, id: u64, text: &str) -> std::io::Result<TextAttachment> {
+    let dir = ws.join(".oxide/attachments");
+    std::fs::create_dir_all(&dir)?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let disk_name = format!("pasted-text-{stamp}-{id}.txt");
+    let path = dir.join(&disk_name);
+    std::fs::write(&path, text.as_bytes())?;
+    let name = if id == 1 {
+        "Pasted text.txt".to_string()
+    } else {
+        format!("Pasted text {id}.txt")
+    };
+    let lines = text.lines().count().max(1);
+    let chars = text.chars().count();
+    Ok(TextAttachment {
+        name,
+        rel_path: format!(".oxide/attachments/{disk_name}"),
+        lines,
+        chars,
+    })
+}
+
+fn text_attachment_name(rel_path: &str) -> String {
+    Path::new(rel_path)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "Pasted text.txt".to_string())
 }
 
 /// Human token count: 272_000 → "272k", 1_000_000 → "1M".
@@ -950,8 +963,8 @@ async fn submit_ce(
     goal_text: Signal<String>,
     mut queue: Signal<Vec<String>>,
     mut attachments: Signal<Vec<String>>,
+    mut text_attachments: Signal<Vec<TextAttachment>>,
     mut picked_element: Signal<Option<String>>,
-    mut pasted_blobs: Signal<Vec<(u64, String)>>,
     steer: bool,
     ws: PathBuf,
 ) {
@@ -963,8 +976,10 @@ async fn submit_ce(
         .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
         .unwrap_or_default();
     let n_imgs = attachments.read().len();
+    let text_files = text_attachments.read().clone();
+    let n_text_files = text_files.len();
     let picked = picked_element.read().clone();
-    if body.is_empty() && tokens.is_empty() && n_imgs == 0 && picked.is_none() {
+    if body.is_empty() && tokens.is_empty() && n_imgs == 0 && n_text_files == 0 && picked.is_none() {
         return;
     }
     // Built-in /review (Bugbot): review the working diff for bugs.
@@ -1008,16 +1023,8 @@ why it's wrong, and the concrete fix. If the diff is clean, say so plainly.{}\n\
     let mut skills_block = String::new();
     let mut mcp_block = String::new();
     let mut ctx_block = String::new();
-    let mut paste_block = String::new();
     for tkn in &tokens {
-        if let Some(id) = tkn.strip_prefix("paste:") {
-            // Long pasted text was collapsed to a chip — expand it for the model.
-            if let Ok(id) = id.parse::<u64>() {
-                if let Some((_, full)) = pasted_blobs.read().iter().find(|(i, _)| *i == id).cloned() {
-                    paste_block.push_str(&format!("\n## Pasted content\n````\n{full}\n````\n"));
-                }
-            }
-        } else if let Some(name) = tkn.strip_prefix("mcp:") {
+        if let Some(name) = tkn.strip_prefix("mcp:") {
             mcp_block.push_str(&format!("\n- `{name}` — call its tools via `mcp__{name}__*`"));
         } else if let Some(name) = tkn.strip_prefix("skill:") {
             let p = ws.join(".oxide/memory/skills").join(format!("{name}.md"));
@@ -1051,8 +1058,25 @@ why it's wrong, and the concrete fix. If the diff is clean, say so plainly.{}\n\
         text.push_str(&ctx_block);
         text.push('\n');
     }
-    if !paste_block.is_empty() {
-        text.push_str(&paste_block);
+    for att in &text_files {
+        let path = ws.join(&att.rel_path);
+        match std::fs::read_to_string(&path) {
+            Ok(full) => {
+                text.push_str(&format!(
+                    "\n## Attached text file: {}\nPath: {}\n````text\n{}\n````\n",
+                    att.name,
+                    att.rel_path,
+                    full.trim_end()
+                ));
+            }
+            Err(err) => {
+                text.push_str(&format!(
+                    "\n## Attached text file: {}\nPath: {}\n[Could not read attachment: {err}]\n",
+                    att.name,
+                    att.rel_path
+                ));
+            }
+        }
     }
     if !mcp_block.is_empty() {
         text.push_str("Use these MCP servers for this task:");
@@ -1078,21 +1102,25 @@ why it's wrong, and the concrete fix. If the diff is clean, say so plainly.{}\n\
         picked_element.set(None);
     }
     text.push_str(&body);
-    // Persist pasted images to files and carry lightweight `wsimg:` refs (NOT
-    // base64) after a \u{2} separator — on BOTH the model text and the display,
-    // so the thumbnails survive a session reload instead of vanishing.
+    // Carry lightweight attachment refs after a \u{2} separator on BOTH the
+    // model text and the display, so sent attachments survive session reload.
     let img_markers: Vec<String> = if n_imgs > 0 {
         save_attachments(&ws, &attachments.read())
     } else {
         Vec::new()
     };
-    let marker_suffix: String = img_markers.iter().map(|m| format!("\u{2}{m}")).collect();
+    let text_markers: Vec<String> = text_files.iter().map(|att| format!("wstxt:{}", att.rel_path)).collect();
+    let marker_suffix: String = img_markers
+        .iter()
+        .chain(text_markers.iter())
+        .map(|m| format!("\u{2}{m}"))
+        .collect();
     if !marker_suffix.is_empty() {
         text.push_str(&marker_suffix); // persisted with the user turn → reload renders them
     }
     let display = if marker_suffix.is_empty() { body.clone() } else { format!("{body}{marker_suffix}") };
     attachments.write().clear();
-    pasted_blobs.write().clear();
+    text_attachments.write().clear();
     if !steer && *streaming.read() {
         queue.write().push(text);
     } else {
@@ -5330,7 +5358,8 @@ fn app() -> Element {
                                                             Author::User => {
                                                                 // Display text may carry pasted images after \u{2} separators —
                                                                 // either inline data URLs or persisted `wsimg:` file refs.
-                                                                let imgs: Vec<String> = m.text.split('\u{2}').skip(1)
+                                                                let markers: Vec<String> = m.text.split('\u{2}').skip(1).map(String::from).collect();
+                                                                let imgs: Vec<String> = markers.iter()
                                                                     .filter_map(|s| {
                                                                         if let Some(rel) = s.strip_prefix("wsimg:") {
                                                                             Some(format!("/wsimg/{rel}"))
@@ -5338,6 +5367,9 @@ fn app() -> Element {
                                                                             Some(s.to_string())
                                                                         } else { None }
                                                                     }).collect();
+                                                                let text_files: Vec<(String, String)> = markers.iter()
+                                                                    .filter_map(|s| s.strip_prefix("wstxt:").map(|rel| (text_attachment_name(rel), rel.to_string())))
+                                                                    .collect();
                                                                 let segs = user_segments(&m.text);
                                                                 let copy = serde_json::to_string(&strip_scaffold(&m.text)).unwrap_or_default();
                                                                 let edit_text = strip_scaffold(&m.text);
@@ -5357,6 +5389,16 @@ fn app() -> Element {
                                                                                     for src in imgs {
                                                                                         img { class: "msg-img", src: "{src}",
                                                                                             onclick: { let s = src.clone(); move |_| chat_img.set(Some(s.clone())) } }
+                                                                                    }
+                                                                                }
+                                                                            }
+                                                                            if !text_files.is_empty() {
+                                                                                div { class: "msg-files",
+                                                                                    for (name, rel) in text_files {
+                                                                                        div { class: "msg-file", title: "{rel}",
+                                                                                            Icon { name: "file" }
+                                                                                            span { "{name}" }
+                                                                                        }
                                                                                     }
                                                                                 }
                                                                             }
@@ -7167,8 +7209,8 @@ fn Composer(
     let mut show_plus = use_signal(|| false);
     let mut show_access = use_signal(|| false);
     let mut mention_sel = use_signal(|| 0usize);
-    // Long pastes collapsed to chips: (id, full text).
-    let pasted_blobs = use_signal(Vec::<(u64, String)>::new);
+    // Long pastes become workspace-local .txt attachments.
+    let mut text_attachments = use_signal(Vec::<TextAttachment>::new);
     let mut paste_seq = use_signal(|| 0u64);
     // `@mention` picker driven by the contenteditable caret query.
     let mut mention_q = use_signal(|| None::<String>);
@@ -7183,8 +7225,11 @@ fn Composer(
     let mut attachments = use_signal(Vec::<String>::new);
     // Full-screen image preview (lightbox) when a thumbnail is clicked.
     let mut preview_img = use_signal(|| None::<String>);
+    let ws_paste = workspace.clone();
     // Intercept image paste into the composer → attachment card (not inline).
-    use_future(move || async move {
+    use_future(move || {
+        let ws_paste = ws_paste.clone();
+        async move {
         let mut eval = dioxus::document::eval(
             r#"
             const attach = function(el){
@@ -7210,7 +7255,7 @@ fn Composer(
                   ev.preventDefault();
                   const lines = text.split('\n').length;
                   if (text.length > 800 || lines > 12) {
-                    // Long paste → collapse to a chip (full text kept Rust-side).
+                    // Long paste → text attachment (full text kept on disk).
                     dioxus.send('PASTE:' + text);
                   } else {
                     document.execCommand('insertText', false, text);
@@ -7233,21 +7278,25 @@ fn Composer(
                     if let Some(text) = msg.strip_prefix("PASTE:") {
                         let id = *paste_seq.peek() + 1;
                         paste_seq.set(id);
-                        let lines = text.lines().count();
-                        let mut pb = pasted_blobs;
-                        pb.write().push((id, text.to_string()));
-                        let label = format!("Pasted #{id} ({lines} lines)");
-                        let tok = format!("paste:{id}");
-                        spawn(async move {
-                            let _ = dioxus::document::eval(&ce_insert_chip_js(&tok, &label)).join::<bool>().await;
-                        });
-                        ce_empty.set(false);
+                        match save_pasted_text_attachment(&ws_paste, id, text) {
+                            Ok(att) => {
+                                text_attachments.write().push(att);
+                                ce_empty.set(false);
+                            }
+                            Err(_) => {
+                                let fallback = text.to_string();
+                                spawn(async move {
+                                    let _ = dioxus::document::eval(&ce_insert_plain_text_js(&fallback)).join::<bool>().await;
+                                });
+                            }
+                        }
                     } else {
                         attachments.write().push(msg);
                     }
                 }
                 Err(_) => break,
             }
+        }
         }
     });
     let mention_items: Vec<String> = match mention_q.read().as_ref() {
@@ -7405,12 +7454,33 @@ fn Composer(
                     img { class: "img-lightbox-img", src: "{src}", onclick: move |e| e.stop_propagation() }
                 }
             }
-            if !attachments.read().is_empty() {
+            if !attachments.read().is_empty() || !text_attachments.read().is_empty() {
                 div { class: "attach-row",
                     for (i, src) in attachments.read().iter().cloned().enumerate() {
                         div { class: "attach-card",
                             img { src: "{src}", onclick: { let s = src.clone(); move |_| preview_img.set(Some(s.clone())) } }
                             button { class: "attach-x", onclick: move |_| { let mut v = attachments.write(); if i < v.len() { v.remove(i); } }, "✕" }
+                        }
+                    }
+                    for (i, att) in text_attachments.read().iter().cloned().enumerate() {
+                        {
+                            let ws_remove = workspace.clone();
+                            rsx! {
+                                div { class: "attach-file-card", title: "{att.rel_path}",
+                                    Icon { name: "file" }
+                                    div { class: "attach-file-main",
+                                        div { class: "attach-file-name", "{att.name}" }
+                                        div { class: "attach-file-meta", "{att.lines} lines · {att.chars} chars" }
+                                    }
+                                    button { class: "attach-x", onclick: move |_| {
+                                        let mut v = text_attachments.write();
+                                        if i < v.len() {
+                                            let removed = v.remove(i);
+                                            let _ = std::fs::remove_file(ws_remove.join(&removed.rel_path));
+                                        }
+                                    }, "✕" }
+                                }
+                            }
                         }
                     }
                 }
@@ -7522,7 +7592,7 @@ fn Composer(
                         }
                         e.prevent_default();
                         let ws = ws_kd2.clone();
-                        spawn(async move { submit_ce(streaming, engine, plan_mode, pursue_goal, goal_text, queue, attachments, picked_element, pasted_blobs, false, ws).await; });
+                        spawn(async move { submit_ce(streaming, engine, plan_mode, pursue_goal, goal_text, queue, attachments, text_attachments, picked_element, false, ws).await; });
                     } else if e.key() == Key::Tab && e.modifiers().shift() {
                         e.prevent_default();
                         let v = *plan_mode.read();
@@ -7793,10 +7863,10 @@ fn Composer(
                         }
                     }
                     if *streaming.read() {
-                        button { class: "send steer", title: "Steer (inject into the running turn)", onclick: move |_| { let ws = ws_steer.clone(); spawn(async move { submit_ce(streaming, engine, plan_mode, pursue_goal, goal_text, queue, attachments, picked_element, pasted_blobs, true, ws).await; }); }, "↪" }
+                        button { class: "send steer", title: "Steer (inject into the running turn)", onclick: move |_| { let ws = ws_steer.clone(); spawn(async move { submit_ce(streaming, engine, plan_mode, pursue_goal, goal_text, queue, attachments, text_attachments, picked_element, true, ws).await; }); }, "↪" }
                         button { class: "send stop", title: "Stop", onclick: move |_| { let _ = engine.send(EngineCmd::Interrupt); }, "■" }
                     } else {
-                        button { class: "send", onclick: move |_| { let ws = ws_btn.clone(); spawn(async move { submit_ce(streaming, engine, plan_mode, pursue_goal, goal_text, queue, attachments, picked_element, pasted_blobs, false, ws).await; }); }, "↑" }
+                        button { class: "send", onclick: move |_| { let ws = ws_btn.clone(); spawn(async move { submit_ce(streaming, engine, plan_mode, pursue_goal, goal_text, queue, attachments, text_attachments, picked_element, false, ws).await; }); }, "↑" }
                     }
                 }
             }

@@ -1405,10 +1405,15 @@ details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
 }
 
 
-/* pasted-image attachment cards above the composer */
+/* pasted attachment cards above the composer */
 .attach-row { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
 .attach-card { position: relative; width: 96px; height: 96px; border-radius: 12px; overflow: hidden; border: 1px solid var(--border); background: var(--surface); }
 .attach-card img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.attach-file-card { position: relative; display: flex; align-items: center; gap: 9px; min-width: 190px; max-width: min(320px, 100%); min-height: 54px; padding: 9px 36px 9px 10px; border-radius: 10px; border: 1px solid var(--border); background: var(--surface); color: var(--text); }
+.attach-file-card svg { width: 18px; height: 18px; color: var(--syn-accent); flex-shrink: 0; }
+.attach-file-main { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.attach-file-name { font-size: 12.5px; font-weight: 650; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.attach-file-meta { font-size: 11px; color: var(--faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .attach-x { position: absolute; top: 4px; right: 4px; width: 22px; height: 22px; border-radius: 50%; background: rgba(0,0,0,.6); color: #fff; border: none; cursor: pointer; font-size: 11px; display: flex; align-items: center; justify-content: center; }
 .attach-x:hover { background: rgba(0,0,0,.85); }
 .ce-input img { max-height: 96px; border-radius: 8px; }
@@ -2346,6 +2351,16 @@ details[open]::details-content { block-size: auto; }
   transition: filter .12s ease, transform .12s ease;
 }
 .msg-img:hover { filter: brightness(1.1); transform: scale(1.04); }
+.msg-files { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 6px; }
+.msg-file {
+  display: inline-flex; align-items: center; gap: 6px;
+  max-width: 280px; padding: 4px 8px; border-radius: 7px;
+  border: 1px solid color-mix(in srgb, var(--text) 14%, transparent);
+  background: color-mix(in srgb, var(--text) 6%, transparent);
+  font-size: 12px; font-weight: 600;
+}
+.msg-file svg { width: 14px; height: 14px; color: var(--syn-accent); flex-shrink: 0; }
+.msg-file span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* Background-task chips (CLI agent "running in background"). */
 .bg-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 0 0 6px; }
