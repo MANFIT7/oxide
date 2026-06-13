@@ -766,6 +766,48 @@ return true;
     )
 }
 
+/// JS to insert a token chip at the current caret, falling back to appending.
+fn ce_insert_chip_js(token: &str, label: &str) -> String {
+    let token = serde_json::to_string(token).unwrap_or_else(|_| "\"\"".into());
+    let label = serde_json::to_string(label).unwrap_or_else(|_| "\"\"".into());
+    format!(
+        r#"
+const ed=document.getElementById('ce-input'); if(!ed) return false;
+const chip=document.createElement('span');
+chip.className='ce-chip'; chip.setAttribute('contenteditable','false');
+chip.dataset.token={token}; chip.textContent={label};
+const sp=document.createTextNode(' ');
+const frag=document.createDocumentFragment();
+frag.appendChild(chip); frag.appendChild(sp);
+const sel=window.getSelection();
+let inserted=false;
+if(sel && sel.rangeCount){{
+  const r=sel.getRangeAt(0);
+  const root=r.commonAncestorContainer.nodeType===1 ? r.commonAncestorContainer : r.commonAncestorContainer.parentNode;
+  if(root && ed.contains(root)){{
+    r.deleteContents();
+    r.insertNode(frag);
+    const nr=document.createRange(); nr.setStartAfter(sp); nr.collapse(true);
+    sel.removeAllRanges(); sel.addRange(nr);
+    inserted=true;
+  }}
+}}
+if(!inserted){{
+  ed.appendChild(chip); ed.appendChild(sp);
+  if(sel){{
+    const nr=document.createRange(); nr.setStartAfter(sp); nr.collapse(true);
+    sel.removeAllRanges(); sel.addRange(nr);
+  }}
+}}
+ed.focus();
+ed.dispatchEvent(new InputEvent('input',{{bubbles:true}}));
+return true;
+"#,
+        token = token,
+        label = label
+    )
+}
+
 /// Split user text into `(is_mention, text)` segments — `@word` at a word
 /// boundary becomes a mention pill.
 /// Strip the prompt scaffolding the composer injects (context files, MCP/skill
@@ -7197,7 +7239,7 @@ fn Composer(
                         let label = format!("Pasted #{id} ({lines} lines)");
                         let tok = format!("paste:{id}");
                         spawn(async move {
-                            let _ = dioxus::document::eval(&ce_insert_js(&tok, &label)).join::<bool>().await;
+                            let _ = dioxus::document::eval(&ce_insert_chip_js(&tok, &label)).join::<bool>().await;
                         });
                         ce_empty.set(false);
                     } else {
