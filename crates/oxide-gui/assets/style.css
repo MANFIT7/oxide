@@ -2478,14 +2478,17 @@ details[open]::details-content { block-size: auto; }
 /* Markdown layout stability — stop reflow jank while content streams in. */
 .agent-md { contain: layout style; }
 .agent-md.live { animation: none; }
-.agent-md.live .live-md { white-space: pre-wrap; line-height: 1.6; }
-.agent-md.live .live-line { min-height: 1.55em; }
-.agent-md.live .live-gap { height: .65em; }
-.agent-md.live pre.live-code {
-  margin: 8px 0 10px;
+/* The trailing in-progress line (kept raw until it completes, then it becomes
+   real markdown). pre-wrap preserves its spacing; no markdown styling so it
+   doesn't flicker as tokens arrive. */
+.agent-md.live .live-tail { white-space: pre-wrap; line-height: 1.6; min-height: 1.55em; }
+/* No per-frame re-animation while streaming — innerHTML is replaced each frame,
+   so any entrance animation (e.g. pre's oxide-rise) would re-fire and flicker. */
+.agent-md.live pre, .agent-md.live h1, .agent-md.live h2, .agent-md.live h3,
+.agent-md.live h4, .agent-md.live h5, .agent-md.live h6 {
   animation: none !important;
-  contain: content;
 }
+.agent-md.live pre { margin: 8px 0 10px; contain: content; }
 .agent-md table { table-layout: fixed; width: 100%; }
 .agent-md td, .agent-md th { overflow-wrap: anywhere; }
 /* Code blocks rise+fade in instead of a hard pop. */

@@ -6525,38 +6525,57 @@ fn md_to_html(src: &str, live: bool) -> String {
     out
 }
 
+/// Live (streaming) markdown render. Earlier this just wrapped each raw line in
+/// a <div> — so `#`, `**bold**`, lists etc. stayed as literal syntax until the
+/// turn ended, then the whole message reflowed at once (a jarring jump). Now we
+/// render real markdown progressively: every COMPLETED line is styled the moment
+/// it finishes (headings/bold appear live, and there's no end-of-turn pop), while
+/// the trailing in-progress line is kept raw so the actively-streaming line
+/// doesn't relayout on every token.
 fn md_live_html(src: &str) -> String {
-    let mut html = String::with_capacity(src.len() + 128);
-    let mut in_code = false;
-    html.push_str("<div class=\"live-md\">");
-    for line in src.lines() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("```") {
-            if in_code {
-                html.push_str("</code></pre>");
-            } else {
-                html.push_str("<pre class=\"live-code\"><code>");
+    // Inside an unclosed ``` fence, render the whole buffer as markdown so the
+    // partial code streams as a code block (pulldown extends an open fence to
+    // EOF) instead of leaking raw ``` lines.
+    if src.matches("```").count() % 2 == 1 {
+        return md_to_html_uncached(src, true);
+    }
+
+    // Split off the trailing partial line at the last newline.
+    let (stable, tail) = match src.rfind('\n') {
+        Some(nl) => (&src[..=nl], &src[nl + 1..]),
+        None => ("", src),
+    };
+
+    // The stable prefix only changes when a line completes — not on every
+    // streamed token (the tail carries the in-progress line) — so cache its
+    // markdown render and re-parse only when the prefix actually changes.
+    let stable_html = if stable.is_empty() {
+        String::new()
+    } else {
+        thread_local! {
+            static LIVE_CACHE: std::cell::RefCell<(u64, String)> =
+                std::cell::RefCell::new((0, String::new()));
+        }
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        stable.hash(&mut h);
+        let key = h.finish();
+        LIVE_CACHE.with(|c| {
+            let mut cell = c.borrow_mut();
+            if cell.0 != key {
+                *cell = (key, md_to_html_uncached(stable, true));
             }
-            in_code = !in_code;
-            continue;
-        }
+            cell.1.clone()
+        })
+    };
 
-        if in_code {
-            html.push_str(&esc(line));
-            html.push('\n');
-        } else if trimmed.is_empty() {
-            html.push_str("<div class=\"live-gap\"></div>");
-        } else {
-            html.push_str("<div class=\"live-line\">");
-            html.push_str(&esc(line));
-            html.push_str("</div>");
-        }
+    let mut html = String::with_capacity(stable_html.len() + tail.len() + 64);
+    html.push_str(&stable_html);
+    if !tail.is_empty() {
+        html.push_str("<div class=\"live-tail\">");
+        html.push_str(&esc(tail));
+        html.push_str("</div>");
     }
-
-    if in_code {
-        html.push_str("</code></pre>");
-    }
-    html.push_str("</div>");
     html
 }
 
