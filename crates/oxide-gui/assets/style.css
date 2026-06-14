@@ -1112,13 +1112,20 @@ svg { width: 17px; height: 17px; flex-shrink: 0; }
 .board-btn { background: var(--accent); color: var(--on-accent); border: none; border-radius: 9px; padding: 8px 14px; font-size: 12.5px; font-weight: 600; cursor: pointer; font-family: inherit; }
 .board-btn.ghost { background: var(--surface); color: var(--text); border: 1px solid var(--border); }
 .board-btn:hover { opacity: .9; }
+.board-sync-status { min-height: 18px; margin: -8px 0 12px; color: var(--faint); font-size: 11.5px; }
 .board-cols { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; flex: 1; overflow: hidden; }
 .board-col { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 12px; overflow-y: auto; }
 .board-col-head { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .4px; color: var(--faint); margin-bottom: 12px; }
 .board-card { position: relative; background: var(--composer); border: 1px solid var(--border); border-radius: 10px; padding: 11px 12px; margin-bottom: 9px; }
 .board-card.doing { border-color: var(--accent); animation: pulseborder 1.6s ease-in-out infinite; }
 @keyframes pulseborder { 50% { border-color: rgba(224,145,58,.4); } }
+.board-card-meta { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; padding-right: 18px; margin-bottom: 7px; color: var(--faint); font-size: 10.8px; line-height: 1.3; }
+.board-source { border: 1px solid var(--border); border-radius: 6px; padding: 2px 6px; color: var(--text); font-weight: 700; }
+.board-source.github { background: rgba(255,255,255,.05); }
+.board-source.linear { background: rgba(94,106,210,.18); border-color: rgba(94,106,210,.45); }
 .board-card-title { font-size: 13.5px; font-weight: 500; line-height: 1.4; padding-right: 16px; }
+.board-card-link { display: inline-block; margin-top: 6px; color: var(--syn-accent); font-size: 11.5px; text-decoration: none; }
+.board-card-link:hover { text-decoration: underline; }
 .board-card-result { font-size: 11.5px; color: var(--muted); margin-top: 7px; line-height: 1.5; max-height: 120px; overflow-y: auto; white-space: pre-wrap; }
 .board-card-branch { font-family: ui-monospace, Menlo, monospace; font-size: 10.5px; color: var(--syn-accent); margin-top: 6px; }
 .board-card-x { position: absolute; top: 7px; right: 8px; background: transparent; border: none; color: var(--faint); cursor: pointer; font-size: 10px; }

@@ -1358,6 +1358,40 @@ fn run_board(mut board: Signal<board::Board>, cfg: Signal<Config>, root: PathBuf
     }
 }
 
+async fn sync_board_issues_once(
+    mut board: Signal<board::Board>,
+    root: PathBuf,
+    mut status: Signal<String>,
+) {
+    status.set("Syncing issues…".to_string());
+    let fetched = board::fetch_issue_cards(&root).await;
+    let (added, updated) = {
+        let mut b = board.write();
+        let result = b.upsert_issues(fetched.issues.clone());
+        let snapshot = b.clone();
+        drop(b);
+        snapshot.save(&root);
+        result
+    };
+    status.set(board::sync_summary(&fetched, added, updated));
+}
+
+fn sync_board_issues(
+    board: Signal<board::Board>,
+    root: PathBuf,
+    status: Signal<String>,
+    mut syncing: Signal<bool>,
+) {
+    if *syncing.read() {
+        return;
+    }
+    syncing.set(true);
+    spawn(async move {
+        sync_board_issues_once(board, root, status).await;
+        syncing.set(false);
+    });
+}
+
 /// Set the permission mode (approval policy + sandbox) and reconfigure.
 fn set_access_mode(
     mut cfg: Signal<Config>,
@@ -2265,6 +2299,8 @@ fn app() -> Element {
     let split_rects = use_signal(std::collections::HashMap::<u64, (f64, f64, f64, f64)>::new);
     let mut show_board = use_signal(|| false);
     let mut board = use_signal(board::Board::default);
+    let board_sync_status = use_signal(|| "Issue sync idle".to_string());
+    let mut board_syncing = use_signal(|| false);
     let mut new_card_title = use_signal(String::new);
     let mut projects_list = use_signal(Vec::<ProjectGroup>::new);
     let mut session_menu = use_signal(|| None::<PathBuf>);
@@ -2283,6 +2319,30 @@ fn app() -> Element {
     // Toast notifications (bottom-right stack, auto-dismiss).
     let toasts = use_signal(Vec::<ToastSpec>::new);
     let toast_seq = use_signal(|| 0u64);
+    use_future(move || async move {
+        let mut last_root = PathBuf::new();
+        let mut last_sync: Option<std::time::Instant> = None;
+        loop {
+            let root = cfg.peek().workspace.clone();
+            let open = *show_board.peek();
+            if open {
+                if let Some(root) = root {
+                    let switched = root != last_root;
+                    let stale = last_sync
+                        .map(|t| t.elapsed() >= std::time::Duration::from_secs(300))
+                        .unwrap_or(true);
+                    if (switched || stale) && !*board_syncing.peek() {
+                        last_root = root.clone();
+                        board_syncing.set(true);
+                        sync_board_issues_once(board, root, board_sync_status).await;
+                        board_syncing.set(false);
+                        last_sync = Some(std::time::Instant::now());
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        }
+    });
     // Agent tabs (multiple agent sessions in one workspace).
     let initial_provider = cfg.read().provider.clone();
     let initial_model = cfg.read().model.clone();
@@ -5591,15 +5651,11 @@ fn app() -> Element {
                                     button { class: "board-btn", onclick: move |_| { let _ = workspace_of(&cfg.read()); run_board(board, cfg, workspace_of(&cfg.read())); }, "▶ Run To-Do" }
                                     button { class: "board-btn ghost", onclick: move |_| {
                                             let root = workspace_of(&cfg.read());
-                                            spawn(async move {
-                                                let issues = board::import_github_issues(&root).await;
-                                                let mut b = board.write();
-                                                for (t, d) in issues { b.add(t, d); }
-                                                let snap = b.clone(); drop(b); snap.save(&root);
-                                            });
-                                        }, "↓ GitHub issues" }
+                                            sync_board_issues(board, root, board_sync_status, board_syncing);
+                                        }, if *board_syncing.read() { "Syncing…" } else { "↻ Sync issues" } }
                                 }
                             }
+                            div { class: "board-sync-status", "{board_sync_status}" }
                             div { class: "board-cols four",
                                 for (col, label) in [(board::TODO, "To Do"), (board::DOING, "In Progress"), (board::REVIEW, "Review"), (board::DONE, "Done")] {
                                     div { class: "board-col",
@@ -5608,9 +5664,29 @@ fn app() -> Element {
                                             {
                                                 let cid = card.id;
                                                 let cbranch = card.branch.clone();
+                                                let has_source = !card.source.is_empty();
+                                                let meta = [
+                                                    card.source_status.clone(),
+                                                    card.source_priority.clone(),
+                                                    card.source_assignee.clone(),
+                                                ]
+                                                .into_iter()
+                                                .filter(|item| !item.trim().is_empty())
+                                                .collect::<Vec<_>>()
+                                                .join(" · ");
+                                                let issue_url = card.source_url.clone();
                                                 rsx! {
                                                     div { class: if col == board::DOING { "board-card doing" } else { "board-card" },
+                                                        if has_source {
+                                                            div { class: "board-card-meta",
+                                                                span { class: if card.source == "Linear" { "board-source linear" } else { "board-source github" }, "{card.source}" }
+                                                                if !meta.is_empty() { span { "{meta}" } }
+                                                            }
+                                                        }
                                                         div { class: "board-card-title", "{card.title}" }
+                                                        if !issue_url.is_empty() {
+                                                            a { class: "board-card-link", href: "{issue_url}", target: "_blank", "Open issue" }
+                                                        }
                                                         if !card.result.is_empty() { div { class: "board-card-result", "{card.result}" } }
                                                         if !card.branch.is_empty() { div { class: "board-card-branch", "{card.branch}" } }
                                                         if col == board::REVIEW && !cbranch.is_empty() {
