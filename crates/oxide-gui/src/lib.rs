@@ -516,14 +516,30 @@ fn activity_label(tool: &str, args: &serde_json::Value) -> String {
         "write_file" => ("edit", "Write", s("path").to_string()),
         "edit" => ("edit", "Edit", s("path").to_string()),
         "read_file" => ("file", "Read", s("path").to_string()),
-        "search" => ("search", "Search", s("pattern").to_string()),
+        "search" => ("search", "Search", short(s("query"))),
         "codebase_search" => ("search", "Find code", short(s("query"))),
         "web_search" => ("globe", "Search web", short(s("query"))),
         "fetch_url" => ("globe", "Fetch", s("url").to_string()),
+        "browser_open" => ("globe", "Open", s("url").to_string()),
         "browser_navigate" => ("globe", "Open", s("url").to_string()),
-        t if t.starts_with("browser_") => ("globe", "Browser", t.trim_start_matches("browser_").to_string()),
+        "browser_read" => ("globe", "Read page", String::new()),
+        "browser_screenshot" => ("globe", "Screenshot", String::new()),
+        "browser_eval" => ("globe", "Evaluate", short(s("script"))),
+        "browser_click" => ("globe", "Click", s("selector").to_string()),
+        "browser_type" => ("globe", "Type", s("selector").to_string()),
+        "todo_write" => {
+            let n = args.get("todos").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+            ("brain", "Update todo", format!("{n} item{}", if n == 1 { "" } else { "s" }))
+        }
+        "ask_user" => ("brain", "Ask user", short(s("question"))),
         "remember" => ("brain", "Remember", String::new()),
         "save_skill" => ("brain", "Save skill", String::new()),
+        t if t.starts_with("mcp__") => {
+            let rest = t.trim_start_matches("mcp__");
+            let (server, name) = rest.split_once("__").unwrap_or(("", rest));
+            ("spark", "MCP", format!("{name} · {server}"))
+        }
+        t if t.starts_with("browser_") => ("globe", "Browser", t.trim_start_matches("browser_").to_string()),
         other => ("spark", "Tool", other.to_string()),
     };
     format!("{icon}\t{verb}\t{detail}")
@@ -1062,11 +1078,23 @@ why it's wrong, and the concrete fix. If the diff is clean, say so plainly.{}\n\
         let path = ws.join(&att.rel_path);
         match std::fs::read_to_string(&path) {
             Ok(full) => {
+                let full = full.trim_end();
+                let chars = full.chars().count();
+                let (body, note) = if chars > 24_000 {
+                    let preview: String = full.chars().take(12_000).collect();
+                    (
+                        format!("{preview}\n\n… [attachment preview truncated at 12000 chars; full text is saved at {}]", att.rel_path),
+                        "The full pasted text is saved on disk. Use `read_file` or `search` on this path if you need content beyond the preview."
+                    )
+                } else {
+                    (full.to_string(), "The full pasted text is included below and also saved at this path.")
+                };
                 text.push_str(&format!(
-                    "\n## Attached text file: {}\nPath: {}\n````text\n{}\n````\n",
+                    "\n## Attached text file: {}\nPath: {}\n{}\n````text\n{}\n````\n",
                     att.name,
                     att.rel_path,
-                    full.trim_end()
+                    note,
+                    body
                 ));
             }
             Err(err) => {
@@ -3052,6 +3080,27 @@ fn app() -> Element {
                                 Event::FileDiff { path, diff, checkpoint, .. } => {
                                     buf.push(ChatMsg { author: Author::Diff(path, checkpoint), text: diff });
                                 }
+                                Event::ToolCallBegin { tool, args, .. } => {
+                                    if tool != "ask_user" {
+                                        buf.push(ChatMsg {
+                                            author: Author::Activity { running: true, ok: true },
+                                            text: activity_label(&tool, &args),
+                                        });
+                                    }
+                                }
+                                Event::ToolCallEnd { output, ok, .. } => {
+                                    let mut out = output.trim().to_string();
+                                    if out.chars().count() > 4000 {
+                                        out = out.chars().take(4000).collect::<String>() + "\n… (truncated)";
+                                    }
+                                    if let Some(c) = buf.iter_mut().rev().find(|c| matches!(c.author, Author::Activity { running: true, .. })) {
+                                        c.author = Author::Activity { running: false, ok };
+                                        if !out.is_empty() {
+                                            c.text.push('\t');
+                                            c.text.push_str(&out);
+                                        }
+                                    }
+                                }
                                 Event::SessionPath { path } => {
                                     // Session binding is rare (once) — keep it on the tab itself.
                                     let pb = std::path::PathBuf::from(&path);
@@ -3325,6 +3374,10 @@ fn app() -> Element {
                             Event::RateLimit { plan, primary_pct, secondary_pct, primary_reset_s, secondary_reset_s } => {
                                 let p_rem = 100u8.saturating_sub(primary_pct);
                                 let s_rem = 100u8.saturating_sub(secondary_pct);
+                                timeline.write().push(TimelineItem {
+                                    title: "ChatGPT subscription usage".into(),
+                                    sub: format!("5h {p_rem}% left · weekly {s_rem}% left"),
+                                });
                                 // Format reset times as a local clock (5h) / date (weekly), like Codex.
                                 let js = format!(
                                     "const P={primary_reset_s},S={secondary_reset_s};const p=new Date(Date.now()+P*1000),s=new Date(Date.now()+S*1000);const t=d=>d.toLocaleTimeString([],{{hour:'numeric',minute:'2-digit'}});const dd=d=>d.toLocaleDateString([],{{month:'short',day:'numeric'}});return JSON.stringify({{p:t(p),s:dd(s)}});"
@@ -4831,6 +4884,7 @@ fn app() -> Element {
                                                 div { class: "insp-card-sub", "{summary}" }
                                                 div { class: "insp-card-actions",
                                                     button { class: "ed-save", onclick: move |_| { let _ = engine.send(EngineCmd::Approve { id, decision: ApprovalDecision::Approve }); }, "Approve" }
+                                                    button { class: "ed-save", onclick: move |_| { let _ = engine.send(EngineCmd::Approve { id, decision: ApprovalDecision::ApproveForSession }); }, "Always" }
                                                     button { class: "ed-close", onclick: move |_| { let _ = engine.send(EngineCmd::Approve { id, decision: ApprovalDecision::Reject }); }, "Reject" }
                                                 }
                                             }

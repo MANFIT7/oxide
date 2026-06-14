@@ -55,12 +55,15 @@ impl ChatGptProvider {
     /// Read `(access_token, account_id)` from the codex auth file.
     fn credentials(&self) -> anyhow::Result<(String, String)> {
         let text = std::fs::read_to_string(&self.auth_path).map_err(|e| {
-            anyhow::anyhow!("ChatGPT login not found ({}): {e}. Run `codex` and log in first.", self.auth_path)
+            anyhow::anyhow!(
+                "ChatGPT subscription login not found ({}): {e}. Run `codex login` or open Codex Desktop and sign in again.",
+                self.auth_path
+            )
         })?;
         let v: Value = serde_json::from_str(&text)?;
         let at = v["tokens"]["access_token"]
             .as_str()
-            .ok_or_else(|| anyhow::anyhow!("no access_token in codex auth"))?
+            .ok_or_else(|| anyhow::anyhow!("ChatGPT subscription auth is missing access_token — run `codex login` to refresh it."))?
             .to_string();
         let acc = v["tokens"]["account_id"].as_str().unwrap_or("").to_string();
         Ok((at, acc))
@@ -80,6 +83,35 @@ fn session_id() -> String {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let h = format!("{n:032x}");
+    format!(
+        "{}-{}-4{}-8{}-{}",
+        &h[0..8],
+        &h[8..12],
+        &h[13..16],
+        &h[17..20],
+        &h[20..32]
+    )
+}
+
+fn hash64(input: &str) -> u64 {
+    let mut h = 0xcbf29ce484222325u64;
+    for b in input.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+fn session_id_for(conversation_id: &str) -> String {
+    let conv = conversation_id.trim();
+    if conv.is_empty() {
+        return session_id();
+    }
+    let h = format!(
+        "{:016x}{:016x}",
+        hash64(&format!("oxide-chatgpt-session:{conv}")),
+        hash64(&format!("oxide-chatgpt-session-v2:{conv}"))
+    );
     format!(
         "{}-{}-4{}-8{}-{}",
         &h[0..8],
@@ -252,6 +284,7 @@ impl Provider for ChatGptProvider {
         sink: mpsc::Sender<StreamItem>,
     ) -> anyhow::Result<()> {
         let (access, account) = self.credentials()?;
+        let chatgpt_session_id = session_id_for(&req.conversation_id);
         let resp = self
             .client
             .post(ENDPOINT)
@@ -261,7 +294,7 @@ impl Provider for ChatGptProvider {
             .header("Accept", "text/event-stream")
             .header("OpenAI-Beta", "responses=experimental")
             .header("originator", "codex_cli_rs")
-            .header("session_id", session_id())
+            .header("session_id", chatgpt_session_id)
             .json(&build_body(&req))
             .send()
             .await?;
@@ -270,7 +303,16 @@ impl Provider for ChatGptProvider {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
             if status.as_u16() == 401 {
-                anyhow::bail!("ChatGPT token expired — run `codex` to refresh login. ({text})");
+                anyhow::bail!("ChatGPT subscription token expired — run `codex login` or sign in again from Codex Desktop. ({text})");
+            }
+            if status.as_u16() == 403 {
+                anyhow::bail!("ChatGPT subscription rejected the request ({status}). Check that this account has Codex/ChatGPT subscription access and re-authenticate if needed. ({text})");
+            }
+            if status.as_u16() == 429 {
+                anyhow::bail!("ChatGPT subscription rate limit reached ({status}). Wait for the plan reset shown in Usage, then retry. ({text})");
+            }
+            if status.as_u16() == 413 || text.to_ascii_lowercase().contains("context") {
+                anyhow::bail!("ChatGPT subscription context is too large ({status}). Compact the chat or remove large attachments, then retry. ({text})");
             }
             anyhow::bail!("chatgpt {status}: {text}");
         }
@@ -348,7 +390,13 @@ impl Provider for ChatGptProvider {
                 }
                 Some("response.failed") => {
                     let msg = v["response"]["error"]["message"].as_str().unwrap_or("response failed");
-                    let _ = sink.send(StreamItem::Notice(format!("error: {msg}"))).await;
+                    anyhow::bail!("ChatGPT response failed: {msg}");
+                }
+                Some("response.incomplete") => {
+                    let reason = v["response"]["incomplete_details"]["reason"]
+                        .as_str()
+                        .unwrap_or("unknown");
+                    anyhow::bail!("ChatGPT response incomplete: {reason}. Compact context or retry with a smaller prompt.");
                 }
                 _ => {}
             }
@@ -446,5 +494,17 @@ mod tests {
         assert_eq!(ids, vec!["call_shell".to_string(), "item_shell".to_string()]);
         assert_eq!(name, "shell");
         assert_eq!(args["command"], "pwd\nls -la");
+    }
+
+    #[test]
+    fn chatgpt_session_id_is_stable_per_conversation() {
+        let a1 = session_id_for("oxide-session-a");
+        let a2 = session_id_for("oxide-session-a");
+        let b = session_id_for("oxide-session-b");
+
+        assert_eq!(a1, a2);
+        assert_ne!(a1, b);
+        assert_eq!(a1.len(), 36);
+        assert_eq!(a1.chars().filter(|c| *c == '-').count(), 4);
     }
 }

@@ -242,11 +242,14 @@ mod builtin {
                     },
                     "required": ["path", "old_string", "new_string"]
                 })),
-            ToolSpec::new("shell", "Run a shell command inside the sandbox.")
+            ToolSpec::new("shell", "Run a shell command inside the sandbox. Use `timeout_seconds` for known long checks; for dev servers/watchers, start them detached and poll instead of blocking.")
                 .mutating(true)
                 .params(serde_json::json!({
                     "type": "object",
-                    "properties": { "command": { "type": "string" } },
+                    "properties": {
+                        "command": { "type": "string" },
+                        "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 600, "description": "Optional timeout; default 120 seconds, max 600." }
+                    },
                     "required": ["command"]
                 })),
             ToolSpec::new("search", "Search the workspace for an exact string/pattern across files (skips vendor/build dirs, caps at 100 hits). Use a tight query with a clear next action — not a broad scan. For 'where is X implemented' by concept, use `codebase_search` instead.").params(

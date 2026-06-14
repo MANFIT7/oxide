@@ -562,6 +562,12 @@ impl Engine {
                 })),
         );
         // Browser automation (headless/visible) for background web testing.
+        tools.push(ToolSpec::new("browser_open", "Ask the frontend to open or focus a browser/app target for the user. Use when the user needs to inspect a page visually.")
+            .mutating(true)
+            .params(serde_json::json!({"type":"object","properties":{"url":{"type":"string"},"note":{"type":"string"}},"required":["url"]})));
+        tools.push(ToolSpec::new("browser_snapshot", "Ask the frontend to capture/refresh a visual snapshot of a browser/app target.")
+            .mutating(true)
+            .params(serde_json::json!({"type":"object","properties":{"url":{"type":"string"},"note":{"type":"string"}},"required":["url"]})));
         tools.push(ToolSpec::new("browser_navigate", "Open a URL in the automation browser; returns the page title and visible text.")
             .mutating(true)
             .params(serde_json::json!({"type":"object","properties":{"url":{"type":"string"}},"required":["url"]})));
@@ -994,9 +1000,14 @@ impl Engine {
         // Idle-timeout like run_turn — a stalled provider must not wedge
         // compaction/orchestration forever (this path can't be interrupted).
         let idle = idle_timeout_for(provider_id);
+        let mut timed_out = false;
         while let Some(item) = match tokio::time::timeout(idle, rx.recv()).await {
             Ok(it) => it,
-            Err(_) => { task.abort(); None }
+            Err(_) => {
+                timed_out = true;
+                task.abort();
+                None
+            }
         } {
             match item {
                 StreamItem::FileChanged(_) => {}
@@ -1035,7 +1046,11 @@ impl Engine {
                 StreamItem::Done => break,
             }
         }
-        task.abort();
+        if timed_out {
+            self.emit(Event::Error { message: format!("{provider_id}: stream timed out") }).await;
+        } else if let Ok(Err(e)) = task.await {
+            self.emit(Event::Error { message: e.to_string() }).await;
+        }
         out
     }
 
@@ -1210,9 +1225,7 @@ impl Engine {
                     self.emit(Event::Info { text: "⚠ worker context full — compacted, retrying".into() }).await;
                     continue;
                 }
-                if round_text.is_empty() {
-                    self.emit(Event::Error { message: err.clone() }).await;
-                }
+                self.emit(Event::Error { message: err.clone() }).await;
             }
             if !round_text.is_empty() {
                 let mut msg = Message::new(Role::Assistant, round_text);
@@ -1328,7 +1341,8 @@ Reply with text only: summarize what you changed, what you verified, and what re
              All shell commands run here (cwd) and relative paths resolve here.\n\
              - Build INSIDE this project, using its existing stack and conventions. Identify the stack first (read package.json / Cargo.toml / the framework config) and add code where it belongs — e.g. for Next.js create pages/components/route handlers in the right folders. NEVER hand-write a standalone `index.html` (or a generic from-scratch solution) when the project is a framework app — use the framework.\n\
              - Create new files ONLY inside this directory. Do NOT write outside it or invent a new sibling folder (e.g. `../something-new`, `/Volumes/...`). Even when asked for a 'separate' or 'standalone' page, put it inside this project unless the user gives an explicit absolute path elsewhere.\n\
-             - Search, read, and edit inside this directory; do NOT scan $HOME or the whole filesystem.",
+             - Search, read, and edit inside this directory; do NOT scan $HOME or the whole filesystem.\n\
+             - For long-running servers/watchers, start them detached with output redirected to a log, then poll the log/port. Do not block a shell tool forever.",
             self.workspace.display(),
             stack.map(|s| format!(" (detected stack: {s})")).unwrap_or_default()
         ));
@@ -1364,6 +1378,8 @@ When the user asks how something works, the architecture, a flow, a sequence, \
 or relationships, include a Mermaid diagram in a ```mermaid fenced code block \
 (flowchart/sequenceDiagram/stateDiagram-v2/classDiagram/erDiagram) — it renders \
 as a visual in the chat. Keep it focused; add a short prose explanation too.\n\
+\n# Task tracking\n\
+For non-trivial work (multiple files, multiple tool steps, or anything that may take more than a few minutes), call `todo_write` early with a short checklist. Keep exactly one item `in_progress`, mark items `completed` as soon as they are done, and update the list when the plan changes.\n\
 \n# Persistent memory & self-improvement\n\
              You have durable memory at .oxide/memory. Use the `remember` tool to store \
              important facts and `save_skill` to capture reusable procedures you discover. \
@@ -1479,6 +1495,50 @@ as a visual in the chat. Keep it focused; add a short prose explanation too.\n\
                     self.session.push(Message::new(Role::Assistant, assistant));
                 }
                 self.emit(Event::Info { text: "turn interrupted".into() }).await;
+                self.fire_hooks("stop", serde_json::json!({})).await;
+                self.emit(Event::TurnFinished { turn }).await;
+                return;
+            }
+
+            // Auto-verify orchestrated workers too. The normal agentic path has
+            // its own verification loop; without this, a subscription backend
+            // could edit files and stop before proving the changes compile.
+            if self.config.auto_verify && self.turn_edited {
+                for verify_iter in 1..=2 {
+                    let Some(report) = self.run_verify().await else {
+                        break;
+                    };
+                    self.turn_edited = false;
+                    self.emit(Event::Info { text: format!("🧪 Auto-verify failed · fixing {verify_iter}/2 · backend: {backend}") }).await;
+                    let header = format!("\n\n— 🧪 Auto-verify fix {verify_iter} —\n");
+                    self.emit(Event::AgentMessageDelta { turn, text: header.clone() }).await;
+                    assistant.push_str(&header);
+                    let vsys = format!(
+                        "{sys}\n\n# Verification fix\nA build/typecheck failed after the backend work. Fix the diagnostics below with tools, then summarize what changed. Do not just explain.\n\nPLAN:\n{plan}\n\nWORK SO FAR:\n{assistant}\n\nVERIFY FAILURE:\n{report}"
+                    );
+                    let worker_id = format!("orchestrate-verify-{}-{verify_iter}", turn.0);
+                    let (fix, was_interrupted) = self
+                        .stream_agentic_collect(&backend, &vsys, &user_text, &effort, turn, &worker_id, op_rx)
+                        .await;
+                    assistant.push_str(&fix);
+                    if was_interrupted {
+                        interrupted = true;
+                        break;
+                    }
+                    if !self.turn_edited {
+                        break;
+                    }
+                }
+            }
+
+            if interrupted {
+                self.emit(Event::Info { text: "turn interrupted".into() }).await;
+                if !assistant.is_empty() {
+                    if let Some(store) = &self.session_store {
+                        let _ = store.append("assistant", &assistant);
+                    }
+                    self.session.push(Message::new(Role::Assistant, assistant));
+                }
                 self.fire_hooks("stop", serde_json::json!({})).await;
                 self.emit(Event::TurnFinished { turn }).await;
                 return;
@@ -1725,9 +1785,7 @@ as a visual in the chat. Keep it focused; add a short prose explanation too.\n\
                     self.emit(Event::Info { text: "⚠ context full — compacted, retrying".into() }).await;
                     continue;
                 }
-                if round_text.is_empty() {
-                    self.emit(Event::Error { message: err.clone() }).await;
-                }
+                self.emit(Event::Error { message: err.clone() }).await;
             }
             if !round_text.is_empty() {
                 if let Some(store) = &self.session_store {

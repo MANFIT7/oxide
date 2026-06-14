@@ -66,8 +66,44 @@ impl ToolRouter {
     /// Human-readable summary of a pending call, for the approval prompt.
     pub fn summarize(&self, tool: &str, args: &serde_json::Value) -> String {
         match tool {
-            "write_file" => format!("write {}", args["path"].as_str().unwrap_or("?")),
-            "shell" => format!("run: {}", args["command"].as_str().unwrap_or("?")),
+            "read_file" => format!("Read file:\n{}", args["path"].as_str().unwrap_or("?")),
+            "write_file" => format!(
+                "Write file:\n{}\n\nContent: {} bytes",
+                args["path"].as_str().unwrap_or("?"),
+                args["content"].as_str().map(|s| s.len()).unwrap_or(0)
+            ),
+            "edit" => format!(
+                "Edit file:\n{}\n\nFind: {} bytes\nReplace with: {} bytes",
+                args["path"].as_str().unwrap_or("?"),
+                args["old_string"].as_str().map(|s| s.len()).unwrap_or(0),
+                args["new_string"].as_str().map(|s| s.len()).unwrap_or(0)
+            ),
+            "shell" => {
+                let timeout = args["timeout_seconds"].as_u64().unwrap_or(120).clamp(1, 600);
+                format!(
+                    "Command:\n{}\n\nWorking directory:\n{}\nTimeout: {timeout}s\n\nThis can modify files, run networked commands, or affect git depending on the command.",
+                    args["command"].as_str().unwrap_or("?"),
+                    self.workspace.display()
+                )
+            }
+            "todo_write" => {
+                let n = args["todos"].as_array().map(|a| a.len()).unwrap_or(0);
+                format!("Update task checklist:\n{n} item(s)")
+            }
+            "browser_navigate" | "browser_open" => {
+                format!("Open browser target:\n{}", args["url"].as_str().unwrap_or("?"))
+            }
+            "browser_snapshot" => {
+                format!("Request browser snapshot:\n{}", args["url"].as_str().unwrap_or("?"))
+            }
+            "browser_click" => format!("Click browser selector:\n{}", args["selector"].as_str().unwrap_or("?")),
+            "browser_type" => format!(
+                "Type into browser selector:\n{}\n\nText: {} chars",
+                args["selector"].as_str().unwrap_or("?"),
+                args["text"].as_str().map(|s| s.chars().count()).unwrap_or(0)
+            ),
+            "web_search" => format!("Search web:\n{}", args["query"].as_str().unwrap_or("?")),
+            "fetch_url" => format!("Fetch URL:\n{}", args["url"].as_str().unwrap_or("?")),
             other => format!("{other} {args}"),
         }
     }
@@ -248,6 +284,8 @@ impl ToolRouter {
         let Some(command) = args["command"].as_str() else {
             return ("shell: missing 'command'".into(), false);
         };
+        let timeout_s = args["timeout_seconds"].as_u64().unwrap_or(120).clamp(1, 600);
+        let started = std::time::Instant::now();
         let mut cmd = self.build_shell_command(command);
         cmd.current_dir(&self.workspace);
         cmd.stdin(std::process::Stdio::null());
@@ -265,7 +303,7 @@ impl ToolRouter {
         };
         #[cfg(unix)]
         let pgid = child.id().map(|id| id as i32);
-        let dur = std::time::Duration::from_secs(120);
+        let dur = std::time::Duration::from_secs(timeout_s);
         match tokio::time::timeout(dur, child.wait_with_output()).await {
             Ok(Ok(out)) => {
                 let mut s = String::new();
@@ -277,7 +315,14 @@ impl ToolRouter {
                 }
                 let ok = out.status.success();
                 let capped: String = s.chars().take(20_000).collect();
-                (capped, ok)
+                let code = out.status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".to_string());
+                let elapsed = format_elapsed(started.elapsed());
+                let body = if capped.trim().is_empty() {
+                    "(no output)".to_string()
+                } else {
+                    capped
+                };
+                (format!("$ {command}\n[exit {code} · {elapsed}]\n{body}"), ok)
             }
             Ok(Err(e)) => (format!("shell error: {e}"), false),
             Err(_) => {
@@ -287,7 +332,10 @@ impl ToolRouter {
                     unsafe { libc::killpg(pg, libc::SIGKILL); }
                 }
                 (
-                    "shell: timed out after 120s and was killed. For long-running processes (dev servers, watchers) start them detached with output redirected — e.g. `nohup npm run dev >/dev/null 2>&1 &` — then poll, instead of blocking.".into(),
+                    format!(
+                        "$ {command}\n[timeout after {timeout_s}s · {}]\nFor long-running processes (dev servers, watchers), start them detached with output redirected — e.g. `nohup npm run dev >/tmp/oxide-dev.log 2>&1 &` — then poll the log or port instead of blocking.",
+                        format_elapsed(started.elapsed())
+                    ),
                     false,
                 )
             }
@@ -324,6 +372,16 @@ impl ToolRouter {
         let mut c = tokio::process::Command::new("/bin/sh");
         c.arg("-c").arg(command);
         c
+    }
+}
+
+fn format_elapsed(d: std::time::Duration) -> String {
+    if d.as_secs() >= 60 {
+        format!("{}m{}s", d.as_secs() / 60, d.as_secs() % 60)
+    } else if d.as_secs() > 0 {
+        format!("{}s", d.as_secs())
+    } else {
+        format!("{}ms", d.as_millis())
     }
 }
 
@@ -399,6 +457,7 @@ mod tests {
         let tools = vec![
             ToolSpec::new("read_file", "r"),
             ToolSpec::new("write_file", "w").mutating(true),
+            ToolSpec::new("shell", "sh").mutating(true),
             ToolSpec::new("search", "s"),
         ];
         ToolRouter::new(
@@ -435,6 +494,26 @@ mod tests {
         assert!(ok);
         assert!(hits.contains("hello.txt"));
 
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[tokio::test]
+    async fn shell_output_includes_command_status_and_duration() {
+        let tmp = std::env::temp_dir().join(format!("oxide-shell-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let r = router(&tmp);
+
+        let (out, ok) = r
+            .execute(
+                "shell",
+                &serde_json::json!({ "command": "printf hello", "timeout_seconds": 5 }),
+            )
+            .await;
+
+        assert!(ok, "shell should succeed: {out}");
+        assert!(out.contains("$ printf hello"));
+        assert!(out.contains("[exit 0"));
+        assert!(out.contains("hello"));
         std::fs::remove_dir_all(&tmp).ok();
     }
 
