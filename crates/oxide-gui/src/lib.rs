@@ -3955,14 +3955,12 @@ fn app() -> Element {
                                             let p_dbl = path.clone();
                                             let p_del = path.clone();
                                             let p_arch = path.clone();
-                                            let p_del2 = path.clone();
                                             let p_arch2 = path.clone();
                                             let t_open = title.clone();
                                             let menu_open = session_menu.read().as_ref() == Some(&path);
                                             let path_str = path.display().to_string();
                                             let path_str_pin = path_str.clone();
                                             let path_str_archive = path_str.clone();
-                                            let path_str_delete = path_str.clone();
                                             let path_str_menu_archive = path_str.clone();
                                             let path_str_menu_delete = path_str.clone();
                                             let is_pinned = pinned_ids.contains(&path_str);
@@ -3986,31 +3984,10 @@ fn app() -> Element {
                                                                 ToastAction::RestoreSessions(vec![path_str_archive.clone()]),
                                                             );
                                                         }, "⊟" }
-                                                        button { class: "row-act-btn danger", title: "Delete", onclick: move |e: dioxus::prelude::MouseEvent| {
-                                                            e.stop_propagation();
-                                                            if confirm_delete_session.peek().as_deref() != Some(path_str_delete.as_str()) {
-                                                                confirm_delete_session.set(Some(path_str_delete.clone()));
-                                                                push_toast(toasts, toast_seq, "info", "Click delete again to remove this session");
-                                                                return;
-                                                            }
-                                                            confirm_delete_session.set(None);
-                                                            let restore = capture_deleted_session(&p_del2);
-                                                            delete_session(&p_del2);
-                                                            sessions_refresh.set(sessions_refresh() + 1);
-                                                            refresh_projects_list(projects_list, cfg);
-                                                            if let Some(spec) = restore {
-                                                                push_action_toast(
-                                                                    toasts,
-                                                                    toast_seq,
-                                                                    "ok",
-                                                                    "Session deleted",
-                                                                    "Restore",
-                                                                    ToastAction::RestoreDeletedSession(spec),
-                                                                );
-                                                            } else {
-                                                                push_toast(toasts, toast_seq, "ok", "Session deleted");
-                                                            }
-                                                        }, "✕" }
+                                                        // Delete is non-destructive here — the visible row action only
+                                                        // archives (hides). Permanent delete lives in the right-click
+                                                        // menu and in Settings → Archived sessions, so a stray click
+                                                        // never destroys a CLI-backed session.
                                                     }
                                                     div { class: "thread recent sub", title: "right-click / double-click for options",
                                                         onclick: move |_| { show_board.set(false); open_session_tab(tabs, active_tab, messages, next_tab_id, cfg, ui, engine, busy_tabs, p_open.clone(), t_open.clone()); },
@@ -5775,9 +5752,10 @@ fn app() -> Element {
                                                         span { class: "diff-adds", "+{total_add}" }
                                                         span { class: "diff-dels", "−{total_del}" }
                                                     }
-                                                } else {
-                                                    span { class: "live-changes-skeleton" }
                                                 }
+                                                // No empty skeleton pill while counts are 0 — the
+                                                // subtitle ("… diffs settle after the turn") already
+                                                // signals pending; a blank grey bar just looked broken.
                                                 button { class: "live-changes-review", title: "Open diffs",
                                                     onclick: move |_| {
                                                         edits_expanded.set(true);
@@ -5844,7 +5822,7 @@ fn app() -> Element {
 
             // ── Settings modal ─────────────────────────────────────────
             if *show_settings.read() {
-                SettingsModal { cfg, ui, engine, on_close: move |_| show_settings.set(false) }
+                SettingsModal { cfg, ui, engine, sessions_refresh, projects_list, on_close: move |_| show_settings.set(false) }
             }
             if *show_skills.read() {
                 SkillsModal { workspace: workspace.clone(), on_close: move |_| show_skills.set(false) }
@@ -6861,6 +6839,8 @@ fn SettingsModal(
     cfg: Signal<Config>,
     ui: Ui,
     engine: Coroutine<EngineCmd>,
+    sessions_refresh: Signal<u64>,
+    projects_list: Signal<Vec<ProjectGroup>>,
     on_close: EventHandler<()>,
 ) -> Element {
     let base = cfg.read().clone();
@@ -6887,6 +6867,10 @@ fn SettingsModal(
     let mut browser_headless = use_signal(|| base.browser_headless);
     let mut notification_sound = use_signal(|| base.notification_sound);
     let mut notification_volume = use_signal(|| base.notification_volume);
+    // Archived-sessions manager: bump to re-query the list; confirm holds the
+    // id awaiting a second click before a permanent delete.
+    let mut arch_refresh = use_signal(|| 0u64);
+    let mut arch_confirm = use_signal(|| None::<String>);
 
     let providers = ["chatgpt", "codex", "claude", "openai", "anthropic", "echo", "mock"];
 
@@ -6938,7 +6922,7 @@ fn SettingsModal(
                     button { class: "term-x", onclick: move |_| on_close.call(()), "✕" }
                 }
                 div { class: "settings-tabs",
-                    for (key, label) in [("model", "Model"), ("access", "Access"), ("agents", "Agents"), ("updates", "Updates")] {
+                    for (key, label) in [("model", "Model"), ("access", "Access"), ("agents", "Agents"), ("sessions", "Sessions"), ("updates", "Updates")] {
                         button { class: if settings_tab.read().as_str() == key { "settings-tab active" } else { "settings-tab" },
                             onclick: move |_| settings_tab.set(key.to_string()), "{label}" }
                     }
@@ -7145,6 +7129,79 @@ fn SettingsModal(
                         select { class: "field-input", onchange: move |e| tab_mode.set(e.value()),
                             option { value: "gui", selected: tab_mode.read().as_str() == "gui", "GUI (chat)" }
                             option { value: "tui", selected: tab_mode.read().as_str() == "tui", "TUI (terminal)" }
+                        }
+                    }
+                  }
+                  if settings_tab.read().as_str() == "sessions" {
+                    div { class: "field",
+                        span { class: "field-label", "Archived sessions" }
+                        span { class: "settings-hint", "Hidden from the sidebar — the underlying CLI session is untouched. Restore brings one back; Delete removes it permanently." }
+                        {
+                            let _ = *arch_refresh.read(); // re-query when this bumps
+                            let archived = oxide_core::db::list_archived();
+                            if archived.is_empty() {
+                                rsx! { div { class: "archived-empty", "No archived sessions." } }
+                            } else {
+                                // Group by workspace, preserving recency order.
+                                let mut groups: Vec<(String, Vec<oxide_core::db::SessionMeta>)> = Vec::new();
+                                for m in archived {
+                                    if let Some(g) = groups.iter_mut().find(|(w, _)| *w == m.workspace) {
+                                        g.1.push(m);
+                                    } else {
+                                        groups.push((m.workspace.clone(), vec![m]));
+                                    }
+                                }
+                                rsx! {
+                                    div { class: "archived-list",
+                                        for (wsname, items) in groups {
+                                            {
+                                                let folder = wsname.rsplit('/').find(|s| !s.is_empty()).unwrap_or(wsname.as_str()).to_string();
+                                                let count = items.len();
+                                                rsx! {
+                                                    div { class: "archived-folder",
+                                                        div { class: "archived-folder-head", title: "{wsname}",
+                                                            Icon { name: "folder" }
+                                                            span { class: "archived-folder-name", "{folder}" }
+                                                            span { class: "archived-count", "{count}" }
+                                                        }
+                                                        for m in items {
+                                                            {
+                                                                let id_r = m.id.clone();
+                                                                let id_d = m.id.clone();
+                                                                let id_key = m.id.clone();
+                                                                let titletext = if m.title.trim().is_empty() { "(untitled)".to_string() } else { m.title.clone() };
+                                                                let confirming = arch_confirm.read().as_deref() == Some(id_key.as_str());
+                                                                rsx! {
+                                                                    div { class: "archived-row",
+                                                                        span { class: "archived-title", title: "{titletext}", "{titletext}" }
+                                                                        button { class: "archived-restore", onclick: move |_| {
+                                                                            oxide_core::db::restore(&id_r);
+                                                                            arch_confirm.set(None);
+                                                                            arch_refresh.set(arch_refresh() + 1);
+                                                                            sessions_refresh.set(sessions_refresh() + 1);
+                                                                            refresh_projects_list(projects_list, cfg);
+                                                                        }, "Restore" }
+                                                                        button { class: if confirming { "archived-del danger" } else { "archived-del" }, onclick: move |_| {
+                                                                            if !confirming {
+                                                                                arch_confirm.set(Some(id_key.clone()));
+                                                                                return;
+                                                                            }
+                                                                            oxide_core::db::delete(&id_d);
+                                                                            arch_confirm.set(None);
+                                                                            arch_refresh.set(arch_refresh() + 1);
+                                                                            sessions_refresh.set(sessions_refresh() + 1);
+                                                                        }, if confirming { "Sure?" } else { "Delete" } }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                   }

@@ -1349,7 +1349,15 @@ as a visual in the chat. Keep it focused; add a short prose explanation too.\n\
                             }
                             Some(StreamItem::FileChanged(path)) => {
                                 if !cli_changed.contains(&path) {
-                                    cli_changed.push(path);
+                                    cli_changed.push(path.clone());
+                                }
+                                // Live counts: diff the file now (checkpoint 0 = not yet
+                                // revertable) so the "Changing files" card shows +/- as edits
+                                // land instead of staying blank until the turn settles. The
+                                // turn-end pass re-emits with the real baseline + checkpoint.
+                                let (rel, diff) = cli_file_diff(&self.workspace, &path).await;
+                                if !diff.trim().is_empty() {
+                                    self.emit(Event::FileDiff { turn, path: rel, diff, checkpoint: 0 }).await;
                                 }
                             }
                             Some(StreamItem::Notice(text)) => {
@@ -1496,29 +1504,8 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
         // git at turn end so the UI gets the same per-file cards + summary.
         let changed: Vec<String> = cli_changed.drain(..).collect();
         for path in changed {
-            let rel = std::path::Path::new(&path)
-                .strip_prefix(&self.workspace)
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|_| path.clone());
-            let out = tokio::process::Command::new("git")
-                .arg("-C").arg(&self.workspace)
-                .args(["diff", "--no-color", "--"]).arg(&rel)
-                .output().await;
-            let mut diff = out
-                .ok()
-                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-                .unwrap_or_default();
-            if diff.trim().is_empty() {
-                // Untracked/new file: render it as all-adds (capped).
-                if let Ok(text) = std::fs::read_to_string(self.workspace.join(&rel)) {
-                    let body: String = text.lines().take(400).map(|l| format!("+{l}\n")).collect();
-                    if !body.is_empty() {
-                        diff = format!("@@ new file @@\n{body}");
-                    }
-                }
-            }
+            let (rel, diff) = cli_file_diff(&self.workspace, &path).await;
             if !diff.trim().is_empty() {
-                let diff: String = diff.chars().take(20_000).collect();
                 // Revertable: prior bytes come from the pre-turn git baseline
                 // (absent there = new file, so revert deletes it).
                 let mut checkpoint = 0u64;
@@ -2167,6 +2154,36 @@ fn unified_diff(old: &str, new: &str, path: &str) -> String {
         .context_radius(3)
         .header(&format!("a/{path}"), &format!("b/{path}"))
         .to_string()
+}
+
+/// Diff a CLI-edited file against the working tree's git baseline, returning
+/// `(workspace-relative path, unified diff)`. New/untracked files render as
+/// all-adds. Used both live (per edit, for streaming counts) and at turn end
+/// (for the final revertable diff). The diff is capped so one huge file can't
+/// blow the event payload.
+async fn cli_file_diff(workspace: &std::path::Path, path: &str) -> (String, String) {
+    let rel = std::path::Path::new(path)
+        .strip_prefix(workspace)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| path.to_string());
+    let out = tokio::process::Command::new("git")
+        .arg("-C").arg(workspace)
+        .args(["diff", "--no-color", "--"]).arg(&rel)
+        .output().await;
+    let mut diff = out
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
+    if diff.trim().is_empty() {
+        if let Ok(text) = std::fs::read_to_string(workspace.join(&rel)) {
+            let body: String = text.lines().take(400).map(|l| format!("+{l}\n")).collect();
+            if !body.is_empty() {
+                diff = format!("@@ new file @@\n{body}");
+            }
+        }
+    }
+    let diff: String = diff.chars().take(20_000).collect();
+    (rel, diff)
 }
 
 fn tool_arg_string(args: &serde_json::Value, key: &str) -> String {

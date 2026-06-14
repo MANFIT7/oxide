@@ -310,6 +310,12 @@ pub fn restore(id: &str) {
     );
 }
 
+/// Every archived session across all workspaces (for the restore manager in
+/// Settings), most-recently-updated first.
+pub fn list_archived() -> Vec<SessionMeta> {
+    list_where("archived_at IS NOT NULL", [], 500)
+}
+
 pub fn delete(id: &str) {
     let c = conn().lock().unwrap();
     let _ = c.execute("DELETE FROM messages WHERE session_id=?1", [id]);
