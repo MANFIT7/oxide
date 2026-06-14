@@ -48,7 +48,7 @@ pub struct Config {
     /// Provider used for the implementation stage (backend agent).
     #[serde(default = "default_backend")]
     pub backend_provider: String,
-    /// Fan the plan out to parallel backend sub-agents (then synthesize).
+    /// Split the plan into backend sub-agents, then synthesize their results.
     #[serde(default)]
     pub subagents: bool,
     /// Recently opened workspace folders (most-recent first).

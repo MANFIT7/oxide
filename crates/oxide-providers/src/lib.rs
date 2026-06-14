@@ -184,6 +184,26 @@ impl Provider for EchoProvider {
     }
 }
 
+/// Scripted planner for orchestration tests: emits a numbered plan and no tools.
+pub struct MockPlanProvider;
+
+#[async_trait]
+impl Provider for MockPlanProvider {
+    fn name(&self) -> &str {
+        "mock_plan"
+    }
+
+    async fn stream(&self, _req: TurnRequest, sink: mpsc::Sender<StreamItem>) -> anyhow::Result<()> {
+        let _ = sink
+            .send(StreamItem::TextDelta(
+                "1. Write the requested file\n2. Report what changed".to_string(),
+            ))
+            .await;
+        let _ = sink.send(StreamItem::Done).await;
+        Ok(())
+    }
+}
+
 /// Scripted provider for tests/demos: emits one `write_file` tool call then a
 /// short reply. Drives the full tool-routing/approval/sandbox path without a
 /// network or API key.
@@ -344,6 +364,7 @@ pub fn build(provider: &str) -> Box<dyn Provider> {
         "claude" => Box::new(cli::ClaudeCliProvider::new()),
         // ChatGPT subscription, no API key / no CLI (reuses codex OAuth login).
         "chatgpt" => Box::new(chatgpt::ChatGptProvider::new()),
+        "mock_plan" => Box::new(MockPlanProvider),
         "mock" => Box::new(MockToolProvider),
         "mock_mcp" => Box::new(MockMcpProvider),
         "mock_browser" => Box::new(MockBrowserProvider),

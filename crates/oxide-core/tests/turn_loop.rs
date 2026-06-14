@@ -94,6 +94,56 @@ async fn mock_provider_tool_call_writes_file_in_sandbox() {
 }
 
 #[tokio::test]
+async fn orchestrated_subagents_run_backend_tool_calls() {
+    let tmp = std::env::temp_dir().join(format!("oxide-subagents-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    let mut config = Config::default();
+    config.provider = "echo".into();
+    config.orchestrate = true;
+    config.subagents = true;
+    config.front_provider = "mock_plan".into();
+    config.backend_provider = "mock".into();
+    config.approval_policy = oxide_protocol::ApprovalPolicy::Never;
+    config.persist = false;
+    config.workspace = Some(tmp.clone());
+
+    let (handle, mut events) = oxide_core::spawn(config).expect("spawn");
+    let _ = events.recv().await; // Ready
+
+    handle
+        .submit(Op::UserTurn {
+            text: "make a file through subagents".into(),
+        })
+        .await
+        .unwrap();
+
+    let mut began = false;
+    let mut patched = false;
+    let mut ended_ok = false;
+    while let Some(ev) = events.recv().await {
+        match ev {
+            Event::ToolCallBegin { tool, .. } => began |= tool == "write_file",
+            Event::PatchApplied { path, .. } => patched |= path == "oxide_mock.txt",
+            Event::ToolCallEnd { ok, .. } => ended_ok |= ok,
+            Event::TurnFinished { .. } => break,
+            _ => {}
+        }
+    }
+
+    assert!(began, "sub-agent backend should begin a tool call");
+    assert!(patched, "sub-agent backend write should emit PatchApplied");
+    assert!(ended_ok, "sub-agent backend tool should finish ok");
+    assert!(
+        tmp.join("oxide_mock.txt").exists(),
+        "sub-agent backend should write in the workspace"
+    );
+
+    handle.submit(Op::Shutdown).await.unwrap();
+    std::fs::remove_dir_all(&tmp).ok();
+}
+
+#[tokio::test]
 async fn checkpoint_then_rewind_undoes_write() {
     let tmp = std::env::temp_dir().join(format!("oxide-rewind-{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();

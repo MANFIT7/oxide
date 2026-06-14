@@ -1039,6 +1039,254 @@ impl Engine {
         out
     }
 
+    /// Run a backend worker to completion with the same tool loop as the main
+    /// agent, but keep its transcript out of the parent conversation. Used by
+    /// orchestrated implementers and sub-agents.
+    #[allow(clippy::too_many_arguments)]
+    async fn stream_agentic_collect(
+        &mut self,
+        provider_id: &str,
+        system: &str,
+        user: &str,
+        effort: &str,
+        turn: TurnId,
+        worker_id: &str,
+        op_rx: &mut mpsc::Receiver<Op>,
+    ) -> (String, bool) {
+        let saved_session = std::mem::replace(
+            &mut self.session,
+            vec![Message::new(Role::User, user.to_string())],
+        );
+        let saved_turn_reads = std::mem::take(&mut self.turn_reads);
+        let saved_turn_edit_paths = std::mem::take(&mut self.turn_edit_paths);
+        let saved_turn_edited = self.turn_edited;
+        let saved_last_tool_sig = std::mem::take(&mut self.last_tool_sig);
+        let saved_last_tool_reps = self.last_tool_reps;
+
+        self.turn_edited = false;
+        self.last_tool_reps = 0;
+
+        let policy = self.active_harness().loop_policy();
+        let model = policy.model.clone().unwrap_or_else(|| {
+            let mut cfg = self.config.clone();
+            cfg.provider = provider_id.to_string();
+            cfg.effective_model()
+        });
+        let max_steps = (policy.max_steps as usize).clamp(1, 24);
+        let tools = self.all_tools();
+        let cli_driver = matches!(provider_id, "codex" | "claude");
+        let cli_baseline = if cli_driver {
+            git_baseline_tree(&self.workspace).await
+        } else {
+            None
+        };
+        let mut cli_changed: Vec<String> = Vec::new();
+        let mut out = String::new();
+        let mut interrupted = false;
+        let mut step = 0usize;
+        let mut overflow_retries = 0u8;
+        let mut wrapped_up = false;
+
+        loop {
+            context::sanitize_tool_pairs(&mut self.session);
+            let mut msgs = vec![Message::new(Role::System, system.to_string())];
+            msgs.extend(self.session.iter().cloned());
+            let conversation_id = self
+                .session_store
+                .as_ref()
+                .map(|s| format!("{}:{worker_id}", s.id))
+                .unwrap_or_else(|| worker_id.to_string());
+            let req = TurnRequest {
+                model: model.clone(),
+                reasoning_effort: effort.to_string(),
+                temperature: policy.temperature,
+                messages: msgs,
+                tools: tools.clone(),
+                cwd: self.workspace.display().to_string(),
+                conversation_id,
+                cli_resume: None,
+            };
+
+            let (stream_tx, mut stream_rx) = mpsc::channel::<StreamItem>(STREAM_QUEUE);
+            let provider = oxide_providers::build(provider_id);
+            let stream_task = tokio::spawn(async move { provider.stream(req, stream_tx).await });
+
+            let mut round_text = String::new();
+            let mut pending_reasoning: Option<serde_json::Value> = None;
+            let mut did_tool = false;
+            let mut steered = false;
+            loop {
+                tokio::select! {
+                    item = stream_rx.recv() => {
+                        match item {
+                            Some(StreamItem::TextDelta(t)) => {
+                                round_text.push_str(&t);
+                                out.push_str(&t);
+                            }
+                            Some(StreamItem::ReasoningDelta(t)) => {
+                                self.emit(Event::ReasoningDelta { turn, text: t }).await;
+                            }
+                            Some(StreamItem::ReasoningItem(v)) => {
+                                pending_reasoning = Some(v);
+                            }
+                            Some(StreamItem::ToolCall { id, name, arguments }) => {
+                                did_tool = true;
+                                let prose = std::mem::take(&mut round_text);
+                                let mut msg = Message::with_tool_call(
+                                    prose,
+                                    oxide_providers::ToolCall { id: id.clone(), name: name.clone(), arguments: arguments.clone() },
+                                );
+                                msg.reasoning_item = pending_reasoning.take();
+                                self.session.push(msg);
+                                if self.handle_tool_call(turn, name, arguments, id, op_rx).await {
+                                    interrupted = true;
+                                    break;
+                                }
+                            }
+                            Some(StreamItem::FileChanged(path)) => {
+                                if !cli_changed.contains(&path) {
+                                    cli_changed.push(path.clone());
+                                }
+                                let (rel, diff) = cli_file_diff(&self.workspace, &path).await;
+                                if !diff.trim().is_empty() {
+                                    self.emit(Event::FileDiff { turn, path: rel, diff, checkpoint: 0 }).await;
+                                }
+                            }
+                            Some(StreamItem::Notice(text)) => {
+                                self.emit(Event::Info { text }).await;
+                            }
+                            Some(StreamItem::Usage { input, output, context_window }) => {
+                                self.emit(Event::TokensUsed { turn, input, output }).await;
+                                if let Some(limit) = context_window {
+                                    self.ctx_window = Some(limit);
+                                    self.emit(Event::ContextWindow { limit }).await;
+                                }
+                            }
+                            Some(StreamItem::RateLimit { plan, primary_pct, secondary_pct, primary_reset_s, secondary_reset_s }) => {
+                                self.emit(Event::RateLimit { plan, primary_pct, secondary_pct, primary_reset_s, secondary_reset_s }).await;
+                            }
+                            Some(StreamItem::CliSession(_)) => {
+                                // Worker CLI sessions are intentionally isolated from
+                                // the parent chat's persisted CLI resume id.
+                            }
+                            Some(StreamItem::Done) | None => break,
+                        }
+                    }
+                    op = op_rx.recv() => {
+                        match op {
+                            Some(Op::Interrupt) => { interrupted = true; break; }
+                            Some(Op::Shutdown) => { interrupted = true; break; }
+                            Some(Op::UserTurn { text }) => {
+                                self.session.push(Message::new(Role::User, text.clone()));
+                                self.emit(Event::Info { text: format!("↪ steering worker: {text}") }).await;
+                                steered = true;
+                            }
+                            Some(Op::Rewind { checkpoint_id }) => {
+                                let restored = self.checkpoints.rewind(checkpoint_id);
+                                self.emit(Event::RewindDone { id: checkpoint_id, restored }).await;
+                            }
+                            Some(other) => {
+                                self.emit(Event::Info { text: format!("queued op ignored by worker: {other:?}") }).await;
+                            }
+                            None => { interrupted = true; break; }
+                        }
+                    }
+                }
+            }
+
+            let stream_err = if interrupted {
+                stream_task.abort();
+                None
+            } else {
+                stream_task.await.ok().and_then(|r| r.err()).map(|e| e.to_string())
+            };
+            if let Some(err) = &stream_err {
+                let low = err.to_lowercase();
+                let overflow = low.contains("context") || low.contains("exceeds") || low.contains("too long")
+                    || low.contains("maximum") || (low.contains("token") && low.contains("limit"));
+                if overflow && round_text.is_empty() && overflow_retries < 2 {
+                    overflow_retries += 1;
+                    self.force_compact(turn).await;
+                    self.emit(Event::Info { text: "⚠ worker context full — compacted, retrying".into() }).await;
+                    continue;
+                }
+                if round_text.is_empty() {
+                    self.emit(Event::Error { message: err.clone() }).await;
+                }
+            }
+            if !round_text.is_empty() {
+                let mut msg = Message::new(Role::Assistant, round_text);
+                msg.reasoning_item = pending_reasoning.take();
+                self.session.push(msg);
+            }
+
+            step += 1;
+            if interrupted {
+                break;
+            }
+            if step >= max_steps {
+                if !wrapped_up {
+                    wrapped_up = true;
+                    self.session.push(Message::new(Role::User,
+                        "<system-reminder>\nMaximum worker tool steps reached. Do NOT call any more tools. \
+Reply with text only: summarize what you changed, what you verified, and what remains.\n</system-reminder>"));
+                    continue;
+                }
+                break;
+            }
+            if cli_driver && !steered {
+                break;
+            }
+            if !did_tool && !steered {
+                break;
+            }
+        }
+
+        let changed: Vec<String> = cli_changed.drain(..).collect();
+        for path in changed {
+            let (rel, diff) = cli_file_diff(&self.workspace, &path).await;
+            if !diff.trim().is_empty() {
+                let mut checkpoint = 0u64;
+                if let Some(tree) = &cli_baseline {
+                    let prior = tokio::process::Command::new("git")
+                        .arg("-C").arg(&self.workspace)
+                        .args(["cat-file", "-p", &format!("{tree}:{rel}")])
+                        .output().await
+                        .ok()
+                        .filter(|o| o.status.success())
+                        .map(|o| o.stdout);
+                    let abs = self.workspace.join(&rel);
+                    checkpoint = self.checkpoints.snapshot_with(&abs, prior);
+                    self.emit(Event::CheckpointCreated {
+                        turn,
+                        id: checkpoint,
+                        label: format!("worker edit {rel}"),
+                    })
+                    .await;
+                }
+                self.emit(Event::FileDiff { turn, path: rel, diff, checkpoint }).await;
+            } else {
+                self.emit(Event::FileDiff { turn, path: rel, diff: String::new(), checkpoint: 0 }).await;
+            }
+        }
+
+        let worker_edited = self.turn_edited;
+        let worker_edit_paths = std::mem::take(&mut self.turn_edit_paths);
+        self.session = saved_session;
+        self.turn_reads = saved_turn_reads;
+        self.turn_edit_paths = saved_turn_edit_paths;
+        self.turn_edit_paths.extend(worker_edit_paths);
+        self.turn_edited = saved_turn_edited || worker_edited;
+        self.last_tool_sig = saved_last_tool_sig;
+        self.last_tool_reps = saved_last_tool_reps;
+
+        if interrupted {
+            self.emit(Event::Info { text: "worker interrupted".into() }).await;
+        }
+
+        (out, interrupted)
+    }
+
     async fn run_turn(&mut self, user_text: String, op_rx: &mut mpsc::Receiver<Op>) {
         let turn = TurnId(self.next_turn);
         self.next_turn += 1;
@@ -1147,7 +1395,7 @@ as a visual in the chat. Keep it focused; add a short prose explanation too.\n\
                 .await;
 
             if self.config.subagents {
-                // ── Fan out the plan's numbered steps to parallel sub-agents ──
+                // ── Run the plan's numbered steps through tool-capable workers ──
                 let subtasks: Vec<String> = plan
                     .lines()
                     .map(|l| l.trim())
@@ -1162,50 +1410,78 @@ as a visual in the chat. Keep it focused; add a short prose explanation too.\n\
                 if subtasks.is_empty() {
                     // No clear steps — fall back to a single implementer.
                     let isys = format!("You are the implementer. Carry out this plan precisely.\n\nPLAN:\n{plan}");
-                    assistant = self.stream_collect(&backend, &isys, &user_text, &effort, turn, false, false).await;
+                    let worker_sys = format!("{sys}\n\n# Orchestration role\n{isys}");
+                    let worker_id = format!("orchestrate-implement-{}", turn.0);
+                    let (out, was_interrupted) = self
+                        .stream_agentic_collect(&backend, &worker_sys, &user_text, &effort, turn, &worker_id, op_rx)
+                        .await;
+                    assistant = out;
+                    interrupted |= was_interrupted;
                 } else {
                     self.emit(Event::Info {
-                        text: format!("🤖 Spawning {} sub-agents · backend: {backend}", subtasks.len()),
+                        text: format!("🤖 Running {} tool-capable sub-agents · backend: {backend}", subtasks.len()),
                     })
                     .await;
-                    let results = {
-                        let this: &Self = &*self; // shared reborrow for concurrent sub-agents
-                        let futures = subtasks.iter().enumerate().map(|(i, st)| {
-                            let bsys = format!(
-                                "You are sub-agent {}. Do EXACTLY this subtask and report what you did. Overall plan for context:\n{plan}",
-                                i + 1
-                            );
-                            let st = st.clone();
-                            let backend = backend.clone();
-                            let effort = effort.clone();
-                            async move {
-                                let out = this.stream_collect(&backend, &bsys, &st, &effort, turn, false, true).await;
-                                (i + 1, st, out)
-                            }
-                        });
-                        futures::future::join_all(futures).await
-                    };
+                    let mut results: Vec<(usize, String, String)> = Vec::with_capacity(subtasks.len());
+                    for (i, st) in subtasks.iter().enumerate() {
+                        let bsys = format!(
+                            "{sys}\n\n# Sub-agent assignment\nYou are sub-agent {}. Do EXACTLY this subtask and report what you did. Overall plan for context:\n{plan}",
+                            i + 1
+                        );
+                        let worker_id = format!("subagent-{}-{}", turn.0, i + 1);
+                        let (out, was_interrupted) = self
+                            .stream_agentic_collect(&backend, &bsys, st, &effort, turn, &worker_id, op_rx)
+                            .await;
+                        interrupted |= was_interrupted;
+                        results.push((i + 1, st.clone(), out));
+                        if interrupted {
+                            break;
+                        }
+                    }
                     for (i, st, _) in &results {
                         self.emit(Event::Info { text: format!("✓ sub-agent {i}: {}", st.chars().take(60).collect::<String>()) }).await;
                     }
-                    // Synthesize sub-agent outputs into the final answer.
-                    self.emit(Event::Info { text: format!("🧩 Synthesizing · front: {front}") }).await;
                     let joined: String = results
                         .iter()
                         .map(|(i, st, r)| format!("### Sub-agent {i} — {st}\n{r}"))
                         .collect::<Vec<_>>()
                         .join("\n\n");
-                    let ssys = format!(
-                        "You are the lead. Combine the sub-agent results into one coherent final answer for the user. Resolve overlaps, note anything incomplete.\n\nSUB-AGENT RESULTS:\n{joined}"
-                    );
-                    assistant = self.stream_collect(&front, &ssys, &user_text, &effort, turn, false, false).await;
+                    if interrupted {
+                        assistant = joined;
+                    } else {
+                        // Synthesize sub-agent outputs into the final answer.
+                        self.emit(Event::Info { text: format!("🧩 Synthesizing · front: {front}") }).await;
+                        let ssys = format!(
+                            "You are the lead. Combine the sub-agent results into one coherent final answer for the user. Resolve overlaps, note anything incomplete.\n\nSUB-AGENT RESULTS:\n{joined}"
+                        );
+                        assistant = self.stream_collect(&front, &ssys, &user_text, &effort, turn, false, false).await;
+                    }
                 }
             } else {
                 self.emit(Event::Info { text: format!("⚙ Implementing · backend: {backend}") }).await;
                 let isys = format!(
                     "You are the implementer. Carry out the following plan precisely to fulfil the user's request — do the actual work, edits and commands.\n\nPLAN:\n{plan}"
                 );
-                assistant = self.stream_collect(&backend, &isys, &user_text, &effort, turn, false, false).await;
+                let worker_sys = format!("{sys}\n\n# Orchestration role\n{isys}");
+                let worker_id = format!("orchestrate-implement-{}", turn.0);
+                let (out, was_interrupted) = self
+                    .stream_agentic_collect(&backend, &worker_sys, &user_text, &effort, turn, &worker_id, op_rx)
+                    .await;
+                assistant = out;
+                interrupted |= was_interrupted;
+            }
+
+            if interrupted {
+                if !assistant.is_empty() {
+                    if let Some(store) = &self.session_store {
+                        let _ = store.append("assistant", &assistant);
+                    }
+                    self.session.push(Message::new(Role::Assistant, assistant));
+                }
+                self.emit(Event::Info { text: "turn interrupted".into() }).await;
+                self.fire_hooks("stop", serde_json::json!({})).await;
+                self.emit(Event::TurnFinished { turn }).await;
+                return;
             }
 
             // ── Review + auto-fix loop (review → if gaps, re-implement) ──
@@ -1239,10 +1515,21 @@ as a visual in the chat. Keep it focused; add a short prose explanation too.\n\
                 let fsys = format!(
                     "You are the implementer. Fix the gaps the reviewer found — make the actual edits/commands. Do not redo what already works.\n\nPLAN:\n{plan}\n\nGAPS TO FIX:\n{review}\n\nWORK SO FAR:\n{assistant}"
                 );
-                let fix = self.stream_collect(&backend, &fsys, &user_text, &effort, turn, false, false).await;
+                let worker_sys = format!("{sys}\n\n# Orchestration role\n{fsys}");
+                let worker_id = format!("orchestrate-fix-{}-{iter}", turn.0);
+                let (fix, was_interrupted) = self
+                    .stream_agentic_collect(&backend, &worker_sys, &user_text, &effort, turn, &worker_id, op_rx)
+                    .await;
                 assistant.push_str(&fix);
+                if was_interrupted {
+                    interrupted = true;
+                    break;
+                }
             }
 
+            if interrupted {
+                self.emit(Event::Info { text: "turn interrupted".into() }).await;
+            }
             if !assistant.is_empty() {
                 if let Some(store) = &self.session_store {
                     let _ = store.append("assistant", &assistant);

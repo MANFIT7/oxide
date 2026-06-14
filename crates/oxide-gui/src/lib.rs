@@ -7092,7 +7092,7 @@ fn SettingsModal(
                             label { class: "toggle-field", style: "margin-top:10px",
                                 input { r#type: "checkbox", checked: *subagents.read(),
                                     onchange: move |e| subagents.set(e.checked()) }
-                                span { class: "field-label", "Sub-agents (fan plan out to parallel backends, then synthesize)" }
+                                span { class: "field-label", "Sub-agents (split plan into tool-capable workers, then synthesize)" }
                             }
                         }
                     }
