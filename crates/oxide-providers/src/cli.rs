@@ -832,11 +832,13 @@ async fn run_claude_interactive_turn(
     let started = Instant::now();
     let mut last_change = Instant::now();
     let mut last_pty_output = Instant::now();
-    let mut emitted_text = String::new();
+    let mut pending_text = String::new();
+    let mut text_emitted = false;
     let mut emitted_tools: HashSet<String> = HashSet::new();
     let mut command_tools: HashSet<String> = HashSet::new();
     let mut emitted_results: HashSet<String> = HashSet::new();
-    let mut emitted_usage = false;
+    let mut pending_usage: Option<(u64, u64, Option<u64>)> = None;
+    let mut usage_emitted = false;
     let mut interval = tokio::time::interval(CLAUDE_INTERACTIVE_POLL);
 
     loop {
@@ -886,44 +888,58 @@ async fn run_claude_interactive_turn(
             });
             last_change = Instant::now();
         }
-        if snapshot.assistant_text != emitted_text {
-            let delta = text_delta(&emitted_text, &snapshot.assistant_text);
-            if !delta.is_empty() {
-                send(sink, StreamItem::TextDelta(delta));
-            }
-            emitted_text = snapshot.assistant_text.clone();
+        if snapshot.assistant_text != pending_text {
+            pending_text = snapshot.assistant_text.clone();
             last_change = Instant::now();
         }
-        if !emitted_usage {
-            if let Some((input, output, context_window)) = snapshot.usage {
-                send(sink, StreamItem::Usage { input, output, context_window });
-                emitted_usage = true;
-            }
+        if let Some(usage) = snapshot.usage {
+            pending_usage = Some(usage);
         }
 
         if let Some(status) = child.try_wait()? {
-            if !status.success() && emitted_text.trim().is_empty() {
+            if !status.success() && pending_text.trim().is_empty() {
                 return Err(anyhow::anyhow!(
                     "interactive Claude Code exited with status {}{}",
                     status.exit_code(),
                     tail_context(&terminal_tail)
                 ));
             }
+            emit_interactive_final(sink, &pending_text, pending_usage, &mut text_emitted, &mut usage_emitted);
             break;
         }
 
-        let final_text_ready = !emitted_text.trim().is_empty()
+        let final_text_ready = !pending_text.trim().is_empty()
             && last_change.elapsed() >= CLAUDE_INTERACTIVE_SETTLE
             && (snapshot.turn_complete
                 || (snapshot.tail == ClaudeTranscriptTail::AssistantText
                     && last_pty_output.elapsed() >= CLAUDE_INTERACTIVE_SETTLE));
         if final_text_ready {
+            emit_interactive_final(sink, &pending_text, pending_usage, &mut text_emitted, &mut usage_emitted);
             break;
         }
     }
 
     let _ = child.kill();
     Ok(())
+}
+
+fn emit_interactive_final(
+    sink: &mpsc::Sender<StreamItem>,
+    text: &str,
+    usage: Option<(u64, u64, Option<u64>)>,
+    text_emitted: &mut bool,
+    usage_emitted: &mut bool,
+) {
+    if !*text_emitted && !text.trim().is_empty() {
+        send(sink, StreamItem::TextDelta(text.to_string()));
+        *text_emitted = true;
+    }
+    if !*usage_emitted {
+        if let Some((input, output, context_window)) = usage {
+            send(sink, StreamItem::Usage { input, output, context_window });
+            *usage_emitted = true;
+        }
+    }
 }
 
 fn emit_claude_tool_use(sink: &mpsc::Sender<StreamItem>, tool: &ClaudeToolUse) {
@@ -1155,13 +1171,6 @@ fn push_text_message(buf: &mut String, text: &str) {
         buf.push_str("\n\n");
     }
     buf.push_str(trimmed);
-}
-
-fn text_delta(previous: &str, current: &str) -> String {
-    current
-        .strip_prefix(previous)
-        .map(str::to_string)
-        .unwrap_or_else(|| current.to_string())
 }
 
 fn claude_transcript_path(cwd: &str, session_id: &str) -> anyhow::Result<PathBuf> {
