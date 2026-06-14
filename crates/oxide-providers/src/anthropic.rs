@@ -235,6 +235,9 @@ mod tests {
                 Message::new(Role::User, "hi"),
             ],
             tools: vec![ToolSpec::new("read_file", "read a file")],
+            cwd: "/tmp".into(),
+            conversation_id: "session".into(),
+            cli_resume: None,
         }
     }
 

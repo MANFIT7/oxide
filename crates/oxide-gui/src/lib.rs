@@ -1716,7 +1716,7 @@ fn jump_to_msg(i: usize) {
 fn scroll_chat_bottom() {
     spawn(async move {
         let _ = dioxus::document::eval(
-            "setTimeout(()=>requestAnimationFrame(()=>{const s=document.querySelector('.scroll'); if(s) s.scrollTop=s.scrollHeight;}),60);",
+            "for (const delay of [0, 40, 140]) setTimeout(()=>requestAnimationFrame(()=>{const s=document.querySelector('.scroll'); if(s) s.scrollTo({top:s.scrollHeight, behavior:'auto'});}),delay);",
         )
         .await;
     });
@@ -2765,6 +2765,7 @@ fn app() -> Element {
                             if let Some(h) = handles.get(&aid) {
                                 messages.write().push(ChatMsg { author: Author::User, text: display });
                                 messages.write().push(ChatMsg { author: Author::Agent, text: String::new() });
+                                scroll_chat_bottom();
                                 streaming.set(true);
                                 busy_tabs.write().insert(aid);
                                 tab_statuses.write().insert(aid, TabStatus::Running);
@@ -2773,6 +2774,7 @@ fn app() -> Element {
                                 // Engine failed to start — don't eat the message silently.
                                 messages.write().push(ChatMsg { author: Author::User, text: display });
                                 messages.write().push(ChatMsg { author: Author::Note, text: "⚠ engine not running — check provider/settings, or switch model to restart it".into() });
+                                scroll_chat_bottom();
                             }
                         }
                         Some(EngineCmd::Reconfigure(conf)) => {
@@ -2950,6 +2952,7 @@ fn app() -> Element {
                             }
                             questions.write().retain(|(qid, _, _)| *qid != id);
                             messages.write().push(ChatMsg { author: Author::User, text });
+                            scroll_chat_bottom();
                         }
                         Some(EngineCmd::Approve { id, decision }) => {
                             if let Some(tid) = active_id!() {
@@ -3457,6 +3460,7 @@ fn app() -> Element {
                                         followups.write().clear();
                                         messages.write().push(ChatMsg { author: Author::User, text: text.clone() });
                                         messages.write().push(ChatMsg { author: Author::Agent, text: String::new() });
+                                        scroll_chat_bottom();
                                         streaming.set(true);
                                         busy_tabs.write().insert(ev_tid);
                                         tab_statuses.write().insert(ev_tid, TabStatus::Running);

@@ -1986,7 +1986,7 @@ Do NOT read it again. Proceed now: make the edits with the edit/write_file tools
             let items: Vec<(String, String)> = arguments["todos"].as_array()
                 .map(|a| a.iter().filter_map(|t| {
                     let c = t["content"].as_str()?.to_string();
-                    let s = t["status"].as_str().unwrap_or("pending").to_string();
+                    let s = normalize_todo_status(t["status"].as_str().unwrap_or("pending"));
                     Some((c, s))
                 }).collect())
                 .unwrap_or_default();
@@ -2206,8 +2206,23 @@ fn tool_arg_string(args: &serde_json::Value, key: &str) -> String {
     args[key].as_str().unwrap_or("").trim().to_string()
 }
 
+fn normalize_todo_status(status: &str) -> String {
+    match status.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+        "completed" | "complete" | "done" => "completed".to_string(),
+        "in_progress" | "in progress" | "active" | "doing" => "in_progress".to_string(),
+        _ => "pending".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod map_test {
+    #[test]
+    fn todo_status_variants_normalize_for_ui() {
+        assert_eq!(super::normalize_todo_status("done"), "completed");
+        assert_eq!(super::normalize_todo_status("in-progress"), "in_progress");
+        assert_eq!(super::normalize_todo_status("blocked"), "pending");
+    }
+
     #[test]
     fn map_shows_structure() {
         let ws = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();

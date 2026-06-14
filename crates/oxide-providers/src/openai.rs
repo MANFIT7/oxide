@@ -225,6 +225,9 @@ mod tests {
                 Message::new(Role::User, "hi"),
             ],
             tools: vec![ToolSpec::new("shell", "run a command").mutating(true)],
+            cwd: "/tmp".into(),
+            conversation_id: "session".into(),
+            cli_resume: None,
         }
     }
 

@@ -13,6 +13,7 @@ use async_trait::async_trait;
 use eventsource_stream::Eventsource;
 use futures::StreamExt;
 use serde_json::{json, Value};
+use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
@@ -156,6 +157,7 @@ fn build_body(req: &TurnRequest) -> Value {
                     "name": t.name,
                     "description": t.description,
                     "parameters": t.parameters,
+                    "strict": false,
                 })
             })
             .collect();
@@ -163,6 +165,79 @@ fn build_body(req: &TurnRequest) -> Value {
         body["tool_choice"] = json!("auto");
     }
     body
+}
+
+fn parse_tool_args(raw: &str) -> Value {
+    serde_json::from_str(raw).unwrap_or_else(|_| json!({}))
+}
+
+fn response_tool_call(
+    item: &Value,
+    pending: &mut HashMap<String, (String, String)>,
+) -> Option<(Vec<String>, String, Value)> {
+    match item["type"].as_str()? {
+        "function_call" => {
+            let item_id = item["id"].as_str().unwrap_or("").to_string();
+            let pending_item = if item_id.is_empty() {
+                None
+            } else {
+                pending.remove(&item_id)
+            };
+            let name = item["name"]
+                .as_str()
+                .map(str::to_string)
+                .or_else(|| pending_item.as_ref().map(|(name, _)| name.clone()))?;
+            let raw = item["arguments"]
+                .as_str()
+                .map(str::to_string)
+                .or_else(|| pending_item.map(|(_, args)| args))
+                .unwrap_or_else(|| "{}".to_string());
+            let call_id = item["call_id"].as_str().unwrap_or("").to_string();
+            Some((vec![call_id, item_id], name, parse_tool_args(&raw)))
+        }
+        "shell_call" => {
+            let commands: Vec<String> = item["action"]["commands"]
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|cmd| cmd.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if commands.is_empty() {
+                return None;
+            }
+            let call_id = item["call_id"].as_str().unwrap_or("").to_string();
+            let item_id = item["id"].as_str().unwrap_or("").to_string();
+            Some((vec![call_id, item_id], "shell".to_string(), json!({ "command": commands.join("\n") })))
+        }
+        _ => None,
+    }
+}
+
+async fn send_tool_call(
+    sink: &mpsc::Sender<StreamItem>,
+    sent: &mut HashSet<String>,
+    ids: Vec<String>,
+    name: String,
+    arguments: Value,
+) -> bool {
+    if ids.iter().any(|id| !id.is_empty() && sent.contains(id)) {
+        return true;
+    }
+    let id = ids
+        .iter()
+        .find(|id| !id.is_empty())
+        .cloned()
+        .unwrap_or_else(|| format!("{name}:{arguments}"));
+    sent.insert(id.clone());
+    for alias in ids {
+        if !alias.is_empty() {
+            sent.insert(alias);
+        }
+    }
+    sink.send(StreamItem::ToolCall { id, name, arguments }).await.is_ok()
 }
 
 #[async_trait]
@@ -221,6 +296,8 @@ impl Provider for ChatGptProvider {
         }
 
         let mut stream = resp.bytes_stream().eventsource();
+        let mut pending_function_args: HashMap<String, (String, String)> = HashMap::new();
+        let mut sent_tools: HashSet<String> = HashSet::new();
         while let Some(ev) = stream.next().await {
             let ev = ev?;
             let v: Value = match serde_json::from_str(&ev.data) {
@@ -245,17 +322,18 @@ impl Provider for ChatGptProvider {
                     if item["type"].as_str() == Some("reasoning") {
                         let _ = sink.send(StreamItem::ReasoningItem(item.clone())).await;
                     }
-                    if item["type"].as_str() == Some("function_call") {
-                        if let Some(name) = item["name"].as_str() {
-                            let args: Value = item["arguments"]
-                                .as_str()
-                                .and_then(|s| serde_json::from_str(s).ok())
-                                .unwrap_or_else(|| json!({}));
-                            let id = item["call_id"].as_str().or_else(|| item["id"].as_str()).unwrap_or("").to_string();
-                            let _ = sink
-                                .send(StreamItem::ToolCall { id, name: name.to_string(), arguments: args })
-                                .await;
+                    if let Some((ids, name, arguments)) = response_tool_call(item, &mut pending_function_args) {
+                        if !send_tool_call(&sink, &mut sent_tools, ids, name, arguments).await {
+                            return Ok(());
                         }
+                    }
+                }
+                Some("response.function_call_arguments.done") => {
+                    let item_id = v["item_id"].as_str().unwrap_or("").to_string();
+                    let name = v["name"].as_str().unwrap_or("").to_string();
+                    let arguments = v["arguments"].as_str().unwrap_or("{}").to_string();
+                    if !item_id.is_empty() && !name.is_empty() {
+                        pending_function_args.insert(item_id, (name, arguments));
                     }
                 }
                 Some("response.completed") => {
@@ -275,7 +353,98 @@ impl Provider for ChatGptProvider {
                 _ => {}
             }
         }
+        for (item_id, (name, raw_args)) in pending_function_args {
+            if !send_tool_call(
+                &sink,
+                &mut sent_tools,
+                vec![item_id],
+                name,
+                parse_tool_args(&raw_args),
+            )
+            .await
+            {
+                return Ok(());
+            }
+        }
         let _ = sink.send(StreamItem::Done).await;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oxide_protocol::ToolSpec;
+
+    fn req_with_tools(tools: Vec<ToolSpec>) -> TurnRequest {
+        TurnRequest {
+            model: "gpt-5.5".to_string(),
+            reasoning_effort: "medium".to_string(),
+            temperature: 0.2,
+            messages: Vec::new(),
+            tools,
+            cwd: "/tmp".to_string(),
+            conversation_id: "session".to_string(),
+            cli_resume: None,
+        }
+    }
+
+    #[test]
+    fn body_uses_responses_function_tool_shape() {
+        let req = req_with_tools(vec![
+            ToolSpec::new("shell", "Run a shell command").mutating(true).params(json!({
+                "type": "object",
+                "properties": { "command": { "type": "string" } },
+                "required": ["command"]
+            })),
+        ]);
+
+        let body = build_body(&req);
+        let tool = &body["tools"][0];
+        assert_eq!(tool["type"], "function");
+        assert_eq!(tool["name"], "shell");
+        assert_eq!(tool["strict"], false);
+        assert_eq!(tool["parameters"]["required"][0], "command");
+        assert_eq!(body["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn output_item_uses_pending_function_arguments_when_needed() {
+        let mut pending = HashMap::from([(
+            "item_1".to_string(),
+            (
+                "todo_write".to_string(),
+                r#"{"todos":[{"content":"Build","status":"in_progress"}]}"#.to_string(),
+            ),
+        )]);
+        let item = json!({
+            "type": "function_call",
+            "id": "item_1",
+            "call_id": "call_1"
+        });
+
+        let (ids, name, args) = response_tool_call(&item, &mut pending).unwrap();
+
+        assert_eq!(ids, vec!["call_1".to_string(), "item_1".to_string()]);
+        assert_eq!(name, "todo_write");
+        assert_eq!(args["todos"][0]["content"], "Build");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn native_shell_call_maps_to_engine_shell_tool() {
+        let mut pending = HashMap::new();
+        let item = json!({
+            "type": "shell_call",
+            "id": "item_shell",
+            "call_id": "call_shell",
+            "action": { "commands": ["pwd", "ls -la"] }
+        });
+
+        let (ids, name, args) = response_tool_call(&item, &mut pending).unwrap();
+
+        assert_eq!(ids, vec!["call_shell".to_string(), "item_shell".to_string()]);
+        assert_eq!(name, "shell");
+        assert_eq!(args["command"], "pwd\nls -la");
     }
 }
