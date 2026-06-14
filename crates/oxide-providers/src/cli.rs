@@ -105,6 +105,44 @@ fn extract_cli_images(req: &TurnRequest) -> (String, Vec<String>) {
     (prompt.trim().to_string(), imgs)
 }
 
+fn clean_cli_command(command: &str) -> String {
+    command
+        .strip_prefix("/bin/zsh -lc ")
+        .unwrap_or(command)
+        .strip_prefix("/bin/sh -c ")
+        .unwrap_or(command)
+        .trim_matches('\'')
+        .trim()
+        .to_string()
+}
+
+fn cli_item_id(item: &Value, fallback: &str) -> String {
+    let raw = item["id"]
+        .as_str()
+        .or_else(|| item["item_id"].as_str())
+        .or_else(|| item["call_id"].as_str())
+        .unwrap_or(fallback);
+    if raw.trim().is_empty() {
+        fallback.to_string()
+    } else {
+        raw.to_string()
+    }
+}
+
+fn cli_exit_code(item: &Value) -> Option<i32> {
+    item["exit_code"]
+        .as_i64()
+        .or_else(|| item["exit_code"].as_str().and_then(|s| s.parse::<i64>().ok()))
+        .and_then(|code| i32::try_from(code).ok())
+}
+
+fn cli_duration_ms(item: &Value) -> u64 {
+    item["duration_ms"]
+        .as_u64()
+        .or_else(|| item["elapsed_ms"].as_u64())
+        .unwrap_or(0)
+}
+
 /// Spawn `program args...` and stream its stdout lines to `on_line`, closing
 /// stdin so the CLI doesn't block waiting for piped input.
 async fn run_jsonl<F>(
@@ -259,16 +297,20 @@ impl Provider for CodexCliProvider {
             match v["type"].as_str() {
                 Some("item.started") => {
                     // Live status while the CLI runs a command/edits a file.
-                    let item = &v["item"];
-                    match item["type"].as_str() {
-                        Some("command_execution") => {
-                            let cmd = item["command"].as_str().unwrap_or("");
-                            let cmd = cmd.strip_prefix("/bin/zsh -lc ").unwrap_or(cmd)
-                                .strip_prefix("/bin/sh -c ").unwrap_or(cmd)
-                                .trim_matches('\'');
-                            let cmd: String = cmd.chars().take(80).collect();
-                            send(sink, StreamItem::Notice(format!("⚙ Running {cmd}")));
-                        }
+	                    let item = &v["item"];
+	                    match item["type"].as_str() {
+	                        Some("command_execution") => {
+	                            let cmd = clean_cli_command(item["command"].as_str().unwrap_or(""));
+	                            let id = cli_item_id(item, &format!("codex-command-{cmd}"));
+	                            send(sink, StreamItem::CommandStarted {
+	                                id,
+	                                command: cmd.clone(),
+	                                cwd: String::new(),
+	                                background: false,
+	                            });
+	                            let cmd: String = cmd.chars().take(80).collect();
+	                            send(sink, StreamItem::Notice(format!("⚙ Running {cmd}")));
+	                        }
                         Some("file_change") => {
                             let p = item["path"].as_str().or_else(|| item["text"].as_str()).unwrap_or("file");
                             send(sink, StreamItem::Notice(format!("⚙ Editing {p}")));
@@ -299,17 +341,28 @@ impl Provider for CodexCliProvider {
                                 send(sink, StreamItem::ReasoningDelta(t.to_string()));
                             }
                         }
-                        Some("command_execution") => {
-                            let cmd = item["command"].as_str().unwrap_or("");
-                            let cmd = cmd.strip_prefix("/bin/zsh -lc ").unwrap_or(cmd)
-                                .strip_prefix("/bin/sh -c ").unwrap_or(cmd)
-                                .trim_matches('\'');
-                            let exit = item["exit_code"].as_str().unwrap_or("");
-                            let out = item["aggregated_output"].as_str().unwrap_or("");
-                            let out: String = out.chars().take(800).collect();
-                            send(sink, StreamItem::Notice(format!("⌘ {cmd}\n{out}").trim_end().to_string()));
-                            let _ = exit;
-                        }
+	                        Some("command_execution") => {
+	                            let cmd = clean_cli_command(item["command"].as_str().unwrap_or(""));
+	                            let id = cli_item_id(item, &format!("codex-command-{cmd}"));
+	                            let out = item["aggregated_output"].as_str().unwrap_or("");
+	                            if !out.is_empty() {
+	                                send(sink, StreamItem::CommandOutput {
+	                                    id: id.clone(),
+	                                    stream: "stdout".to_string(),
+	                                    chunk: out.to_string(),
+	                                });
+	                            }
+	                            let exit_code = cli_exit_code(item);
+	                            let ok = exit_code.map(|code| code == 0).unwrap_or(true);
+	                            send(sink, StreamItem::CommandFinished {
+	                                id,
+	                                ok,
+	                                exit_code,
+	                                duration_ms: cli_duration_ms(item),
+	                            });
+	                            let out: String = out.chars().take(800).collect();
+	                            send(sink, StreamItem::Notice(format!("⌘ {cmd}\n{out}").trim_end().to_string()));
+	                        }
                         Some("file_change") => {
                             let summary = item["text"].as_str()
                                 .or_else(|| item["path"].as_str())
@@ -472,8 +525,8 @@ impl Provider for ClaudeCliProvider {
                                         }
                                     }
                                 }
-                                Some("tool_use") => {
-                                    let name = block["name"].as_str().unwrap_or("tool");
+	                                Some("tool_use") => {
+	                                    let name = block["name"].as_str().unwrap_or("tool");
                                     // Pull the human-relevant arg so the live status reads
                                     // "⚙ Read src/lib.rs", not a bare tool name.
                                     let input = &block["input"];
@@ -485,9 +538,19 @@ impl Provider for ClaudeCliProvider {
                                     // A backgrounded command ("I'll let you know when done")
                                     // won't stream its result back — surface WHAT it's doing
                                     // with a distinct ⏳ marker so the UI can show it persistently.
-                                    let bg = input["run_in_background"].as_bool() == Some(true);
-                                    let label = if bg {
-                                        if detail.is_empty() { format!("⏳ {name}") } else { format!("⏳ {name} {detail}") }
+	                                    let bg = input["run_in_background"].as_bool() == Some(true);
+	                                    if matches!(name, "Bash" | "Shell") || input["command"].as_str().is_some() {
+	                                        let command = input["command"].as_str().unwrap_or(detail.as_str()).to_string();
+	                                        let id = block["id"].as_str().map(str::to_string).unwrap_or_else(|| format!("claude-command-{command}"));
+	                                        send(sink, StreamItem::CommandStarted {
+	                                            id,
+	                                            command,
+	                                            cwd: String::new(),
+	                                            background: bg,
+	                                        });
+	                                    }
+	                                    let label = if bg {
+	                                        if detail.is_empty() { format!("⏳ {name}") } else { format!("⏳ {name} {detail}") }
                                     } else if detail.is_empty() {
                                         format!("⚙ {name}")
                                     } else {

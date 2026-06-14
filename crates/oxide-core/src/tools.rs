@@ -5,9 +5,11 @@
 //! mutation. Centralizing this is what makes the security model auditable.
 
 use crate::sandbox::{self, PathCheck};
-use oxide_protocol::{ApprovalPolicy, SandboxPolicy, ToolSpec};
+use oxide_protocol::{ApprovalPolicy, Event, SandboxPolicy, ToolSpec, TurnId};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+use tokio::sync::mpsc;
 
 pub struct ToolRouter {
     pub approval_policy: ApprovalPolicy,
@@ -342,6 +344,115 @@ impl ToolRouter {
         }
     }
 
+    /// Streaming variant used by GUI/subscription paths. It preserves the same
+    /// sandbox/approval command construction as `exec_shell`, but emits command
+    /// output chunks while the process is still running.
+    pub async fn exec_shell_streaming(
+        &self,
+        args: &serde_json::Value,
+        turn: TurnId,
+        command_id: String,
+        worker_id: Option<String>,
+        event_tx: mpsc::Sender<Event>,
+    ) -> (String, bool) {
+        let Some(command) = args["command"].as_str() else {
+            return ("shell: missing 'command'".into(), false);
+        };
+        let timeout_s = args["timeout_seconds"].as_u64().unwrap_or(120).clamp(1, 600);
+        let started = std::time::Instant::now();
+        let mut cmd = self.build_shell_command(command);
+        cmd.current_dir(&self.workspace);
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+        cmd.kill_on_drop(true);
+        #[cfg(unix)]
+        cmd.process_group(0);
+
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => return (format!("shell spawn error: {e}"), false),
+        };
+        #[cfg(unix)]
+        let pgid = child.id().map(|id| id as i32);
+
+        let (line_tx, mut line_rx) = mpsc::unbounded_channel::<(&'static str, String)>();
+        if let Some(stdout) = child.stdout.take() {
+            spawn_shell_reader(stdout, "stdout", line_tx.clone());
+        }
+        if let Some(stderr) = child.stderr.take() {
+            spawn_shell_reader(stderr, "stderr", line_tx.clone());
+        }
+        drop(line_tx);
+
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        let mut wait_task = tokio::spawn(async move { child.wait().await });
+        let deadline = tokio::time::sleep(std::time::Duration::from_secs(timeout_s));
+        tokio::pin!(deadline);
+        let mut rx_open = true;
+
+        let status = loop {
+            tokio::select! {
+                result = &mut wait_task => {
+                    break result.unwrap_or_else(|err| Err(std::io::Error::new(std::io::ErrorKind::Other, err)));
+                }
+                line = line_rx.recv(), if rx_open => {
+                    match line {
+                        Some((stream, chunk)) => {
+                            append_shell_chunk(if stream == "stderr" { &mut stderr } else { &mut stdout }, &chunk);
+                            let _ = event_tx.send(Event::CommandOutput {
+                                turn,
+                                command_id: command_id.clone(),
+                                worker_id: worker_id.clone(),
+                                stream: stream.to_string(),
+                                chunk,
+                            }).await;
+                        }
+                        None => rx_open = false,
+                    }
+                }
+                _ = &mut deadline => {
+                    #[cfg(unix)]
+                    if let Some(pg) = pgid {
+                        unsafe { libc::killpg(pg, libc::SIGKILL); }
+                    }
+                    wait_task.abort();
+                    let body = shell_output_body(&stdout, &stderr);
+                    return (
+                        format!(
+                            "$ {command}\n[timeout after {timeout_s}s · {}]\n{body}\nFor long-running processes (dev servers, watchers), start them detached with output redirected — e.g. `nohup npm run dev >/tmp/oxide-dev.log 2>&1 &` — then poll the log or port instead of blocking.",
+                            format_elapsed(started.elapsed())
+                        ),
+                        false,
+                    );
+                }
+            }
+        };
+
+        while let Ok(Some((stream, chunk))) = tokio::time::timeout(std::time::Duration::from_millis(50), line_rx.recv()).await {
+            append_shell_chunk(if stream == "stderr" { &mut stderr } else { &mut stdout }, &chunk);
+            let _ = event_tx.send(Event::CommandOutput {
+                turn,
+                command_id: command_id.clone(),
+                worker_id: worker_id.clone(),
+                stream: stream.to_string(),
+                chunk,
+            }).await;
+        }
+
+        match status {
+            Ok(exit) => {
+                let ok = exit.success();
+                let code = exit.status_code_string();
+                let elapsed = format_elapsed(started.elapsed());
+                let body = shell_output_body(&stdout, &stderr);
+                (format!("$ {command}\n[exit {code} · {elapsed}]\n{body}"), ok)
+            }
+            Err(e) => (format!("shell error: {e}"), false),
+        }
+    }
+
     #[cfg(target_os = "macos")]
     fn build_shell_command(&self, command: &str) -> tokio::process::Command {
         // Explicit user approval lifts the sandbox for THIS call — that's what
@@ -372,6 +483,49 @@ impl ToolRouter {
         let mut c = tokio::process::Command::new("/bin/sh");
         c.arg("-c").arg(command);
         c
+    }
+}
+
+fn spawn_shell_reader<R>(reader: R, stream: &'static str, tx: mpsc::UnboundedSender<(&'static str, String)>)
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(reader).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let _ = tx.send((stream, format!("{line}\n")));
+        }
+    });
+}
+
+fn append_shell_chunk(buf: &mut String, chunk: &str) {
+    buf.push_str(chunk);
+    if buf.len() > 24_000 {
+        let keep: String = buf.chars().rev().take(20_000).collect::<Vec<_>>().into_iter().rev().collect();
+        *buf = keep;
+    }
+}
+
+fn shell_output_body(stdout: &str, stderr: &str) -> String {
+    let mut s = stdout.to_string();
+    if !stderr.trim().is_empty() {
+        if !s.trim().is_empty() {
+            s.push('\n');
+        }
+        s.push_str("[stderr] ");
+        s.push_str(stderr);
+    }
+    let capped: String = s.chars().take(20_000).collect();
+    if capped.trim().is_empty() { "(no output)".to_string() } else { capped }
+}
+
+trait ExitStatusExt {
+    fn status_code_string(&self) -> String;
+}
+
+impl ExitStatusExt for std::process::ExitStatus {
+    fn status_code_string(&self) -> String {
+        self.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".to_string())
     }
 }
 

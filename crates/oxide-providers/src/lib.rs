@@ -102,6 +102,26 @@ pub enum StreamItem {
         name: String,
         arguments: serde_json::Value,
     },
+    /// A provider-native CLI command started.
+    CommandStarted {
+        id: String,
+        command: String,
+        cwd: String,
+        background: bool,
+    },
+    /// Incremental or final output from a provider-native CLI command.
+    CommandOutput {
+        id: String,
+        stream: String,
+        chunk: String,
+    },
+    /// A provider-native CLI command finished.
+    CommandFinished {
+        id: String,
+        ok: bool,
+        exit_code: Option<i32>,
+        duration_ms: u64,
+    },
     /// A transcript note from the provider (e.g. an agentic CLI ran a command).
     Notice(String),
     /// The provider's native CLI session id (codex thread / claude uuid). The

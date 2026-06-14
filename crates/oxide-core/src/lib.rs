@@ -1775,6 +1775,9 @@ Rules:
                 StreamItem::RateLimit { plan, primary_pct, secondary_pct, primary_reset_s, secondary_reset_s } => {
                     self.emit(Event::RateLimit { plan, primary_pct, secondary_pct, primary_reset_s, secondary_reset_s }).await;
                 }
+                StreamItem::CommandStarted { .. }
+                | StreamItem::CommandOutput { .. }
+                | StreamItem::CommandFinished { .. } => {}
                 StreamItem::ToolCall { .. } => {}
                 StreamItem::ReasoningItem(_) => {}
                 // Sub-agent / silent collection — don't let its CLI session id
@@ -1918,7 +1921,7 @@ Rules:
                                 );
                                 msg.reasoning_item = pending_reasoning.take();
                                 self.session.push(msg);
-                                if self.handle_tool_call(turn, name, arguments, id, op_rx).await {
+	                                if self.handle_tool_call(turn, name, arguments, id, Some(worker_id), op_rx).await {
                                     interrupted = true;
                                     break;
                                 }
@@ -1932,11 +1935,40 @@ Rules:
                                     self.emit(Event::FileDiff { turn, path: rel, diff, checkpoint: 0 }).await;
                                 }
                             }
-                            Some(StreamItem::Notice(text)) => {
-                                self.emit(Event::Info { text }).await;
-                            }
-                            Some(StreamItem::Usage { input, output, context_window }) => {
-                                self.emit(Event::TokensUsed { turn, input, output }).await;
+	                            Some(StreamItem::Notice(text)) => {
+	                                self.emit(Event::Info { text }).await;
+	                            }
+	                            Some(StreamItem::CommandStarted { id, command, cwd, background }) => {
+	                                self.emit(Event::CommandStarted {
+	                                    turn,
+	                                    command_id: id,
+	                                    worker_id: Some(worker_id.to_string()),
+	                                    command,
+	                                    cwd: if cwd.is_empty() { self.workspace.display().to_string() } else { cwd },
+	                                    background,
+	                                }).await;
+	                            }
+	                            Some(StreamItem::CommandOutput { id, stream, chunk }) => {
+	                                self.emit(Event::CommandOutput {
+	                                    turn,
+	                                    command_id: id,
+	                                    worker_id: Some(worker_id.to_string()),
+	                                    stream,
+	                                    chunk,
+	                                }).await;
+	                            }
+	                            Some(StreamItem::CommandFinished { id, ok, exit_code, duration_ms }) => {
+	                                self.emit(Event::CommandFinished {
+	                                    turn,
+	                                    command_id: id,
+	                                    worker_id: Some(worker_id.to_string()),
+	                                    ok,
+	                                    exit_code,
+	                                    duration_ms,
+	                                }).await;
+	                            }
+	                            Some(StreamItem::Usage { input, output, context_window }) => {
+	                                self.emit(Event::TokensUsed { turn, input, output }).await;
                                 if let Some(limit) = context_window {
                                     self.ctx_window = Some(limit);
                                     self.emit(Event::ContextWindow { limit }).await;
@@ -2561,7 +2593,7 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                                 // of thought instead of re-thinking every round.
                                 msg.reasoning_item = pending_reasoning.take();
                                 self.session.push(msg);
-                                if self.handle_tool_call(turn, name, arguments, id, op_rx).await {
+	                                if self.handle_tool_call(turn, name, arguments, id, None, op_rx).await {
                                     interrupted = true;
                                     break;
                                 }
@@ -2579,11 +2611,40 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                                     self.emit(Event::FileDiff { turn, path: rel, diff, checkpoint: 0 }).await;
                                 }
                             }
-                            Some(StreamItem::Notice(text)) => {
-                                self.emit(Event::Info { text }).await;
-                            }
-                            Some(StreamItem::Usage { input, output, context_window }) => {
-                                self.emit(Event::TokensUsed { turn, input, output }).await;
+	                            Some(StreamItem::Notice(text)) => {
+	                                self.emit(Event::Info { text }).await;
+	                            }
+	                            Some(StreamItem::CommandStarted { id, command, cwd, background }) => {
+	                                self.emit(Event::CommandStarted {
+	                                    turn,
+	                                    command_id: id,
+	                                    worker_id: None,
+	                                    command,
+	                                    cwd: if cwd.is_empty() { self.workspace.display().to_string() } else { cwd },
+	                                    background,
+	                                }).await;
+	                            }
+	                            Some(StreamItem::CommandOutput { id, stream, chunk }) => {
+	                                self.emit(Event::CommandOutput {
+	                                    turn,
+	                                    command_id: id,
+	                                    worker_id: None,
+	                                    stream,
+	                                    chunk,
+	                                }).await;
+	                            }
+	                            Some(StreamItem::CommandFinished { id, ok, exit_code, duration_ms }) => {
+	                                self.emit(Event::CommandFinished {
+	                                    turn,
+	                                    command_id: id,
+	                                    worker_id: None,
+	                                    ok,
+	                                    exit_code,
+	                                    duration_ms,
+	                                }).await;
+	                            }
+	                            Some(StreamItem::Usage { input, output, context_window }) => {
+	                                self.emit(Event::TokensUsed { turn, input, output }).await;
                                 if let Some(limit) = context_window {
                                     self.ctx_window = Some(limit);
                                     self.emit(Event::ContextWindow { limit }).await;
@@ -2990,6 +3051,7 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
         name: String,
         mut arguments: serde_json::Value,
         call_id: String,
+        worker_id: Option<&str>,
         op_rx: &mut mpsc::Receiver<Op>,
     ) -> bool {
         self.emit(Event::ToolCallBegin {
@@ -3221,6 +3283,39 @@ Do NOT read it again. Proceed now: make the edits with the edit/write_file tools
             self.emit(Event::Todos { items: items.clone() }).await;
             let done = items.iter().filter(|(_, s)| s == "completed").count();
             (format!("todo list updated ({done}/{} done)", items.len()), true)
+        } else if name == "shell" {
+            let command = arguments["command"].as_str().unwrap_or("").to_string();
+            let command_id = if call_id.trim().is_empty() {
+                format!("shell-{}-{}", turn.0, self.next_approval)
+            } else {
+                format!("shell-{}-{call_id}", turn.0)
+            };
+            self.emit(Event::CommandStarted {
+                turn,
+                command_id: command_id.clone(),
+                worker_id: worker_id.map(str::to_string),
+                command,
+                cwd: self.workspace.display().to_string(),
+                background: false,
+            }).await;
+            let started = std::time::Instant::now();
+            let (output, ok) = router.exec_shell_streaming(
+                &arguments,
+                turn,
+                command_id.clone(),
+                worker_id.map(str::to_string),
+                self.event_tx.clone(),
+            ).await;
+            let exit_code = shell_exit_code(&output);
+            self.emit(Event::CommandFinished {
+                turn,
+                command_id,
+                worker_id: worker_id.map(str::to_string),
+                ok,
+                exit_code,
+                duration_ms: started.elapsed().as_millis() as u64,
+            }).await;
+            (output, ok)
         } else if name == "web_search" {
             web_search(arguments["query"].as_str().unwrap_or("")).await
         } else if name == "fetch_url" {
@@ -3443,6 +3538,9 @@ async fn collect_provider_text_silent(provider_id: &str, req: TurnRequest) -> Re
             StreamItem::TextDelta(text) => out.push_str(&text),
             StreamItem::Done => break,
             StreamItem::FileChanged(_)
+            | StreamItem::CommandStarted { .. }
+            | StreamItem::CommandOutput { .. }
+            | StreamItem::CommandFinished { .. }
             | StreamItem::ReasoningDelta(_)
             | StreamItem::ReasoningItem(_)
             | StreamItem::ToolCall { .. }
@@ -3493,6 +3591,12 @@ fn looks_like_secret(text: &str) -> bool {
         || lower.contains("token=")
         || lower.contains("bearer ")
         || lower.contains("sk-")
+}
+
+fn shell_exit_code(output: &str) -> Option<i32> {
+    let line = output.lines().find(|line| line.starts_with("[exit "))?;
+    let raw = line.trim_start_matches("[exit ").split_whitespace().next()?;
+    raw.parse::<i32>().ok()
 }
 
 fn tool_arg_string(args: &serde_json::Value, key: &str) -> String {

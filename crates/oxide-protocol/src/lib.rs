@@ -91,6 +91,32 @@ pub enum Event {
         output: String,
         ok: bool,
     },
+    /// A shell/CLI command started. `worker_id` is set for sub-agent-owned commands.
+    CommandStarted {
+        turn: TurnId,
+        command_id: String,
+        worker_id: Option<String>,
+        command: String,
+        cwd: String,
+        background: bool,
+    },
+    /// Incremental command output.
+    CommandOutput {
+        turn: TurnId,
+        command_id: String,
+        worker_id: Option<String>,
+        stream: String,
+        chunk: String,
+    },
+    /// A shell/CLI command finished.
+    CommandFinished {
+        turn: TurnId,
+        command_id: String,
+        worker_id: Option<String>,
+        ok: bool,
+        exit_code: Option<i32>,
+        duration_ms: u64,
+    },
     /// A file patch was applied to disk.
     PatchApplied { turn: TurnId, path: String },
     /// The agent's current task checklist `(content, status)` where status is

@@ -545,6 +545,33 @@ fn activity_label(tool: &str, args: &serde_json::Value) -> String {
     format!("{icon}\t{verb}\t{detail}")
 }
 
+fn command_activity_label(command: &str, background: bool) -> String {
+    let short: String = command.trim().chars().take(140).collect();
+    let verb = if background { "Background" } else { "Run" };
+    format!("terminal\t{verb}\t{short}")
+}
+
+fn append_activity_output(text: &mut String, chunk: &str) {
+    if chunk.is_empty() {
+        return;
+    }
+    let mut parts = text.splitn(4, '\t');
+    let icon = parts.next().unwrap_or("terminal");
+    let verb = parts.next().unwrap_or("Run");
+    let detail = parts.next().unwrap_or("");
+    let mut output = parts.next().unwrap_or("").to_string();
+    output.push_str(chunk);
+    if output.chars().count() > 8000 {
+        output = output.chars().rev().take(7000).collect::<Vec<_>>().into_iter().rev().collect::<String>();
+        output.insert_str(0, "… (output truncated)\n");
+    }
+    *text = format!("{icon}\t{verb}\t{detail}\t{output}");
+}
+
+fn activity_has_output(text: &str) -> bool {
+    text.splitn(4, '\t').nth(3).map(|s| !s.trim().is_empty()).unwrap_or(false)
+}
+
 #[derive(Clone, PartialEq)]
 struct ChatMsg {
     author: Author,
@@ -659,6 +686,16 @@ struct SubagentCard {
     profile: String,
     task: String,
     summary: String,
+    running: bool,
+    ok: bool,
+    logs: Vec<CommandLog>,
+}
+
+#[derive(Clone, PartialEq)]
+struct CommandLog {
+    command_id: String,
+    command: String,
+    output: String,
     running: bool,
     ok: bool,
 }
@@ -2320,6 +2357,7 @@ fn app() -> Element {
     // running state but, once the user toggles, their choice sticks across the
     // streaming re-renders that would otherwise force it back open.
     let mut act_open = use_signal(std::collections::HashMap::<usize, bool>::new);
+    let mut command_rows = use_signal(std::collections::HashMap::<String, usize>::new);
     let mut status = use_signal(String::new);
     let mut turn_start = use_signal(|| None::<std::time::Instant>);
     // Seconds since the turn started (ticks while streaming, shown in the pill).
@@ -2775,6 +2813,7 @@ fn app() -> Element {
             // the UI signal (and re-schedule the sidebar) on every delta. Merged
             // back into the tab when the user switches to it.
             let mut bg_buffers: std::collections::HashMap<u64, Vec<ChatMsg>> = std::collections::HashMap::new();
+            let mut bg_command_rows: std::collections::HashMap<u64, std::collections::HashMap<String, usize>> = std::collections::HashMap::new();
             let mut parked_appr: std::collections::HashMap<u64, Vec<(u64, String, String)>> = std::collections::HashMap::new();
             let mut parked_q: std::collections::HashMap<u64, Vec<(u64, String, Vec<String>)>> = std::collections::HashMap::new();
 
@@ -3027,6 +3066,7 @@ fn app() -> Element {
                             followups.write().clear();
                             thinking.set(String::new());
                             bg_jobs.write().clear();
+                            command_rows.write().clear();
                             // The tab's snapshot + anything that streamed while it was
                             // backgrounded (drained from the bg buffer in one write).
                             let mut cur_msgs = tabs.peek().iter().find(|t| t.id == id).map(|t| t.messages.clone()).unwrap_or(msgs);
@@ -3059,6 +3099,7 @@ fn app() -> Element {
                             parked_appr.remove(&id);
                             parked_q.remove(&id);
                             bg_buffers.remove(&id);
+                            bg_command_rows.remove(&id);
                             busy_tabs.write().remove(&id);
                             tab_statuses.write().remove(&id);
                         }
@@ -3155,9 +3196,12 @@ fn app() -> Element {
                                 Event::Info { text } => {
                                     if text.starts_with("session") || text.starts_with("mcp ") || text.starts_with("mcp '") {
                                         // noise
-                                    } else if let Some(label) = text.strip_prefix('⚙').or_else(|| text.strip_prefix('⏳')) {
-                                        let label = label.trim().to_string();
-                                        let (verb, detail) = label.split_once(' ').unwrap_or((label.as_str(), ""));
+	                                    } else if let Some(label) = text.strip_prefix('⚙').or_else(|| text.strip_prefix('⏳')) {
+	                                        let label = label.trim().to_string();
+	                                        if label.starts_with("Running ") && bg_command_rows.get(&ev_tid).map(|rows| !rows.is_empty()).unwrap_or(false) {
+	                                            continue;
+	                                        }
+	                                        let (verb, detail) = label.split_once(' ').unwrap_or((label.as_str(), ""));
                                         let row = format!("spark\t{verb}\t{detail}");
                                         if buf.last().map(|m| m.author == Author::Agent && m.text.is_empty()).unwrap_or(false) {
                                             buf.pop();
@@ -3172,28 +3216,58 @@ fn app() -> Element {
                                 Event::FileDiff { path, diff, checkpoint, .. } => {
                                     buf.push(ChatMsg { author: Author::Diff(path, checkpoint), text: diff });
                                 }
-                                Event::ToolCallBegin { tool, args, .. } => {
-                                    if tool != "ask_user" {
-                                        buf.push(ChatMsg {
+	                                Event::ToolCallBegin { tool, args, .. } => {
+	                                    if tool != "ask_user" && tool != "shell" {
+	                                        buf.push(ChatMsg {
                                             author: Author::Activity { running: true, ok: true },
                                             text: activity_label(&tool, &args),
                                         });
                                     }
                                 }
-                                Event::ToolCallEnd { output, ok, .. } => {
-                                    let mut out = output.trim().to_string();
-                                    if out.chars().count() > 4000 {
-                                        out = out.chars().take(4000).collect::<String>() + "\n… (truncated)";
-                                    }
+	                                Event::ToolCallEnd { output, ok, .. } => {
+	                                    let mut out = output.trim().to_string();
+	                                    if out.chars().count() > 4000 {
+	                                        out = out.chars().take(4000).collect::<String>() + "\n… (truncated)";
+	                                    }
                                     if let Some(c) = buf.iter_mut().rev().find(|c| matches!(c.author, Author::Activity { running: true, .. })) {
                                         c.author = Author::Activity { running: false, ok };
                                         if !out.is_empty() {
                                             c.text.push('\t');
                                             c.text.push_str(&out);
-                                        }
-                                    }
-                                }
-                                Event::SessionPath { path } => {
+	                                        }
+	                                    }
+	                                }
+	                                Event::CommandStarted { command_id, command, background, .. } => {
+	                                    let idx = buf.len();
+	                                    buf.push(ChatMsg {
+	                                        author: Author::Activity { running: true, ok: true },
+	                                        text: command_activity_label(&command, background),
+	                                    });
+	                                    bg_command_rows.entry(ev_tid).or_default().insert(command_id, idx);
+	                                }
+	                                Event::CommandOutput { command_id, chunk, .. } => {
+	                                    let idx = bg_command_rows.get(&ev_tid).and_then(|m| m.get(&command_id).copied());
+	                                    if let Some(idx) = idx.and_then(|idx| buf.get_mut(idx).map(|_| idx)) {
+	                                        append_activity_output(&mut buf[idx].text, &chunk);
+	                                    } else {
+	                                        let idx = buf.len();
+	                                        let mut text = command_activity_label(&command_id, false);
+	                                        append_activity_output(&mut text, &chunk);
+	                                        buf.push(ChatMsg { author: Author::Activity { running: true, ok: true }, text });
+	                                        bg_command_rows.entry(ev_tid).or_default().insert(command_id, idx);
+	                                    }
+	                                }
+	                                Event::CommandFinished { command_id, ok, exit_code, .. } => {
+	                                    if let Some(idx) = bg_command_rows.get(&ev_tid).and_then(|m| m.get(&command_id).copied()) {
+	                                        if let Some(row) = buf.get_mut(idx) {
+	                                            row.author = Author::Activity { running: false, ok };
+	                                            if let Some(code) = exit_code {
+	                                                append_activity_output(&mut row.text, &format!("\n[exit {code}]\n"));
+	                                            }
+	                                        }
+	                                    }
+	                                }
+	                                Event::SessionPath { path } => {
                                     // Session binding is rare (once) — keep it on the tab itself.
                                     let pb = std::path::PathBuf::from(&path);
                                     if let Some(t) = tabs.write().iter_mut().find(|t| t.id == ev_tid) {
@@ -3278,11 +3352,15 @@ fn app() -> Element {
                                         }
                                         mw.push(ChatMsg { author: Author::Activity { running: false, ok: true }, text: row });
                                     }
-                                } else if text.starts_with('⚙') {
-                                    // CLI-driver tool activity: live shimmer + an activity
-                                    // trail row in the chat (synara-style).
-                                    let mut label = text.trim_start_matches('⚙').trim().to_string();
-                                    // "mcp__server__tool …" → "tool · server (MCP)".
+	                                } else if text.starts_with('⚙') {
+	                                    // CLI-driver tool activity: live shimmer + an activity
+	                                    // trail row in the chat (synara-style).
+	                                    let mut label = text.trim_start_matches('⚙').trim().to_string();
+	                                    if label.starts_with("Running ") && !command_rows.read().is_empty() {
+	                                        status.set(label);
+	                                        continue;
+	                                    }
+	                                    // "mcp__server__tool …" → "tool · server (MCP)".
                                     if let Some(rest) = label.strip_prefix("mcp__") {
                                         let (srv, tail) = rest.split_once("__").unwrap_or(("", rest));
                                         let (tool, args) = tail.split_once(' ').unwrap_or((tail, ""));
@@ -3378,9 +3456,10 @@ fn app() -> Element {
                                 turn_edits.write().clear();
                                 bg_jobs.write().clear();
                                 todos.write().clear();
-                                workflow_cards.write().clear();
-                                subagent_cards.write().clear();
-                                edits_expanded.set(false);
+	                                workflow_cards.write().clear();
+	                                subagent_cards.write().clear();
+	                                command_rows.write().clear();
+	                                edits_expanded.set(false);
                                 edits_undone.set(false);
                                 think_open.set(None);
                                 timeline.write().push(TimelineItem { title: format!("Turn {turn} started"), sub: String::new() });
@@ -3412,10 +3491,11 @@ fn app() -> Element {
                                     worker_id,
                                     profile: profile.clone(),
                                     task: task.clone(),
-                                    summary: String::new(),
-                                    running: true,
-                                    ok: true,
-                                });
+	                                    summary: String::new(),
+	                                    running: true,
+	                                    ok: true,
+	                                    logs: Vec::new(),
+	                                });
                                 timeline.write().push(TimelineItem {
                                     title: format!("Subagent · {profile}"),
                                     sub: task,
@@ -3433,10 +3513,11 @@ fn app() -> Element {
                                             worker_id,
                                             profile: profile.clone(),
                                             task: task.clone(),
-                                            summary: summary.clone(),
-                                            running: false,
-                                            ok,
-                                        });
+	                                            summary: summary.clone(),
+	                                            running: false,
+	                                            ok,
+	                                            logs: Vec::new(),
+	                                        });
                                     }
                                 }
                                 timeline.write().push(TimelineItem {
@@ -3453,30 +3534,103 @@ fn app() -> Element {
                                 // Live shimmer shows WHAT it's doing ("Reading src/lib.rs…"),
                                 // not just a generic verb.
                                 status.set(activity_label(&tool, &args));
-                                if tool != "ask_user" {
-                                    push_activity!(ChatMsg { author: Author::Activity { running: true, ok: true }, text: activity_label(&tool, &args) });
-                                }
+	                                if tool != "ask_user" && tool != "shell" {
+	                                    push_activity!(ChatMsg { author: Author::Activity { running: true, ok: true }, text: activity_label(&tool, &args) });
+	                                }
                             }
-                            Event::ToolCallEnd { tool, output, ok, .. } => {
-                                timeline.write().push(TimelineItem { title: format!("⚙ {tool}"), sub: if ok { "done".into() } else { "failed".into() } });
-                                // Mark the most recent running activity row as finished and
-                                // attach its output (truncated) so the row can expand it.
-                                let mut out = output.trim().to_string();
-                                if out.chars().count() > 4000 {
-                                    out = out.chars().take(4000).collect::<String>() + "\n… (truncated)";
-                                }
-                                let mut m = messages.write();
-                                if let Some(c) = m.iter_mut().rev().find(|c| matches!(c.author, Author::Activity { running: true, .. })) {
-                                    c.author = Author::Activity { running: false, ok };
-                                    if !out.is_empty() {
-                                        c.text.push('\t');
-                                        c.text.push_str(&out);
-                                    }
-                                }
-                            }
-                            Event::Todos { items } => {
-                                todos.set(items);
-                            }
+	                            Event::ToolCallEnd { tool, output, ok, .. } => {
+	                                timeline.write().push(TimelineItem { title: format!("⚙ {tool}"), sub: if ok { "done".into() } else { "failed".into() } });
+	                                // Mark the most recent running activity row as finished and
+	                                // attach its output (truncated) so the row can expand it.
+	                                let mut out = output.trim().to_string();
+	                                if out.chars().count() > 4000 {
+	                                    out = out.chars().take(4000).collect::<String>() + "\n… (truncated)";
+	                                }
+	                                let mut m = messages.write();
+	                                if let Some(c) = m.iter_mut().rev().find(|c| matches!(c.author, Author::Activity { running: true, .. })) {
+	                                    c.author = Author::Activity { running: false, ok };
+	                                    if !out.is_empty() && !(tool == "shell" && activity_has_output(&c.text)) {
+	                                        c.text.push('\t');
+	                                        c.text.push_str(&out);
+	                                    }
+	                                }
+	                            }
+	                            Event::CommandStarted { command_id, worker_id, command, cwd, background, .. } => {
+	                                timeline.write().push(TimelineItem {
+	                                    title: if background { "⌘ background command".into() } else { "⌘ command".into() },
+	                                    sub: format!("{command} · {cwd}"),
+	                                });
+	                                if let Some(worker_id) = worker_id {
+	                                    let mut cards = subagent_cards.write();
+	                                    if let Some(card) = cards.iter_mut().find(|c| c.worker_id == worker_id) {
+	                                        card.logs.push(CommandLog {
+	                                            command_id,
+	                                            command,
+	                                            output: String::new(),
+	                                            running: true,
+	                                            ok: true,
+	                                        });
+	                                    }
+	                                } else {
+	                                    if background && !bg_jobs.read().iter().any(|j| j == &command) {
+	                                        bg_jobs.write().push(command.clone());
+	                                    }
+	                                    status.set(if background { format!("Background · {command}") } else { format!("Running · {command}") });
+	                                    let mut m = messages.write();
+	                                    let idx = m.len();
+	                                    m.push(ChatMsg {
+	                                        author: Author::Activity { running: true, ok: true },
+	                                        text: command_activity_label(&command, background),
+	                                    });
+	                                    command_rows.write().insert(command_id, idx);
+	                                }
+	                            }
+	                            Event::CommandOutput { command_id, worker_id, stream, chunk, .. } => {
+	                                if let Some(worker_id) = worker_id {
+	                                    let mut cards = subagent_cards.write();
+	                                    if let Some(card) = cards.iter_mut().find(|c| c.worker_id == worker_id) {
+	                                        if let Some(log) = card.logs.iter_mut().find(|log| log.command_id == command_id) {
+	                                            if stream == "stderr" && !chunk.trim().is_empty() {
+	                                                log.output.push_str("[stderr] ");
+	                                            }
+	                                            log.output.push_str(&chunk);
+	                                            if log.output.chars().count() > 7000 {
+	                                                log.output = log.output.chars().rev().take(6000).collect::<Vec<_>>().into_iter().rev().collect();
+	                                                log.output.insert_str(0, "… (output truncated)\n");
+	                                            }
+	                                        }
+	                                    }
+	                                } else if let Some(idx) = command_rows.read().get(&command_id).copied() {
+	                                    if let Some(row) = messages.write().get_mut(idx) {
+	                                        let chunk = if stream == "stderr" && !chunk.trim().is_empty() { format!("[stderr] {chunk}") } else { chunk };
+	                                        append_activity_output(&mut row.text, &chunk);
+	                                    }
+	                                }
+	                            }
+	                            Event::CommandFinished { command_id, worker_id, ok, exit_code, duration_ms, .. } => {
+	                                let footer = match exit_code {
+	                                    Some(code) => format!("\n[exit {code} · {}ms]\n", duration_ms),
+	                                    None => format!("\n[done · {}ms]\n", duration_ms),
+	                                };
+	                                if let Some(worker_id) = worker_id {
+	                                    let mut cards = subagent_cards.write();
+	                                    if let Some(card) = cards.iter_mut().find(|c| c.worker_id == worker_id) {
+	                                        if let Some(log) = card.logs.iter_mut().find(|log| log.command_id == command_id) {
+	                                            log.running = false;
+	                                            log.ok = ok;
+	                                            log.output.push_str(&footer);
+	                                        }
+	                                    }
+	                                } else if let Some(idx) = command_rows.read().get(&command_id).copied() {
+	                                    if let Some(row) = messages.write().get_mut(idx) {
+	                                        row.author = Author::Activity { running: false, ok };
+	                                        append_activity_output(&mut row.text, &footer);
+	                                    }
+	                                }
+	                            }
+	                            Event::Todos { items } => {
+	                                todos.set(items);
+	                            }
                             Event::PatchApplied { path, .. } => {
                                 timeline.write().push(TimelineItem { title: "✎ patched".into(), sub: path });
                                 let v = *git_refresh.read();
@@ -6014,12 +6168,40 @@ fn app() -> Element {
                                                         }
                                                         div { class: "subagent-copy",
                                                             div { class: "subagent-title", "{card.profile} · {card.task}" }
-                                                            if !card.summary.trim().is_empty() {
-                                                                div { class: "subagent-summary", "{card.summary}" }
-                                                            }
-                                                        }
-                                                    }
-                                                }
+	                                                            if !card.summary.trim().is_empty() {
+	                                                                div { class: "subagent-summary", "{card.summary}" }
+	                                                            }
+	                                                            if !card.logs.is_empty() {
+	                                                                div { class: "subagent-logs",
+	                                                                    for log in card.logs {
+	                                                                        {
+	                                                                            let log_cls = if log.running { "subagent-log running" } else if log.ok { "subagent-log done" } else { "subagent-log fail" };
+	                                                                            let lines = log.output.lines().count();
+	                                                                            rsx! {
+	                                                                                details { class: "{log_cls}", open: log.running,
+	                                                                                    summary { class: "subagent-log-head",
+	                                                                                        span { class: "subagent-log-status",
+	                                                                                            if log.running { span { class: "syn-spinner" } }
+	                                                                                            else if log.ok { "✓" }
+	                                                                                            else { "!" }
+	                                                                                        }
+	                                                                                        span { class: "subagent-log-command", "{log.command}" }
+	                                                                                        if lines > 0 {
+	                                                                                            span { class: "subagent-log-lines", "{lines} lines" }
+	                                                                                        }
+	                                                                                    }
+	                                                                                    if !log.output.trim().is_empty() {
+	                                                                                        pre { class: "subagent-log-output", "{log.output}" }
+	                                                                                    }
+	                                                                                }
+	                                                                            }
+	                                                                        }
+	                                                                    }
+	                                                                }
+	                                                            }
+	                                                        }
+	                                                    }
+	                                                }
                                             }
                                         }
                                     }

@@ -295,6 +295,27 @@ fn apply_event(event: Event, state: &mut State) {
                 Style::default().fg(color),
             )));
         }
+        Event::CommandStarted { command, background, .. } => {
+            state.push(Line::from(Span::styled(
+                format!("⌘ {}{command}", if background { "background " } else { "" }),
+                Style::default().fg(Color::Yellow),
+            )));
+        }
+        Event::CommandOutput { stream, chunk, .. } => {
+            let text = chunk.trim_end();
+            if !text.is_empty() {
+                state.push(Line::from(Span::styled(
+                    format!("{stream}: {text}"),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+        }
+        Event::CommandFinished { ok, exit_code, duration_ms, .. } => {
+            state.push(Line::from(Span::styled(
+                format!("⌘ {} · exit {} · {duration_ms}ms", if ok { "done" } else { "failed" }, exit_code.map(|c| c.to_string()).unwrap_or_else(|| "?".into())),
+                Style::default().fg(if ok { Color::Green } else { Color::Red }),
+            )));
+        }
         Event::Todos { .. } => {}
         Event::PatchApplied { path, .. } => state.push(Line::from(Span::styled(
             format!("✎ patched {path}"),

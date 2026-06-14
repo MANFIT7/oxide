@@ -169,6 +169,22 @@ async fn run_exec(config: Config, prompt: String, yes: bool) -> Result<()> {
             } => {
                 println!("[tool] {tool} ok={ok}: {output}")
             }
+            Event::CommandStarted { command, background, .. } => {
+                println!("[command] {}{command}", if background { "background " } else { "" });
+            }
+            Event::CommandOutput { stream, chunk, .. } => {
+                if !chunk.trim().is_empty() {
+                    println!("[{stream}] {}", chunk.trim_end());
+                }
+            }
+            Event::CommandFinished { ok, exit_code, duration_ms, .. } => {
+                println!(
+                    "[command] {} exit={} duration={}ms",
+                    if ok { "done" } else { "failed" },
+                    exit_code.map(|code| code.to_string()).unwrap_or_else(|| "?".into()),
+                    duration_ms
+                );
+            }
             Event::Todos { items } => println!("[todos] {}/{} done", items.iter().filter(|(_, s)| s == "completed").count(), items.len()),
             Event::PatchApplied { path, .. } => println!("[patch] {path}"),
             Event::CheckpointCreated { id, label, .. } => {

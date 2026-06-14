@@ -1284,6 +1284,32 @@ impl OxideDesktop {
             Event::Shutdown => {
                 self.streaming = false;
             }
+            Event::CommandStarted { command, background, .. } => {
+                self.timeline.push(TimelineItem {
+                    title: if background { "Background command".to_string() } else { "Command started".to_string() },
+                    detail: command,
+                    state: TimelineState::Running,
+                    request_id: None,
+                });
+            }
+            Event::CommandOutput { chunk, .. } => {
+                if !chunk.trim().is_empty() {
+                    self.timeline.push(TimelineItem {
+                        title: "Command output".to_string(),
+                        detail: chunk.chars().take(400).collect(),
+                        state: TimelineState::Running,
+                        request_id: None,
+                    });
+                }
+            }
+            Event::CommandFinished { ok, exit_code, .. } => {
+                self.timeline.push(TimelineItem {
+                    title: if ok { "Command finished".to_string() } else { "Command failed".to_string() },
+                    detail: exit_code.map(|code| format!("exit {code}")).unwrap_or_else(|| "exit unknown".to_string()),
+                    state: if ok { TimelineState::Done } else { TimelineState::Error },
+                    request_id: None,
+                });
+            }
             Event::FileDiff { .. } | Event::HookFired { .. } | Event::QuestionAsked { .. } | Event::RateLimit { .. } => {}
         }
     }

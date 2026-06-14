@@ -1734,6 +1734,15 @@ details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
 .subagent-row { display: grid; grid-template-columns: 20px minmax(0, 1fr); gap: 9px; align-items: start; padding: 5px 0; }
 .subagent-row.done .subagent-status { color: #40c977; border-color: rgba(64,201,119,.6); background: rgba(64,201,119,.10); }
 .subagent-row.fail .subagent-status { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 60%, var(--border)); }
+.subagent-logs { margin-top: 7px; display: grid; gap: 5px; }
+.subagent-log { border-left: 1px solid var(--border); padding-left: 8px; }
+.subagent-log-head { list-style: none; display: grid; grid-template-columns: 16px minmax(0, 1fr) auto; gap: 7px; align-items: center; cursor: pointer; color: var(--muted); font-family: ui-monospace, Menlo, monospace; font-size: 11.5px; }
+.subagent-log-head::-webkit-details-marker { display: none; }
+.subagent-log.running .subagent-log-command { color: var(--text); }
+.subagent-log.fail .subagent-log-status { color: var(--danger); }
+.subagent-log-command { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.subagent-log-lines { color: var(--faint); font-family: var(--font-ui); font-size: 11px; }
+.subagent-log-output { margin: 6px 0 2px; padding: 8px 9px; max-height: 220px; overflow: auto; white-space: pre-wrap; word-break: break-word; border: 1px solid var(--border); border-radius: 7px; background: var(--composer); color: var(--text); font-family: ui-monospace, Menlo, monospace; font-size: 11.5px; line-height: 1.5; }
 .subagent-status .syn-spinner { width: 11px; height: 11px; }
 .subagent-copy { min-width: 0; }
 .subagent-title { color: var(--text); font-size: 12.5px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
