@@ -12,15 +12,25 @@
 use crate::{Provider, Role, StreamItem, TurnRequest};
 use async_trait::async_trait;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
 
 /// CLI session ids per (binary, workspace) so consecutive turns RESUME the same
 /// CLI conversation instead of starting amnesiac one-shots.
 static SESSIONS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+static CLAUDE_INTERACTIVE_SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+const CLAUDE_INTERACTIVE_POLL: Duration = Duration::from_millis(250);
+const CLAUDE_INTERACTIVE_SETTLE: Duration = Duration::from_millis(1600);
+const CLAUDE_INTERACTIVE_TURN_TIMEOUT: Duration = Duration::from_secs(45 * 60);
+const CLAUDE_INTERACTIVE_READY_TIMEOUT: Duration = Duration::from_secs(8);
 
 fn session_key(bin: &str, conv: &str, cwd: &str) -> String {
     // Prefer the per-conversation id; fall back to cwd if absent.
@@ -596,6 +606,708 @@ impl Provider for ClaudeCliProvider {
             true
         })
         .await
+    }
+}
+
+/// Drives interactive Claude Code through a PTY while preserving Oxide's chat UI.
+///
+/// This intentionally avoids `claude -p`: Claude runs as a normal interactive
+/// TTY session, receives the prompt through bracketed paste, and Oxide follows
+/// Claude Code's native JSONL transcript for the assistant text/tool events.
+pub struct ClaudeInteractiveProvider {
+    bin: String,
+}
+
+impl ClaudeInteractiveProvider {
+    pub fn new() -> Self {
+        Self {
+            bin: resolve_bin("claude", "OXIDE_CLAUDE_BIN"),
+        }
+    }
+}
+
+impl Default for ClaudeInteractiveProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl Provider for ClaudeInteractiveProvider {
+    fn name(&self) -> &str {
+        "claude_interactive"
+    }
+
+    async fn stream(&self, req: TurnRequest, sink: mpsc::Sender<StreamItem>) -> anyhow::Result<()> {
+        let (mut prompt, images) = extract_cli_images(&req);
+        if !images.is_empty() {
+            prompt.push_str("\n\nAttached image file(s) — use your Read tool to view:\n");
+            for img in &images {
+                prompt.push_str(&format!("- {img}\n"));
+            }
+        }
+        let skey = session_key(&self.bin, &req.conversation_id, &req.cwd);
+        let resume = req.cli_resume.clone()
+            .or_else(|| session_get(&skey))
+            .or_else(|| req.conversation_id.strip_prefix("claude-").map(str::to_string));
+        let session_id = resume.clone().unwrap_or_else(new_claude_session_id);
+        session_set(&skey, &session_id);
+        send(&sink, StreamItem::CliSession(session_id.clone()));
+
+        let transcript = claude_transcript_path(&req.cwd, &session_id)?;
+        let baseline_lines = count_file_lines(&transcript);
+        let result = run_claude_interactive_turn(
+            &self.bin,
+            &req,
+            &prompt,
+            &session_id,
+            resume.as_deref(),
+            &transcript,
+            baseline_lines,
+            &sink,
+        )
+        .await;
+
+        let _ = sink.send(StreamItem::Done).await;
+        result
+    }
+}
+
+struct PtyChildGuard {
+    child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
+}
+
+impl PtyChildGuard {
+    fn new(child: Box<dyn portable_pty::Child + Send + Sync>) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+        match self.child.as_mut() {
+            Some(child) => child.try_wait(),
+            None => Ok(None),
+        }
+    }
+
+    fn kill(&mut self) -> std::io::Result<()> {
+        match self.child.as_mut() {
+            Some(child) => child.kill(),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for PtyChildGuard {
+    fn drop(&mut self) {
+        let _ = self.kill();
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ClaudeToolUse {
+    id: String,
+    name: String,
+    detail: String,
+    command: Option<String>,
+    file_path: Option<String>,
+    background: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ClaudeToolResult {
+    id: String,
+    content: String,
+    is_error: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudeTranscriptTail {
+    None,
+    User,
+    AssistantText,
+    AssistantToolUse,
+    Other,
+}
+
+impl Default for ClaudeTranscriptTail {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+#[derive(Debug, Default)]
+struct ClaudeTranscriptSnapshot {
+    session_id: Option<String>,
+    assistant_text: String,
+    tail: ClaudeTranscriptTail,
+    tool_uses: Vec<ClaudeToolUse>,
+    tool_results: Vec<ClaudeToolResult>,
+    turn_complete: bool,
+    usage: Option<(u64, u64, Option<u64>)>,
+}
+
+async fn run_claude_interactive_turn(
+    bin: &str,
+    req: &TurnRequest,
+    prompt: &str,
+    session_id: &str,
+    resume: Option<&str>,
+    transcript: &Path,
+    baseline_lines: usize,
+    sink: &mpsc::Sender<StreamItem>,
+) -> anyhow::Result<()> {
+    let pty = portable_pty::native_pty_system();
+    let pair = pty
+        .openpty(portable_pty::PtySize { rows: 36, cols: 120, pixel_width: 0, pixel_height: 0 })
+        .map_err(|e| anyhow::anyhow!("failed to open Claude interactive PTY: {e}"))?;
+
+    let mut cmd = portable_pty::CommandBuilder::new(bin);
+    cmd.arg("--dangerously-skip-permissions");
+    if let Some(id) = resume {
+        cmd.arg("--resume");
+        cmd.arg(id);
+    } else {
+        cmd.arg("--session-id");
+        cmd.arg(session_id);
+    }
+    if !req.model.is_empty() {
+        cmd.arg("--model");
+        cmd.arg(&req.model);
+    }
+    if !req.reasoning_effort.is_empty() {
+        cmd.arg("--effort");
+        cmd.arg(claude_effort(&req.reasoning_effort));
+    }
+    if !req.cwd.is_empty() {
+        cmd.cwd(&req.cwd);
+    }
+    cmd.env("TERM", "xterm-256color");
+    if let Ok(home) = std::env::var("HOME") {
+        let path = std::env::var("PATH").unwrap_or_default();
+        cmd.env("PATH", format!("{home}/.superconductor/bin:{home}/.local/bin:{home}/.bun/bin:/opt/homebrew/bin:/usr/local/bin:{path}"));
+    }
+
+    let child = pair
+        .slave
+        .spawn_command(cmd)
+        .map_err(|e| anyhow::anyhow!("failed to spawn interactive Claude Code '{bin}': {e}"))?;
+    let mut child = PtyChildGuard::new(child);
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|e| anyhow::anyhow!("failed to read Claude interactive PTY: {e}"))?;
+    let mut writer = pair
+        .master
+        .take_writer()
+        .map_err(|e| anyhow::anyhow!("failed to write Claude interactive PTY: {e}"))?;
+    let _master = pair.master;
+    let (pty_tx, pty_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if pty_tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let mut terminal_tail = String::new();
+    wait_for_claude_prompt(&pty_rx, &mut terminal_tail);
+    writer
+        .write_all(&interactive_paste_bytes(prompt))
+        .map_err(|e| anyhow::anyhow!("failed to send prompt to interactive Claude Code: {e}"))?;
+    writer
+        .flush()
+        .map_err(|e| anyhow::anyhow!("failed to flush prompt to interactive Claude Code: {e}"))?;
+
+    send(sink, StreamItem::Notice("Claude Code interactive session started".to_string()));
+
+    let started = Instant::now();
+    let mut last_change = Instant::now();
+    let mut last_pty_output = Instant::now();
+    let mut emitted_text = String::new();
+    let mut emitted_tools: HashSet<String> = HashSet::new();
+    let mut command_tools: HashSet<String> = HashSet::new();
+    let mut emitted_results: HashSet<String> = HashSet::new();
+    let mut emitted_usage = false;
+    let mut interval = tokio::time::interval(CLAUDE_INTERACTIVE_POLL);
+
+    loop {
+        interval.tick().await;
+        while let Ok(bytes) = pty_rx.try_recv() {
+            last_pty_output = Instant::now();
+            push_tail(&mut terminal_tail, &bytes);
+        }
+
+        if started.elapsed() > CLAUDE_INTERACTIVE_TURN_TIMEOUT {
+            return Err(anyhow::anyhow!(
+                "Claude interactive turn timed out after {} minutes",
+                CLAUDE_INTERACTIVE_TURN_TIMEOUT.as_secs() / 60
+            ));
+        }
+
+        let snapshot = parse_claude_transcript(transcript, baseline_lines);
+        if let Some(id) = snapshot.session_id.as_deref() {
+            send(sink, StreamItem::CliSession(id.to_string()));
+        }
+        for tool in snapshot.tool_uses {
+            if !emitted_tools.insert(tool.id.clone()) {
+                continue;
+            }
+            if tool.command.is_some() {
+                command_tools.insert(tool.id.clone());
+            }
+            emit_claude_tool_use(sink, &tool);
+            last_change = Instant::now();
+        }
+        for result in snapshot.tool_results {
+            if !command_tools.contains(&result.id) || !emitted_results.insert(result.id.clone()) {
+                continue;
+            }
+            if !result.content.is_empty() {
+                send(sink, StreamItem::CommandOutput {
+                    id: result.id.clone(),
+                    stream: if result.is_error { "stderr" } else { "stdout" }.to_string(),
+                    chunk: result.content,
+                });
+            }
+            send(sink, StreamItem::CommandFinished {
+                id: result.id,
+                ok: !result.is_error,
+                exit_code: None,
+                duration_ms: 0,
+            });
+            last_change = Instant::now();
+        }
+        if snapshot.assistant_text != emitted_text {
+            let delta = text_delta(&emitted_text, &snapshot.assistant_text);
+            if !delta.is_empty() {
+                send(sink, StreamItem::TextDelta(delta));
+            }
+            emitted_text = snapshot.assistant_text.clone();
+            last_change = Instant::now();
+        }
+        if !emitted_usage {
+            if let Some((input, output, context_window)) = snapshot.usage {
+                send(sink, StreamItem::Usage { input, output, context_window });
+                emitted_usage = true;
+            }
+        }
+
+        if let Some(status) = child.try_wait()? {
+            if !status.success() && emitted_text.trim().is_empty() {
+                return Err(anyhow::anyhow!(
+                    "interactive Claude Code exited with status {}{}",
+                    status.exit_code(),
+                    tail_context(&terminal_tail)
+                ));
+            }
+            break;
+        }
+
+        let final_text_ready = !emitted_text.trim().is_empty()
+            && last_change.elapsed() >= CLAUDE_INTERACTIVE_SETTLE
+            && (snapshot.turn_complete
+                || (snapshot.tail == ClaudeTranscriptTail::AssistantText
+                    && last_pty_output.elapsed() >= CLAUDE_INTERACTIVE_SETTLE));
+        if final_text_ready {
+            break;
+        }
+    }
+
+    let _ = child.kill();
+    Ok(())
+}
+
+fn emit_claude_tool_use(sink: &mpsc::Sender<StreamItem>, tool: &ClaudeToolUse) {
+    if let Some(command) = &tool.command {
+        send(sink, StreamItem::CommandStarted {
+            id: tool.id.clone(),
+            command: command.clone(),
+            cwd: String::new(),
+            background: tool.background,
+        });
+    }
+    let label = if tool.background {
+        if tool.detail.is_empty() { format!("⏳ {}", tool.name) } else { format!("⏳ {} {}", tool.name, tool.detail) }
+    } else if tool.detail.is_empty() {
+        format!("⚙ {}", tool.name)
+    } else {
+        format!("⚙ {} {}", tool.name, tool.detail)
+    };
+    send(sink, StreamItem::Notice(label));
+    if let Some(path) = &tool.file_path {
+        send(sink, StreamItem::FileChanged(path.clone()));
+    }
+}
+
+fn wait_for_claude_prompt(rx: &std::sync::mpsc::Receiver<Vec<u8>>, terminal_tail: &mut String) {
+    let started = Instant::now();
+    loop {
+        while let Ok(bytes) = rx.try_recv() {
+            push_tail(terminal_tail, &bytes);
+        }
+        if claude_prompt_ready(terminal_tail) || started.elapsed() >= CLAUDE_INTERACTIVE_READY_TIMEOUT {
+            std::thread::sleep(Duration::from_millis(250));
+            while let Ok(bytes) = rx.try_recv() {
+                push_tail(terminal_tail, &bytes);
+            }
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn claude_prompt_ready(tail: &str) -> bool {
+    tail.contains("Claude Code")
+        && (tail.contains("Try")
+            || tail.contains("bypass permissions")
+            || tail.contains("/effort")
+            || tail.contains("❯"))
+}
+
+fn parse_claude_transcript(path: &Path, baseline_lines: usize) -> ClaudeTranscriptSnapshot {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return ClaudeTranscriptSnapshot::default();
+    };
+    let mut snapshot = ClaudeTranscriptSnapshot::default();
+    for (line_idx, line) in text.lines().enumerate().skip(baseline_lines) {
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if snapshot.session_id.is_none() {
+            snapshot.session_id = transcript_session_id(&v);
+        }
+        if v["type"].as_str() == Some("system") && v["subtype"].as_str() == Some("turn_duration") {
+            snapshot.turn_complete = true;
+            snapshot.tail = ClaudeTranscriptTail::Other;
+            continue;
+        }
+        if v["type"].as_str() == Some("last-prompt") && !snapshot.assistant_text.trim().is_empty() {
+            snapshot.turn_complete = true;
+            snapshot.tail = ClaudeTranscriptTail::Other;
+            continue;
+        }
+        let role = v["type"]
+            .as_str()
+            .or_else(|| v["message"]["role"].as_str())
+            .unwrap_or("");
+        match role {
+            "assistant" => parse_claude_assistant_line(&v, line_idx, &mut snapshot),
+            "user" => parse_claude_user_line(&v, &mut snapshot),
+            _ => snapshot.tail = ClaudeTranscriptTail::Other,
+        }
+    }
+    snapshot
+}
+
+fn parse_claude_user_line(v: &Value, snapshot: &mut ClaudeTranscriptSnapshot) {
+    if let Value::Array(blocks) = &v["message"]["content"] {
+        for block in blocks {
+            if block["type"].as_str() != Some("tool_result") {
+                continue;
+            }
+            let id = block["tool_use_id"].as_str().unwrap_or("").trim();
+            if id.is_empty() {
+                continue;
+            }
+            snapshot.tool_results.push(ClaudeToolResult {
+                id: id.to_string(),
+                content: tool_result_content(block),
+                is_error: block["is_error"].as_bool() == Some(true),
+            });
+        }
+    }
+    snapshot.tail = ClaudeTranscriptTail::User;
+}
+
+fn parse_claude_assistant_line(v: &Value, line_idx: usize, snapshot: &mut ClaudeTranscriptSnapshot) {
+    let content = &v["message"]["content"];
+    let mut text_parts: Vec<String> = Vec::new();
+    let mut has_tool_use = false;
+    match content {
+        Value::String(s) => {
+            if !s.trim().is_empty() {
+                text_parts.push(s.trim().to_string());
+            }
+        }
+        Value::Array(blocks) => {
+            for (block_idx, block) in blocks.iter().enumerate() {
+                match block["type"].as_str() {
+                    Some("text") => {
+                        if let Some(text) = block["text"].as_str() {
+                            if !text.trim().is_empty() {
+                                text_parts.push(text.trim().to_string());
+                            }
+                        }
+                    }
+                    Some("tool_use") => {
+                        has_tool_use = true;
+                        snapshot.tool_uses.push(parse_claude_tool_use(block, line_idx, block_idx));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+    if !text_parts.is_empty() {
+        push_text_message(&mut snapshot.assistant_text, &text_parts.join("\n"));
+    }
+    snapshot.usage = transcript_usage(v).or(snapshot.usage);
+    snapshot.tail = if has_tool_use {
+        ClaudeTranscriptTail::AssistantToolUse
+    } else if !text_parts.is_empty() {
+        ClaudeTranscriptTail::AssistantText
+    } else {
+        ClaudeTranscriptTail::Other
+    };
+}
+
+fn parse_claude_tool_use(block: &Value, line_idx: usize, block_idx: usize) -> ClaudeToolUse {
+    let name = block["name"].as_str().unwrap_or("tool").to_string();
+    let input = &block["input"];
+    let detail = ["file_path", "path", "command", "pattern", "query", "url", "description"]
+        .iter()
+        .find_map(|k| input[*k].as_str())
+        .unwrap_or("")
+        .chars()
+        .take(120)
+        .collect::<String>();
+    let command = input["command"].as_str().map(str::to_string);
+    let file_path = if matches!(name.as_str(), "Edit" | "Write" | "MultiEdit" | "NotebookEdit") {
+        input["file_path"].as_str().map(str::to_string)
+    } else {
+        None
+    };
+    ClaudeToolUse {
+        id: block["id"]
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("claude-interactive-tool-{line_idx}-{block_idx}")),
+        name,
+        detail,
+        command,
+        file_path,
+        background: input["run_in_background"].as_bool() == Some(true),
+    }
+}
+
+fn tool_result_content(block: &Value) -> String {
+    match &block["content"] {
+        Value::String(s) => s.chars().take(8000).collect(),
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|item| {
+                item["text"]
+                    .as_str()
+                    .or_else(|| item["content"].as_str())
+                    .map(str::to_string)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            .chars()
+            .take(8000)
+            .collect(),
+        _ => String::new(),
+    }
+}
+
+fn transcript_session_id(v: &Value) -> Option<String> {
+    v["sessionId"]
+        .as_str()
+        .or_else(|| v["session_id"].as_str())
+        .filter(|id| !id.trim().is_empty())
+        .map(str::to_string)
+}
+
+fn transcript_usage(v: &Value) -> Option<(u64, u64, Option<u64>)> {
+    let usage = if v["message"]["usage"].is_object() {
+        &v["message"]["usage"]
+    } else {
+        &v["usage"]
+    };
+    let input = usage["input_tokens"].as_u64().unwrap_or(0);
+    let output = usage["output_tokens"].as_u64().unwrap_or(0);
+    if input == 0 && output == 0 {
+        return None;
+    }
+    let context_window = v["modelUsage"]
+        .as_object()
+        .and_then(|m| m.values().next())
+        .and_then(|mu| mu["contextWindow"].as_u64());
+    Some((input, output, context_window))
+}
+
+fn push_text_message(buf: &mut String, text: &str) {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    if !buf.is_empty() {
+        buf.push_str("\n\n");
+    }
+    buf.push_str(trimmed);
+}
+
+fn text_delta(previous: &str, current: &str) -> String {
+    current
+        .strip_prefix(previous)
+        .map(str::to_string)
+        .unwrap_or_else(|| current.to_string())
+}
+
+fn claude_transcript_path(cwd: &str, session_id: &str) -> anyhow::Result<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("HOME is not set; cannot locate Claude Code transcripts"))?;
+    let workspace = if cwd.trim().is_empty() {
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    } else {
+        PathBuf::from(cwd)
+    };
+    let slug = workspace.display().to_string().replace('/', "-").replace('.', "-");
+    Ok(home.join(".claude/projects").join(slug).join(format!("{session_id}.jsonl")))
+}
+
+fn count_file_lines(path: &Path) -> usize {
+    std::fs::read_to_string(path)
+        .map(|text| text.lines().count())
+        .unwrap_or(0)
+}
+
+fn interactive_paste_bytes(prompt: &str) -> Vec<u8> {
+    let normalized = prompt.replace("\r\n", "\n").replace('\r', "\n");
+    if normalized.trim().is_empty() {
+        return b"\r".to_vec();
+    }
+    format!("\x1b[200~{normalized}\x1b[201~\r").into_bytes()
+}
+
+fn new_claude_session_id() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let count = CLAUDE_INTERACTIVE_SESSION_COUNTER.fetch_add(1, Ordering::Relaxed) as u128;
+    let pid = std::process::id() as u128;
+    let mut x = now ^ (pid << 64) ^ count;
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xff51afd7ed558ccd);
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xc4ceb9fe1a85ec53);
+    x ^= x >> 33;
+    let mut bytes = x.to_be_bytes();
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15],
+    )
+}
+
+fn push_tail(tail: &mut String, bytes: &[u8]) {
+    let piece = String::from_utf8_lossy(bytes);
+    tail.push_str(&strip_ansi(&piece));
+    if tail.chars().count() > 2400 {
+        let keep = tail
+            .chars()
+            .rev()
+            .take(2000)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<String>();
+        *tail = keep;
+    }
+}
+
+fn strip_ansi(input: &str) -> String {
+    let mut out = String::new();
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\x1b' {
+            out.push(ch);
+            continue;
+        }
+        if chars.peek() == Some(&'[') {
+            let _ = chars.next();
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() || matches!(c, '~') {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+fn tail_context(tail: &str) -> String {
+    let clean = tail.trim();
+    if clean.is_empty() {
+        String::new()
+    } else {
+        format!(" — {}", clean.chars().take(700).collect::<String>())
+    }
+}
+
+#[cfg(test)]
+mod claude_interactive_tests {
+    use super::*;
+
+    #[test]
+    fn parses_interactive_transcript_after_baseline() {
+        let path = std::env::temp_dir().join(format!("oxide-claude-interactive-{}.jsonl", new_claude_session_id()));
+        let text = r#"{"type":"assistant","sessionId":"old","message":{"content":[{"type":"text","text":"old"}]}}
+{"type":"user","sessionId":"abc","message":{"content":"check"}}
+{"type":"assistant","sessionId":"abc","message":{"content":[{"type":"text","text":"I'll inspect."},{"type":"tool_use","id":"tool-1","name":"Bash","input":{"command":"git status"}}],"usage":{"input_tokens":10,"output_tokens":20}}}
+{"type":"user","sessionId":"abc","message":{"content":[{"type":"tool_result","tool_use_id":"tool-1","content":"ok"}]}}
+{"type":"assistant","sessionId":"abc","message":{"content":[{"type":"text","text":"Done."}],"usage":{"input_tokens":11,"output_tokens":22}}}
+{"type":"system","subtype":"turn_duration","durationMs":1200,"sessionId":"abc"}
+"#;
+        std::fs::write(&path, text).unwrap();
+        let snapshot = parse_claude_transcript(&path, 1);
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(snapshot.session_id.as_deref(), Some("abc"));
+        assert_eq!(snapshot.assistant_text, "I'll inspect.\n\nDone.");
+        assert_eq!(snapshot.tail, ClaudeTranscriptTail::Other);
+        assert!(snapshot.turn_complete);
+        assert_eq!(snapshot.tool_uses.len(), 1);
+        assert_eq!(snapshot.tool_uses[0].command.as_deref(), Some("git status"));
+        assert_eq!(snapshot.tool_results.len(), 1);
+        assert_eq!(snapshot.tool_results[0].id, "tool-1");
+        assert_eq!(snapshot.tool_results[0].content, "ok");
+        assert_eq!(snapshot.usage, Some((11, 22, None)));
+    }
+
+    #[test]
+    fn prompt_is_sent_as_bracketed_paste() {
+        let bytes = interactive_paste_bytes("hello\nworld");
+        let text = String::from_utf8(bytes).unwrap();
+        assert_eq!(text, "\x1b[200~hello\nworld\x1b[201~\r");
     }
 }
 

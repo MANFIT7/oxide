@@ -61,7 +61,7 @@ fn svg_inner(s: &str) -> String {
 fn provider_logo(provider: &str) -> Option<String> {
     match provider {
         "chatgpt" | "codex" | "openai" => Some(svg_inner(SVG_OPENAI).replace("#000000", "currentColor")),
-        "claude" | "anthropic" => Some(svg_inner(SVG_CLAUDE)),
+        "claude" | "claude_interactive" | "anthropic" => Some(svg_inner(SVG_CLAUDE)),
         "cursor" => Some(svg_inner(SVG_CURSOR)),
         "mcp" => Some(svg_inner(SVG_MCP).replace("#000000", "currentColor")),
         _ => None,
@@ -132,6 +132,33 @@ const MODEL_PRESETS: &[ModelPreset] = &[
         label: "Sonnet 4.6",
         summary: "Balanced speed and intelligence",
         badge: "Fast",
+        fast: true,
+    },
+    ModelPreset {
+        provider: "claude_interactive",
+        model: "claude-fable-5",
+        provider_label: "Claude Code Interactive",
+        label: "Fable 5",
+        summary: "Interactive Claude Code session, no claude -p",
+        badge: "TTY",
+        fast: false,
+    },
+    ModelPreset {
+        provider: "claude_interactive",
+        model: "claude-opus-4-8",
+        provider_label: "Claude Code Interactive",
+        label: "Opus 4.8",
+        summary: "Interactive Claude Code session for deep work",
+        badge: "TTY",
+        fast: false,
+    },
+    ModelPreset {
+        provider: "claude_interactive",
+        model: "claude-sonnet-4-6",
+        provider_label: "Claude Code Interactive",
+        label: "Sonnet 4.6",
+        summary: "Interactive Claude Code session, experimental",
+        badge: "TTY",
         fast: true,
     },
     ModelPreset {
@@ -220,7 +247,7 @@ const EFFORT_PRESETS: &[EffortPreset] = &[
 fn effort_levels(provider: &str) -> &'static [EffortPreset] {
     match provider {
         // Claude Code CLI + Anthropic API: low/medium/high/xhigh/max.
-        "claude" | "anthropic" => &EFFORT_PRESETS[0..5],
+        "claude" | "claude_interactive" | "anthropic" => &EFFORT_PRESETS[0..5],
         // GPT family (codex/chatgpt/openai): low/medium/high/xhigh.
         "codex" | "chatgpt" | "openai" => &EFFORT_PRESETS[0..4],
         // Others: plain low/medium/high.
@@ -952,7 +979,7 @@ fn fmt_tokens(n: u64) -> String {
 fn provider_family(p: &str) -> &'static str {
     match p {
         "chatgpt" | "codex" | "openai" => "gpt",
-        "claude" | "anthropic" => "claude",
+        "claude" | "claude_interactive" | "anthropic" => "claude",
         _ => "",
     }
 }
@@ -2714,7 +2741,7 @@ fn app() -> Element {
         let mut last_prov = String::new();
         loop {
             let prov = cfg.peek().provider.clone();
-            let is_claude = matches!(prov.as_str(), "claude" | "anthropic");
+            let is_claude = matches!(prov.as_str(), "claude" | "claude_interactive" | "anthropic");
             let switched = prov != last_prov;
             last_prov = prov;
             if is_claude
@@ -4639,6 +4666,16 @@ fn app() -> Element {
                                         },
                                         if let Some(l) = provider_logo("claude") { span { class: "agent-tab-logo prov-logo", dangerous_inner_html: l } }
                                         span { class: "menu-name", "Claude Code" }
+                                    }
+                                    button { class: "menu-item", onclick: move |_| {
+                                            show_newtab.set(false);
+                                            new_agent_tab(tabs, active_tab, messages, cfg, engine, next_tab_id, "claude_interactive", "", "Claude Code Interactive");
+                                        },
+                                        if let Some(l) = provider_logo("claude_interactive") { span { class: "agent-tab-logo prov-logo", dangerous_inner_html: l } }
+                                        span { class: "menu-copy",
+                                            span { class: "menu-name", "Claude Code Interactive" }
+                                            span { class: "menu-meta", "Experimental · no claude -p" }
+                                        }
                                     }
                                 }
                             }
@@ -6976,6 +7013,7 @@ fn make_title(text: &str) -> String {
 /// Display title for a provider id.
 fn provider_title(provider: &str) -> &'static str {
     match provider {
+        "claude_interactive" => "Claude Code Interactive",
         "claude" => "Claude Code",
         "codex" => "Codex",
         "chatgpt" => "ChatGPT",
@@ -7462,7 +7500,7 @@ fn SettingsModal(
     let mut arch_refresh = use_signal(|| 0u64);
     let mut arch_confirm = use_signal(|| None::<String>);
 
-    let providers = ["chatgpt", "codex", "claude", "openai", "anthropic", "echo", "mock"];
+    let providers = ["chatgpt", "codex", "claude", "claude_interactive", "openai", "anthropic", "echo", "mock"];
 
     let mut save = move |_| {
         let mut c = cfg.read().clone();
@@ -9072,6 +9110,10 @@ fn SplitLeaf(
                             button { class: "menu-item", onclick: move |_| { show_menu.set(false); on_set_mode.call(("tui".into(), "claude".into())); },
                                 if let Some(l) = provider_logo("claude") { span { class: "agent-tab-logo prov-logo", dangerous_inner_html: l } }
                                 span { class: "menu-name", "TUI · Claude Code" }
+                            }
+                            button { class: "menu-item", onclick: move |_| { show_menu.set(false); on_set_mode.call(("gui".into(), "claude_interactive".into())); },
+                                if let Some(l) = provider_logo("claude_interactive") { span { class: "agent-tab-logo prov-logo", dangerous_inner_html: l } }
+                                span { class: "menu-name", "GUI · Claude Code Interactive" }
                             }
                         }
                     }

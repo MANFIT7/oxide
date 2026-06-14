@@ -5077,6 +5077,7 @@ dependencies = [
  "eventsource-stream",
  "futures",
  "oxide-protocol",
+ "portable-pty",
  "reqwest",
  "serde",
  "serde_json",

@@ -9,7 +9,7 @@ mod anthropic;
 mod chatgpt;
 mod cli;
 mod openai;
-pub use cli::{ClaudeCliProvider, CodexCliProvider};
+pub use cli::{ClaudeCliProvider, ClaudeInteractiveProvider, CodexCliProvider};
 
 use async_trait::async_trait;
 use oxide_protocol::ToolSpec;
@@ -382,6 +382,7 @@ pub fn build(provider: &str) -> Box<dyn Provider> {
         // CLI drivers — use the user's logged-in codex/claude, no API key.
         "codex" => Box::new(cli::CodexCliProvider::new()),
         "claude" => Box::new(cli::ClaudeCliProvider::new()),
+        "claude_interactive" => Box::new(cli::ClaudeInteractiveProvider::new()),
         // ChatGPT subscription, no API key / no CLI (reuses codex OAuth login).
         "chatgpt" => Box::new(chatgpt::ChatGptProvider::new()),
         "mock_plan" => Box::new(MockPlanProvider),
@@ -402,5 +403,6 @@ mod tests {
         assert_eq!(build("xai").name(), "xai");
         assert_eq!(build("deepseek").name(), "deepseek");
         assert_eq!(build("mistral").name(), "mistral");
+        assert_eq!(build("claude_interactive").name(), "claude_interactive");
     }
 }

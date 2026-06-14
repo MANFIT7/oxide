@@ -340,7 +340,7 @@ fn fast_model_for_provider(provider: &str) -> Option<&'static str> {
     match provider {
         "codex" => Some("gpt-5.3-codex-spark"),
         "openai" => Some("gpt-5.4"),
-        "claude" | "anthropic" => Some("claude-sonnet-4-6"),
+        "claude" | "claude_interactive" | "anthropic" => Some("claude-sonnet-4-6"),
         "gemini" => Some("gemini-3.5-flash"),
         "xai" => Some("grok-build-0.1"),
         "deepseek" => Some("deepseek-v4-flash"),

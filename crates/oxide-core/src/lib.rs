@@ -746,7 +746,7 @@ fn idle_timeout_for(provider: &str) -> std::time::Duration {
     match provider {
         // Effectively "never" (a finite value avoids Instant overflow in
         // tokio's timer); the child exiting closes the stream and ends the round.
-        "claude" | "codex" => std::time::Duration::from_secs(30 * 24 * 3600),
+        "claude" | "claude_interactive" | "codex" => std::time::Duration::from_secs(30 * 24 * 3600),
         _ => std::time::Duration::from_secs(180),
     }
 }
@@ -1400,7 +1400,7 @@ impl Engine {
         assistant_text: &str,
         edited_paths: &[String],
     ) {
-        if !matches!(source_provider, "codex" | "claude") || edited_paths.is_empty() || assistant_text.trim().is_empty() {
+        if !matches!(source_provider, "codex" | "claude" | "claude_interactive") || edited_paths.is_empty() || assistant_text.trim().is_empty() {
             return;
         }
 
@@ -1851,7 +1851,7 @@ Rules:
         });
         let max_steps = profile.max_steps.min(policy.max_steps as usize).clamp(1, 24);
         let tools = self.tools_for_worker_profile(&profile);
-        let cli_driver = matches!(profile.provider.as_str(), "codex" | "claude");
+        let cli_driver = matches!(profile.provider.as_str(), "codex" | "claude" | "claude_interactive");
         let worker_system = format!(
             "{system}\n\n# Sub-agent profile: {}\n{}\n\nAvailable tool policy: {} tool(s) exposed for this worker.",
             profile.id,
@@ -2511,7 +2511,7 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
         // CLI drivers (codex/claude) are self-agentic: they run their own tool
         // loop, so Oxide's nudge/wrap-up/auto-verify rounds would just respawn
         // the CLI with an out-of-context reminder as the whole prompt.
-        let cli_driver = matches!(self.config.provider.as_str(), "codex" | "claude");
+        let cli_driver = matches!(self.config.provider.as_str(), "codex" | "claude" | "claude_interactive");
         let mut nudges = 0u8;
         let mut memory_nudged = false;
         // Files a CLI driver reported changing — diffed + shown at turn end.
@@ -2840,7 +2840,7 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
         // Context-aware follow-up suggestions, generated off-turn on the fast
         // lane. CLI drivers are skipped (a cold CLI spawn for 3 chips isn't
         // worth the cost) — the UI keeps its heuristic chips there.
-        if !interrupted && !matches!(self.config.provider.as_str(), "codex" | "claude" | "echo") {
+        if !interrupted && !matches!(self.config.provider.as_str(), "codex" | "claude" | "claude_interactive" | "echo") {
             let last_user = self.session.iter().rev()
                 .find(|m| m.role == Role::User && !m.content.starts_with("<system-reminder>"))
                 .map(|m| m.content.chars().take(1200).collect::<String>())
