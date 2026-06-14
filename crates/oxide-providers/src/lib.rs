@@ -77,6 +77,10 @@ pub struct TurnRequest {
     /// Stable id for THIS conversation (session file id). CLI drivers key their
     /// resume map on it so two tabs in one workspace don't share a CLI session.
     pub conversation_id: String,
+    /// The provider's native CLI session id (codex thread / claude uuid) persisted
+    /// from a previous run, so a resume after an app restart reattaches to the
+    /// real CLI session instead of starting fresh. None = no prior link.
+    pub cli_resume: Option<String>,
 }
 
 /// Normalized streaming output. Each provider maps its SSE events to these.
@@ -100,6 +104,9 @@ pub enum StreamItem {
     },
     /// A transcript note from the provider (e.g. an agentic CLI ran a command).
     Notice(String),
+    /// The provider's native CLI session id (codex thread / claude uuid). The
+    /// engine persists it so a later resume reattaches to the same CLI session.
+    CliSession(String),
     /// Final token usage for the call. `context_window` is the model's limit if
     /// the backend reports it (CLI drivers do).
     Usage {

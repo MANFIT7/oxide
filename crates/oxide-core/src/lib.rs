@@ -985,6 +985,7 @@ impl Engine {
             tools: vec![],
             cwd: self.workspace.display().to_string(),
                 conversation_id: self.session_store.as_ref().map(|s| s.id.clone()).unwrap_or_default(),
+                cli_resume: None,
         };
         let (tx, mut rx) = mpsc::channel::<StreamItem>(STREAM_QUEUE);
         let provider = oxide_providers::build(provider_id);
@@ -1028,6 +1029,9 @@ impl Engine {
                 }
                 StreamItem::ToolCall { .. } => {}
                 StreamItem::ReasoningItem(_) => {}
+                // Sub-agent / silent collection — don't let its CLI session id
+                // overwrite the main session's stored link.
+                StreamItem::CliSession(_) => {}
                 StreamItem::Done => break,
             }
         }
@@ -1299,6 +1303,9 @@ as a visual in the chat. Keep it focused; add a short prose explanation too.\n\
                 tools: tools.clone(),
                 cwd: self.workspace.display().to_string(),
                 conversation_id: self.session_store.as_ref().map(|s| s.id.clone()).unwrap_or_default(),
+                // Seed the native CLI session id (if linked on a prior run) so a
+                // resume after restart reattaches instead of starting fresh.
+                cli_resume: self.session_store.as_ref().and_then(|s| db::cli_session(&s.id)),
             };
 
             let (stream_tx, mut stream_rx) = mpsc::channel::<StreamItem>(STREAM_QUEUE);
@@ -1372,6 +1379,13 @@ as a visual in the chat. Keep it focused; add a short prose explanation too.\n\
                             }
                             Some(StreamItem::RateLimit { plan, primary_pct, secondary_pct, primary_reset_s, secondary_reset_s }) => {
                                 self.emit(Event::RateLimit { plan, primary_pct, secondary_pct, primary_reset_s, secondary_reset_s }).await;
+                            }
+                            Some(StreamItem::CliSession(cli_id)) => {
+                                // Persist the link so a resume after restart reattaches to
+                                // this exact CLI session instead of starting a fresh one.
+                                if let Some(store) = &self.session_store {
+                                    db::set_cli_session(&store.id, &cli_id);
+                                }
                             }
                             Some(StreamItem::Done) | None => break,
                         }
@@ -1572,6 +1586,7 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
                         tools: Vec::new(),
                         cwd: String::new(),
                         conversation_id: String::new(),
+                        cli_resume: None,
                     };
                     let (stx, mut srx) = mpsc::channel::<StreamItem>(64);
                     let task = tokio::spawn(async move { provider.stream(req, stx).await });
@@ -1629,6 +1644,7 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
                             tools: Vec::new(),
                             cwd: String::new(),
                             conversation_id: String::new(),
+                            cli_resume: None,
                         };
                         let (stx, mut srx) = mpsc::channel::<StreamItem>(64);
                         let task = tokio::spawn(async move { provider.stream(req, stx).await });

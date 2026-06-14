@@ -221,7 +221,8 @@ impl Provider for CodexCliProvider {
     async fn stream(&self, req: TurnRequest, sink: mpsc::Sender<StreamItem>) -> anyhow::Result<()> {
         let (prompt, images) = extract_cli_images(&req);
         let skey = session_key(&self.bin, &req.conversation_id, &req.cwd);
-        let resume = session_get(&skey);
+        // Prefer the persisted link (survives app restarts) over the in-memory map.
+        let resume = req.cli_resume.clone().or_else(|| session_get(&skey));
         let mut args = vec!["exec".to_string()];
         if let Some(id) = &resume {
             // Continue the same codex thread — context carries across turns.
@@ -282,6 +283,7 @@ impl Provider for CodexCliProvider {
                 Some("thread.started") => {
                     if let Some(id) = v["thread_id"].as_str() {
                         session_set(&skey_cb, id);
+                        send(sink, StreamItem::CliSession(id.to_string()));
                     }
                 }
                 Some("item.completed") => {
@@ -394,7 +396,9 @@ impl Provider for ClaudeCliProvider {
         let skey = session_key(&self.bin, &req.conversation_id, &req.cwd);
         // Continuing an imported Claude TUI session ("claude-<uuid>") resumes
         // claude's OWN native session by that uuid → full context, no replay.
-        let resume = session_get(&skey)
+        // The persisted link (survives restarts) wins over the in-memory map.
+        let resume = req.cli_resume.clone()
+            .or_else(|| session_get(&skey))
             .or_else(|| req.conversation_id.strip_prefix("claude-").map(str::to_string));
         let mut args = vec![
             "-p".to_string(),
@@ -429,6 +433,7 @@ impl Provider for ClaudeCliProvider {
                 Some("system") => {
                     if let Some(id) = v["session_id"].as_str() {
                         session_set(&skey_cb, id);
+                        send(sink, StreamItem::CliSession(id.to_string()));
                     }
                 }
                 Some("stream_event") => {
@@ -503,6 +508,7 @@ impl Provider for ClaudeCliProvider {
                 Some("result") => {
                     if let Some(id) = v["session_id"].as_str() {
                         session_set(&skey_cb, id);
+                        send(sink, StreamItem::CliSession(id.to_string()));
                     }
                     if v["is_error"].as_bool() == Some(true) {
                         let msg = v["result"].as_str().unwrap_or("Claude CLI error");

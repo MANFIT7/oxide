@@ -37,6 +37,7 @@ fn conn() -> &'static Mutex<Connection> {
                title TEXT NOT NULL DEFAULT '',
                pinned INTEGER NOT NULL DEFAULT 0,
                archived_at INTEGER,
+               cli_session_id TEXT,
                created_ms INTEGER NOT NULL,
                updated_ms INTEGER NOT NULL
              );
@@ -50,6 +51,8 @@ fn conn() -> &'static Mutex<Connection> {
                PRIMARY KEY (session_id, seq)
              );",
         );
+        // Migration for existing dbs (errors harmlessly if the column is there).
+        let _ = c.execute("ALTER TABLE sessions ADD COLUMN cli_session_id TEXT", []);
         // Backfill: legacy imports stamped rows with the import moment, which
         // flattened ordering/relative times. The id leads with the original
         // epoch-ms — restore created/updated from it when they disagree wildly.
@@ -314,6 +317,29 @@ pub fn restore(id: &str) {
 /// Settings), most-recently-updated first.
 pub fn list_archived() -> Vec<SessionMeta> {
     list_where("archived_at IS NOT NULL", [], 500)
+}
+
+/// Persist the provider's native CLI session id (codex thread / claude uuid) for
+/// this Oxide session, so a resume after an app restart can hand the CLI back
+/// its own session via `--resume` instead of starting a fresh one.
+pub fn set_cli_session(id: &str, cli_session_id: &str) {
+    let c = conn().lock().unwrap();
+    let _ = c.execute(
+        "UPDATE sessions SET cli_session_id=?2 WHERE id=?1",
+        rusqlite::params![id, cli_session_id],
+    );
+}
+
+/// The stored native CLI session id for this Oxide session, if any.
+pub fn cli_session(id: &str) -> Option<String> {
+    let c = conn().lock().unwrap();
+    c.query_row(
+        "SELECT cli_session_id FROM sessions WHERE id=?1",
+        [id],
+        |r| r.get::<_, Option<String>>(0),
+    )
+    .ok()
+    .flatten()
 }
 
 pub fn delete(id: &str) {
