@@ -614,6 +614,7 @@ use oxide_harness::{Harness, Registry, SkillRoute};
 use oxide_mcp::{is_mcp_tool, server_of, HttpOptions, McpClient, StdioSpawnOptions};
 use oxide_protocol::{ApprovalDecision, Event, Op, ToolSpec, TurnId};
 use oxide_providers::{Message, Provider, Role, StreamItem, TurnRequest};
+use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use store::{CheckpointStore, SessionStore};
@@ -827,6 +828,22 @@ struct WorkerProfile {
     instructions: String,
     allowed_tools: Vec<String>,
     max_steps: usize,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SelfImproveCapture {
+    #[serde(default)]
+    facts: Vec<String>,
+    #[serde(default)]
+    skills: Vec<SelfImproveSkill>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SelfImproveSkill {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    content: String,
 }
 
 impl WorkerProfile {
@@ -1375,6 +1392,128 @@ impl Engine {
         }
     }
 
+    async fn run_cli_self_improvement_bridge(
+        &self,
+        turn: TurnId,
+        source_provider: &str,
+        user_text: &str,
+        assistant_text: &str,
+        edited_paths: &[String],
+    ) {
+        if !matches!(source_provider, "codex" | "claude") || edited_paths.is_empty() || assistant_text.trim().is_empty() {
+            return;
+        }
+
+        self.emit_audit(
+            Some(turn),
+            "memory",
+            "CLI self-improvement",
+            format!("Analyzing {} edited path(s) for durable learning", edited_paths.len()),
+            "running",
+        ).await;
+
+        let memory_store = memory::Memory::new(&self.workspace);
+        let existing_memory = compact_chars(&memory_store.load_block(), 4000);
+        let edited = edited_paths.iter().take(20).map(|path| format!("- {path}")).collect::<Vec<_>>().join("\n");
+        let system = "\
+You are Oxide's post-turn self-improvement bridge for native CLI providers.
+Inspect one completed coding-agent turn and decide whether anything durable should be stored in project memory.
+Return ONLY compact JSON with this exact shape:
+{\"facts\":[\"...\"],\"skills\":[{\"name\":\"short-slug\",\"content\":\"# Title\\nReusable steps...\"}]}
+Rules:
+- Save only durable, non-obvious project quirks, user preferences, gotchas, or reusable procedures.
+- Do not save temporary task status, release numbers, generic advice, or a plain list of edited files.
+- Do not duplicate existing memory.
+- Do not include secrets, tokens, keys, passwords, or private credentials.
+- Use at most 3 facts and at most 1 skill.
+- If nothing qualifies, return {\"facts\":[],\"skills\":[]}.";
+        let user = format!(
+            "Workspace: {}\nProvider: {source_provider}\n\nExisting memory:\n{}\n\nUser request:\n{}\n\nEdited paths:\n{}\n\nCLI final answer:\n{}",
+            self.workspace.display(),
+            if existing_memory.trim().is_empty() { "(none)" } else { existing_memory.trim() },
+            compact_chars(user_text.trim(), 4000),
+            edited,
+            compact_chars(assistant_text.trim(), 6000),
+        );
+        let req = TurnRequest {
+            model: String::new(),
+            reasoning_effort: "low".to_string(),
+            temperature: 0.0,
+            messages: vec![Message::new(Role::System, system.to_string()), Message::new(Role::User, user)],
+            tools: Vec::new(),
+            cwd: self.workspace.display().to_string(),
+            conversation_id: self
+                .session_store
+                .as_ref()
+                .map(|s| format!("{}:cli-self-improve:{}", s.id, turn.0))
+                .unwrap_or_else(|| format!("cli-self-improve:{}", turn.0)),
+            cli_resume: None,
+        };
+
+        let raw = match collect_provider_text_silent("chatgpt", req).await {
+            Ok(text) if !text.trim().is_empty() => text,
+            Ok(_) => {
+                self.emit_audit(Some(turn), "memory", "CLI self-improvement skipped", "empty bridge response", "skipped").await;
+                return;
+            }
+            Err(err) => {
+                self.emit_audit(Some(turn), "memory", "CLI self-improvement unavailable", err, "skipped").await;
+                return;
+            }
+        };
+
+        let Some(capture) = parse_self_improvement_capture(&raw) else {
+            self.emit_audit(
+                Some(turn),
+                "memory",
+                "CLI self-improvement parse failed",
+                compact_chars(raw.trim(), 1200),
+                "failed",
+            ).await;
+            return;
+        };
+
+        let existing_lower = existing_memory.to_ascii_lowercase();
+        let mut saved_facts = 0usize;
+        let mut saved_skills = 0usize;
+        let mut errors = Vec::new();
+        for fact in capture.facts.into_iter().take(3) {
+            let fact = clean_memory_fact(&fact);
+            if fact.is_empty() || looks_like_secret(&fact) || existing_lower.contains(&fact.to_ascii_lowercase()) {
+                continue;
+            }
+            match memory_store.remember(&fact) {
+                Ok(()) => saved_facts += 1,
+                Err(err) => errors.push(format!("remember failed: {err}")),
+            }
+        }
+        for skill in capture.skills.into_iter().take(1) {
+            let name = skill.name.trim();
+            let content = skill.content.trim();
+            if name.is_empty() || content.len() < 20 || looks_like_secret(content) {
+                continue;
+            }
+            match memory_store.save_skill(name, content) {
+                Ok(()) => saved_skills += 1,
+                Err(err) => errors.push(format!("save_skill failed: {err}")),
+            }
+        }
+
+        if !errors.is_empty() {
+            self.emit_audit(Some(turn), "memory", "CLI self-improvement save failed", errors.join("\n"), "failed").await;
+        } else if saved_facts == 0 && saved_skills == 0 {
+            self.emit_audit(Some(turn), "memory", "CLI self-improvement skipped", "no durable learning selected", "skipped").await;
+        } else {
+            self.emit_audit(
+                Some(turn),
+                "memory",
+                "CLI self-improvement saved",
+                format!("facts: {saved_facts}, skills: {saved_skills}"),
+                "done",
+            ).await;
+        }
+    }
+
     /// Dispatch a namespaced MCP tool call to the owning server.
     async fn mcp_call(&self, name: &str, args: &serde_json::Value) -> (String, bool) {
         let Some(server) = server_of(name) else {
@@ -1885,6 +2024,10 @@ Reply with text only: summarize what you changed, what you verified, and what re
         for path in changed {
             let (rel, diff) = cli_file_diff(&self.workspace, &path).await;
             if !diff.trim().is_empty() {
+                self.turn_edited = true;
+                if !self.turn_edit_paths.iter().any(|path| path == &rel) {
+                    self.turn_edit_paths.push(rel.clone());
+                }
                 let mut checkpoint = 0u64;
                 if let Some(tree) = &cli_baseline {
                     let prior = tokio::process::Command::new("git")
@@ -1911,6 +2054,7 @@ Reply with text only: summarize what you changed, what you verified, and what re
 
         let worker_edited = self.turn_edited;
         let worker_edit_paths = std::mem::take(&mut self.turn_edit_paths);
+        let worker_edit_paths_for_bridge = worker_edit_paths.clone();
         self.session = saved_session;
         self.turn_reads = saved_turn_reads;
         self.turn_edit_paths = saved_turn_edit_paths;
@@ -1921,6 +2065,17 @@ Reply with text only: summarize what you changed, what you verified, and what re
 
         if interrupted {
             self.emit(Event::Info { text: "worker interrupted".into() }).await;
+        }
+
+        if cli_driver && !interrupted {
+            self.run_cli_self_improvement_bridge(
+                turn,
+                &profile.provider,
+                user,
+                &out,
+                &worker_edit_paths_for_bridge,
+            )
+            .await;
         }
 
         self.fire_hooks(
@@ -2498,6 +2653,7 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                 self.emit(Event::Error { message: err.clone() }).await;
             }
             if !round_text.is_empty() {
+                assistant.push_str(&round_text);
                 if let Some(store) = &self.session_store {
                     let _ = store.append("assistant", &round_text);
                 }
@@ -2575,6 +2731,10 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
         for path in changed {
             let (rel, diff) = cli_file_diff(&self.workspace, &path).await;
             if !diff.trim().is_empty() {
+                self.turn_edited = true;
+                if !self.turn_edit_paths.iter().any(|path| path == &rel) {
+                    self.turn_edit_paths.push(rel.clone());
+                }
                 // Revertable: prior bytes come from the pre-turn git baseline
                 // (absent there = new file, so revert deletes it).
                 let mut checkpoint = 0u64;
@@ -2602,6 +2762,16 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
                 // its pending "editing…" row instead of spinning forever.
                 self.emit(Event::FileDiff { turn, path: rel, diff: String::new(), checkpoint: 0 }).await;
             }
+        }
+        if cli_driver && !interrupted {
+            self.run_cli_self_improvement_bridge(
+                turn,
+                &self.config.provider,
+                &user_text,
+                &assistant,
+                &self.turn_edit_paths,
+            )
+            .await;
         }
         self.run_stop_lifecycle(turn, &user_text, interrupted).await;
         self.emit(Event::TurnFinished { turn }).await;
@@ -3255,6 +3425,76 @@ async fn cli_file_diff(workspace: &std::path::Path, path: &str) -> (String, Stri
     (rel, diff)
 }
 
+async fn collect_provider_text_silent(provider_id: &str, req: TurnRequest) -> Result<String, String> {
+    let (tx, mut rx) = mpsc::channel::<StreamItem>(STREAM_QUEUE);
+    let provider = oxide_providers::build(provider_id);
+    let task = tokio::spawn(async move { provider.stream(req, tx).await });
+    let mut out = String::new();
+    let mut timed_out = false;
+    while let Some(item) = match tokio::time::timeout(std::time::Duration::from_secs(60), rx.recv()).await {
+        Ok(item) => item,
+        Err(_) => {
+            timed_out = true;
+            task.abort();
+            None
+        }
+    } {
+        match item {
+            StreamItem::TextDelta(text) => out.push_str(&text),
+            StreamItem::Done => break,
+            StreamItem::FileChanged(_)
+            | StreamItem::ReasoningDelta(_)
+            | StreamItem::ReasoningItem(_)
+            | StreamItem::ToolCall { .. }
+            | StreamItem::Notice(_)
+            | StreamItem::CliSession(_)
+            | StreamItem::Usage { .. }
+            | StreamItem::RateLimit { .. } => {}
+        }
+    }
+    if timed_out {
+        return Err(format!("{provider_id}: self-improvement bridge timed out"));
+    }
+    match task.await {
+        Ok(Ok(())) => Ok(out),
+        Ok(Err(err)) => Err(err.to_string()),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+fn parse_self_improvement_capture(text: &str) -> Option<SelfImproveCapture> {
+    let trimmed = text.trim();
+    if let Ok(capture) = serde_json::from_str::<SelfImproveCapture>(trimmed) {
+        return Some(capture);
+    }
+    let candidate = if let Some(start) = trimmed.find('{') {
+        let end = trimmed.rfind('}')?;
+        if end <= start {
+            return None;
+        }
+        &trimmed[start..=end]
+    } else {
+        return None;
+    };
+    serde_json::from_str::<SelfImproveCapture>(candidate).ok()
+}
+
+fn clean_memory_fact(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn looks_like_secret(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("password=")
+        || lower.contains("passwd=")
+        || lower.contains("api_key=")
+        || lower.contains("apikey=")
+        || lower.contains("secret=")
+        || lower.contains("token=")
+        || lower.contains("bearer ")
+        || lower.contains("sk-")
+}
+
 fn tool_arg_string(args: &serde_json::Value, key: &str) -> String {
     args[key].as_str().unwrap_or("").trim().to_string()
 }
@@ -3278,6 +3518,17 @@ mod map_test {
         assert_eq!(super::normalize_todo_status("done"), "completed");
         assert_eq!(super::normalize_todo_status("in-progress"), "in_progress");
         assert_eq!(super::normalize_todo_status("blocked"), "pending");
+    }
+
+    #[test]
+    fn self_improvement_capture_parses_plain_and_fenced_json() {
+        let plain = r#"{"facts":["Oxide CLI edits are reconstructed from git diff"],"skills":[]}"#;
+        let parsed = super::parse_self_improvement_capture(plain).unwrap();
+        assert_eq!(parsed.facts.len(), 1);
+
+        let fenced = "```json\n{\"facts\":[],\"skills\":[{\"name\":\"release-check\",\"content\":\"# Release check\\nVerify assets before finishing.\"}]}\n```";
+        let parsed = super::parse_self_improvement_capture(fenced).unwrap();
+        assert_eq!(parsed.skills[0].name, "release-check");
     }
 
     #[test]
