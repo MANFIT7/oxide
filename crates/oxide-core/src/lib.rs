@@ -27,8 +27,7 @@ mod store;
 mod tools;
 pub use tools::{Routed, ToolRouter};
 
-use oxide_config::Config;
-use oxide_config::McpServerConfig;
+use oxide_config::{Config, McpEnvVar, McpServerConfig};
 
 /// A shallow file-tree of the workspace, injected into the system prompt so the
 /// agent sees the project's real structure from the first message (and doesn't
@@ -265,43 +264,51 @@ async fn fetch_url(url: &str) -> (String, bool) {
 /// Discover MCP servers configured in Codex (`~/.codex/config.toml`) and Claude
 /// desktop / Claude Code (`mcpServers` JSON), so Oxide can reuse them.
 pub fn discover_external_mcp() -> Vec<McpServerConfig> {
+    let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    discover_external_mcp_for_workspace(&workspace)
+}
+
+/// Workspace-aware MCP discovery. This includes repo-scoped Codex config at
+/// `.codex/config.toml` in addition to user/global config files.
+pub fn discover_external_mcp_for_workspace(workspace: &Path) -> Vec<McpServerConfig> {
     // Cache for 60s — engines respawn on every tab switch and ~/.claude.json
     // can be megabytes; no need to re-read + re-parse it each time.
-    static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<(std::time::Instant, Vec<McpServerConfig>)>>> =
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, (std::time::Instant, Vec<McpServerConfig>)>>> =
         std::sync::OnceLock::new();
     let cache = CACHE.get_or_init(Default::default);
+    let cache_key = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf())
+        .display()
+        .to_string();
     if let Ok(g) = cache.lock() {
-        if let Some((t, v)) = g.as_ref() {
+        if let Some((t, v)) = g.get(&cache_key) {
             if t.elapsed() < std::time::Duration::from_secs(60) {
                 return v.clone();
             }
         }
     }
     let mut out: Vec<McpServerConfig> = Vec::new();
-    let mut seen = std::collections::HashSet::new();
     let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
         return out;
     };
-    let mut push = |name: String, command: String, args: Vec<String>, url: String, enabled: bool| {
-        if (command.is_empty() && url.is_empty()) || !seen.insert(name.clone()) {
+    let mut push = |server: McpServerConfig| {
+        if server.name.trim().is_empty() || (server.command.is_empty() && server.url.is_empty()) {
             return;
         }
-        out.push(McpServerConfig { name, command, args, url, enabled });
+        if let Some(pos) = out.iter().position(|existing| existing.name == server.name) {
+            out[pos] = server;
+        } else {
+            out.push(server);
+        }
     };
-    // Codex: ~/.codex/config.toml -> [mcp_servers.NAME]
-    if let Ok(text) = std::fs::read_to_string(home.join(".codex/config.toml")) {
-        if let Ok(v) = toml::from_str::<toml::Value>(&text) {
-            if let Some(tbl) = v.get("mcp_servers").and_then(|x| x.as_table()) {
-                for (name, e) in tbl {
-                    let s = |k: &str| e.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
-                    let args = e
-                        .get("args")
-                        .and_then(|x| x.as_array())
-                        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
-                        .unwrap_or_default();
-                    let enabled = e.get("enabled").and_then(|x| x.as_bool()).unwrap_or(true);
-                    push(name.clone(), s("command"), args, s("url"), enabled);
-                }
+    for (path, source) in [
+        (home.join(".codex/config.toml"), "Codex user config".to_string()),
+        (workspace.join(".codex/config.toml"), "Codex project config".to_string()),
+    ] {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            if let Ok(v) = toml::from_str::<toml::Value>(&text) {
+                collect_codex_mcp(&v, &source, &mut push);
             }
         }
     }
@@ -312,30 +319,302 @@ pub fn discover_external_mcp() -> Vec<McpServerConfig> {
     ] {
         if let Ok(text) = std::fs::read_to_string(&p) {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                if let Some(obj) = v.get("mcpServers").and_then(|x| x.as_object()) {
-                    for (name, e) in obj {
-                        let s = |k: &str| e.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
-                        let args = e
-                            .get("args")
-                            .and_then(|x| x.as_array())
-                            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
-                            .unwrap_or_default();
-                        push(name.clone(), s("command"), args, s("url"), true);
-                    }
+                if p.ends_with(".claude.json") {
+                    collect_claude_code_mcp(&v, workspace, &mut push);
+                } else {
+                    collect_json_mcp_servers(&v, "Claude Desktop", &mut push);
                 }
             }
         }
     }
     if let Ok(mut g) = cache.lock() {
-        *g = Some((std::time::Instant::now(), out.clone()));
+        g.insert(cache_key, (std::time::Instant::now(), out.clone()));
     }
     out
 }
-use oxide_harness::{Harness, Registry};
-use oxide_mcp::{is_mcp_tool, server_of, McpClient};
+
+fn collect_codex_mcp(value: &toml::Value, source: &str, push: &mut impl FnMut(McpServerConfig)) {
+    if let Some(tbl) = value.get("mcp_servers").and_then(|x| x.as_table()) {
+        for (name, entry) in tbl {
+            push(toml_mcp_server(name, entry, source));
+        }
+    }
+    if let Some(plugins) = value.get("plugins").and_then(|x| x.as_table()) {
+        for (plugin, cfg) in plugins {
+            if let Some(servers) = cfg.get("mcp_servers").and_then(|x| x.as_table()) {
+                for (name, entry) in servers {
+                    push(toml_mcp_server(name, entry, &format!("Codex plugin {plugin}")));
+                }
+            }
+        }
+    }
+}
+
+fn toml_mcp_server(name: &str, entry: &toml::Value, source: &str) -> McpServerConfig {
+    let s = |key: &str| entry.get(key).and_then(|x| x.as_str()).unwrap_or("").to_string();
+    McpServerConfig {
+        name: name.to_string(),
+        command: s("command"),
+        args: toml_string_array(entry.get("args")),
+        url: s("url"),
+        enabled: entry.get("enabled").and_then(|x| x.as_bool()).unwrap_or(true),
+        source: source.to_string(),
+        cwd: s("cwd"),
+        env: toml_string_map(entry.get("env")),
+        env_vars: toml_env_vars(entry.get("env_vars")),
+        bearer_token_env_var: s("bearer_token_env_var"),
+        http_headers: toml_string_map(entry.get("http_headers")),
+        env_http_headers: toml_string_map(entry.get("env_http_headers")),
+        startup_timeout_sec: toml_u64(entry.get("startup_timeout_sec")),
+        tool_timeout_sec: toml_u64(entry.get("tool_timeout_sec")),
+        enabled_tools: toml_string_array(entry.get("enabled_tools")),
+        disabled_tools: toml_string_array(entry.get("disabled_tools")),
+        required: entry.get("required").and_then(|x| x.as_bool()).unwrap_or(false),
+    }
+}
+
+fn collect_json_mcp_servers(value: &serde_json::Value, source: &str, push: &mut impl FnMut(McpServerConfig)) {
+    if let Some(obj) = value.get("mcpServers").and_then(|x| x.as_object()) {
+        for (name, entry) in obj {
+            push(json_mcp_server(name, entry, source));
+        }
+    }
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_json_mcp_servers(item, source, push);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (key, item) in map {
+                if key != "mcpServers" {
+                    collect_json_mcp_servers(item, source, push);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_claude_code_mcp(value: &serde_json::Value, workspace: &Path, push: &mut impl FnMut(McpServerConfig)) {
+    if let Some(obj) = value.get("mcpServers").and_then(|x| x.as_object()) {
+        for (name, entry) in obj {
+            push(json_mcp_server(name, entry, "Claude Code"));
+        }
+    }
+    let workspace_key = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf())
+        .display()
+        .to_string();
+    let Some(projects) = value.get("projects").and_then(|x| x.as_object()) else {
+        return;
+    };
+    for (project_path, project_cfg) in projects {
+        let project_key = std::path::PathBuf::from(project_path)
+            .canonicalize()
+            .unwrap_or_else(|_| std::path::PathBuf::from(project_path))
+            .display()
+            .to_string();
+        if project_key == workspace_key {
+            collect_json_mcp_servers(project_cfg, "Claude Code project", push);
+        }
+    }
+}
+
+fn json_mcp_server(name: &str, entry: &serde_json::Value, source: &str) -> McpServerConfig {
+    let s = |key: &str| entry.get(key).and_then(|x| x.as_str()).unwrap_or("").to_string();
+    McpServerConfig {
+        name: name.to_string(),
+        command: s("command"),
+        args: json_string_array(entry.get("args")),
+        url: s("url"),
+        enabled: entry.get("enabled").and_then(|x| x.as_bool()).unwrap_or(true),
+        source: source.to_string(),
+        cwd: s("cwd"),
+        env: json_string_map(entry.get("env")),
+        env_vars: json_env_vars(entry.get("env_vars")),
+        bearer_token_env_var: s("bearer_token_env_var"),
+        http_headers: json_string_map(entry.get("http_headers")),
+        env_http_headers: json_string_map(entry.get("env_http_headers")),
+        startup_timeout_sec: json_u64(entry.get("startup_timeout_sec")),
+        tool_timeout_sec: json_u64(entry.get("tool_timeout_sec")),
+        enabled_tools: json_string_array(entry.get("enabled_tools")),
+        disabled_tools: json_string_array(entry.get("disabled_tools")),
+        required: entry.get("required").and_then(|x| x.as_bool()).unwrap_or(false),
+    }
+}
+
+fn toml_string_array(value: Option<&toml::Value>) -> Vec<String> {
+    value
+        .and_then(|x| x.as_array())
+        .map(|items| items.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .unwrap_or_default()
+}
+
+fn json_string_array(value: Option<&serde_json::Value>) -> Vec<String> {
+    value
+        .and_then(|x| x.as_array())
+        .map(|items| items.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .unwrap_or_default()
+}
+
+fn toml_string_map(value: Option<&toml::Value>) -> BTreeMap<String, String> {
+    value
+        .and_then(|x| x.as_table())
+        .map(|tbl| {
+            tbl.iter()
+                .filter_map(|(key, value)| value.as_str().map(|v| (key.clone(), v.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn json_string_map(value: Option<&serde_json::Value>) -> BTreeMap<String, String> {
+    value
+        .and_then(|x| x.as_object())
+        .map(|tbl| {
+            tbl.iter()
+                .filter_map(|(key, value)| value.as_str().map(|v| (key.clone(), v.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn toml_env_vars(value: Option<&toml::Value>) -> Vec<McpEnvVar> {
+    value
+        .and_then(|x| x.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    if let Some(name) = item.as_str() {
+                        Some(McpEnvVar::Name(name.to_string()))
+                    } else {
+                        item.as_table().and_then(|tbl| {
+                            let name = tbl.get("name")?.as_str()?.to_string();
+                            let source = tbl.get("source").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            Some(McpEnvVar::Named { name, source })
+                        })
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn json_env_vars(value: Option<&serde_json::Value>) -> Vec<McpEnvVar> {
+    value
+        .and_then(|x| x.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    if let Some(name) = item.as_str() {
+                        Some(McpEnvVar::Name(name.to_string()))
+                    } else {
+                        item.as_object().and_then(|obj| {
+                            let name = obj.get("name")?.as_str()?.to_string();
+                            let source = obj.get("source").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            Some(McpEnvVar::Named { name, source })
+                        })
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn toml_u64(value: Option<&toml::Value>) -> Option<u64> {
+    value.and_then(|x| x.as_integer()).and_then(|n| u64::try_from(n).ok()).filter(|n| *n > 0)
+}
+
+fn json_u64(value: Option<&serde_json::Value>) -> Option<u64> {
+    value.and_then(|x| x.as_u64()).filter(|n| *n > 0)
+}
+
+fn duration_secs(value: Option<u64>, default_secs: u64) -> std::time::Duration {
+    std::time::Duration::from_secs(value.filter(|secs| *secs > 0).unwrap_or(default_secs))
+}
+
+fn mcp_pool_key(server: &McpServerConfig) -> String {
+    let mut key = vec![
+        server.name.clone(),
+        server.command.clone(),
+        server.args.join("\u{1f}"),
+        server.url.clone(),
+        server.cwd.clone(),
+        server.bearer_token_env_var.clone(),
+        server.startup_timeout_sec.map(|v| v.to_string()).unwrap_or_default(),
+        server.tool_timeout_sec.map(|v| v.to_string()).unwrap_or_default(),
+    ];
+    key.push(format!("{:?}", server.env));
+    key.push(format!("{:?}", server.env_vars));
+    key.push(format!("{:?}", server.http_headers));
+    key.push(format!("{:?}", server.env_http_headers));
+    key.push(server.enabled_tools.join("\u{1f}"));
+    key.push(server.disabled_tools.join("\u{1f}"));
+    key.join("\u{1e}")
+}
+
+fn filter_mcp_tools(server: &McpServerConfig, tools: Vec<ToolSpec>) -> Vec<ToolSpec> {
+    let prefix = format!("mcp__{}__", server.name);
+    tools
+        .into_iter()
+        .filter(|tool| {
+            let bare = tool.name.strip_prefix(&prefix).unwrap_or(&tool.name);
+            server.tool_allowed(bare)
+        })
+        .collect()
+}
+
+fn selected_skill_routes(routes: Vec<SkillRoute>, user_text: &str) -> Vec<SkillRoute> {
+    let lower = user_text.to_ascii_lowercase();
+    routes
+        .into_iter()
+        .filter(|route| {
+            route
+                .triggers
+                .iter()
+                .any(|trigger| !trigger.trim().is_empty() && lower.contains(&trigger.to_ascii_lowercase()))
+        })
+        .take(3)
+        .collect()
+}
+
+fn workflow_title(id: &str) -> String {
+    match id {
+        "frontend" => "Frontend workflow",
+        "review" => "Review workflow",
+        "release" => "Release workflow",
+        "github-action" => "GitHub Actions workflow",
+        "browser-test" => "Browser test workflow",
+        other => other,
+    }
+    .to_string()
+}
+
+fn skill_routes_block(routes: &[SkillRoute]) -> String {
+    if routes.is_empty() {
+        return String::new();
+    }
+    let mut block = String::from("\n\n# Auto-selected workflow routes\n");
+    for route in routes {
+        block.push_str(&format!("\n## {}\n{}\n", route.id, route.instructions.trim()));
+        if !route.template.is_empty() {
+            block.push_str("Template checklist:\n");
+            for (idx, step) in route.template.iter().enumerate() {
+                block.push_str(&format!("{}. {}\n", idx + 1, step.trim()));
+            }
+        }
+    }
+    block
+}
+use oxide_harness::{Harness, Registry, SkillRoute};
+use oxide_mcp::{is_mcp_tool, server_of, HttpOptions, McpClient, StdioSpawnOptions};
 use oxide_protocol::{ApprovalDecision, Event, Op, ToolSpec, TurnId};
 use oxide_providers::{Message, Provider, Role, StreamItem, TurnRequest};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use store::{CheckpointStore, SessionStore};
 use tokio::sync::mpsc;
@@ -398,7 +677,7 @@ pub fn spawn(config: Config) -> anyhow::Result<(EngineHandle, mpsc::Receiver<Eve
         if let Ok(msgs) = SessionStore::load(id) {
             history = msgs
                 .into_iter()
-                .filter(|m| m.role != "meta")
+                .filter(|m| model_history_role(&m.role))
                 .map(|m| Message::new(role_from_str(&m.role), m.content))
                 .collect();
             tracing::info!(count = history.len(), "resumed session {id}");
@@ -440,6 +719,7 @@ pub fn spawn(config: Config) -> anyhow::Result<(EngineHandle, mpsc::Receiver<Eve
         checkpoints: CheckpointStore::default(),
         mcp_clients: Vec::new(),
         mcp_tools: Vec::new(),
+        mcp_instructions: Vec::new(),
         browser: None,
         ctx_window: None,
         read_files: std::collections::HashSet::new(),
@@ -479,6 +759,22 @@ fn role_from_str(s: &str) -> Role {
     }
 }
 
+fn model_history_role(role: &str) -> bool {
+    matches!(role, "system" | "user" | "assistant" | "tool")
+}
+
+fn compact_chars(text: &str, limit: usize) -> String {
+    let mut out: String = text.chars().take(limit).collect();
+    if text.chars().count() > limit {
+        out.push_str("\n…");
+    }
+    out
+}
+
+fn compact_json(value: &serde_json::Value, limit: usize) -> String {
+    compact_chars(&value.to_string(), limit)
+}
+
 struct Engine {
     config: Config,
     registry: Registry,
@@ -499,6 +795,8 @@ struct Engine {
     mcp_clients: Vec<std::sync::Arc<McpClient>>,
     /// Namespaced tool specs discovered from all MCP servers.
     mcp_tools: Vec<ToolSpec>,
+    /// Server-level MCP instructions returned during initialize.
+    mcp_instructions: Vec<(String, String)>,
     /// Lazily launched browser-automation session.
     browser: Option<browser::BrowserSession>,
     /// Model context window (tokens), reported by the provider; drives the
@@ -521,9 +819,125 @@ struct Engine {
     event_tx: mpsc::Sender<Event>,
 }
 
+#[derive(Clone)]
+struct WorkerProfile {
+    id: String,
+    provider: String,
+    effort: String,
+    instructions: String,
+    allowed_tools: Vec<String>,
+    max_steps: usize,
+}
+
+impl WorkerProfile {
+    fn implementer(provider: &str, effort: &str) -> Self {
+        Self {
+            id: "implementer".to_string(),
+            provider: provider.to_string(),
+            effort: effort.to_string(),
+            instructions: "You may inspect, edit, run commands, and verify. Keep changes scoped and finish the assigned implementation.".to_string(),
+            allowed_tools: Vec::new(),
+            max_steps: 24,
+        }
+    }
+}
+
+fn subagent_profile_for(task: &str, provider: &str, effort: &str) -> WorkerProfile {
+    let lower = task.to_ascii_lowercase();
+    if lower.contains("test") || lower.contains("verify") || lower.contains("lint") || lower.contains("build") {
+        WorkerProfile {
+            id: "tester".to_string(),
+            provider: provider.to_string(),
+            effort: "low".to_string(),
+            instructions: "You are the tester subagent. Run or inspect verification only. Do not edit files; report failures with exact commands and diagnostics.".to_string(),
+            allowed_tools: vec![
+                "read_file", "search", "codebase_search", "shell", "browser_navigate", "browser_read",
+                "browser_screenshot", "fetch_url",
+            ].into_iter().map(String::from).collect(),
+            max_steps: 12,
+        }
+    } else if lower.contains("review") || lower.contains("audit") || lower.contains("risk") || lower.contains("risiko") {
+        WorkerProfile {
+            id: "reviewer".to_string(),
+            provider: provider.to_string(),
+            effort: "high".to_string(),
+            instructions: "You are the reviewer subagent. Inspect for correctness, regressions, security, and test gaps. Do not edit files; return findings with file references.".to_string(),
+            allowed_tools: vec!["read_file", "search", "codebase_search", "shell", "fetch_url"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            max_steps: 12,
+        }
+    } else if lower.contains("inspect") || lower.contains("explore") || lower.contains("find") || lower.contains("research") {
+        WorkerProfile {
+            id: "explorer".to_string(),
+            provider: provider.to_string(),
+            effort: "low".to_string(),
+            instructions: "You are the explorer subagent. Locate relevant code, docs, and facts. Do not edit files; return a concise map of what matters.".to_string(),
+            allowed_tools: vec!["read_file", "search", "codebase_search", "web_search", "fetch_url"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            max_steps: 10,
+        }
+    } else {
+        WorkerProfile::implementer(provider, effort)
+    }
+}
+
 impl Engine {
     async fn emit(&self, ev: Event) {
         let _ = self.event_tx.send(ev).await;
+    }
+
+    async fn emit_audit(
+        &self,
+        turn: Option<TurnId>,
+        kind: &str,
+        title: impl Into<String>,
+        detail: impl Into<String>,
+        status: &str,
+    ) {
+        let title = compact_chars(&title.into(), 240);
+        let detail = compact_chars(&detail.into(), 1600);
+        let status = status.to_string();
+        if turn.is_some() {
+            if let Some(store) = &self.session_store {
+                let body = serde_json::json!({
+                    "kind": kind,
+                    "title": title,
+                    "detail": detail,
+                    "status": status,
+                    "turn": turn.map(|t| t.0),
+                    "ts_ms": std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or_default(),
+                });
+                let _ = store.append("event", &body.to_string());
+            }
+        }
+        self.emit(Event::AuditLog {
+            turn,
+            kind: kind.to_string(),
+            title,
+            detail,
+            status,
+        })
+        .await;
+    }
+
+    async fn emit_tool_end(&self, turn: TurnId, tool: String, output: String, ok: bool) {
+        let status = if ok { "done" } else { "failed" };
+        self.emit_audit(
+            Some(turn),
+            "tool",
+            format!("Tool finished · {tool}"),
+            output.trim(),
+            status,
+        )
+        .await;
+        self.emit(Event::ToolCallEnd { turn, tool, output, ok }).await;
     }
 
     fn active_harness(&self) -> &dyn Harness {
@@ -605,6 +1019,25 @@ impl Engine {
         tools
     }
 
+    fn tools_for_worker_profile(&self, profile: &WorkerProfile) -> Vec<ToolSpec> {
+        let tools = self.all_tools();
+        if profile.allowed_tools.is_empty() {
+            return tools;
+        }
+        tools
+            .into_iter()
+            .filter(|tool| {
+                profile.allowed_tools.iter().any(|allowed| {
+                    if let Some(prefix) = allowed.strip_suffix('*') {
+                        tool.name.starts_with(prefix)
+                    } else {
+                        tool.name == *allowed
+                    }
+                })
+            })
+            .collect()
+    }
+
     /// Ensure the browser session is launched; returns a ref or an error string.
     async fn ensure_browser(&mut self) -> Result<&browser::BrowserSession, String> {
         if self.browser.is_none() {
@@ -658,7 +1091,7 @@ impl Engine {
         let mut servers = self.config.mcp_servers.clone();
         // Auto-import MCP servers configured in Codex / Claude desktop so they
         // are available in Oxide without re-declaring them.
-        for ext in discover_external_mcp() {
+        for ext in discover_external_mcp_for_workspace(&self.workspace) {
             if !servers.iter().any(|s| s.name == ext.name) {
                 servers.push(ext);
             }
@@ -672,7 +1105,7 @@ impl Engine {
             .map(|srv| {
                 let srv = srv.clone();
                 async move {
-                    let key = format!("{}|{}|{}|{}", srv.name, srv.command, srv.args.join(" "), srv.url);
+                    let key = mcp_pool_key(&srv);
                     // Reuse a live pooled connection when it still answers.
                     if let Some((client, tools)) = pool.lock().await.get(&key).cloned() {
                         let alive = tokio::time::timeout(
@@ -689,16 +1122,43 @@ impl Engine {
                     }
                     let fut = async {
                         let client = if !srv.url.is_empty() {
-                            McpClient::connect_http(&srv.name, &srv.url).await?
+                            McpClient::connect_http_with(
+                                &srv.name,
+                                &srv.url,
+                                HttpOptions {
+                                    bearer_token_env_var: srv.bearer_token_env_var.clone(),
+                                    headers: srv.http_headers.clone(),
+                                    env_headers: srv.env_http_headers.clone(),
+                                    request_timeout: duration_secs(srv.tool_timeout_sec, 30),
+                                },
+                            ).await?
                         } else {
-                            McpClient::connect_stdio(&srv.name, &srv.command, &srv.args).await?
+                            let cwd = if srv.cwd.trim().is_empty() {
+                                None
+                            } else {
+                                Some(std::path::PathBuf::from(&srv.cwd))
+                            };
+                            McpClient::connect_stdio_with(
+                                &srv.name,
+                                &srv.command,
+                                &srv.args,
+                                StdioSpawnOptions {
+                                    cwd,
+                                    env: srv.env.clone(),
+                                    env_vars: srv.env_vars.iter().map(|env| env.name().to_string()).collect(),
+                                    request_timeout: duration_secs(srv.tool_timeout_sec, 60),
+                                },
+                            ).await?
                         };
-                        let tools = client.list_tools().await?;
+                        let tools = filter_mcp_tools(&srv, client.list_tools().await?);
                         Ok::<_, anyhow::Error>((std::sync::Arc::new(client), tools))
                     };
-                    let res = match tokio::time::timeout(std::time::Duration::from_secs(15), fut).await {
+                    let res = match tokio::time::timeout(duration_secs(srv.startup_timeout_sec, 15), fut).await {
                         Ok(r) => r,
-                        Err(_) => Err(anyhow::anyhow!("timed out after 15s")),
+                        Err(_) => Err(anyhow::anyhow!(
+                            "timed out after {}s",
+                            duration_secs(srv.startup_timeout_sec, 15).as_secs()
+                        )),
                     };
                     if let Ok((client, tools)) = &res {
                         pool.lock().await.insert(key, (client.clone(), tools.clone()));
@@ -708,8 +1168,12 @@ impl Engine {
             })
             .collect::<Vec<_>>();
         for (srv, connect) in futures::future::join_all(conn_futs).await {
-            match connect.map(|(c, t)| { self.mcp_clients.push(c); t }) {
-                Ok(tools) => {
+            match connect.map(|(c, t)| {
+                let instructions = c.instructions().to_string();
+                self.mcp_clients.push(c);
+                (t, instructions)
+            }) {
+                Ok((tools, instructions)) => {
                     {
                         let tool_names = tools.iter().map(|tool| tool.name.clone()).collect();
                         self.emit(Event::McpServerStatus {
@@ -725,6 +1189,9 @@ impl Engine {
                         })
                         .await;
                         self.mcp_tools.extend(tools);
+                        if !instructions.trim().is_empty() {
+                            self.mcp_instructions.push((srv.name.clone(), instructions));
+                        }
                     }
                 }
                 Err(e) => {
@@ -747,34 +1214,165 @@ impl Engine {
 
     /// Fire lifecycle hooks for `event`. Returns true if a `pre_tool` hook
     /// blocked (non-zero exit). Payload JSON is passed via `$OXIDE_HOOK_PAYLOAD`.
-    async fn fire_hooks(&self, event: &str, payload: serde_json::Value) -> bool {
+    async fn fire_hooks(&self, event: &str, matcher: &str, payload: serde_json::Value) -> bool {
         let hooks = hooks::Hooks::load(&self.workspace);
+        self.fire_hook_commands(&hooks, event, matcher, payload).await
+    }
+
+    async fn fire_hook_commands(
+        &self,
+        hooks: &hooks::Hooks,
+        event: &str,
+        matcher: &str,
+        payload: serde_json::Value,
+    ) -> bool {
         let mut blocked = false;
-        for cmd in hooks.commands(event) {
+        let audit_turn = payload.get("turn").and_then(|v| v.as_u64()).map(TurnId);
+        for hook in hooks.commands_for(event, matcher) {
+            if !hook.status_message.is_empty() {
+                self.emit(Event::Info { text: hook.status_message.clone() }).await;
+            }
             let fut = tokio::process::Command::new("/bin/sh")
                 .arg("-c")
-                .arg(cmd)
+                .arg(&hook.command)
                 .current_dir(&self.workspace)
                 .env("OXIDE_HOOK_EVENT", event)
+                .env("OXIDE_HOOK_MATCHER", matcher)
                 .env("OXIDE_HOOK_PAYLOAD", payload.to_string())
                 .stdin(std::process::Stdio::null())
                 .kill_on_drop(true)
                 .output();
-            // A hook must never wedge the agent — bound it (60s, then killed).
-            let status = tokio::time::timeout(std::time::Duration::from_secs(60), fut).await;
+            // A hook must never wedge the agent — bound it, then kill on drop.
+            let status = tokio::time::timeout(std::time::Duration::from_secs(hook.timeout), fut).await;
             let ok = matches!(&status, Ok(Ok(o)) if o.status.success());
             let this_blocked = event == "pre_tool" && !ok;
             if this_blocked {
                 blocked = true;
             }
+            self.emit_audit(
+                audit_turn,
+                "hook",
+                format!("Hook {event}"),
+                hook.command.clone(),
+                if this_blocked { "blocked" } else if ok { "done" } else { "failed" },
+            )
+            .await;
             self.emit(Event::HookFired {
                 hook: event.to_string(),
-                command: cmd.clone(),
+                command: hook.command.clone(),
                 blocked: this_blocked,
             })
             .await;
         }
         blocked
+    }
+
+    async fn run_stop_lifecycle(&self, turn: TurnId, user_text: &str, interrupted: bool) {
+        let hooks = hooks::Hooks::load(&self.workspace);
+        let payload = serde_json::json!({
+            "turn": turn.0,
+            "interrupted": interrupted,
+            "workspace": self.workspace.display().to_string(),
+            "edited_paths": self.turn_edit_paths.clone(),
+            "user_text": user_text,
+        });
+        self.run_auto_lint(&hooks, turn).await;
+        self.write_turn_summary(&hooks, turn, user_text, interrupted).await;
+        self.fire_hook_commands(&hooks, "stop", "", payload).await;
+    }
+
+    async fn run_auto_lint(&self, hooks: &hooks::Hooks, turn: TurnId) {
+        if !hooks.auto().lint || self.turn_edit_paths.is_empty() {
+            return;
+        }
+        let command = if hooks.auto().lint_command.trim().is_empty() {
+            match self.default_lint_command() {
+                Some(command) => command,
+                None => return,
+            }
+        } else {
+            hooks.auto().lint_command.clone()
+        };
+        self.emit(Event::Info { text: format!("auto-lint: {command}") }).await;
+        self.emit_audit(Some(turn), "lint", "Auto lint started", command.clone(), "running").await;
+        let fut = tokio::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&command)
+            .current_dir(&self.workspace)
+            .output();
+        let out = match tokio::time::timeout(std::time::Duration::from_secs(180), fut).await {
+            Ok(Ok(output)) => output,
+            Ok(Err(err)) => {
+                self.emit_audit(Some(turn), "lint", "Auto lint failed", err.to_string(), "failed").await;
+                self.emit(Event::Error { message: format!("auto-lint spawn failed: {err}") }).await;
+                return;
+            }
+            Err(_) => {
+                self.emit_audit(Some(turn), "lint", "Auto lint timed out", "after 180s", "failed").await;
+                self.emit(Event::Error { message: "auto-lint timed out after 180s".into() }).await;
+                return;
+            }
+        };
+        let mut text = String::from_utf8_lossy(&out.stdout).to_string();
+        text.push_str(&String::from_utf8_lossy(&out.stderr));
+        let text: String = text.trim().chars().take(4000).collect();
+        if out.status.success() {
+            self.emit_audit(Some(turn), "lint", "Auto lint passed", command, "done").await;
+            self.emit(Event::Info { text: "auto-lint passed".into() }).await;
+        } else {
+            self.emit_audit(Some(turn), "lint", "Auto lint failed", text.clone(), "failed").await;
+            self.emit(Event::Error {
+                message: if text.is_empty() { "auto-lint failed".into() } else { format!("auto-lint failed:\n{text}") },
+            })
+            .await;
+        }
+    }
+
+    fn default_lint_command(&self) -> Option<String> {
+        let ws = &self.workspace;
+        if ws.join("Cargo.toml").exists() {
+            Some("cargo check --message-format short".into())
+        } else if ws.join("package.json").exists() {
+            Some("npm run lint --if-present".into())
+        } else if ws.join("pyproject.toml").exists() || ws.join("requirements.txt").exists() {
+            Some("ruff check .".into())
+        } else {
+            None
+        }
+    }
+
+    async fn write_turn_summary(&self, hooks: &hooks::Hooks, turn: TurnId, user_text: &str, interrupted: bool) {
+        if !hooks.auto().summarize {
+            return;
+        }
+        let dir = self.workspace.join(".oxide/turn-summaries");
+        if let Err(err) = std::fs::create_dir_all(&dir) {
+            self.emit(Event::Error { message: format!("turn summary mkdir failed: {err}") }).await;
+            return;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or_default();
+        let edited = if self.turn_edit_paths.is_empty() {
+            "- none".to_string()
+        } else {
+            self.turn_edit_paths
+                .iter()
+                .map(|path| format!("- {path}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let body = format!(
+            "# Turn {}\n\n- timestamp: {now}\n- interrupted: {interrupted}\n\n## Request\n{}\n\n## Edited Paths\n{edited}\n",
+            turn.0,
+            user_text.trim()
+        );
+        let path = dir.join(format!("turn-{}-{now}.md", turn.0));
+        match std::fs::write(&path, body) {
+            Ok(()) => self.emit(Event::Info { text: format!("turn summary saved: {}", path.display()) }).await,
+            Err(err) => self.emit(Event::Error { message: format!("turn summary write failed: {err}") }).await,
+        }
     }
 
     /// Dispatch a namespaced MCP tool call to the owning server.
@@ -1060,12 +1658,11 @@ impl Engine {
     #[allow(clippy::too_many_arguments)]
     async fn stream_agentic_collect(
         &mut self,
-        provider_id: &str,
         system: &str,
         user: &str,
-        effort: &str,
         turn: TurnId,
         worker_id: &str,
+        profile: WorkerProfile,
         op_rx: &mut mpsc::Receiver<Op>,
     ) -> (String, bool) {
         let saved_session = std::mem::replace(
@@ -1081,15 +1678,44 @@ impl Engine {
         self.turn_edited = false;
         self.last_tool_reps = 0;
 
+        let profile_id = profile.id.clone();
+        self.fire_hooks(
+            "subagent_start",
+            &profile_id,
+            serde_json::json!({ "turn": turn.0, "worker_id": worker_id, "profile": profile_id.clone(), "assignment": user }),
+        )
+        .await;
+        self.emit(Event::SubagentStarted {
+            turn,
+            worker_id: worker_id.to_string(),
+            profile: profile_id.clone(),
+            task: user.to_string(),
+        })
+        .await;
+        self.emit_audit(
+            Some(turn),
+            "subagent",
+            format!("Subagent started · {profile_id}"),
+            user,
+            "running",
+        )
+        .await;
+
         let policy = self.active_harness().loop_policy();
         let model = policy.model.clone().unwrap_or_else(|| {
             let mut cfg = self.config.clone();
-            cfg.provider = provider_id.to_string();
+            cfg.provider = profile.provider.clone();
             cfg.effective_model()
         });
-        let max_steps = (policy.max_steps as usize).clamp(1, 24);
-        let tools = self.all_tools();
-        let cli_driver = matches!(provider_id, "codex" | "claude");
+        let max_steps = profile.max_steps.min(policy.max_steps as usize).clamp(1, 24);
+        let tools = self.tools_for_worker_profile(&profile);
+        let cli_driver = matches!(profile.provider.as_str(), "codex" | "claude");
+        let worker_system = format!(
+            "{system}\n\n# Sub-agent profile: {}\n{}\n\nAvailable tool policy: {} tool(s) exposed for this worker.",
+            profile.id,
+            profile.instructions,
+            tools.len()
+        );
         let cli_baseline = if cli_driver {
             git_baseline_tree(&self.workspace).await
         } else {
@@ -1104,7 +1730,7 @@ impl Engine {
 
         loop {
             context::sanitize_tool_pairs(&mut self.session);
-            let mut msgs = vec![Message::new(Role::System, system.to_string())];
+            let mut msgs = vec![Message::new(Role::System, worker_system.clone())];
             msgs.extend(self.session.iter().cloned());
             let conversation_id = self
                 .session_store
@@ -1113,7 +1739,7 @@ impl Engine {
                 .unwrap_or_else(|| worker_id.to_string());
             let req = TurnRequest {
                 model: model.clone(),
-                reasoning_effort: effort.to_string(),
+                reasoning_effort: profile.effort.clone(),
                 temperature: policy.temperature,
                 messages: msgs,
                 tools: tools.clone(),
@@ -1123,7 +1749,7 @@ impl Engine {
             };
 
             let (stream_tx, mut stream_rx) = mpsc::channel::<StreamItem>(STREAM_QUEUE);
-            let provider = oxide_providers::build(provider_id);
+            let provider = oxide_providers::build(&profile.provider);
             let stream_task = tokio::spawn(async move { provider.stream(req, stream_tx).await });
 
             let mut round_text = String::new();
@@ -1297,6 +1923,31 @@ Reply with text only: summarize what you changed, what you verified, and what re
             self.emit(Event::Info { text: "worker interrupted".into() }).await;
         }
 
+        self.fire_hooks(
+            "subagent_stop",
+            &profile_id,
+            serde_json::json!({ "turn": turn.0, "worker_id": worker_id, "profile": profile_id.clone(), "interrupted": interrupted }),
+        )
+        .await;
+        let summary = compact_chars(out.trim(), 900);
+        self.emit(Event::SubagentFinished {
+            turn,
+            worker_id: worker_id.to_string(),
+            profile: profile_id.clone(),
+            task: user.to_string(),
+            summary: summary.clone(),
+            ok: !interrupted,
+        })
+        .await;
+        self.emit_audit(
+            Some(turn),
+            "subagent",
+            format!("Subagent finished · {profile_id}"),
+            summary,
+            if interrupted { "interrupted" } else { "done" },
+        )
+        .await;
+
         (out, interrupted)
     }
 
@@ -1372,6 +2023,29 @@ Reply with text only: summarize what you changed, what you verified, and what re
             sys.push_str("\n\n# Project instructions (AGENTS.md)\n");
             sys.push_str(&agents);
         }
+        let selected_routes = selected_skill_routes(harness.skill_routes(), &user_text);
+        for route in &selected_routes {
+            let title = workflow_title(&route.id);
+            self.emit(Event::WorkflowSelected {
+                turn,
+                id: route.id.clone(),
+                title: title.clone(),
+                steps: route.template.clone(),
+            })
+            .await;
+            self.emit_audit(
+                Some(turn),
+                "workflow",
+                title,
+                route.template.join("\n"),
+                "selected",
+            )
+            .await;
+        }
+        let route_block = skill_routes_block(&selected_routes);
+        if !route_block.is_empty() {
+            sys.push_str(&route_block);
+        }
         sys.push_str(
             "\n\n# Diagrams\n\
 When the user asks how something works, the architecture, a flow, a sequence, \
@@ -1388,6 +2062,12 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
         if !mem_block.is_empty() {
             sys.push_str("\n\n");
             sys.push_str(&mem_block);
+        }
+        if !self.mcp_instructions.is_empty() {
+            sys.push_str("\n\n# MCP server instructions\n");
+            for (server, instructions) in &self.mcp_instructions {
+                sys.push_str(&format!("\n## {server}\n{}\n", instructions.trim()));
+            }
         }
         let mut assistant = String::new();
         let mut interrupted = false;
@@ -1429,7 +2109,14 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                     let worker_sys = format!("{sys}\n\n# Orchestration role\n{isys}");
                     let worker_id = format!("orchestrate-implement-{}", turn.0);
                     let (out, was_interrupted) = self
-                        .stream_agentic_collect(&backend, &worker_sys, &user_text, &effort, turn, &worker_id, op_rx)
+                        .stream_agentic_collect(
+                            &worker_sys,
+                            &user_text,
+                            turn,
+                            &worker_id,
+                            WorkerProfile::implementer(&backend, &effort),
+                            op_rx,
+                        )
                         .await;
                     assistant = out;
                     interrupted |= was_interrupted;
@@ -1440,13 +2127,15 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                     .await;
                     let mut results: Vec<(usize, String, String)> = Vec::with_capacity(subtasks.len());
                     for (i, st) in subtasks.iter().enumerate() {
+                        let profile = subagent_profile_for(st, &backend, &effort);
+                        let profile_id = profile.id.clone();
                         let bsys = format!(
-                            "{sys}\n\n# Sub-agent assignment\nYou are sub-agent {}. Do EXACTLY this subtask and report what you did. Overall plan for context:\n{plan}",
+                            "{sys}\n\n# Sub-agent assignment\nYou are sub-agent {} ({profile_id}). Do EXACTLY this subtask and report what you did. Overall plan for context:\n{plan}",
                             i + 1
                         );
-                        let worker_id = format!("subagent-{}-{}", turn.0, i + 1);
+                        let worker_id = format!("subagent-{}-{}-{}", turn.0, i + 1, profile_id);
                         let (out, was_interrupted) = self
-                            .stream_agentic_collect(&backend, &bsys, st, &effort, turn, &worker_id, op_rx)
+                            .stream_agentic_collect(&bsys, st, turn, &worker_id, profile, op_rx)
                             .await;
                         interrupted |= was_interrupted;
                         results.push((i + 1, st.clone(), out));
@@ -1481,7 +2170,14 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                 let worker_sys = format!("{sys}\n\n# Orchestration role\n{isys}");
                 let worker_id = format!("orchestrate-implement-{}", turn.0);
                 let (out, was_interrupted) = self
-                    .stream_agentic_collect(&backend, &worker_sys, &user_text, &effort, turn, &worker_id, op_rx)
+                    .stream_agentic_collect(
+                        &worker_sys,
+                        &user_text,
+                        turn,
+                        &worker_id,
+                        WorkerProfile::implementer(&backend, &effort),
+                        op_rx,
+                    )
                     .await;
                 assistant = out;
                 interrupted |= was_interrupted;
@@ -1495,7 +2191,7 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                     self.session.push(Message::new(Role::Assistant, assistant));
                 }
                 self.emit(Event::Info { text: "turn interrupted".into() }).await;
-                self.fire_hooks("stop", serde_json::json!({})).await;
+                self.run_stop_lifecycle(turn, &user_text, true).await;
                 self.emit(Event::TurnFinished { turn }).await;
                 return;
             }
@@ -1518,7 +2214,14 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                     );
                     let worker_id = format!("orchestrate-verify-{}-{verify_iter}", turn.0);
                     let (fix, was_interrupted) = self
-                        .stream_agentic_collect(&backend, &vsys, &user_text, &effort, turn, &worker_id, op_rx)
+                        .stream_agentic_collect(
+                            &vsys,
+                            &user_text,
+                            turn,
+                            &worker_id,
+                            WorkerProfile::implementer(&backend, &effort),
+                            op_rx,
+                        )
                         .await;
                     assistant.push_str(&fix);
                     if was_interrupted {
@@ -1539,7 +2242,7 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                     }
                     self.session.push(Message::new(Role::Assistant, assistant));
                 }
-                self.fire_hooks("stop", serde_json::json!({})).await;
+                self.run_stop_lifecycle(turn, &user_text, true).await;
                 self.emit(Event::TurnFinished { turn }).await;
                 return;
             }
@@ -1578,7 +2281,14 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                 let worker_sys = format!("{sys}\n\n# Orchestration role\n{fsys}");
                 let worker_id = format!("orchestrate-fix-{}-{iter}", turn.0);
                 let (fix, was_interrupted) = self
-                    .stream_agentic_collect(&backend, &worker_sys, &user_text, &effort, turn, &worker_id, op_rx)
+                    .stream_agentic_collect(
+                        &worker_sys,
+                        &user_text,
+                        turn,
+                        &worker_id,
+                        WorkerProfile::implementer(&backend, &effort),
+                        op_rx,
+                    )
                     .await;
                 assistant.push_str(&fix);
                 if was_interrupted {
@@ -1596,7 +2306,7 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                 }
                 self.session.push(Message::new(Role::Assistant, assistant));
             }
-            self.fire_hooks("stop", serde_json::json!({})).await;
+            self.run_stop_lifecycle(turn, &user_text, interrupted).await;
             self.emit(Event::TurnFinished { turn }).await;
             return;
         }
@@ -1893,7 +2603,7 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
                 self.emit(Event::FileDiff { turn, path: rel, diff: String::new(), checkpoint: 0 }).await;
             }
         }
-        self.fire_hooks("stop", serde_json::json!({})).await;
+        self.run_stop_lifecycle(turn, &user_text, interrupted).await;
         self.emit(Event::TurnFinished { turn }).await;
 
         // Context-aware follow-up suggestions, generated off-turn on the fast
@@ -2118,6 +2828,14 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
             args: arguments.clone(),
         })
         .await;
+        self.emit_audit(
+            Some(turn),
+            "tool",
+            format!("Tool started · {name}"),
+            compact_json(&arguments, 800),
+            "running",
+        )
+        .await;
 
         // ask_user: surface a question (with optional choices) and block for the answer.
         if name == "ask_user" {
@@ -2138,14 +2856,25 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
                     Some(Op::UserTurn { text }) => break text,
                     Some(Op::Interrupt) | Some(Op::Shutdown) | None => {
                         self.session.push(Message::tool_result("interrupted before answering", call_id));
+                        self.emit_tool_end(turn, name, "interrupted before answering".into(), false).await;
                         return true;
                     }
                     Some(_) => {}
                 }
             };
             self.session.push(Message::tool_result(format!("[ask_user answer] {answer}"), call_id));
-            self.emit(Event::ToolCallEnd { turn, tool: name, output: answer, ok: true }).await;
+            self.emit_tool_end(turn, name, answer, true).await;
             return false;
+        }
+
+        let hook_config = hooks::Hooks::load(&self.workspace);
+        if hook_config.auto().guard_dangerous_shell {
+            if let Some(reason) = hooks::dangerous_tool_reason(&name, &arguments) {
+                self.session.push(Message::tool_result(reason.clone(), call_id));
+                self.emit_audit(Some(turn), "guard", "Dangerous command blocked", reason.clone(), "blocked").await;
+                self.emit_tool_end(turn, name, reason, false).await;
+                return false;
+            }
         }
 
         let mut router = ToolRouter::new(
@@ -2163,14 +2892,9 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
             Routed::Denied(reason) => {
                 // Always pair the recorded tool call with a result — a dangling
                 // function_call poisons every later request on paired providers.
-                self.session.push(Message::tool_result(format!("denied: {reason}"), call_id));
-                self.emit(Event::ToolCallEnd {
-                    turn,
-                    tool: name,
-                    output: format!("denied: {reason}"),
-                    ok: false,
-                })
-                .await;
+                let output = format!("denied: {reason}");
+                self.session.push(Message::tool_result(output.clone(), call_id));
+                self.emit_tool_end(turn, name, output, false).await;
                 return false;
             }
             Routed::Run => {
@@ -2199,13 +2923,7 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
                         }) if rid == request_id => match decision {
                             ApprovalDecision::Reject => {
                                 self.session.push(Message::tool_result("rejected by user", call_id));
-                                self.emit(Event::ToolCallEnd {
-                                    turn,
-                                    tool: name,
-                                    output: "rejected by user".into(),
-                                    ok: false,
-                                })
-                                .await;
+                                self.emit_tool_end(turn, name, "rejected by user".into(), false).await;
                                 return false;
                             }
                             ApprovalDecision::ApproveForSession => {
@@ -2220,6 +2938,7 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
                         },
                         Some(Op::Interrupt) | Some(Op::Shutdown) | None => {
                             self.session.push(Message::tool_result("interrupted before approval", call_id));
+                            self.emit_tool_end(turn, name, "interrupted before approval".into(), false).await;
                             return true;
                         }
                         Some(_) => {} // ignore unrelated ops while awaiting approval
@@ -2229,15 +2948,9 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
         }
 
         // pre_tool hook — may block.
-        if self.fire_hooks("pre_tool", serde_json::json!({ "tool": name.clone(), "args": arguments.clone() })).await {
+        if self.fire_hooks("pre_tool", &name, serde_json::json!({ "turn": turn.0, "tool": name.clone(), "args": arguments.clone() })).await {
             self.session.push(Message::tool_result("blocked by pre_tool hook", call_id));
-            self.emit(Event::ToolCallEnd {
-                turn,
-                tool: name,
-                output: "blocked by pre_tool hook".into(),
-                ok: false,
-            })
-            .await;
+            self.emit_tool_end(turn, name, "blocked by pre_tool hook".into(), false).await;
             return false;
         }
 
@@ -2260,7 +2973,7 @@ a different tool, or ask_user if you're blocked).",
                     self.last_tool_reps + 1
                 );
                 self.session.push(Message::tool_result(msg.clone(), call_id));
-                self.emit(Event::ToolCallEnd { turn, tool: name, output: msg, ok: false }).await;
+                self.emit_tool_end(turn, name, msg, false).await;
                 return false;
             }
         }
@@ -2275,7 +2988,7 @@ a different tool, or ask_user if you're blocked).",
 Do NOT read it again. Proceed now: make the edits with the edit/write_file tools."
                     );
                     self.session.push(Message::tool_result(format!("[tool read_file]\n{msg}"), call_id));
-                    self.emit(Event::ToolCallEnd { turn, tool: name, output: msg, ok: true }).await;
+                    self.emit_tool_end(turn, name, msg, true).await;
                     return false;
                 }
             }
@@ -2417,7 +3130,8 @@ Do NOT read it again. Proceed now: make the edits with the edit/write_file tools
         // post_tool hook (informational).
         self.fire_hooks(
             "post_tool",
-            serde_json::json!({ "tool": name.clone(), "ok": ok, "output": output.clone() }),
+            &name,
+            serde_json::json!({ "turn": turn.0, "tool": name.clone(), "ok": ok, "output": output.clone() }),
         )
         .await;
         // Feed the result back into the conversation so the agentic loop can
@@ -2429,13 +3143,7 @@ Do NOT read it again. Proceed now: make the edits with the edit/write_file tools
             output.clone()
         };
         self.session.push(Message::tool_result(format!("[tool {name}]\n{stored}"), call_id));
-        self.emit(Event::ToolCallEnd {
-            turn,
-            tool: name,
-            output,
-            ok,
-        })
-        .await;
+        self.emit_tool_end(turn, name, output, ok).await;
         false
     }
 }
@@ -2561,6 +3269,10 @@ fn normalize_todo_status(status: &str) -> String {
 
 #[cfg(test)]
 mod map_test {
+    use oxide_config::{McpEnvVar, McpServerConfig};
+    use oxide_harness::SkillRoute;
+    use oxide_protocol::ToolSpec;
+
     #[test]
     fn todo_status_variants_normalize_for_ui() {
         assert_eq!(super::normalize_todo_status("done"), "completed");
@@ -2574,5 +3286,98 @@ mod map_test {
         let m = super::project_map(ws);
         assert!(m.contains("crates/") && m.contains("Cargo.toml"), "map:\n{m}");
         eprintln!("--- project map sample ---\n{}", &m[..m.len().min(400)]);
+    }
+
+    #[test]
+    fn codex_mcp_config_fields_are_preserved() {
+        let value = toml::from_str::<toml::Value>(
+            r#"
+command = "npx"
+args = ["-y", "pkg"]
+enabled = false
+cwd = "/tmp/project"
+env = { STATIC_TOKEN = "abc" }
+env_vars = ["LOCAL_TOKEN", { name = "REMOTE_TOKEN", source = "remote" }]
+bearer_token_env_var = "HTTP_TOKEN"
+http_headers = { "X-Team" = "oxide" }
+env_http_headers = { "X-Secret" = "SECRET_ENV" }
+startup_timeout_sec = 12
+tool_timeout_sec = 34
+enabled_tools = ["read"]
+disabled_tools = ["write"]
+required = true
+"#,
+        )
+        .unwrap();
+
+        let server = super::toml_mcp_server("context7", &value, "Codex project config");
+
+        assert_eq!(server.name, "context7");
+        assert_eq!(server.command, "npx");
+        assert_eq!(server.args, vec!["-y", "pkg"]);
+        assert!(!server.enabled);
+        assert_eq!(server.cwd, "/tmp/project");
+        assert_eq!(server.env.get("STATIC_TOKEN").map(String::as_str), Some("abc"));
+        assert!(matches!(server.env_vars.first(), Some(McpEnvVar::Name(name)) if name == "LOCAL_TOKEN"));
+        assert!(matches!(
+            server.env_vars.get(1),
+            Some(McpEnvVar::Named { name, source }) if name == "REMOTE_TOKEN" && source == "remote"
+        ));
+        assert_eq!(server.bearer_token_env_var, "HTTP_TOKEN");
+        assert_eq!(server.http_headers.get("X-Team").map(String::as_str), Some("oxide"));
+        assert_eq!(server.env_http_headers.get("X-Secret").map(String::as_str), Some("SECRET_ENV"));
+        assert_eq!(server.startup_timeout_sec, Some(12));
+        assert_eq!(server.tool_timeout_sec, Some(34));
+        assert_eq!(server.enabled_tools, vec!["read"]);
+        assert_eq!(server.disabled_tools, vec!["write"]);
+        assert!(server.required);
+    }
+
+    #[test]
+    fn mcp_tool_filter_uses_bare_tool_names() {
+        let server = McpServerConfig {
+            name: "fs".to_string(),
+            enabled_tools: vec!["read".to_string(), "write".to_string()],
+            disabled_tools: vec!["write".to_string()],
+            ..McpServerConfig::default()
+        };
+        let tools = vec![
+            ToolSpec::new("mcp__fs__read", "read"),
+            ToolSpec::new("mcp__fs__write", "write"),
+            ToolSpec::new("mcp__fs__list", "list"),
+        ];
+
+        let filtered = super::filter_mcp_tools(&server, tools);
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "mcp__fs__read");
+    }
+
+    #[test]
+    fn skill_router_selects_matching_workflow() {
+        let selected = super::selected_skill_routes(
+            vec![SkillRoute {
+                id: "frontend".to_string(),
+                triggers: vec!["ui".to_string()],
+                instructions: "Use browser verification.".to_string(),
+                template: vec!["Open browser".to_string()],
+            }],
+            "Perbaiki UI composer",
+        );
+        let block = super::skill_routes_block(&selected);
+
+        assert!(block.contains("frontend"));
+        assert!(block.contains("browser verification"));
+        assert!(block.contains("Open browser"));
+    }
+
+    #[test]
+    fn subagent_profile_limits_reviewer_tools() {
+        let profile = super::subagent_profile_for("review the diff for risks", "codex", "medium");
+
+        assert_eq!(profile.id, "reviewer");
+        assert!(profile.allowed_tools.contains(&"read_file".to_string()));
+        assert!(!profile.allowed_tools.contains(&"edit".to_string()));
+        assert_eq!(profile.effort, "high");
     }
 }

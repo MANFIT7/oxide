@@ -671,6 +671,18 @@ svg { width: 17px; height: 17px; flex-shrink: 0; }
 .insp-card-actions { display: flex; gap: 8px; margin-top: 10px; }
 .insp-card-actions button { padding: 5px 12px; font-size: 12px; }
 
+.replay-card { margin: 10px 0; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); overflow: hidden; }
+.replay-head { display: flex; align-items: center; gap: 10px; justify-content: space-between; padding: 10px 12px; border-bottom: 1px solid var(--border); }
+.replay-title { font-size: 13px; font-weight: 700; color: var(--text); }
+.replay-meta { font-size: 11.5px; color: var(--muted); padding: 0 12px 8px; }
+.replay-head .replay-meta { padding: 0; }
+.replay-list { max-height: 360px; overflow: auto; }
+.replay-row { padding: 8px 12px; border-top: 1px solid color-mix(in srgb, var(--border) 72%, transparent); }
+.replay-row:first-child { border-top: 0; }
+.replay-row-title { font-size: 12.5px; color: var(--text); font-weight: 600; word-break: break-word; }
+.replay-row-detail { margin-top: 3px; color: var(--muted); font-size: 11.5px; line-height: 1.35; white-space: pre-wrap; word-break: break-word; max-height: 86px; overflow: hidden; }
+.replay-event .replay-row-title { color: color-mix(in srgb, var(--syn-accent) 70%, var(--text)); }
+
 .tl-item { padding: 9px 6px; border-bottom: 1px solid var(--border); }
 .tl-title { font-size: 13px; }
 .tl-sub { font-size: 11.5px; color: var(--faint); margin-top: 2px; word-break: break-word; }
@@ -1251,6 +1263,7 @@ svg { width: 17px; height: 17px; flex-shrink: 0; }
 .mcp-remove { margin-left: auto; background: transparent; border: 1px solid var(--border); color: var(--muted); border-radius: 7px; padding: 4px 11px; font-size: 12px; cursor: pointer; font-family: inherit; }
 .mcp-remove:hover { color: var(--danger); border-color: rgba(239,93,93,.4); }
 .mcp-cmd { font-family: ui-monospace, Menlo, monospace; font-size: 11.5px; color: var(--muted); margin-top: 5px; }
+.mcp-src { font-size: 11px; color: var(--faint); margin-top: 5px; }
 .mcp-st { font-size: 11px; color: var(--faint); margin-top: 4px; }
 .mcp-add { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--border); }
 
@@ -1708,6 +1721,23 @@ details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
 .msg-act:hover { color: var(--text); border-color: var(--syn-accent); }
 
 /* agent task checklist (todo_write) */
+.workflow-stack { width: 100%; max-width: 760px; margin: 0 auto 8px; display: grid; gap: 8px; }
+.workflow-card, .subagents-card { width: 100%; max-width: 760px; margin: 0 auto 8px; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 10px 14px; }
+.workflow-head, .subagents-head { display: flex; align-items: center; gap: 8px; min-height: 22px; font-size: 12.5px; font-weight: 650; color: var(--text); }
+.workflow-ic svg { width: 14px; height: 14px; color: var(--muted); }
+.workflow-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.workflow-id { margin-left: auto; font-size: 11px; font-weight: 600; color: var(--muted); border: 1px solid var(--border); border-radius: 999px; padding: 1px 7px; }
+.workflow-steps { display: grid; gap: 4px; margin-top: 7px; }
+.workflow-step { display: grid; grid-template-columns: 18px minmax(0, 1fr); gap: 8px; align-items: start; color: var(--muted); font-size: 12.5px; line-height: 1.35; }
+.workflow-num, .subagent-status { width: 18px; height: 18px; display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; border: 1px solid var(--border); border-radius: 6px; font-size: 10px; color: var(--muted); }
+.subagents-card { display: grid; gap: 7px; }
+.subagent-row { display: grid; grid-template-columns: 20px minmax(0, 1fr); gap: 9px; align-items: start; padding: 5px 0; }
+.subagent-row.done .subagent-status { color: #40c977; border-color: rgba(64,201,119,.6); background: rgba(64,201,119,.10); }
+.subagent-row.fail .subagent-status { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 60%, var(--border)); }
+.subagent-status .syn-spinner { width: 11px; height: 11px; }
+.subagent-copy { min-width: 0; }
+.subagent-title { color: var(--text); font-size: 12.5px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.subagent-summary { margin-top: 2px; color: var(--muted); font-size: 12px; line-height: 1.35; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
 .todo-card { width: 100%; max-width: 760px; margin: 0 auto 8px; background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 10px 14px; }
 .todo-head { display: flex; align-items: center; gap: 7px; font-size: 12.5px; font-weight: 600; color: var(--text); margin-bottom: 6px; }
 .todo-head .todo-ic svg { width: 14px; height: 14px; color: var(--muted); }
@@ -1724,7 +1754,7 @@ details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
 .model-menu, .effort-menu, .plus-menu, .sel-menu, .access-menu, .palette, .modal,
 .theme-menu, .mention-menu, .thread-menu, .newtab-menu { animation: menu-in .12s ease-out; }
 /* non-.row cards get the same entrance as messages */
-.question-card, .approval-card, .edits-card, .todo-card, .queue-bar, .status-pill,
+.question-card, .approval-card, .edits-card, .todo-card, .workflow-card, .subagents-card, .queue-bar, .status-pill,
 .thinking-box, .attach-card, .elem-chip { animation: synara-msg-in .22s cubic-bezier(.22,1,.36,1); }
 /* smooth hover on dense controls */
 .menu-item, .plus-item, .insp-tab, .agent-tab, .node, .ed-save, .ed-close,
@@ -1737,7 +1767,7 @@ details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
 @media (prefers-reduced-motion: reduce) {
   .model-menu, .effort-menu, .plus-menu, .sel-menu, .access-menu, .palette, .modal,
   .theme-menu, .mention-menu, .thread-menu, .newtab-menu,
-  .question-card, .approval-card, .edits-card, .todo-card, .queue-bar, .status-pill,
+  .question-card, .approval-card, .edits-card, .todo-card, .workflow-card, .subagents-card, .queue-bar, .status-pill,
   .thinking-box, .attach-card, .elem-chip { animation: none; }
 }
 

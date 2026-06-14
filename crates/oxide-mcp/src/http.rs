@@ -7,24 +7,35 @@
 use crate::Transport;
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex;
 
 pub struct HttpTransport {
     client: reqwest::Client,
     url: String,
+    bearer_token_env_var: String,
+    headers: BTreeMap<String, String>,
+    env_headers: BTreeMap<String, String>,
     next_id: AtomicU64,
     session: Mutex<Option<String>>,
 }
 
 impl HttpTransport {
     pub fn new(url: impl Into<String>) -> Self {
+        Self::new_with(url, HttpOptions::default())
+    }
+
+    pub fn new_with(url: impl Into<String>, options: HttpOptions) -> Self {
         Self {
             client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
+                .timeout(options.request_timeout)
                 .build()
                 .unwrap_or_default(),
             url: url.into(),
+            bearer_token_env_var: options.bearer_token_env_var,
+            headers: options.headers,
+            env_headers: options.env_headers,
             next_id: AtomicU64::new(1),
             session: Mutex::new(None),
         }
@@ -36,6 +47,21 @@ impl HttpTransport {
             .post(&self.url)
             .header("Content-Type", "application/json")
             .header("Accept", "application/json, text/event-stream");
+        if !self.bearer_token_env_var.is_empty() {
+            if let Ok(token) = std::env::var(&self.bearer_token_env_var) {
+                if !token.is_empty() {
+                    req = req.bearer_auth(token);
+                }
+            }
+        }
+        for (key, value) in &self.headers {
+            req = req.header(key.as_str(), value.as_str());
+        }
+        for (key, env_name) in &self.env_headers {
+            if let Ok(value) = std::env::var(env_name) {
+                req = req.header(key.as_str(), value);
+            }
+        }
         if let Some(sid) = self.session.lock().await.clone() {
             req = req.header("Mcp-Session-Id", sid);
         }
@@ -76,6 +102,24 @@ impl HttpTransport {
             }
         }
         anyhow::bail!("mcp http: no response for id {want_id}");
+    }
+}
+
+pub struct HttpOptions {
+    pub bearer_token_env_var: String,
+    pub headers: BTreeMap<String, String>,
+    pub env_headers: BTreeMap<String, String>,
+    pub request_timeout: std::time::Duration,
+}
+
+impl Default for HttpOptions {
+    fn default() -> Self {
+        Self {
+            bearer_token_env_var: String::new(),
+            headers: BTreeMap::new(),
+            env_headers: BTreeMap::new(),
+            request_timeout: std::time::Duration::from_secs(30),
+        }
     }
 }
 

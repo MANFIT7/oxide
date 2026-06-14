@@ -253,6 +253,15 @@ fn apply_event(event: Event, state: &mut State) {
         Event::SessionPath { .. } => {}
         Event::Followups { .. } => {}
         Event::TurnStarted { turn } => state.status = format!("{turn} running…"),
+        Event::WorkflowSelected { title, steps, .. } => {
+            state.push(Line::from(Span::styled(
+                format!("workflow: {title}"),
+                Style::default().fg(Color::Blue),
+            )));
+            for (i, step) in steps.iter().enumerate() {
+                state.push(Line::from(format!("  {}. {step}", i + 1)));
+            }
+        }
         Event::ApprovalRequested {
             request_id,
             tool,
@@ -361,6 +370,18 @@ fn apply_event(event: Event, state: &mut State) {
         Event::HookFired { hook, command, blocked } => state.push(Line::from(Span::styled(
             format!("hook {hook}: {command}{}", if blocked { " (blocked)" } else { "" }),
             Style::default().fg(Color::DarkGray),
+        ))),
+        Event::AuditLog { kind, title, status, .. } => state.push(Line::from(Span::styled(
+            format!("audit {kind}: {status} · {title}"),
+            Style::default().fg(Color::DarkGray),
+        ))),
+        Event::SubagentStarted { profile, task, .. } => state.push(Line::from(Span::styled(
+            format!("subagent {profile}: {task}"),
+            Style::default().fg(Color::Blue),
+        ))),
+        Event::SubagentFinished { profile, summary, ok, .. } => state.push(Line::from(Span::styled(
+            format!("subagent {profile} {}: {summary}", if ok { "done" } else { "stopped" }),
+            Style::default().fg(if ok { Color::Green } else { Color::Red }),
         ))),
         Event::RateLimit { plan, primary_pct, secondary_pct, .. } => {
             state.push(Line::from(Span::styled(

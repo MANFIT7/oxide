@@ -6,6 +6,8 @@
 use crate::Transport;
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -15,6 +17,7 @@ use tokio::sync::Mutex;
 pub struct StdioTransport {
     next_id: AtomicU64,
     inner: Mutex<Io>,
+    request_timeout: std::time::Duration,
     // Keep the child alive for the transport's lifetime; killed on drop.
     _child: Child,
 }
@@ -27,13 +30,29 @@ struct Io {
 impl StdioTransport {
     /// Spawn `command args...` with piped stdio.
     pub fn spawn(command: &str, args: &[String]) -> anyhow::Result<Self> {
-        let mut child = tokio::process::Command::new(command)
-            .args(args)
+        Self::spawn_with(command, args, StdioSpawnOptions::default())
+    }
+
+    /// Spawn `command args...` with optional cwd/env inherited from an existing MCP config.
+    pub fn spawn_with(command: &str, args: &[String], options: StdioSpawnOptions) -> anyhow::Result<Self> {
+        let mut cmd = tokio::process::Command::new(command);
+        cmd.args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()?;
+            .kill_on_drop(true);
+        if let Some(cwd) = options.cwd {
+            cmd.current_dir(cwd);
+        }
+        for (key, value) in options.env {
+            cmd.env(key, value);
+        }
+        for key in options.env_vars {
+            if let Ok(value) = std::env::var(&key) {
+                cmd.env(key, value);
+            }
+        }
+        let mut child = cmd.spawn()?;
         let stdin = child
             .stdin
             .take()
@@ -48,6 +67,7 @@ impl StdioTransport {
                 stdin,
                 stdout: BufReader::new(stdout),
             }),
+            request_timeout: options.request_timeout,
             _child: child,
         })
     }
@@ -92,7 +112,7 @@ impl Transport for StdioTransport {
                 }
             }
         };
-        match tokio::time::timeout(std::time::Duration::from_secs(60), read).await {
+        match tokio::time::timeout(self.request_timeout, read).await {
             Ok(r) => r,
             Err(_) => anyhow::bail!("mcp request timed out"),
         }
@@ -102,5 +122,23 @@ impl Transport for StdioTransport {
         let msg = json!({ "jsonrpc": "2.0", "method": method, "params": params });
         let mut io = self.inner.lock().await;
         StdioTransport::send(&mut io, &msg).await
+    }
+}
+
+pub struct StdioSpawnOptions {
+    pub cwd: Option<PathBuf>,
+    pub env: BTreeMap<String, String>,
+    pub env_vars: Vec<String>,
+    pub request_timeout: std::time::Duration,
+}
+
+impl Default for StdioSpawnOptions {
+    fn default() -> Self {
+        Self {
+            cwd: None,
+            env: BTreeMap::new(),
+            env_vars: Vec::new(),
+            request_timeout: std::time::Duration::from_secs(60),
+        }
     }
 }

@@ -646,6 +646,38 @@ struct TimelineItem {
     sub: String,
 }
 
+#[derive(Clone, PartialEq)]
+struct WorkflowCard {
+    id: String,
+    title: String,
+    steps: Vec<String>,
+}
+
+#[derive(Clone, PartialEq)]
+struct SubagentCard {
+    worker_id: String,
+    profile: String,
+    task: String,
+    summary: String,
+    running: bool,
+    ok: bool,
+}
+
+#[derive(Clone, PartialEq)]
+struct ReplayRow {
+    role: String,
+    title: String,
+    detail: String,
+}
+
+#[derive(Clone, PartialEq)]
+struct SessionReplay {
+    path: PathBuf,
+    title: String,
+    rows: Vec<ReplayRow>,
+    total: usize,
+}
+
 /// Shared file/editor state, provided via context so tree nodes can reach it.
 #[derive(Clone, Copy, PartialEq)]
 struct Ui {
@@ -1375,7 +1407,7 @@ fn slash_commands(ws: &Path, query: &str) -> Vec<(String, String)> {
 
 /// Combined `@` menu: skills first, then files/folders.
 /// MCP servers (own + auto-imported) matching `query`, as `mcp:<server>` tokens.
-fn mcp_candidates(query: &str) -> Vec<String> {
+fn mcp_candidates(ws: &Path, query: &str) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     if let Ok(cfg) = Config::load() {
         for s in cfg.mcp_servers {
@@ -1384,7 +1416,7 @@ fn mcp_candidates(query: &str) -> Vec<String> {
             }
         }
     }
-    for s in oxide_core::discover_external_mcp() {
+    for s in oxide_core::discover_external_mcp_for_workspace(ws) {
         if s.enabled {
             names.push(s.name);
         }
@@ -1408,7 +1440,7 @@ fn all_mention_items(ws: &Path, query: &str) -> Vec<String> {
         .filter(|t| q.is_empty() || t.contains(&q))
         .map(|t| t.to_string())
         .collect();
-    v.extend(mcp_candidates(query));
+    v.extend(mcp_candidates(ws, query));
     v.extend(skill_candidates(ws, query));
     v.extend(mention_candidates(ws, query));
     v
@@ -1862,7 +1894,7 @@ fn load_session(path: &Path) -> Vec<ChatMsg> {
     let mut out: Vec<ChatMsg> = rows
         .into_iter()
         .filter_map(|(role, content)| {
-            if role == "meta" || role == "tool" || role == "system" {
+            if !matches!(role.as_str(), "user" | "assistant" | "summary") {
                 return None;
             }
             let author = match role.as_str() {
@@ -1878,6 +1910,64 @@ fn load_session(path: &Path) -> Vec<ChatMsg> {
         out.insert(0, ChatMsg { author: Author::Note, text: format!("… {hidden} earlier messages hidden (long session) — the agent still resumes the full context") });
     }
     out
+}
+
+fn replay_role_label(role: &str) -> &'static str {
+    match role {
+        "user" => "User",
+        "assistant" => "Assistant",
+        "summary" => "Summary",
+        "event" => "Audit",
+        "meta" => "Meta",
+        "tool" => "Tool",
+        "system" => "System",
+        _ => "Row",
+    }
+}
+
+fn parse_replay_row(role: String, content: String) -> ReplayRow {
+    if role == "event" {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
+            let kind = v["kind"].as_str().unwrap_or("event");
+            let title = v["title"].as_str().unwrap_or(kind);
+            let status = v["status"].as_str().unwrap_or("");
+            let detail = v["detail"].as_str().unwrap_or("");
+            let title = if status.is_empty() {
+                format!("{} · {}", replay_role_label(&role), title)
+            } else {
+                format!("{} · {} · {}", replay_role_label(&role), status, title)
+            };
+            return ReplayRow {
+                role,
+                title,
+                detail: detail.chars().take(600).collect(),
+            };
+        }
+    }
+    let mut lines = content.lines();
+    let first = lines.find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+    ReplayRow {
+        role: role.clone(),
+        title: format!("{} · {}", replay_role_label(&role), first.chars().take(80).collect::<String>()),
+        detail: content.chars().take(600).collect(),
+    }
+}
+
+fn load_session_replay(path: &Path, title: String) -> SessionReplay {
+    let rows = oxide_core::db::load(&sid(path));
+    let total = rows.len();
+    let start = total.saturating_sub(80);
+    let replay_rows = rows
+        .into_iter()
+        .skip(start)
+        .map(|(role, content)| parse_replay_row(role, content))
+        .collect();
+    SessionReplay {
+        path: path.to_path_buf(),
+        title,
+        rows: replay_rows,
+        total,
+    }
 }
 
 /// Run a git subcommand in the workspace, returning stdout (stderr appended).
@@ -2184,6 +2274,9 @@ fn app() -> Element {
     // Inspector (right panel) state — ported from the desktop command center.
     let mut inspector_tab = use_signal(|| "files".to_string());
     let mut timeline = use_signal(Vec::<TimelineItem>::new);
+    let mut workflow_cards = use_signal(Vec::<WorkflowCard>::new);
+    let mut subagent_cards = use_signal(Vec::<SubagentCard>::new);
+    let mut session_replay = use_signal(|| None::<SessionReplay>);
     let mut approvals = use_signal(Vec::<(u64, String, String)>::new);
     let mut checkpoints = use_signal(Vec::<(u64, String)>::new);
     let mut usage = use_signal(|| (0u64, 0u64));
@@ -2503,13 +2596,12 @@ fn app() -> Element {
         markers.set(thread_json_load(&ws, "markers", &stem));
         // Recap = last compaction summary recorded in the session file.
         let recap = sess
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .map(|t| {
-                t.lines()
-                    .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-                    .filter(|v| v["role"].as_str() == Some("summary"))
+            .map(|p| {
+                oxide_core::db::load(&sid(&p))
+                    .into_iter()
+                    .filter(|(role, _)| role == "summary")
                     .last()
-                    .and_then(|v| v["content"].as_str().map(str::to_string))
+                    .map(|(_, content)| content)
                     .unwrap_or_default()
             })
             .unwrap_or_default();
@@ -3286,10 +3378,71 @@ fn app() -> Element {
                                 turn_edits.write().clear();
                                 bg_jobs.write().clear();
                                 todos.write().clear();
+                                workflow_cards.write().clear();
+                                subagent_cards.write().clear();
                                 edits_expanded.set(false);
                                 edits_undone.set(false);
                                 think_open.set(None);
                                 timeline.write().push(TimelineItem { title: format!("Turn {turn} started"), sub: String::new() });
+                            }
+                            Event::WorkflowSelected { id, title, steps, .. } => {
+                                workflow_cards.write().push(WorkflowCard {
+                                    id,
+                                    title: title.clone(),
+                                    steps: steps.clone(),
+                                });
+                                timeline.write().push(TimelineItem {
+                                    title: format!("Workflow · {title}"),
+                                    sub: steps.join(" · "),
+                                });
+                            }
+                            Event::AuditLog { kind, title, detail, status, .. } => {
+                                let sub = if detail.trim().is_empty() {
+                                    status.clone()
+                                } else {
+                                    format!("{status} · {detail}")
+                                };
+                                timeline.write().push(TimelineItem {
+                                    title: format!("Audit · {kind} · {title}"),
+                                    sub,
+                                });
+                            }
+                            Event::SubagentStarted { worker_id, profile, task, .. } => {
+                                subagent_cards.write().push(SubagentCard {
+                                    worker_id,
+                                    profile: profile.clone(),
+                                    task: task.clone(),
+                                    summary: String::new(),
+                                    running: true,
+                                    ok: true,
+                                });
+                                timeline.write().push(TimelineItem {
+                                    title: format!("Subagent · {profile}"),
+                                    sub: task,
+                                });
+                            }
+                            Event::SubagentFinished { worker_id, profile, task, summary, ok, .. } => {
+                                {
+                                    let mut cards = subagent_cards.write();
+                                    if let Some(card) = cards.iter_mut().find(|c| c.worker_id == worker_id) {
+                                        card.summary = summary.clone();
+                                        card.running = false;
+                                        card.ok = ok;
+                                    } else {
+                                        cards.push(SubagentCard {
+                                            worker_id,
+                                            profile: profile.clone(),
+                                            task: task.clone(),
+                                            summary: summary.clone(),
+                                            running: false,
+                                            ok,
+                                        });
+                                    }
+                                }
+                                timeline.write().push(TimelineItem {
+                                    title: format!("Subagent {} · {profile}", if ok { "done" } else { "stopped" }),
+                                    sub: if summary.trim().is_empty() { task } else { summary },
+                                });
                             }
                             Event::ApprovalRequested { request_id, tool, summary } => {
                                 approvals.write().push((request_id, tool.clone(), summary.clone()));
@@ -4919,6 +5072,8 @@ fn app() -> Element {
                                                         let path = session.path.clone();
                                                         let open_path = path.clone();
                                                         let open_title = title.clone();
+                                                        let replay_path = path.clone();
+                                                        let replay_title = title.clone();
                                                         rsx! {
                                                             div { class: "insp-card",
                                                                 div { class: "insp-card-title",
@@ -4941,6 +5096,53 @@ fn app() -> Element {
                                                                             open_title.clone(),
                                                                         );
                                                                     }, "Open" }
+                                                                    button { class: "ed-close", onclick: move |_| {
+                                                                        session_replay.set(Some(load_session_replay(&replay_path, replay_title.clone())));
+                                                                    }, "Replay" }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                if let Some(replay) = session_replay.read().clone() {
+                                                    {
+                                                        let open_path = replay.path.clone();
+                                                        let open_title = replay.title.clone();
+                                                        let hidden = replay.total.saturating_sub(replay.rows.len());
+                                                        rsx! {
+                                                            div { class: "replay-card",
+                                                                div { class: "replay-head",
+                                                                    div {
+                                                                        div { class: "replay-title", "{replay.title}" }
+                                                                        div { class: "replay-meta", "{replay.total} stored row(s)" }
+                                                                    }
+                                                                    button { class: "ed-save", onclick: move |_| {
+                                                                        open_session_tab(
+                                                                            tabs,
+                                                                            active_tab,
+                                                                            messages,
+                                                                            next_tab_id,
+                                                                            cfg,
+                                                                            ui,
+                                                                            engine,
+                                                                            busy_tabs,
+                                                                            open_path.clone(),
+                                                                            open_title.clone(),
+                                                                        );
+                                                                    }, "Continue" }
+                                                                }
+                                                                if hidden > 0 {
+                                                                    div { class: "replay-meta", "{hidden} earlier row(s) hidden" }
+                                                                }
+                                                                div { class: "replay-list",
+                                                                    for row in replay.rows {
+                                                                        div { class: "replay-row replay-{row.role}",
+                                                                            div { class: "replay-row-title", "{row.title}" }
+                                                                            if !row.detail.trim().is_empty() {
+                                                                                div { class: "replay-row-detail", "{row.detail}" }
+                                                                            }
+                                                                        }
+                                                                    }
                                                                 }
                                                             }
                                                         }
@@ -5761,6 +5963,69 @@ fn app() -> Element {
                                 }
                             }
                         }
+                        if !workflow_cards.read().is_empty() {
+                            {
+                                let cards = workflow_cards.read().clone();
+                                rsx! {
+                                    div { class: "workflow-stack",
+                                        for card in cards {
+                                            div { class: "workflow-card",
+                                                div { class: "workflow-head",
+                                                    span { class: "workflow-ic", Icon { name: "list" } }
+                                                    span { class: "workflow-title", "{card.title}" }
+                                                    span { class: "workflow-id", "{card.id}" }
+                                                }
+                                                if !card.steps.is_empty() {
+                                                    div { class: "workflow-steps",
+                                                        for (i, step) in card.steps.iter().enumerate() {
+                                                            div { class: "workflow-step",
+                                                                span { class: "workflow-num", "{i + 1}" }
+                                                                span { "{step}" }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if !subagent_cards.read().is_empty() {
+                            {
+                                let cards = subagent_cards.read().clone();
+                                let done = cards.iter().filter(|c| !c.running).count();
+                                let total = cards.len();
+                                rsx! {
+                                    div { class: "subagents-card",
+                                        div { class: "subagents-head",
+                                            span { class: "workflow-ic", Icon { name: "spark" } }
+                                            span { "Subagents {done}/{total}" }
+                                        }
+                                        for card in cards {
+                                            {
+                                                let row_cls = if card.running { "subagent-row running" } else if card.ok { "subagent-row done" } else { "subagent-row fail" };
+                                                rsx! {
+                                                    div { class: "{row_cls}",
+                                                        span { class: "subagent-status",
+                                                            if card.running { span { class: "syn-spinner" } }
+                                                            else if card.ok { "✓" }
+                                                            else { "!" }
+                                                        }
+                                                        div { class: "subagent-copy",
+                                                            div { class: "subagent-title", "{card.profile} · {card.task}" }
+                                                            if !card.summary.trim().is_empty() {
+                                                                div { class: "subagent-summary", "{card.summary}" }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         if !todos.read().is_empty() {
                             {
                                 let items = todos.read().clone();
@@ -6126,7 +6391,8 @@ fn McpModal(cfg: Signal<Config>, engine: Coroutine<EngineCmd>, status: Signal<st
     let mut command = use_signal(String::new);
     let mut args = use_signal(String::new);
     let servers = cfg.read().mcp_servers.clone();
-    let imported: Vec<oxide_config::McpServerConfig> = oxide_core::discover_external_mcp()
+    let workspace = workspace_of(&cfg.read());
+    let imported: Vec<oxide_config::McpServerConfig> = oxide_core::discover_external_mcp_for_workspace(&workspace)
         .into_iter()
         .filter(|e| !servers.iter().any(|s| s.name == e.name))
         .collect();
@@ -6146,13 +6412,14 @@ fn McpModal(cfg: Signal<Config>, engine: Coroutine<EngineCmd>, status: Signal<st
                             let i = i;
                             let st = status.read().get(&s.name).cloned();
                             let connected = st.as_deref().map(|x| x.starts_with("connected")).unwrap_or(false);
-                            let cmdline = format!("{} {}", s.command, s.args.join(" "));
+                            let cmdline = if s.url.is_empty() { format!("{} {}", s.command, s.args.join(" ")) } else { s.url.clone() };
                             let servers2 = servers.clone();
                             rsx! {
                                 div { class: "mcp-item",
                                     div { class: "mcp-top",
                                         span { class: if connected { "mcp-dot on" } else { "mcp-dot" } }
                                         span { class: "skill-name", "{s.name}" }
+                                        span { class: "mcp-tag", if s.url.is_empty() { "local" } else { "http" } }
                                         button { class: "mcp-remove", onclick: move |_| {
                                             let mut list = servers2.clone(); list.remove(i);
                                             let mut c = cfg.read().clone(); c.mcp_servers = list; cfg.set(c.clone());
@@ -6173,6 +6440,7 @@ fn McpModal(cfg: Signal<Config>, engine: Coroutine<EngineCmd>, status: Signal<st
                                 let connected = st.as_deref().map(|x| x.starts_with("connected")).unwrap_or(false);
                                 let line = if s.url.is_empty() { format!("{} {}", s.command, s.args.join(" ")) } else { s.url.clone() };
                                 let disabled = !s.enabled;
+                                let source = if s.source.is_empty() { "imported".to_string() } else { s.source.clone() };
                                 rsx! {
                                     div { class: "mcp-item",
                                         div { class: "mcp-top",
@@ -6180,6 +6448,7 @@ fn McpModal(cfg: Signal<Config>, engine: Coroutine<EngineCmd>, status: Signal<st
                                             span { class: "skill-name", "{s.name}" }
                                             span { class: "mcp-tag", if disabled { "disabled" } else if s.url.is_empty() { "imported" } else { "http" } }
                                         }
+                                        div { class: "mcp-src", "{source}" }
                                         div { class: "mcp-cmd", "{line}" }
                                         if let Some(st) = st { div { class: "mcp-st", "{st}" } }
                                     }
@@ -6198,7 +6467,12 @@ fn McpModal(cfg: Signal<Config>, engine: Coroutine<EngineCmd>, status: Signal<st
                             if n.is_empty() || cmd.is_empty() { return; }
                             let a: Vec<String> = args.read().split_whitespace().map(String::from).collect();
                             let mut list = cfg.read().mcp_servers.clone();
-                            list.push(oxide_config::McpServerConfig { name: n, command: cmd, args: a, url: String::new(), enabled: true });
+                            list.push(oxide_config::McpServerConfig {
+                                name: n,
+                                command: cmd,
+                                args: a,
+                                ..oxide_config::McpServerConfig::default()
+                            });
                             let mut c = cfg.read().clone(); c.mcp_servers = list; cfg.set(c.clone());
                             let _ = engine.send(EngineCmd::Reconfigure(c));
                             name.set(String::new()); command.set(String::new()); args.set(String::new());
@@ -8725,6 +8999,10 @@ fn ChatPane(
                             messages.write().push(ChatMsg { author: Author::Note, text: format!("❓ {question}") });
                             pane_question.set(Some((question, options)));
                         }
+                        Some(Event::WorkflowSelected { .. })
+                        | Some(Event::AuditLog { .. })
+                        | Some(Event::SubagentStarted { .. })
+                        | Some(Event::SubagentFinished { .. }) => {}
                         Some(Event::Shutdown) | None => break,
                         _ => {}
                     }

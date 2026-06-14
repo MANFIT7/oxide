@@ -7,6 +7,7 @@
 use anyhow::{Context, Result};
 use oxide_protocol::{ApprovalPolicy, SandboxPolicy};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -145,6 +146,7 @@ fn default_backend() -> String {
 
 /// One MCP server launcher (stdio command, or a remote HTTP/SSE `url`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct McpServerConfig {
     /// Short name used to namespace its tools (`mcp__<name>__<tool>`).
     pub name: String,
@@ -160,6 +162,98 @@ pub struct McpServerConfig {
     /// Whether this server is active.
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Source that was imported from (for UI/debug only).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub source: String,
+    /// Working directory for stdio MCP launchers.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub cwd: String,
+    /// Static environment values for stdio MCP launchers.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+    /// Environment variable names to forward from Oxide's process.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub env_vars: Vec<McpEnvVar>,
+    /// Bearer token environment variable for HTTP MCP servers.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub bearer_token_env_var: String,
+    /// Static HTTP headers for remote MCP servers.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub http_headers: BTreeMap<String, String>,
+    /// HTTP headers whose values are read from environment variables.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub env_http_headers: BTreeMap<String, String>,
+    /// Optional server startup/connect timeout, in seconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub startup_timeout_sec: Option<u64>,
+    /// Optional per-request/tool timeout, in seconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_timeout_sec: Option<u64>,
+    /// Optional allow list of bare MCP tool names exposed to the model.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub enabled_tools: Vec<String>,
+    /// Optional deny list of bare MCP tool names hidden from the model.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub disabled_tools: Vec<String>,
+    /// Whether this MCP server is required for the session.
+    #[serde(skip_serializing_if = "is_false")]
+    pub required: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum McpEnvVar {
+    Name(String),
+    Named {
+        name: String,
+        #[serde(default)]
+        source: String,
+    },
+}
+
+impl McpEnvVar {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Name(name) => name,
+            Self::Named { name, .. } => name,
+        }
+    }
+}
+
+impl Default for McpServerConfig {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            command: String::new(),
+            args: Vec::new(),
+            url: String::new(),
+            enabled: true,
+            source: String::new(),
+            cwd: String::new(),
+            env: BTreeMap::new(),
+            env_vars: Vec::new(),
+            bearer_token_env_var: String::new(),
+            http_headers: BTreeMap::new(),
+            env_http_headers: BTreeMap::new(),
+            startup_timeout_sec: None,
+            tool_timeout_sec: None,
+            enabled_tools: Vec::new(),
+            disabled_tools: Vec::new(),
+            required: false,
+        }
+    }
+}
+
+impl McpServerConfig {
+    pub fn tool_allowed(&self, bare_name: &str) -> bool {
+        let explicitly_enabled =
+            self.enabled_tools.is_empty() || self.enabled_tools.iter().any(|name| name == bare_name);
+        explicitly_enabled && !self.disabled_tools.iter().any(|name| name == bare_name)
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl Default for Config {

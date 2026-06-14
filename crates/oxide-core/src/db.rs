@@ -179,7 +179,7 @@ pub fn message_count(id: &str) -> usize {
     let c = conn().lock().unwrap();
     c.query_row(
         "SELECT COUNT(*) FROM messages
-         WHERE session_id=?1 AND role NOT IN ('meta', 'tool', 'system')",
+         WHERE session_id=?1 AND role NOT IN ('meta', 'tool', 'system', 'event', 'summary')",
         [id],
         |r| r.get::<_, i64>(0),
     )

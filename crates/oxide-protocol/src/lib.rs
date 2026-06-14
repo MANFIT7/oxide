@@ -61,6 +61,13 @@ pub enum Event {
     Followups { items: Vec<String> },
     /// A new turn began.
     TurnStarted { turn: TurnId },
+    /// A workflow route/template was auto-selected for this turn.
+    WorkflowSelected {
+        turn: TurnId,
+        id: String,
+        title: String,
+        steps: Vec<String>,
+    },
     /// A chunk of the assistant's streamed message.
     AgentMessageDelta { turn: TurnId, text: String },
     /// Model reasoning/thinking delta (optional to render).
@@ -102,6 +109,30 @@ pub enum Event {
         hook: String,
         command: String,
         blocked: bool,
+    },
+    /// Durable audit row for tools, hooks, workflows, and verification.
+    AuditLog {
+        turn: Option<TurnId>,
+        kind: String,
+        title: String,
+        detail: String,
+        status: String,
+    },
+    /// A sub-agent worker started.
+    SubagentStarted {
+        turn: TurnId,
+        worker_id: String,
+        profile: String,
+        task: String,
+    },
+    /// A sub-agent worker finished.
+    SubagentFinished {
+        turn: TurnId,
+        worker_id: String,
+        profile: String,
+        task: String,
+        summary: String,
+        ok: bool,
     },
     /// The agent is asking the user a question, optionally with choices.
     QuestionAsked {

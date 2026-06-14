@@ -29,6 +29,15 @@ pub struct LoopPolicy {
     pub model: Option<String>,
 }
 
+/// Lightweight workflow hint a harness can auto-select from user intent.
+#[derive(Debug, Clone)]
+pub struct SkillRoute {
+    pub id: String,
+    pub triggers: Vec<String>,
+    pub instructions: String,
+    pub template: Vec<String>,
+}
+
 impl Default for LoopPolicy {
     fn default() -> Self {
         Self {
@@ -56,6 +65,10 @@ pub trait Harness: Send + Sync {
     fn loop_policy(&self) -> LoopPolicy {
         LoopPolicy::default()
     }
+    /// Harness-owned workflow routes auto-selected from the user request.
+    fn skill_routes(&self) -> Vec<SkillRoute> {
+        Vec::new()
+    }
 }
 
 /// A harness defined entirely by data (TOML manifest) — the extensibility path.
@@ -74,6 +87,8 @@ pub struct ManifestHarness {
     pub system_prompt_file: Option<String>,
     #[serde(default)]
     pub tools: Vec<ManifestTool>,
+    #[serde(default)]
+    pub skill_routes: Vec<ManifestSkillRoute>,
     #[serde(default)]
     pub max_steps: Option<u32>,
     #[serde(default)]
@@ -94,6 +109,17 @@ pub struct ManifestTool {
     pub mutating: bool,
     #[serde(default)]
     pub parameters: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ManifestSkillRoute {
+    pub id: String,
+    #[serde(default)]
+    pub triggers: Vec<String>,
+    #[serde(default)]
+    pub instructions: String,
+    #[serde(default)]
+    pub template: Vec<String>,
 }
 
 impl ManifestHarness {
@@ -153,6 +179,18 @@ impl Harness for ManifestHarness {
             model: self.model.clone(),
         }
     }
+    fn skill_routes(&self) -> Vec<SkillRoute> {
+        self.skill_routes
+            .iter()
+            .map(|route| SkillRoute {
+                id: route.id.clone(),
+                triggers: route.triggers.clone(),
+                instructions: route.instructions.clone(),
+                template: route.template.clone(),
+            })
+            .filter(|route| !route.id.trim().is_empty() && !route.instructions.trim().is_empty())
+            .collect()
+    }
 }
 
 /// Holds every available harness and resolves the active one.
@@ -211,7 +249,7 @@ impl Registry {
 }
 
 mod builtin {
-    use super::{Harness, LoopPolicy};
+    use super::{Harness, LoopPolicy, SkillRoute};
     use oxide_protocol::ToolSpec;
 
     fn core_tools() -> Vec<ToolSpec> {
@@ -265,6 +303,80 @@ mod builtin {
         ]
     }
 
+    fn default_skill_routes() -> Vec<SkillRoute> {
+        vec![
+            SkillRoute {
+                id: "frontend".to_string(),
+                triggers: vec!["frontend", "ui", "ux", "css", "animation", "animasi", "responsive", "component"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+                instructions: "Use the frontend workflow: inspect existing UI conventions, make the real interface work, verify rendered behavior with browser tools when practical, and avoid cosmetic-only changes.".to_string(),
+                template: vec![
+                    "Inspect existing UI conventions and affected components.",
+                    "Implement the real interaction/state changes.",
+                    "Verify the rendered UI or relevant build/test path.",
+                    "Report changed files and residual risk.",
+                ].into_iter().map(String::from).collect(),
+            },
+            SkillRoute {
+                id: "review".to_string(),
+                triggers: vec!["review", "audit", "risiko", "bug", "regression"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+                instructions: "Use review workflow: prioritize concrete bugs, regressions, missing tests, and risky behavior. Lead with findings and file references before summaries.".to_string(),
+                template: vec![
+                    "Read the diff and relevant call-sites.",
+                    "Check correctness, regressions, security, and test gaps.",
+                    "Return findings first with file references.",
+                ].into_iter().map(String::from).collect(),
+            },
+            SkillRoute {
+                id: "release".to_string(),
+                triggers: vec!["release", "tag", "dmg", "github release", "publish", "push"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+                instructions: "Use release workflow: keep staging scoped, verify build artifacts, check GitHub Actions/release status, and do not assume a release succeeded without evidence.".to_string(),
+                template: vec![
+                    "Confirm staged scope and current branch.",
+                    "Run the relevant validation/build.",
+                    "Commit, tag, and push only the intended changes.",
+                    "Watch GitHub Actions and verify release assets.",
+                ].into_iter().map(String::from).collect(),
+            },
+            SkillRoute {
+                id: "github-action".to_string(),
+                triggers: vec!["github action", "workflow", "ci", "failing check", "actions"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+                instructions: "Use CI workflow: inspect workflow definitions and current logs when available, reproduce the failing command locally when possible, then patch the smallest root cause.".to_string(),
+                template: vec![
+                    "Inspect the workflow and latest failing logs.",
+                    "Reproduce the failing command locally when possible.",
+                    "Patch the smallest root cause.",
+                    "Re-run the targeted validation.",
+                ].into_iter().map(String::from).collect(),
+            },
+            SkillRoute {
+                id: "browser-test".to_string(),
+                triggers: vec!["browser", "screenshot", "playwright", "localhost", "web test"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+                instructions: "Use browser-test workflow: open the target, verify visual state and interactions, collect screenshots or readable page state, and report what was actually observed.".to_string(),
+                template: vec![
+                    "Open the target URL or local app.",
+                    "Exercise the requested interaction.",
+                    "Capture readable state or screenshot evidence.",
+                    "Report observed behavior and fixes.",
+                ].into_iter().map(String::from).collect(),
+            },
+        ]
+    }
+
     /// General-purpose coding agent.
     pub struct DefaultHarness;
     impl Harness for DefaultHarness {
@@ -314,6 +426,9 @@ mod builtin {
         fn tools(&self) -> Vec<ToolSpec> {
             core_tools()
         }
+        fn skill_routes(&self) -> Vec<SkillRoute> {
+            default_skill_routes()
+        }
     }
 
     /// Planning-forward harness — example of a swappable behavior pack.
@@ -333,6 +448,9 @@ mod builtin {
         }
         fn tools(&self) -> Vec<ToolSpec> {
             core_tools()
+        }
+        fn skill_routes(&self) -> Vec<SkillRoute> {
+            default_skill_routes()
         }
         fn loop_policy(&self) -> LoopPolicy {
             LoopPolicy {

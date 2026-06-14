@@ -136,6 +136,12 @@ async fn run_exec(config: Config, prompt: String, yes: bool) -> Result<()> {
             Event::SessionPath { .. } => {}
             Event::Followups { .. } => {}
             Event::TurnStarted { turn } => println!("[{turn}] started"),
+            Event::WorkflowSelected { title, steps, .. } => {
+                println!("[workflow] {title}");
+                for (i, step) in steps.iter().enumerate() {
+                    println!("  {}. {step}", i + 1);
+                }
+            }
             Event::AgentMessageDelta { text, .. } => print!("{text}"),
             Event::ReasoningDelta { .. } => {}
             Event::ApprovalRequested {
@@ -181,6 +187,15 @@ async fn run_exec(config: Config, prompt: String, yes: bool) -> Result<()> {
             Event::FileDiff { path, .. } => println!("[diff] {path}"),
             Event::HookFired { hook, command, blocked } => {
                 println!("[hook] {hook}: {command}{}", if blocked { " (blocked)" } else { "" })
+            }
+            Event::AuditLog { kind, title, status, .. } => {
+                println!("[audit:{kind}] {status}: {title}")
+            }
+            Event::SubagentStarted { profile, task, .. } => {
+                println!("[subagent] {profile} started: {task}")
+            }
+            Event::SubagentFinished { profile, summary, ok, .. } => {
+                println!("[subagent] {profile} ok={ok}: {summary}")
             }
             Event::RateLimit { plan, primary_pct, secondary_pct, .. } => {
                 println!("[usage] {plan}: 5h {primary_pct}% · weekly {secondary_pct}%")

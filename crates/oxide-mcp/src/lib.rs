@@ -16,8 +16,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 mod http;
 mod stdio;
-pub use http::HttpTransport;
-pub use stdio::StdioTransport;
+pub use http::{HttpOptions, HttpTransport};
+pub use stdio::{StdioSpawnOptions, StdioTransport};
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
@@ -38,6 +38,7 @@ pub struct McpClient {
     server: String,
     transport: Box<dyn Transport>,
     next_id: AtomicU64,
+    instructions: String,
 }
 
 impl McpClient {
@@ -46,12 +47,13 @@ impl McpClient {
         server: impl Into<String>,
         transport: Box<dyn Transport>,
     ) -> anyhow::Result<Self> {
-        let client = Self {
+        let mut client = Self {
             server: server.into(),
             transport,
             next_id: AtomicU64::new(1),
+            instructions: String::new(),
         };
-        client.initialize().await?;
+        client.instructions = client.initialize().await?;
         Ok(client)
     }
 
@@ -65,6 +67,17 @@ impl McpClient {
         Self::connect(server, Box::new(transport)).await
     }
 
+    /// Spawn `command args...` with environment/cwd options and connect.
+    pub async fn connect_stdio_with(
+        server: impl Into<String>,
+        command: &str,
+        args: &[String],
+        options: StdioSpawnOptions,
+    ) -> anyhow::Result<Self> {
+        let transport = StdioTransport::spawn_with(command, args, options)?;
+        Self::connect(server, Box::new(transport)).await
+    }
+
     /// Connect to a remote MCP server over Streamable HTTP/SSE.
     pub async fn connect_http(
         server: impl Into<String>,
@@ -73,12 +86,25 @@ impl McpClient {
         Self::connect(server, Box::new(HttpTransport::new(url))).await
     }
 
+    /// Connect to a remote MCP server over Streamable HTTP/SSE with auth/header options.
+    pub async fn connect_http_with(
+        server: impl Into<String>,
+        url: &str,
+        options: HttpOptions,
+    ) -> anyhow::Result<Self> {
+        Self::connect(server, Box::new(HttpTransport::new_with(url, options))).await
+    }
+
     pub fn server(&self) -> &str {
         &self.server
     }
 
-    async fn initialize(&self) -> anyhow::Result<()> {
-        self.transport
+    pub fn instructions(&self) -> &str {
+        &self.instructions
+    }
+
+    async fn initialize(&self) -> anyhow::Result<String> {
+        let result = self.transport
             .call(
                 "initialize",
                 json!({
@@ -94,7 +120,12 @@ impl McpClient {
             .notify("notifications/initialized", json!({}))
             .await;
         let _ = self.next_id.fetch_add(1, Ordering::Relaxed);
-        Ok(())
+        Ok(result
+            .get("instructions")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string())
     }
 
     /// List the server's tools as namespaced [`ToolSpec`]s.

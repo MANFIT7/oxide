@@ -977,6 +977,14 @@ impl OxideDesktop {
                     request_id: None,
                 });
             }
+            Event::WorkflowSelected { title, steps, .. } => {
+                self.timeline.push(TimelineItem {
+                    title,
+                    detail: steps.join("\n"),
+                    state: TimelineState::Done,
+                    request_id: None,
+                });
+            }
             Event::AgentMessageDelta { text, .. } => {
                 if let Some(last) = self.chat.last_mut() {
                     if last.kind == MsgKind::Agent {
@@ -1211,6 +1219,36 @@ impl OxideDesktop {
                         text,
                     });
                 }
+            }
+            Event::AuditLog { kind, title, detail, status, .. } => {
+                let state = match status.as_str() {
+                    "failed" | "blocked" | "interrupted" => TimelineState::Error,
+                    "running" => TimelineState::Running,
+                    _ => TimelineState::Done,
+                };
+                let detail = if detail.trim().is_empty() { status } else { format!("{status} · {detail}") };
+                self.timeline.push(TimelineItem {
+                    title: format!("{kind}: {title}"),
+                    detail,
+                    state,
+                    request_id: None,
+                });
+            }
+            Event::SubagentStarted { profile, task, .. } => {
+                self.timeline.push(TimelineItem {
+                    title: format!("Subagent: {profile}"),
+                    detail: task,
+                    state: TimelineState::Running,
+                    request_id: None,
+                });
+            }
+            Event::SubagentFinished { profile, summary, ok, .. } => {
+                self.timeline.push(TimelineItem {
+                    title: format!("Subagent finished: {profile}"),
+                    detail: summary,
+                    state: if ok { TimelineState::Done } else { TimelineState::Error },
+                    request_id: None,
+                });
             }
             Event::Error { message } => {
                 self.streaming = false;
@@ -1883,10 +1921,11 @@ impl OxideDesktop {
                 return;
             }
         };
-        let server = McpServerConfig { url: String::new(), enabled: true,
+        let server = McpServerConfig {
             name: self.mcp_name.trim().to_string(),
             command: self.mcp_command.trim().to_string(),
             args,
+            ..McpServerConfig::default()
         };
         if let Err(e) = validate_mcp_server(&server) {
             self.mcp_message = e.to_string();
@@ -9171,10 +9210,11 @@ mod tests {
             review_prompt: "Review risks".to_string(),
             created_ms: 12,
         }];
-        let mcp = vec![McpServerConfig { url: String::new(), enabled: true,
+        let mcp = vec![McpServerConfig {
             name: "fs".to_string(),
             command: "npx".to_string(),
             args: vec!["server".to_string()],
+            ..McpServerConfig::default()
         }];
 
         let results = build_global_search_results(GlobalSearchInputs {
@@ -9360,18 +9400,20 @@ mod tests {
         let mut cfg = Config::default();
         upsert_mcp_server(
             &mut cfg,
-            McpServerConfig { url: String::new(), enabled: true,
+            McpServerConfig {
                 name: "fs".to_string(),
                 command: "npx".to_string(),
                 args: vec!["old".to_string()],
+                ..McpServerConfig::default()
             },
         );
         upsert_mcp_server(
             &mut cfg,
-            McpServerConfig { url: String::new(), enabled: true,
+            McpServerConfig {
                 name: "fs".to_string(),
                 command: "bunx".to_string(),
                 args: vec!["new".to_string()],
+                ..McpServerConfig::default()
             },
         );
 
@@ -9384,15 +9426,17 @@ mod tests {
     fn mcp_server_remove_deletes_matching_name_only() {
         let mut cfg = Config::default();
         cfg.mcp_servers = vec![
-            McpServerConfig { url: String::new(), enabled: true,
+            McpServerConfig {
                 name: "fs".to_string(),
                 command: "npx".to_string(),
                 args: Vec::new(),
+                ..McpServerConfig::default()
             },
-            McpServerConfig { url: String::new(), enabled: true,
+            McpServerConfig {
                 name: "linear".to_string(),
                 command: "bunx".to_string(),
                 args: Vec::new(),
+                ..McpServerConfig::default()
             },
         ];
 
@@ -9439,10 +9483,11 @@ mod tests {
     #[test]
     fn configured_mcp_health_falls_back_before_runtime_status() {
         let mut health = BTreeMap::new();
-        let server = McpServerConfig { url: String::new(), enabled: true,
+        let server = McpServerConfig {
             name: "fs".to_string(),
             command: "npx".to_string(),
             args: vec!["server".to_string()],
+            ..McpServerConfig::default()
         };
 
         let item = mcp_health_for(&health, &server);
@@ -10680,10 +10725,11 @@ mod tests {
             review_prompt: "Review risks".to_string(),
             created_ms: 4,
         }];
-        let mcp = vec![McpServerConfig { url: String::new(), enabled: true,
+        let mcp = vec![McpServerConfig {
             name: "filesystem".to_string(),
             command: "npx".to_string(),
             args: vec!["server".to_string()],
+            ..McpServerConfig::default()
         }];
         let shortcuts = shortcut_catalog();
         let repo_index = collect_repo_index(&tmp, REPO_INDEX_ENTRY_LIMIT);
