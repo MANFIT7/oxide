@@ -479,9 +479,9 @@ impl Provider for ClaudeCliProvider {
             args.push("--resume".to_string());
             args.push(id.clone());
         }
-        if !req.model.is_empty() {
+        if let Some(model) = claude_model_arg(&req.model) {
             args.push("--model".to_string());
-            args.push(req.model.clone());
+            args.push(model.to_string());
         }
         if !req.reasoning_effort.is_empty() {
             args.push("--effort".to_string());
@@ -772,9 +772,9 @@ async fn run_claude_interactive_turn(
         cmd.arg("--session-id");
         cmd.arg(session_id);
     }
-    if !req.model.is_empty() {
+    if let Some(model) = claude_model_arg(&req.model) {
         cmd.arg("--model");
-        cmd.arg(&req.model);
+        cmd.arg(model);
     }
     if !req.reasoning_effort.is_empty() {
         cmd.arg("--effort");
@@ -1402,6 +1402,18 @@ mod claude_interactive_tests {
         let text = String::from_utf8(bytes).unwrap();
         assert_eq!(text, "\x1b[200~hello\nworld\x1b[201~\r");
     }
+
+    #[test]
+    fn claude_cli_ignores_non_claude_models() {
+        assert_eq!(claude_model_arg(""), None);
+        assert_eq!(claude_model_arg("gpt-5.5"), None);
+        assert_eq!(claude_model_arg("gpt-5.3-codex-spark"), None);
+        assert_eq!(claude_model_arg("claude-sonnet-4-6"), Some("claude-sonnet-4-6"));
+        assert_eq!(claude_model_arg("sonnet"), Some("sonnet"));
+        assert_eq!(claude_model_arg("opus"), Some("opus"));
+        assert_eq!(claude_model_arg("fable"), Some("fable"));
+        assert_eq!(claude_model_arg("haiku"), Some("haiku"));
+    }
 }
 
 fn codex_effort(effort: &str) -> &str {
@@ -1411,4 +1423,17 @@ fn codex_effort(effort: &str) -> &str {
 fn claude_effort(effort: &str) -> &str {
     // claude --effort accepts low|medium|high|xhigh|max directly.
     effort
+}
+
+fn claude_model_arg(model: &str) -> Option<&str> {
+    let model = model.trim();
+    if model.is_empty() {
+        return None;
+    }
+    let lower = model.to_ascii_lowercase();
+    if lower.starts_with("claude-") || matches!(lower.as_str(), "fable" | "opus" | "sonnet" | "haiku") {
+        Some(model)
+    } else {
+        None
+    }
 }

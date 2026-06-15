@@ -4,7 +4,7 @@
 //! falls out of the recents list. Legacy per-workspace JSONL files are
 //! imported idempotently on first sight.
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
@@ -75,6 +75,24 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+fn is_throwaway_workspace(workspace: &str) -> bool {
+    workspace.starts_with("/var/folders/")
+        || workspace.starts_with("/private/var/folders/")
+        || workspace.starts_with("/tmp/")
+        || workspace.starts_with("/private/tmp/")
+}
+
+fn clean_imported_title(title: &str) -> String {
+    title
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("Codex session")
+        .chars()
+        .take(60)
+        .collect()
+}
+
 /// Session metadata row for listings.
 #[derive(Debug, Clone)]
 pub struct SessionMeta {
@@ -103,7 +121,7 @@ pub fn exists(id: &str) -> bool {
 pub fn append(id: &str, workspace: &Path, provider: &str, role: &str, content: &str) {
     // Never record throwaway workspaces (test temp dirs) in the global db.
     let wss = workspace.to_string_lossy();
-    let throwaway = wss.starts_with("/var/folders/") || wss.starts_with("/tmp/") || std::env::var_os("OXIDE_NO_DB").is_some();
+    let throwaway = is_throwaway_workspace(wss.as_ref()) || std::env::var_os("OXIDE_NO_DB").is_some();
     if throwaway && !cfg!(test) {
         return;
     }
@@ -348,6 +366,80 @@ pub fn delete(id: &str) {
     let _ = c.execute("DELETE FROM sessions WHERE id=?1", [id]);
 }
 
+/// Import Codex Desktop thread metadata from its local state db. This is
+/// read-only against Codex's db; Oxide stores only a lightweight row with the
+/// native Codex thread id in `cli_session_id`, so opening it can resume via the
+/// existing Codex CLI session.
+pub fn import_codex_desktop_threads(limit: usize) {
+    static LAST: OnceLock<Mutex<Option<std::time::Instant>>> = OnceLock::new();
+    {
+        let mut g = LAST.get_or_init(Default::default).lock().unwrap();
+        if let Some(t) = *g {
+            if t.elapsed() < std::time::Duration::from_secs(5) { return; }
+        }
+        *g = Some(std::time::Instant::now());
+    }
+
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else { return };
+    let path = home.join(".codex/state_5.sqlite");
+    import_codex_desktop_threads_from(&path, limit);
+}
+
+fn import_codex_desktop_threads_from(path: &Path, limit: usize) {
+    if !path.exists() { return; }
+    let Ok(codex) = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY) else { return };
+    let _ = codex.busy_timeout(std::time::Duration::from_millis(250));
+
+    let sql = "
+        SELECT id, cwd, title,
+               COALESCE(created_at_ms, created_at * 1000),
+               COALESCE(updated_at_ms, updated_at * 1000)
+        FROM threads
+        WHERE archived = 0
+          AND cwd <> ''
+          AND title <> ''
+          AND source NOT LIKE '%subagent%'
+        ORDER BY COALESCE(updated_at_ms, updated_at * 1000) DESC
+        LIMIT ?1";
+    let Ok(mut st) = codex.prepare(sql) else { return };
+    let Ok(rows) = st.query_map(rusqlite::params![limit as i64], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, i64>(3)?,
+            r.get::<_, i64>(4)?,
+        ))
+    }) else { return };
+
+    let c = conn().lock().unwrap();
+    for row in rows.flatten() {
+        let (native_id, workspace, title, created_ms, updated_ms) = row;
+        if native_id.trim().is_empty()
+            || workspace.trim().is_empty()
+            || is_throwaway_workspace(&workspace)
+        {
+            continue;
+        }
+        let id = format!("codex:{native_id}");
+        let title = clean_imported_title(&title);
+        let created_ms = created_ms.max(0);
+        let updated_ms = updated_ms.max(created_ms);
+        let _ = c.execute(
+            "INSERT INTO sessions (id, workspace, provider, title, cli_session_id, created_ms, updated_ms)
+             VALUES (?1, ?2, 'codex', ?3, ?4, ?5, ?6)
+             ON CONFLICT(id) DO UPDATE SET
+               workspace=excluded.workspace,
+               provider='codex',
+               title=excluded.title,
+               cli_session_id=excluded.cli_session_id,
+               updated_ms=MAX(sessions.updated_ms, excluded.updated_ms),
+               archived_at=NULL",
+            rusqlite::params![id, workspace, title, native_id, created_ms, updated_ms],
+        );
+    }
+}
+
 /// Import Claude Code CLI (TUI) transcripts for a workspace into the global db,
 /// so TUI conversations show up and persist like normal chats. Claude stores
 /// them at ~/.claude/projects/<slug>/<uuid>.jsonl (slug = cwd with '/'→'-').
@@ -472,5 +564,61 @@ pub fn import_workspace(ws: &Path) {
             }
         }
         let _ = std::fs::rename(&p, p.with_extension("jsonl.imported"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn imports_codex_desktop_threads_as_resumable_sessions() {
+        let path = std::env::temp_dir().join(format!(
+            "oxide-codex-state-{}-{}.sqlite",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let codex = Connection::open(&path).expect("open temp codex db");
+        codex.execute_batch(
+            "CREATE TABLE threads (
+               id TEXT NOT NULL,
+               cwd TEXT NOT NULL,
+               title TEXT NOT NULL,
+               created_at INTEGER NOT NULL,
+               updated_at INTEGER NOT NULL,
+               created_at_ms INTEGER,
+               updated_at_ms INTEGER,
+               archived INTEGER NOT NULL,
+               source TEXT NOT NULL
+             );",
+        ).expect("create threads table");
+        codex.execute(
+            "INSERT INTO threads (id, cwd, title, created_at, updated_at, created_at_ms, updated_at_ms, archived, source)
+             VALUES (?1, ?2, ?3, 10, 20, 10000, 20000, 0, 'vscode')",
+            rusqlite::params![
+                "native-thread-1",
+                "/Volumes/Data/oxide-test-import",
+                "  Read README\nextra",
+            ],
+        ).expect("insert codex thread");
+        codex.execute(
+            "INSERT INTO threads (id, cwd, title, created_at, updated_at, created_at_ms, updated_at_ms, archived, source)
+             VALUES (?1, ?2, ?3, 10, 20, 10000, 20000, 0, 'vscode')",
+            rusqlite::params!["tmp-thread", "/private/var/folders/tmp-project", "Tmp"],
+        ).expect("insert temp thread");
+        drop(codex);
+
+        import_codex_desktop_threads_from(&path, 10);
+
+        let sessions = list(Path::new("/Volumes/Data/oxide-test-import"), 10);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "codex:native-thread-1");
+        assert_eq!(sessions[0].provider, "codex");
+        assert_eq!(sessions[0].title, "Read README");
+        assert_eq!(cli_session(&sessions[0].id).as_deref(), Some("native-thread-1"));
+        assert!(list(Path::new("/private/var/folders/tmp-project"), 10).is_empty());
+
+        let _ = std::fs::remove_file(&path);
     }
 }

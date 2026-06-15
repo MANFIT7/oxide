@@ -432,6 +432,7 @@ fn activity_kind(icon: &str, verb: &str, detail: &str) -> ActivityKind {
     match icon {
         "terminal" => ActivityKind::Command,
         "edit" => ActivityKind::FileChange,
+        "eye" => ActivityKind::FileRead,
         "file" => ActivityKind::FileRead,
         "search" => ActivityKind::Search,
         "globe" => ActivityKind::Web,
@@ -542,7 +543,7 @@ fn activity_label(tool: &str, args: &serde_json::Value) -> String {
         "shell" => ("terminal", "Run", short(s("command"))),
         "write_file" => ("edit", "Write", s("path").to_string()),
         "edit" => ("edit", "Edit", s("path").to_string()),
-        "read_file" => ("file", "Read", s("path").to_string()),
+        "read_file" => ("eye", "Read", s("path").to_string()),
         "search" => ("search", "Search", short(s("query"))),
         "codebase_search" => ("search", "Find code", short(s("query"))),
         "web_search" => ("globe", "Search web", short(s("query"))),
@@ -692,6 +693,7 @@ struct SessionListItem {
 }
 
 type ProjectGroup = (PathBuf, String, Vec<(PathBuf, String, String, String)>);
+const PROJECT_SESSION_LIMIT: usize = 30;
 
 /// One row in the inspector Timeline.
 #[derive(Clone, PartialEq)]
@@ -1542,6 +1544,7 @@ fn all_mention_items(ws: &Path, query: &str) -> Vec<String> {
 
 /// List persisted sessions from the global DB, matching the sidebar source.
 fn list_sessions(ws: &Path) -> Vec<SessionListItem> {
+    oxide_core::db::import_codex_desktop_threads(300);
     oxide_core::db::import_workspace(ws);
     oxide_core::db::import_claude_sessions(ws);
     oxide_core::db::list(ws, 50)
@@ -1608,7 +1611,13 @@ fn recent_sessions(ws: &Path) -> Vec<(PathBuf, std::time::SystemTime, String, St
     // Import legacy JSONL + Claude Code TUI transcripts, then query the global db.
     oxide_core::db::import_workspace(ws);
     oxide_core::db::import_claude_sessions(ws);
-    oxide_core::db::list(ws, 30)
+    db_recent_sessions(ws, 30)
+}
+
+/// Recent sessions from the global DB only. Used for inactive `/Volumes/...`
+/// projects so their chat rows stay visible without touching the volume.
+fn db_recent_sessions(ws: &Path, limit: usize) -> Vec<(PathBuf, std::time::SystemTime, String, String)> {
+    oxide_core::db::list(ws, limit)
         .into_iter()
         .map(|m| {
             let t = std::time::UNIX_EPOCH + std::time::Duration::from_millis(m.updated_ms.max(0) as u64);
@@ -1664,6 +1673,7 @@ fn should_defer_recent_workspace_scan(current: &Path, workspace: &Path) -> bool 
 fn build_projects(current: &Path, recents: &[PathBuf]) -> Vec<ProjectGroup> {
     let mut seen = HashSet::new();
     let mut wss: Vec<(PathBuf, bool)> = Vec::new();
+    oxide_core::db::import_codex_desktop_threads(300);
     // STABLE order: db recency first (only changes when you actually chat, not
     // when you click to switch), then the current workspace + recents as a
     // fallback so a brand-new project still appears. Clicking never reorders.
@@ -1689,15 +1699,15 @@ fn build_projects(current: &Path, recents: &[PathBuf]) -> Vec<ProjectGroup> {
         // Group each project's OWN chats under it (synara-style), so a chat
         // always appears under the folder it belongs to — not just the active
         // one. These are user-opened folders, so access is already granted.
-        let items: Vec<(PathBuf, String, String, String)> = if deferred {
-            Vec::new()
+        let sessions = if deferred {
+            db_recent_sessions(&ws, PROJECT_SESSION_LIMIT)
         } else {
-            recent_sessions(&ws)
-                .into_iter()
-                .take(8)
-                .map(|(p, m, t, prov)| (p, t, relative_time(m), prov))
-                .collect()
+            recent_sessions(&ws).into_iter().take(PROJECT_SESSION_LIMIT).collect()
         };
+        let items: Vec<(PathBuf, String, String, String)> = sessions
+            .into_iter()
+            .map(|(p, m, t, prov)| (p, t, relative_time(m), prov))
+            .collect();
         let name = project_name(&ws);
         out.push((ws, name, items));
     }
@@ -2398,7 +2408,9 @@ fn app() -> Element {
     let mut new_card_title = use_signal(String::new);
     let mut projects_list = use_signal(Vec::<ProjectGroup>::new);
     let mut session_menu = use_signal(|| None::<PathBuf>);
-    let mut expanded_projects = use_signal(HashSet::<String>::new);
+    // Project chat lists are open by default; this set tracks projects the user
+    // manually compacted with "Show less".
+    let mut compacted_projects = use_signal(HashSet::<String>::new);
     // Projects whose chat list is collapsed (click the caret on the header).
     let mut collapsed_projects = use_signal(HashSet::<String>::new);
     // Bump to force the sidebar (pins/projects) to re-read the session db.
@@ -3530,7 +3542,8 @@ fn app() -> Element {
                                     } else {
                                         match verb.to_ascii_lowercase().as_str() {
                                             "bash" | "shell" | "running" => "terminal",
-                                            "read" | "write" | "edit" | "editing" | "multiedit" => "file",
+                                            "read" => "eye",
+                                            "create" | "write" | "edit" | "editing" | "multiedit" | "notebookedit" => "edit",
                                             "grep" | "glob" | "search" | "searching" | "websearch" => "search",
                                             "task" | "agent" => "spark",
                                             _ => "spark",
@@ -4349,7 +4362,7 @@ fn app() -> Element {
                                 let pname2 = pkey.clone();
                                 let pname_col = pkey.clone();
                                 let collapsed = collapsed_projects.read().contains(&pkey);
-                                let expanded = expanded_projects.read().contains(&pkey);
+                                let expanded = !compacted_projects.read().contains(&pkey);
                                 let shown = if expanded { sessions.len() } else { sessions.len().min(5) };
                                 let total = sessions.len();
                                 let pws_switch = pws.clone();
@@ -4582,7 +4595,7 @@ fn app() -> Element {
                                     }
                                     if total > 5 && !collapsed {
                                         button { class: "show-more", onclick: move |_| {
-                                            let mut e = expanded_projects.write();
+                                            let mut e = compacted_projects.write();
                                             if e.contains(&pname2) { e.remove(&pname2); } else { e.insert(pname2.clone()); }
                                         }, if expanded { "Show less" } else { "Show more" } }
                                     }
@@ -9046,6 +9059,7 @@ fn icon_static(key: &str) -> &'static str {
     match key {
         "terminal" => "terminal",
         "edit" => "edit",
+        "eye" => "eye",
         "file" => "file",
         "search" => "search",
         "globe" => "globe",
@@ -9603,6 +9617,9 @@ fn Icon(name: &'static str) -> Element {
         }
         "search" => {
             rsx! { circle { cx: "11", cy: "11", r: "7" } line { x1: "21", y1: "21", x2: "16.65", y2: "16.65" } }
+        }
+        "eye" => {
+            rsx! { path { d: "M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z" } circle { cx: "12", cy: "12", r: "3" } }
         }
         "plugins" => rsx! {
             rect { x: "3", y: "3", width: "7", height: "7", rx: "1" }
