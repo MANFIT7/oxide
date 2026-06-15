@@ -1545,7 +1545,7 @@ fn all_mention_items(ws: &Path, query: &str) -> Vec<String> {
 
 /// List persisted sessions from the global DB, matching the sidebar source.
 fn list_sessions(ws: &Path) -> Vec<SessionListItem> {
-    oxide_core::db::import_codex_desktop_threads(300);
+    oxide_core::db::import_codex_desktop_threads_for_workspaces([ws.to_path_buf()], 300);
     oxide_core::db::import_workspace(ws);
     oxide_core::db::import_claude_sessions(ws);
     oxide_core::db::list(ws, 50)
@@ -1674,12 +1674,27 @@ fn should_defer_recent_workspace_scan(current: &Path, workspace: &Path) -> bool 
 fn build_projects(current: &Path, recents: &[PathBuf]) -> Vec<ProjectGroup> {
     let mut seen = HashSet::new();
     let mut wss: Vec<(PathBuf, bool)> = Vec::new();
-    oxide_core::db::import_codex_desktop_threads(300);
+    let opened_by_oxide: Vec<PathBuf> = oxide_core::db::workspaces_opened_by_oxide()
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+    let mut known_workspaces: HashSet<String> = HashSet::new();
+    for w in std::iter::once(current.to_path_buf())
+        .chain(recents.iter().cloned())
+        .chain(opened_by_oxide.iter().cloned())
+    {
+        if !w.as_os_str().is_empty() {
+            known_workspaces.insert(w.display().to_string());
+        }
+    }
+    let import_workspaces: Vec<PathBuf> = known_workspaces.iter().map(PathBuf::from).collect();
+    oxide_core::db::import_codex_desktop_threads_for_workspaces(import_workspaces, 500);
     // STABLE order: db recency first (only changes when you actually chat, not
     // when you click to switch), then the current workspace + recents as a
     // fallback so a brand-new project still appears. Clicking never reorders.
     let db_ws: Vec<PathBuf> = oxide_core::db::workspaces()
         .into_iter()
+        .filter(|w| known_workspaces.contains(w))
         .map(PathBuf::from)
         .collect();
     for w in db_ws
@@ -2416,7 +2431,6 @@ fn app() -> Element {
     let mut collapsed_projects = use_signal(HashSet::<String>::new);
     // Bump to force the sidebar (pins/projects) to re-read the session db.
     let mut sessions_refresh = use_signal(|| 0u64);
-    let mut confirm_delete_session = use_signal(|| None::<String>);
     let mut confirm_archive_workspace = use_signal(|| None::<String>);
     let restored_sessions = use_signal(HashSet::<String>::new);
     // Tab currently animating closed.
@@ -4503,7 +4517,6 @@ fn app() -> Element {
                                             let path_str_pin = path_str.clone();
                                             let path_str_archive = path_str.clone();
                                             let path_str_menu_archive = path_str.clone();
-                                            let path_str_menu_delete = path_str.clone();
                                             let is_pinned = pinned_ids.contains(&path_str);
                                             let anchor_class = if restored_sessions.read().contains(&path_str) { "thread-anchor restored" } else { "thread-anchor" };
                                             rsx! {
@@ -4562,12 +4575,6 @@ fn app() -> Element {
                                                                 Icon { name: "folder" } span { class: "menu-name", "Archive" }
                                                             }
                                                             button { class: "menu-item danger", onclick: move |_| {
-                                                                if confirm_delete_session.peek().as_deref() != Some(path_str_menu_delete.as_str()) {
-                                                                    confirm_delete_session.set(Some(path_str_menu_delete.clone()));
-                                                                    push_toast(toasts, toast_seq, "info", "Click Delete again to remove this session");
-                                                                    return;
-                                                                }
-                                                                confirm_delete_session.set(None);
                                                                 let restore = capture_deleted_session(&p_del);
                                                                 delete_session(&p_del);
                                                                 session_menu.set(None);

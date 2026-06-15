@@ -49,6 +49,10 @@ fn conn() -> &'static Mutex<Connection> {
                content TEXT NOT NULL,
                ts_ms INTEGER NOT NULL,
                PRIMARY KEY (session_id, seq)
+             );
+             CREATE TABLE IF NOT EXISTS session_tombstones (
+               id TEXT PRIMARY KEY,
+               deleted_at INTEGER NOT NULL
              );",
         );
         // Migration for existing dbs (errors harmlessly if the column is there).
@@ -128,6 +132,7 @@ pub fn append(id: &str, workspace: &Path, provider: &str, role: &str, content: &
     let c = conn().lock().unwrap();
     let t = now_ms();
     let ws = workspace.display().to_string();
+    let _ = c.execute("DELETE FROM session_tombstones WHERE id=?1", [id]);
     let _ = c.execute(
         "INSERT INTO sessions (id, workspace, provider, title, created_ms, updated_ms)
          VALUES (?1, ?2, ?3, '', ?4, ?4)
@@ -209,6 +214,7 @@ pub fn message_count(id: &str) -> usize {
 pub fn rewrite(id: &str, workspace: &Path, provider: &str, msgs: &[(String, String)]) {
     {
         let c = conn().lock().unwrap();
+        let _ = c.execute("DELETE FROM session_tombstones WHERE id=?1", [id]);
         let _ = c.execute("DELETE FROM messages WHERE session_id=?1", [id]);
     }
     for (role, content) in msgs {
@@ -236,6 +242,26 @@ pub fn workspaces() -> Vec<String> {
     let mut out = Vec::new();
     if let Ok(mut st) = c.prepare(
         "SELECT workspace, MAX(updated_ms) m FROM sessions WHERE archived_at IS NULL
+         GROUP BY workspace ORDER BY m DESC LIMIT 50",
+    ) {
+        if let Ok(rows) = st.query_map([], |r| r.get::<_, String>(0)) {
+            for row in rows.flatten() {
+                out.push(row);
+            }
+        }
+    }
+    out
+}
+
+/// Workspaces that Oxide itself has touched. Imported Codex Desktop rows do not
+/// count; otherwise merely reading Codex history would populate unrelated
+/// folders in the sidebar.
+pub fn workspaces_opened_by_oxide() -> Vec<String> {
+    let c = conn().lock().unwrap();
+    let mut out = Vec::new();
+    if let Ok(mut st) = c.prepare(
+        "SELECT workspace, MAX(updated_ms) m FROM sessions
+         WHERE archived_at IS NULL AND id NOT LIKE 'codex:%'
          GROUP BY workspace ORDER BY m DESC LIMIT 50",
     ) {
         if let Ok(rows) = st.query_map([], |r| r.get::<_, String>(0)) {
@@ -325,6 +351,7 @@ pub fn archive(id: &str) {
 
 pub fn restore(id: &str) {
     let c = conn().lock().unwrap();
+    let _ = c.execute("DELETE FROM session_tombstones WHERE id=?1", [id]);
     let _ = c.execute(
         "UPDATE sessions SET archived_at=NULL WHERE id=?1",
         rusqlite::params![id],
@@ -362,6 +389,11 @@ pub fn cli_session(id: &str) -> Option<String> {
 
 pub fn delete(id: &str) {
     let c = conn().lock().unwrap();
+    let _ = c.execute(
+        "INSERT INTO session_tombstones (id, deleted_at) VALUES (?1, ?2)
+         ON CONFLICT(id) DO UPDATE SET deleted_at=excluded.deleted_at",
+        rusqlite::params![id, now_ms()],
+    );
     let _ = c.execute("DELETE FROM messages WHERE session_id=?1", [id]);
     let _ = c.execute("DELETE FROM sessions WHERE id=?1", [id]);
 }
@@ -371,6 +403,18 @@ pub fn delete(id: &str) {
 /// native Codex thread id in `cli_session_id`, so opening it can resume via the
 /// existing Codex CLI session.
 pub fn import_codex_desktop_threads(limit: usize) {
+    let workspaces: Vec<PathBuf> = workspaces_opened_by_oxide()
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+    import_codex_desktop_threads_for_workspaces(workspaces, limit);
+}
+
+pub fn import_codex_desktop_threads_for_workspaces<I, P>(workspaces: I, limit: usize)
+where
+    I: IntoIterator<Item = P>,
+    P: AsRef<Path>,
+{
     static LAST: OnceLock<Mutex<Option<std::time::Instant>>> = OnceLock::new();
     {
         let mut g = LAST.get_or_init(Default::default).lock().unwrap();
@@ -380,12 +424,25 @@ pub fn import_codex_desktop_threads(limit: usize) {
         *g = Some(std::time::Instant::now());
     }
 
+    let allowed: std::collections::HashSet<String> = workspaces
+        .into_iter()
+        .map(|p| p.as_ref().display().to_string())
+        .filter(|p| !p.is_empty() && !is_throwaway_workspace(p))
+        .collect();
+    if allowed.is_empty() {
+        return;
+    }
+
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else { return };
     let path = home.join(".codex/state_5.sqlite");
-    import_codex_desktop_threads_from(&path, limit);
+    import_codex_desktop_threads_from(&path, &allowed, limit);
 }
 
-fn import_codex_desktop_threads_from(path: &Path, limit: usize) {
+fn import_codex_desktop_threads_from(
+    path: &Path,
+    allowed: &std::collections::HashSet<String>,
+    limit: usize,
+) {
     if !path.exists() { return; }
     let Ok(codex) = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY) else { return };
     let _ = codex.busy_timeout(std::time::Duration::from_millis(250));
@@ -418,10 +475,21 @@ fn import_codex_desktop_threads_from(path: &Path, limit: usize) {
         if native_id.trim().is_empty()
             || workspace.trim().is_empty()
             || is_throwaway_workspace(&workspace)
+            || !allowed.contains(&workspace)
         {
             continue;
         }
         let id = format!("codex:{native_id}");
+        let tombstoned = c
+            .query_row(
+                "SELECT 1 FROM session_tombstones WHERE id=?1",
+                [&id],
+                |_| Ok(()),
+            )
+            .is_ok();
+        if tombstoned {
+            continue;
+        }
         let title = clean_imported_title(&title);
         let created_ms = created_ms.max(0);
         let updated_ms = updated_ms.max(created_ms);
@@ -433,8 +501,7 @@ fn import_codex_desktop_threads_from(path: &Path, limit: usize) {
                provider='codex',
                title=excluded.title,
                cli_session_id=excluded.cli_session_id,
-               updated_ms=MAX(sessions.updated_ms, excluded.updated_ms),
-               archived_at=NULL",
+               updated_ms=MAX(sessions.updated_ms, excluded.updated_ms)",
             rusqlite::params![id, workspace, title, native_id, created_ms, updated_ms],
         );
     }
@@ -607,9 +674,16 @@ mod tests {
              VALUES (?1, ?2, ?3, 10, 20, 10000, 20000, 0, 'vscode')",
             rusqlite::params!["tmp-thread", "/private/var/folders/tmp-project", "Tmp"],
         ).expect("insert temp thread");
+        codex.execute(
+            "INSERT INTO threads (id, cwd, title, created_at, updated_at, created_at_ms, updated_at_ms, archived, source)
+             VALUES (?1, ?2, ?3, 10, 20, 10000, 20000, 0, 'vscode')",
+            rusqlite::params!["other-thread", "/Volumes/Data/unopened-by-oxide", "Unopened"],
+        ).expect("insert unopened thread");
         drop(codex);
 
-        import_codex_desktop_threads_from(&path, 10);
+        let allowed =
+            std::collections::HashSet::from(["/Volumes/Data/oxide-test-import".to_string()]);
+        import_codex_desktop_threads_from(&path, &allowed, 10);
 
         let sessions = list(Path::new("/Volumes/Data/oxide-test-import"), 10);
         assert_eq!(sessions.len(), 1);
@@ -618,6 +692,18 @@ mod tests {
         assert_eq!(sessions[0].title, "Read README");
         assert_eq!(cli_session(&sessions[0].id).as_deref(), Some("native-thread-1"));
         assert!(list(Path::new("/private/var/folders/tmp-project"), 10).is_empty());
+        assert!(list(Path::new("/Volumes/Data/unopened-by-oxide"), 10).is_empty());
+
+        archive("codex:native-thread-1");
+        import_codex_desktop_threads_from(&path, &allowed, 10);
+        assert!(list(Path::new("/Volumes/Data/oxide-test-import"), 10).is_empty());
+
+        restore("codex:native-thread-1");
+        assert_eq!(list(Path::new("/Volumes/Data/oxide-test-import"), 10).len(), 1);
+
+        delete("codex:native-thread-1");
+        import_codex_desktop_threads_from(&path, &allowed, 10);
+        assert!(list(Path::new("/Volumes/Data/oxide-test-import"), 10).is_empty());
 
         let _ = std::fs::remove_file(&path);
     }
