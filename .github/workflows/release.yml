@@ -80,8 +80,38 @@ jobs:
           security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$OXIDE_CERT_PASSWORD" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$PW" "$KEYCHAIN" >/dev/null
           security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | sed s/\"//g)
-          security find-identity -v -p codesigning
-          identity="$(security find-identity -v -p codesigning | awk -F '\"' '/\"/ { print $2; exit }')"
+          CERT_PEM="$RUNNER_TEMP/signing-cert.pem"
+          security find-certificate -c "Oxide Dev" -p "$KEYCHAIN" > "$CERT_PEM" || true
+          if [ ! -s "$CERT_PEM" ]; then
+            security find-certificate -a -p "$KEYCHAIN" > "$CERT_PEM" || true
+          fi
+          if [ -s "$CERT_PEM" ]; then
+            python3 - "$KEYCHAIN" "$CERT_PEM" <<'PY'
+          import subprocess
+          import sys
+
+          try:
+              subprocess.run(
+                  [
+                      "security",
+                      "add-trusted-cert",
+                      "-r",
+                      "trustRoot",
+                      "-p",
+                      "codeSign",
+                      "-k",
+                      sys.argv[1],
+                      sys.argv[2],
+                  ],
+                  check=False,
+                  timeout=30,
+              )
+          except subprocess.TimeoutExpired:
+              print("::warning title=Signing trust timed out::Timed out while trusting the imported signing certificate; release will fall back to ad-hoc signing if no valid identity is available.")
+          PY
+          fi
+          security find-identity -v -p codesigning "$KEYCHAIN"
+          identity="$(security find-identity -v -p codesigning "$KEYCHAIN" | awk -F '\"' '/\"/ { print $2; exit }')"
           rm -f "$RUNNER_TEMP/cert.p12"
           if [ -z "$identity" ]; then
             echo "::warning title=Unsigned release::Signing certificate was imported but no valid codesigning identity was found; this build will be ad-hoc signed."
