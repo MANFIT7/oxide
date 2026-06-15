@@ -61,6 +61,7 @@ jobs:
       # ad-hoc signed (still works; just prompts on each update).
       - name: Import signing certificate
         id: signing
+        timeout-minutes: 3
         env:
           OXIDE_CERT_P12: ${{ secrets.OXIDE_CERT_P12 }}
           OXIDE_CERT_PASSWORD: ${{ secrets.OXIDE_CERT_PASSWORD }}
@@ -79,10 +80,6 @@ jobs:
           security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$OXIDE_CERT_PASSWORD" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$PW" "$KEYCHAIN" >/dev/null
           security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | sed s/\"//g)
-          security find-certificate -c "Oxide Dev" -p "$KEYCHAIN" > "$RUNNER_TEMP/oxide-dev.pem" || true
-          if [ -s "$RUNNER_TEMP/oxide-dev.pem" ]; then
-            security add-trusted-cert -r trustRoot -k "$KEYCHAIN" "$RUNNER_TEMP/oxide-dev.pem" || true
-          fi
           security find-identity -v -p codesigning
           rm -f "$RUNNER_TEMP/cert.p12"
           echo "available=true" >> "$GITHUB_OUTPUT"
