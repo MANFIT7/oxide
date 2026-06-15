@@ -693,7 +693,8 @@ struct SessionListItem {
 }
 
 type ProjectGroup = (PathBuf, String, Vec<(PathBuf, String, String, String)>);
-const PROJECT_SESSION_LIMIT: usize = 30;
+const PROJECT_SESSION_LIMIT: usize = 500;
+const PROJECT_SESSION_PAGE_SIZE: usize = 5;
 
 /// One row in the inspector Timeline.
 #[derive(Clone, PartialEq)]
@@ -2408,9 +2409,9 @@ fn app() -> Element {
     let mut new_card_title = use_signal(String::new);
     let mut projects_list = use_signal(Vec::<ProjectGroup>::new);
     let mut session_menu = use_signal(|| None::<PathBuf>);
-    // Project chat lists are open by default; this set tracks projects the user
-    // manually compacted with "Show less".
-    let mut compacted_projects = use_signal(HashSet::<String>::new);
+    // Per-project visible session count. Default is 5; Show more reveals
+    // another page so long histories expand gradually.
+    let mut project_session_pages = use_signal(HashMap::<String, usize>::new);
     // Projects whose chat list is collapsed (click the caret on the header).
     let mut collapsed_projects = use_signal(HashSet::<String>::new);
     // Bump to force the sidebar (pins/projects) to re-read the session db.
@@ -4362,9 +4363,11 @@ fn app() -> Element {
                                 let pname2 = pkey.clone();
                                 let pname_col = pkey.clone();
                                 let collapsed = collapsed_projects.read().contains(&pkey);
-                                let expanded = !compacted_projects.read().contains(&pkey);
-                                let shown = if expanded { sessions.len() } else { sessions.len().min(5) };
                                 let total = sessions.len();
+                                let requested = project_session_pages.read().get(&pkey).copied().unwrap_or(PROJECT_SESSION_PAGE_SIZE);
+                                let shown = requested.min(total).max(PROJECT_SESSION_PAGE_SIZE.min(total));
+                                let can_show_more = shown < total;
+                                let show_more_label = if can_show_more { "Show more" } else { "Show less" };
                                 let pws_switch = pws.clone();
                                 rsx! {
                                   div { key: "{pkey}", class: "project-group",
@@ -4593,11 +4596,16 @@ fn app() -> Element {
                                     }
                                         }
                                     }
-                                    if total > 5 && !collapsed {
+                                    if total > PROJECT_SESSION_PAGE_SIZE && !collapsed {
                                         button { class: "show-more", onclick: move |_| {
-                                            let mut e = compacted_projects.write();
-                                            if e.contains(&pname2) { e.remove(&pname2); } else { e.insert(pname2.clone()); }
-                                        }, if expanded { "Show less" } else { "Show more" } }
+                                            let mut pages = project_session_pages.write();
+                                            let next = if shown >= total {
+                                                PROJECT_SESSION_PAGE_SIZE
+                                            } else {
+                                                (shown + PROJECT_SESSION_PAGE_SIZE).min(total)
+                                            };
+                                            pages.insert(pname2.clone(), next);
+                                        }, "{show_more_label}" }
                                     }
                                   }
                                 }
