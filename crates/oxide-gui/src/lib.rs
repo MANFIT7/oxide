@@ -14,7 +14,7 @@ use dioxus::desktop::{Config as DesktopConfig, WindowBuilder};
 use dioxus::prelude::*;
 use futures::StreamExt;
 use oxide_config::Config;
-use oxide_core::EngineHandle;
+use oxide_core::{automation, EngineHandle};
 use oxide_protocol::{ApprovalDecision, ApprovalPolicy, Event, Op, SandboxPolicy};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -993,7 +993,9 @@ fn strip_scaffold(text: &str) -> String {
         "## Git context", "## Working git diff", "### status", "### recent commits",
         "### working diff", "(Use the `", "[Preview selection", "[Plan mode]",
         "[Pursue goal]", "(user attached", "- selector:", "- component:",
-        "- source:", "- text:", "- html:", "Selected UI element",
+        "- source:", "- text:", "- html:", "Selected UI element", "Run automation now",
+        "Name:", "Kind:", "Schedule:", "Status:", "Automation prompt:",
+        "## Automation request", "## Automation context",
     ];
     // Display messages may carry image data-URLs after a \u{2} separator —
     // those are render-only; never let them leak into copies/history/titles.
@@ -1054,6 +1056,17 @@ fn user_segments(text: &str) -> Vec<(bool, String)> {
 
 /// Strip the `mcp:`/`skill:` prefix from a mention token for its chip label.
 fn mention_label(token: &str) -> String {
+    if let Some(rest) = token.strip_prefix("automation:") {
+        if rest == "create" {
+            return "Create automation".to_string();
+        }
+        return rest
+            .split_once('|')
+            .map(|(_, name)| name)
+            .unwrap_or(rest)
+            .trim_end_matches('/')
+            .to_string();
+    }
     token
         .strip_prefix("mcp:")
         .or_else(|| token.strip_prefix("skill:"))
@@ -1164,6 +1177,18 @@ why it's wrong, and the concrete fix. If the diff is clean, say so plainly.{}\n\
                 "codebase" => ctx_block.push_str("\n(Use the `codebase_search` tool to find relevant code semantically before acting.)\n"),
                 "web" => ctx_block.push_str("\n(Use the `web_search` tool to research this on the web.)\n"),
                 _ => {}
+            }
+        } else if let Some(rest) = tkn.strip_prefix("automation:") {
+            if rest == "create" {
+                ctx_block.push_str(
+                    "\n## Automation request\nThe user selected Create automation from the @ menu. Help them define a useful workspace automation. If enough details are present, create a `.oxide/automations/*.toml` automation spec with fields `id`, `name`, `kind = \"cron\"`, `status = \"ACTIVE\"`, `schedule`, `prompt`, and `created_ms`. Use schedules like `FREQ=DAILY;INTERVAL=1`, `FREQ=HOURLY;INTERVAL=2`, or `FREQ=MINUTELY;INTERVAL=30`.\n",
+                );
+            } else {
+                let (id, name) = rest.split_once('|').unwrap_or((rest, rest));
+                ctx_block.push_str(&format!(
+                    "\n## Automation context\nSelected automation: `{}` ({id}). Use this when the user asks to review, update, pause, or run that automation.\n",
+                    name
+                ));
             }
         } else {
             files.push(format!("@{tkn}"));
@@ -1422,6 +1447,50 @@ fn sync_board_issues(
     });
 }
 
+fn run_automation_turn(
+    workspace: PathBuf,
+    spec: automation::AutomationSpec,
+    trigger: &'static str,
+    engine: Coroutine<EngineCmd>,
+    streaming: Signal<bool>,
+    mut queue: Signal<Vec<String>>,
+    mut runs: Signal<Vec<automation::AutomationRunSpec>>,
+    mut status: Signal<String>,
+) {
+    let run = automation::run_from_spec(&spec, trigger, "queued", automation::now_ms());
+    match automation::write_run(&workspace, &run) {
+        Ok(()) => {
+            if let Ok(next_runs) = automation::read_runs(&workspace) {
+                runs.set(next_runs);
+            }
+            let prompt = automation::build_run_prompt(&spec);
+            let label = format!("Run automation: {}", spec.name);
+            if *streaming.read() {
+                queue.write().push(prompt);
+                status.set(format!("Queued automation: {}", spec.name));
+            } else {
+                let _ = engine.send(EngineCmd::Submit { engine: prompt, display: label });
+                status.set(format!("Started automation: {}", spec.name));
+            }
+        }
+        Err(err) => status.set(format!("Automation failed: {err}")),
+    }
+}
+
+fn relative_ms(value: u64) -> String {
+    let now = automation::now_ms();
+    let secs = now.saturating_sub(value) / 1000;
+    if secs < 3600 {
+        format!("{}m", (secs / 60).max(1))
+    } else if secs < 86_400 {
+        format!("{}h", secs / 3600)
+    } else if secs < 604_800 {
+        format!("{}d", secs / 86_400)
+    } else {
+        format!("{}w", secs / 604_800)
+    }
+}
+
 /// Set the permission mode (approval policy + sandbox) and reconfigure.
 fn set_access_mode(
     mut cfg: Signal<Config>,
@@ -1529,6 +1598,26 @@ fn mcp_candidates(ws: &Path, query: &str) -> Vec<String> {
         .collect()
 }
 
+fn automation_candidates(ws: &Path, query: &str) -> Vec<String> {
+    let q = query.to_ascii_lowercase();
+    let mut out = Vec::new();
+    if q.is_empty() || "automation".contains(&q) || "create automation".contains(&q) {
+        out.push("automation:create".to_string());
+    }
+    if let Ok(specs) = automation::read_specs(ws) {
+        for spec in specs {
+            let hay = format!("{} {}", spec.id, spec.name).to_ascii_lowercase();
+            if q.is_empty() || hay.contains(&q) {
+                out.push(format!("automation:{}|{}", spec.id, spec.name));
+            }
+            if out.len() >= 10 {
+                break;
+            }
+        }
+    }
+    out
+}
+
 fn all_mention_items(ws: &Path, query: &str) -> Vec<String> {
     let q = query.to_ascii_lowercase();
     // Special context providers (Cursor-style @git / @web / @codebase).
@@ -1537,6 +1626,7 @@ fn all_mention_items(ws: &Path, query: &str) -> Vec<String> {
         .filter(|t| q.is_empty() || t.contains(&q))
         .map(|t| t.to_string())
         .collect();
+    v.extend(automation_candidates(ws, query));
     v.extend(mcp_candidates(ws, query));
     v.extend(skill_candidates(ws, query));
     v.extend(mention_candidates(ws, query));
@@ -2375,6 +2465,7 @@ fn app() -> Element {
     let mut term_sel = use_signal(|| 0usize);
     let mut term_seq = use_signal(|| 1u64);
     let mut show_settings = use_signal(|| false);
+    let mut settings_initial_tab = use_signal(|| "model".to_string());
     let mut show_skills = use_signal(|| false);
     let mut show_mcp = use_signal(|| false);
     let mut show_theme_menu = use_signal(|| false);
@@ -2422,6 +2513,13 @@ fn app() -> Element {
     let board_sync_status = use_signal(|| "Issue sync idle".to_string());
     let mut board_syncing = use_signal(|| false);
     let mut new_card_title = use_signal(String::new);
+    let mut automations = use_signal(Vec::<automation::AutomationSpec>::new);
+    let mut automation_runs = use_signal(Vec::<automation::AutomationRunSpec>::new);
+    let automation_name = use_signal(|| automation::DEFAULT_NAME.to_string());
+    let automation_schedule = use_signal(|| automation::DEFAULT_SCHEDULE.to_string());
+    let automation_prompt = use_signal(|| automation::DEFAULT_PROMPT.to_string());
+    let automation_status = use_signal(|| "Automations idle".to_string());
+    let automation_confirm_delete = use_signal(|| None::<String>);
     let mut projects_list = use_signal(Vec::<ProjectGroup>::new);
     let mut session_menu = use_signal(|| None::<PathBuf>);
     // Per-project visible session count. Default is 5; Show more reveals
@@ -2437,6 +2535,7 @@ fn app() -> Element {
     let mut closing_tab = use_signal(|| None::<u64>);
     // Suggested follow-up prompts shown above the composer after a turn.
     let mut followups = use_signal(Vec::<String>::new);
+    let mut queue = use_signal(Vec::<String>::new);
     // Toast notifications (bottom-right stack, auto-dismiss).
     let toasts = use_signal(Vec::<ToastSpec>::new);
     let toast_seq = use_signal(|| 0u64);
@@ -2509,7 +2608,6 @@ fn app() -> Element {
     let goal_text = use_signal(String::new);
     let mut memory_text = use_signal(String::new);
     let mut thinking = use_signal(String::new);
-    let mut queue = use_signal(Vec::<String>::new);
     // Background tasks the CLI agent started ("running in background") — their
     // result won't stream back, so we surface what they are as persistent chips.
     let mut bg_jobs = use_signal(Vec::<String>::new);
@@ -2870,6 +2968,8 @@ fn app() -> Element {
             if !recents.is_empty() {
                 projects_list.set(build_projects(std::path::Path::new(""), &recents));
             }
+            automations.set(Vec::new());
+            automation_runs.set(Vec::new());
         }
         let _ = sessions_refresh.read();
         if cfg.read().workspace.is_some() {
@@ -2889,6 +2989,29 @@ fn app() -> Element {
                     .unwrap_or_default();
                     board.set(bd);
                     pl.set(groups);
+                });
+            }
+            {
+                let ws2 = ws.clone();
+                let mut autos = automations;
+                let mut runs = automation_runs;
+                let mut auto_status = automation_status;
+                spawn(async move {
+                    let loaded = tokio::task::spawn_blocking(move || {
+                        let specs = automation::read_specs(&ws2)?;
+                        let runs = automation::read_runs(&ws2)?;
+                        Ok::<_, anyhow::Error>((specs, runs))
+                    })
+                    .await;
+                    match loaded {
+                        Ok(Ok((specs, run_specs))) => {
+                            autos.set(specs);
+                            runs.set(run_specs);
+                            auto_status.set("Automations idle".to_string());
+                        }
+                        Ok(Err(err)) => auto_status.set(format!("Automation load failed: {err}")),
+                        Err(err) => auto_status.set(format!("Automation load failed: {err}")),
+                    }
                 });
             }
             // Clean up orphaned pane worktrees from a previous run — ONCE per
@@ -4120,6 +4243,32 @@ fn app() -> Element {
                 model.clone()
             }
         });
+    use_future(move || async move {
+        loop {
+            let root = cfg.peek().workspace.clone();
+            if let Some(root) = root {
+                let now = automation::now_ms();
+                let specs = automations.peek().clone();
+                let runs_snapshot = automation_runs.peek().clone();
+                for spec in specs {
+                    if automation::is_due(&spec, &runs_snapshot, now) {
+                        run_automation_turn(
+                            root.clone(),
+                            spec,
+                            "scheduled",
+                            engine,
+                            streaming,
+                            queue,
+                            automation_runs,
+                            automation_status,
+                        );
+                        break;
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        }
+    });
     // Effort is shown by its own pill — keep the model label clean.
     let model_label = match *context_limit.read() {
         Some(limit) => format!("{model_name} · {}", fmt_tokens(limit)),
@@ -4321,6 +4470,12 @@ fn app() -> Element {
                     }
                     button { class: if *show_board.read() { "nav-item on" } else { "nav-item" }, onclick: move |_| { let v = *show_board.read(); show_board.set(!v); },
                         Icon { name: "list" } span { "Board" }
+                    }
+                    button { class: "nav-item", onclick: move |_| {
+                            settings_initial_tab.set("automations".to_string());
+                            show_settings.set(true);
+                        },
+                        Icon { name: "target" } span { "Automations" }
                     }
                 }
                 div { class: "section-row",
@@ -4646,7 +4801,10 @@ fn app() -> Element {
                         }
                     }
                 }
-                button { class: "settings-btn", onclick: move |_| show_settings.set(true),
+                button { class: "settings-btn", onclick: move |_| {
+                        settings_initial_tab.set("model".to_string());
+                        show_settings.set(true);
+                    },
                     Icon { name: "settings" } span { "Settings" }
                 }
             }
@@ -5891,7 +6049,10 @@ fn app() -> Element {
                                        bypass, project: project.clone(), branch: branch.clone(),
                                        context_used: ctx_used, context_limit: ctx_limit,
                                        workspace: workspace.clone(), plan_mode, pursue_goal, goal_text, queue, picked_element,
-                                       on_settings: move |_| show_settings.set(true),
+                                       on_settings: move |_| {
+                                           settings_initial_tab.set("model".to_string());
+                                           show_settings.set(true);
+                                       },
                                        on_open_folder: move |_| open_folder(cfg, ui, engine), on_pick_workspace: move |dir| apply_workspace(cfg, ui, engine, dir) }
                             div { class: "suggestions",
                                 for s in suggestions.iter() {
@@ -6529,7 +6690,10 @@ fn app() -> Element {
                                        project: project.clone(), branch: branch.clone(),
                                        context_used: ctx_used, context_limit: ctx_limit,
                                        workspace: workspace.clone(), plan_mode, pursue_goal, goal_text, queue, picked_element,
-                                       on_settings: move |_| show_settings.set(true),
+                                       on_settings: move |_| {
+                                           settings_initial_tab.set("model".to_string());
+                                           show_settings.set(true);
+                                       },
                                        on_open_folder: move |_| open_folder(cfg, ui, engine), on_pick_workspace: move |dir| apply_workspace(cfg, ui, engine, dir) }
                         }
                     }
@@ -6542,7 +6706,24 @@ fn app() -> Element {
 
             // ── Settings modal ─────────────────────────────────────────
             if *show_settings.read() {
-                SettingsModal { cfg, ui, engine, sessions_refresh, projects_list, on_close: move |_| show_settings.set(false) }
+                SettingsModal {
+                    cfg,
+                    ui,
+                    engine,
+                    sessions_refresh,
+                    projects_list,
+                    initial_tab: settings_initial_tab.read().clone(),
+                    automations,
+                    automation_runs,
+                    automation_name,
+                    automation_schedule,
+                    automation_prompt,
+                    automation_status,
+                    automation_confirm_delete,
+                    streaming,
+                    queue,
+                    on_close: move |_| show_settings.set(false)
+                }
             }
             if *show_skills.read() {
                 SkillsModal { workspace: workspace.clone(), on_close: move |_| show_skills.set(false) }
@@ -6653,9 +6834,16 @@ fn app() -> Element {
                             "MCP servers" => show_mcp.set(true),
                             "Skills" => show_skills.set(true),
                             "Board" => { show_board.set(true); }
+                            "Automations" => {
+                                settings_initial_tab.set("automations".to_string());
+                                show_settings.set(true);
+                            }
                             "Files panel" => select_env_tab(env_tab, show_env, env_tab_by_tab, tabs, active_tab, "files", true),
                             "Terminal" => select_env_tab(env_tab, show_env, env_tab_by_tab, tabs, active_tab, "term", true),
-                            "Settings…" => show_settings.set(true),
+                            "Settings…" => {
+                                settings_initial_tab.set("model".to_string());
+                                show_settings.set(true);
+                            },
                             "Theme: Light" => set_theme(cfg, "light"),
                             "Theme: Dark" => set_theme(cfg, "dark"),
                             "Theme: System" => set_theme(cfg, "system"),
@@ -6665,7 +6853,7 @@ fn app() -> Element {
                     };
                     let actions: Vec<(&str, &str)> = vec![
                         ("plus", "New chat"), ("folder", "Open folder…"), ("plugins", "Split view"),
-                        ("plugins", "MCP servers"), ("target", "Skills"), ("list", "Board"),
+                        ("plugins", "MCP servers"), ("target", "Skills"), ("list", "Board"), ("target", "Automations"),
                         ("plugins", "Files panel"), ("terminal", "Terminal"), ("settings", "Settings…"),
                         ("spark", "Theme: Light"), ("target", "Theme: Dark"), ("settings", "Theme: System"),
                         ("list", "Toggle density"),
@@ -7583,6 +7771,16 @@ fn SettingsModal(
     engine: Coroutine<EngineCmd>,
     sessions_refresh: Signal<u64>,
     projects_list: Signal<Vec<ProjectGroup>>,
+    initial_tab: String,
+    mut automations: Signal<Vec<automation::AutomationSpec>>,
+    mut automation_runs: Signal<Vec<automation::AutomationRunSpec>>,
+    mut automation_name: Signal<String>,
+    mut automation_schedule: Signal<String>,
+    mut automation_prompt: Signal<String>,
+    mut automation_status: Signal<String>,
+    mut automation_confirm_delete: Signal<Option<String>>,
+    streaming: Signal<bool>,
+    queue: Signal<Vec<String>>,
     on_close: EventHandler<()>,
 ) -> Element {
     let base = cfg.read().clone();
@@ -7655,7 +7853,7 @@ fn SettingsModal(
         on_close.call(());
     };
 
-    let mut settings_tab = use_signal(|| "model".to_string());
+    let mut settings_tab = use_signal(|| initial_tab.clone());
     rsx! {
         div { class: "modal-overlay", onclick: move |_| on_close.call(()),
             div { class: "modal", onclick: move |e| e.stop_propagation(),
@@ -7664,7 +7862,7 @@ fn SettingsModal(
                     button { class: "term-x", onclick: move |_| on_close.call(()), "✕" }
                 }
                 div { class: "settings-tabs",
-                    for (key, label) in [("model", "Model"), ("access", "Access"), ("agents", "Agents"), ("sessions", "Sessions"), ("updates", "Updates")] {
+                    for (key, label) in [("model", "Model"), ("access", "Access"), ("agents", "Agents"), ("automations", "Automations"), ("sessions", "Sessions"), ("updates", "Updates")] {
                         button { class: if settings_tab.read().as_str() == key { "settings-tab active" } else { "settings-tab" },
                             onclick: move |_| settings_tab.set(key.to_string()), "{label}" }
                     }
@@ -7944,6 +8142,150 @@ fn SettingsModal(
                                     }
                                 }
                             }
+                      }
+                    }
+                  }
+                  if settings_tab.read().as_str() == "automations" {
+                    div { class: "field cgpt-field",
+                        span { class: "field-label", "Create automation" }
+                        span { class: "settings-hint", "Runs in this workspace using RRULE-style intervals: FREQ=MINUTELY, HOURLY, or DAILY with INTERVAL=N." }
+                        label { class: "field",
+                            span { class: "field-label", "Name" }
+                            input {
+                                class: "field-input",
+                                value: "{automation_name}",
+                                oninput: move |e| automation_name.set(e.value())
+                            }
+                        }
+                        label { class: "field",
+                            span { class: "field-label", "Schedule" }
+                            input {
+                                class: "field-input",
+                                value: "{automation_schedule}",
+                                oninput: move |e| automation_schedule.set(e.value())
+                            }
+                        }
+                        label { class: "field",
+                            span { class: "field-label", "Prompt" }
+                            textarea {
+                                class: "field-input",
+                                rows: "5",
+                                value: "{automation_prompt}",
+                                oninput: move |e| automation_prompt.set(e.value())
+                            }
+                        }
+                        div { class: "field-folder",
+                            span { class: "folder-path", "{automation_status}" }
+                            button { class: "ed-save", onclick: move |_| {
+                                let root = workspace_of(&cfg.read());
+                                let name = automation_name.read().trim().to_string();
+                                let schedule = automation_schedule.read().trim().to_string();
+                                let prompt = automation_prompt.read().trim().to_string();
+                                if name.is_empty() || schedule.is_empty() || prompt.is_empty() {
+                                    automation_status.set("Name, schedule, and prompt are required".to_string());
+                                    return;
+                                }
+                                if automation::interval_ms(&schedule).is_none() {
+                                    automation_status.set("Schedule must be FREQ=MINUTELY|HOURLY|DAILY;INTERVAL=N".to_string());
+                                    return;
+                                }
+                                let spec = automation::new_spec(&name, &schedule, &prompt, automation::now_ms());
+                                match automation::write_spec(&root, &spec) {
+                                    Ok(()) => {
+                                        automations.set(automation::read_specs(&root).unwrap_or_default());
+                                        automation_runs.set(automation::read_runs(&root).unwrap_or_default());
+                                        automation_confirm_delete.set(None);
+                                        automation_status.set(format!("Saved automation: {}", spec.name));
+                                    }
+                                    Err(err) => automation_status.set(format!("Automation save failed: {err}")),
+                                }
+                            }, "Save automation" }
+                        }
+                    }
+                    div { class: "field",
+                        span { class: "field-label", "Saved automations" }
+                        if automations.read().is_empty() {
+                            div { class: "archived-empty", "No automations saved yet." }
+                        } else {
+                            div { class: "archived-list",
+                                for spec in automations.read().iter().cloned() {
+                                    {
+                                        let latest = automation::latest_run(&automation_runs.read(), &spec.id)
+                                            .map(|run| format!("last {} · {}", run.trigger, relative_ms(run.started_ms)))
+                                            .unwrap_or_else(|| "never run".to_string());
+                                        let spec_run = spec.clone();
+                                        let spec_toggle = spec.clone();
+                                        let spec_delete = spec.clone();
+                                        let confirm = automation_confirm_delete.read().as_deref() == Some(spec.id.as_str());
+                                        let status_class = if spec.status == "ACTIVE" { "archived-count" } else { "archived-del" };
+                                        rsx! {
+                                            div { class: "archived-folder",
+                                                div { class: "archived-folder-head", title: "{spec.prompt}",
+                                                    Icon { name: "target" }
+                                                    span { class: "archived-folder-name", "{spec.name}" }
+                                                    span { class: "{status_class}", "{spec.status}" }
+                                                }
+                                                div { class: "archived-row",
+                                                    span { class: "archived-title", title: "{spec.schedule}", "{spec.schedule} · {latest}" }
+                                                    button { class: "archived-restore", onclick: move |_| {
+                                                        let root = workspace_of(&cfg.read());
+                                                        run_automation_turn(
+                                                            root,
+                                                            spec_run.clone(),
+                                                            "manual",
+                                                            engine,
+                                                            streaming,
+                                                            queue,
+                                                            automation_runs,
+                                                            automation_status,
+                                                        );
+                                                    }, "Run now" }
+                                                    button { class: "archived-restore", onclick: move |_| {
+                                                        let root = workspace_of(&cfg.read());
+                                                        let next = automation::with_toggled_status(&spec_toggle);
+                                                        match automation::write_spec(&root, &next) {
+                                                            Ok(()) => {
+                                                                automations.set(automation::read_specs(&root).unwrap_or_default());
+                                                                automation_confirm_delete.set(None);
+                                                                automation_status.set(format!("{} automation: {}", if next.status == "ACTIVE" { "Activated" } else { "Paused" }, next.name));
+                                                            }
+                                                            Err(err) => automation_status.set(format!("Automation update failed: {err}")),
+                                                        }
+                                                    }, if spec.status == "ACTIVE" { "Pause" } else { "Activate" } }
+                                                    button { class: if confirm { "archived-del danger" } else { "archived-del" }, onclick: move |_| {
+                                                        let root = workspace_of(&cfg.read());
+                                                        if !confirm {
+                                                            automation_confirm_delete.set(Some(spec_delete.id.clone()));
+                                                            return;
+                                                        }
+                                                        match automation::delete_spec(&root, &spec_delete.id) {
+                                                            Ok(()) => {
+                                                                automations.set(automation::read_specs(&root).unwrap_or_default());
+                                                                automation_confirm_delete.set(None);
+                                                                automation_status.set(format!("Deleted automation: {}", spec_delete.name));
+                                                            }
+                                                            Err(err) => automation_status.set(format!("Automation delete failed: {err}")),
+                                                        }
+                                                    }, if confirm { "Sure?" } else { "Delete" } }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if !automation_runs.read().is_empty() {
+                        div { class: "field",
+                            span { class: "field-label", "Recent runs" }
+                            div { class: "archived-list",
+                                for run in automation_runs.read().iter().take(8).cloned() {
+                                    div { class: "archived-row",
+                                        span { class: "archived-title", title: "{run.prompt}", "{run.automation_name} · {run.trigger}" }
+                                        span { class: "archived-count", "{run.status} · {relative_ms(run.started_ms)}" }
+                                    }
+                                }
+                            }
                         }
                     }
                   }
@@ -8207,14 +8549,23 @@ fn Composer(
                                 let is_mcp = path.starts_with("mcp:");
                                 let is_skill = path.starts_with("skill:");
                                 let is_ctx = path.starts_with("ctx:");
-                                let disp = path.strip_prefix("mcp:").or_else(|| path.strip_prefix("skill:")).or_else(|| path.strip_prefix("ctx:")).unwrap_or(&path).to_string();
-                                let icon_name = if is_ctx { "branch" } else if is_mcp { "plugins" } else if is_skill { "target" } else if path.ends_with('/') { "folder" } else { "file" };
-                                let grp = |p: &str| if p.starts_with("ctx:") { 0 } else if p.starts_with("mcp:") { 1 } else if p.starts_with("skill:") { 2 } else { 3 };
+                                let is_automation = path.starts_with("automation:");
+                                let disp = if is_automation {
+                                    mention_label(&path)
+                                } else {
+                                    path.strip_prefix("mcp:")
+                                        .or_else(|| path.strip_prefix("skill:"))
+                                        .or_else(|| path.strip_prefix("ctx:"))
+                                        .unwrap_or(&path)
+                                        .to_string()
+                                };
+                                let icon_name = if is_ctx { "branch" } else if is_automation { "target" } else if is_mcp { "plugins" } else if is_skill { "target" } else if path.ends_with('/') { "folder" } else { "file" };
+                                let grp = |p: &str| if p.starts_with("ctx:") { 0 } else if p.starts_with("automation:") { 1 } else if p.starts_with("mcp:") { 2 } else if p.starts_with("skill:") { 3 } else { 4 };
                                 // Section header when the group changes.
                                 let group = grp(&path);
                                 let prev_group = if i == 0 { -1 } else { grp(&mention_items[i - 1]) };
                                 let header = if group != prev_group {
-                                    Some(match group { 0 => "Context", 1 => "MCP servers", 2 => "Skills", _ => "Files" })
+                                    Some(match group { 0 => "Context", 1 => "Automations", 2 => "MCP servers", 3 => "Skills", _ => "Files" })
                                 } else { None };
                                 let sel = i == msel;
                                 rsx! {
@@ -8233,7 +8584,8 @@ fn Composer(
                                         if is_mcp { span { class: "nav-logo mcp-logo", dangerous_inner_html: provider_logo("mcp").unwrap_or_default() } }
                                         else { Icon { name: icon_name } }
                                         span { class: "menu-name", "{disp}" }
-                                        if is_mcp { span { class: "menu-tag", "mcp" } }
+                                        if is_automation { span { class: "menu-tag", "auto" } }
+                                        else if is_mcp { span { class: "menu-tag", "mcp" } }
                                         else if is_skill { span { class: "menu-tag", "skill" } }
                                     }
                                 }

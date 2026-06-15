@@ -22,6 +22,7 @@ mod index;
 mod hooks;
 mod memory;
 mod sandbox;
+pub mod automation;
 pub mod db;
 mod store;
 mod tools;
@@ -833,6 +834,16 @@ struct WorkerProfile {
     max_steps: usize,
 }
 
+const DEFAULT_SUBAGENT_OPERATING_MODE: &str = "\
+Operate with high agency: think clearly, verify evidence, act proactively, \
+question weak assumptions, and keep moving toward a concrete result. Treat \
+blockers as things to diagnose, not excuses to stop. Prefer primary evidence \
+from code, tests, logs, raw payloads, release assets, or UI behavior over \
+speculation. Be constructively disagreeable when the plan or assumption is \
+weak, while staying within safety, permission, sandbox, and tool policies. End \
+with proof of what changed, what was validated, what remains risky, and the \
+next concrete action.";
+
 #[derive(Debug, Default, Deserialize)]
 struct SelfImproveCapture {
     #[serde(default)]
@@ -860,6 +871,16 @@ impl WorkerProfile {
             max_steps: 24,
         }
     }
+}
+
+fn worker_profile_system_block(profile: &WorkerProfile, exposed_tools: usize) -> String {
+    format!(
+        "# Sub-agent default operating mode\n{}\n\n# Sub-agent profile: {}\n{}\n\nAvailable tool policy: {} tool(s) exposed for this worker.",
+        DEFAULT_SUBAGENT_OPERATING_MODE,
+        profile.id,
+        profile.instructions,
+        exposed_tools
+    )
 }
 
 fn subagent_profile_for(task: &str, provider: &str, effort: &str) -> WorkerProfile {
@@ -1902,10 +1923,8 @@ Rules:
         let tools = self.tools_for_worker_profile(&profile);
         let cli_driver = matches!(profile.provider.as_str(), "codex" | "claude" | "claude_interactive");
         let worker_system = format!(
-            "{system}\n\n# Sub-agent profile: {}\n{}\n\nAvailable tool policy: {} tool(s) exposed for this worker.",
-            profile.id,
-            profile.instructions,
-            tools.len()
+            "{system}\n\n{}",
+            worker_profile_system_block(&profile, tools.len())
         );
         let cli_baseline = if cli_driver {
             git_baseline_tree(&self.workspace).await
@@ -3829,5 +3848,19 @@ required = true
         assert!(profile.allowed_tools.contains(&"read_file".to_string()));
         assert!(!profile.allowed_tools.contains(&"edit".to_string()));
         assert_eq!(profile.effort, "high");
+    }
+
+    #[test]
+    fn subagent_system_block_includes_default_high_agency_mode() {
+        let profile = super::WorkerProfile::implementer("codex", "medium");
+        let block = super::worker_profile_system_block(&profile, 8);
+
+        assert!(block.contains("Sub-agent default operating mode"));
+        assert!(block.contains("Operate with high agency"));
+        assert!(block.contains(
+            "staying within safety, permission, sandbox, and tool policies"
+        ));
+        assert!(block.contains("Sub-agent profile: implementer"));
+        assert!(block.contains("8 tool(s) exposed"));
     }
 }
