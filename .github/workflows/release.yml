@@ -81,13 +81,21 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$PW" "$KEYCHAIN" >/dev/null
           security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | sed s/\"//g)
           security find-identity -v -p codesigning
+          identity="$(security find-identity -v -p codesigning | awk -F '\"' '/\"/ { print $2; exit }')"
           rm -f "$RUNNER_TEMP/cert.p12"
+          if [ -z "$identity" ]; then
+            echo "::warning title=Unsigned release::Signing certificate was imported but no valid codesigning identity was found; this build will be ad-hoc signed."
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "identity=$identity" >> "$GITHUB_OUTPUT"
           echo "available=true" >> "$GITHUB_OUTPUT"
 
       - name: Build dmg
         run: |
           if [ "${{ steps.signing.outputs.available }}" = "true" ]; then
             export OXIDE_REQUIRE_SIGNING=1
+            export OXIDE_SIGN_IDENTITY="${{ steps.signing.outputs.identity }}"
           fi
           bash scripts/make-dmg.sh
 
