@@ -179,13 +179,59 @@ jobs:
           shasum -a 256 dist/Oxide.dmg > dist/Oxide.dmg.sha256
           shasum -a 256 oxide-macos-arm64.gz > oxide-macos-arm64.gz.sha256
 
+      - name: Generate release notes
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          PREVIOUS_TAG: ${{ steps.previous_tag.outputs.tag }}
+        run: |
+          notes="$RUNNER_TEMP/release-notes.md"
+          release_utc="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          release_local="$(TZ=Asia/Makassar date '+%Y-%m-%d %H:%M:%S WITA')"
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          short_sha="$(git rev-parse --short "$TAG")"
+          full_sha="$(git rev-parse "$TAG")"
+
+          {
+            echo "Built by GitHub Actions on ${release_local} (${release_utc})."
+            echo
+            echo "## Build"
+            echo "- Workflow run: [${GITHUB_RUN_ID}](${run_url})"
+            echo "- Commit: \`${short_sha}\`"
+            echo "- Full SHA: \`${full_sha}\`"
+            echo
+            echo "## Changes"
+            if [ -n "$PREVIOUS_TAG" ]; then
+              changes="$(git log --pretty=format:'- %s (`%h`)' --no-merges "${PREVIOUS_TAG}..${TAG}" | sed '/^- Release v[0-9][0-9.]* (`[0-9a-f]*`)$/d' || true)"
+              if [ -n "$changes" ]; then
+                echo "$changes"
+              else
+                echo "- Release packaging and version metadata for ${TAG}."
+              fi
+              echo
+              echo "Changed files:"
+              git diff --name-only "${PREVIOUS_TAG}..${TAG}" | sed 's/^/- `/' | sed 's/$/`/'
+              echo
+              echo "**Full Changelog**: https://github.com/${GITHUB_REPOSITORY}/compare/${PREVIOUS_TAG}...${TAG}"
+            else
+              echo "- Initial release notes base was not available."
+            fi
+            echo
+            echo "## Install"
+            echo "Open the dmg, drag Oxide to Applications, then run:"
+            echo
+            echo '```sh'
+            echo 'xattr -dr com.apple.quarantine /Applications/Oxide.app'
+            echo '```'
+          } > "$notes"
+
+          cat "$notes" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Attach assets to the release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
           name: ${{ steps.tag.outputs.tag }}
-          generate_release_notes: true
-          previous_tag: ${{ steps.previous_tag.outputs.tag }}
+          body_path: ${{ runner.temp }}/release-notes.md
           files: |
             dist/Oxide.dmg
             dist/Oxide.dmg.sha256
