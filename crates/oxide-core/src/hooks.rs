@@ -25,6 +25,7 @@
 //! command = "./scripts/guard.sh"
 //! timeout = 30
 //! statusMessage = "Checking shell command"
+//! async = false
 //! ```
 
 use std::collections::HashMap;
@@ -36,6 +37,7 @@ pub struct HookCommand {
     pub matcher: String,
     pub timeout: u64,
     pub status_message: String,
+    pub background: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -106,6 +108,7 @@ impl Hooks {
                         matcher: String::new(),
                         timeout: 60,
                         status_message: String::new(),
+                        background: false,
                     },
                 );
             }
@@ -140,18 +143,26 @@ impl Hooks {
                     for command in simple_commands(value) {
                         self.push(
                             &event,
-                            HookCommand {
-                                command,
-                                matcher: String::new(),
-                                timeout: 60,
-                                status_message: String::new(),
-                            },
-                        );
-                    }
+                        HookCommand {
+                            command,
+                            matcher: String::new(),
+                            timeout: 60,
+                            status_message: String::new(),
+                            background: false,
+                        },
+                    );
+                }
                 }
                 toml::Value::Table(table) => {
                     for command in command_hooks(table, "") {
                         self.push(&event, command);
+                    }
+                    if let Some(hooks) = table.get("hooks").and_then(|value| value.as_array()) {
+                        for item in hooks.iter().filter_map(|value| value.as_table()) {
+                            for command in command_hooks(item, "") {
+                                self.push(&event, command);
+                            }
+                        }
                     }
                 }
                 _ => {}
@@ -222,11 +233,15 @@ fn command_hooks(table: &toml::map::Map<String, toml::Value>, inherited_matcher:
         .get("type")
         .and_then(|value| value.as_str())
         .unwrap_or("command");
-    let is_async = table.get("async").and_then(|value| value.as_bool()).unwrap_or(false);
+    let is_async = table
+        .get("async")
+        .or_else(|| table.get("background"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
     let Some(command) = table.get("command").and_then(|value| value.as_str()) else {
         return Vec::new();
     };
-    if hook_type != "command" || is_async {
+    if hook_type != "command" {
         return Vec::new();
     }
     vec![HookCommand {
@@ -248,6 +263,7 @@ fn command_hooks(table: &toml::map::Map<String, toml::Value>, inherited_matcher:
             .and_then(|value| value.as_str())
             .unwrap_or("")
             .to_string(),
+        background: is_async,
     }]
 }
 
@@ -313,6 +329,26 @@ statusMessage = "Guard"
         assert_eq!(shell[0].timeout, 12);
         assert_eq!(shell[0].status_message, "Guard");
         assert!(read.is_empty());
+    }
+
+    #[test]
+    fn parses_background_command_hooks() {
+        let text = r#"
+[[hooks.Stop.hooks]]
+type = "command"
+command = "./summarize.sh"
+async = true
+"#;
+        let mut hooks = Hooks {
+            map: HashMap::new(),
+            auto: HookAuto::default(),
+        };
+        hooks.load_table(text.parse::<toml::Value>().unwrap().as_table().unwrap().clone());
+
+        let stop = hooks.commands_for("stop", "");
+
+        assert_eq!(stop.len(), 1);
+        assert!(stop[0].background);
     }
 
     #[test]

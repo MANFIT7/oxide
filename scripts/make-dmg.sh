@@ -7,6 +7,8 @@ APP="Oxide"
 ID="com.oxide.desktop"
 DIST="dist"
 BIN="target/release/oxide"
+SIGN_NAME="${OXIDE_SIGN_IDENTITY:-Oxide Dev}"
+REQUIRE_SIGNING="${OXIDE_REQUIRE_SIGNING:-0}"
 
 echo "▶ building release binary…"
 cargo build --release -p oxide-cli
@@ -60,21 +62,29 @@ cat > "$APPDIR/Contents/Info.plist" <<PLIST
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>LSMinimumSystemVersion</key><string>11.0</string>
   <key>NSHighResolutionCapable</key><true/>
+  <key>NSRemovableVolumesUsageDescription</key><string>Oxide needs access to project folders you choose on external or mounted volumes so agents can read and edit that workspace.</string>
+  <key>NSNetworkVolumesUsageDescription</key><string>Oxide needs access to project folders you choose on network volumes so agents can read and edit that workspace.</string>
 </dict></plist>
 PLIST
 
-# Sign with the stable "Oxide Dev" identity when present (scripts/make-cert.sh)
+# Sign with the stable identity when present (scripts/make-cert.sh)
 # so macOS TCC "Allow" grants persist across updates; ad-hoc otherwise.
-SIGN_ID="$(security find-identity -v -p codesigning 2>/dev/null | grep -m1 'Oxide Dev' | awk '{print $2}' || true)"
+SIGN_ID="$(security find-identity -v -p codesigning 2>/dev/null | grep -m1 "$SIGN_NAME" | awk '{print $2}' || true)"
 if [ -n "${SIGN_ID:-}" ]; then
-  echo "▶ signing with Oxide Dev (stable identity)…"
+  echo "▶ signing with $SIGN_NAME (stable identity)…"
   codesign --force --sign "$SIGN_ID" --identifier com.oxide.desktop "$APPDIR/Contents/MacOS/oxide-bin"
   codesign --force --sign "$SIGN_ID" --identifier com.oxide.desktop "$APPDIR/Contents/MacOS/$APP"
   codesign --force --deep --sign "$SIGN_ID" --identifier com.oxide.desktop "$APPDIR"
   # Sign the raw release binary too so the OTA-swapped binary keeps the SAME
   # identity (otherwise the first OTA update reverts to ad-hoc and TCC re-asks).
   codesign --force --sign "$SIGN_ID" --identifier com.oxide.desktop "$BIN" 2>/dev/null || true
+  codesign --verify --deep --verbose=2 "$APPDIR"
+elif [ "$REQUIRE_SIGNING" = "1" ]; then
+  echo "✗ required signing identity '$SIGN_NAME' was not found" >&2
+  security find-identity -v -p codesigning >&2 || true
+  exit 1
 else
+  echo "⚠ no '$SIGN_NAME' identity in keychain — app will be ad-hoc signed and macOS may re-ask volume permissions after updates." >&2
   codesign --force --deep --sign - "$APPDIR" 2>/dev/null || true
 fi
 

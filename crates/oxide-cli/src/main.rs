@@ -46,6 +46,12 @@ enum Command {
         /// Auto-approve every tool call (non-interactive).
         #[arg(long)]
         yes: bool,
+        /// Emit each engine event as one JSON line.
+        #[arg(long)]
+        json_events: bool,
+        /// Answer the first ask_user question automatically.
+        #[arg(long)]
+        answer: Option<String>,
     },
     /// Launch the Rust-native desktop command center.
     Gui,
@@ -54,12 +60,32 @@ enum Command {
         #[command(subcommand)]
         action: HarnessAction,
     },
+    /// Inspect persisted sessions from the global Oxide database.
+    Session {
+        #[command(subcommand)]
+        action: SessionAction,
+    },
 }
 
 #[derive(Subcommand)]
 enum HarnessAction {
     /// List every registered harness (builtin + manifest).
     List,
+}
+
+#[derive(Subcommand)]
+enum SessionAction {
+    /// List sessions for the current workspace.
+    List {
+        /// Maximum rows to print.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// Show a session transcript by id.
+    Show {
+        /// Session id from `oxide session list`.
+        id: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -111,10 +137,13 @@ fn main() -> Result<()> {
             rt.block_on(async move {
                 match other {
                     Command::Tui => run_tui(config).await,
-                    Command::Exec { prompt, yes } => run_exec(config, prompt, yes).await,
+                    Command::Exec { prompt, yes, json_events, answer } => {
+                        run_exec(config, prompt, yes, json_events, answer).await
+                    }
                     Command::Harness { action } => match action {
                         HarnessAction::List => list_harnesses(&config),
                     },
+                    Command::Session { action } => run_session(action, &config),
                     Command::Gui => unreachable!(),
                 }
             })
@@ -124,38 +153,66 @@ fn main() -> Result<()> {
 
 /// Headless single-turn runner: submit one prompt, print every event, optionally
 /// auto-approve tool calls. Drives the same engine as the TUI/GUI.
-async fn run_exec(config: Config, prompt: String, yes: bool) -> Result<()> {
+async fn run_exec(
+    config: Config,
+    prompt: String,
+    yes: bool,
+    json_events: bool,
+    answer: Option<String>,
+) -> Result<()> {
     use oxide_protocol::{ApprovalDecision, Event, Op};
 
     let (handle, mut events) = oxide_core::spawn(config)?;
     handle.submit(Op::UserTurn { text: prompt }).await?;
+    let mut missing_answer: Option<String> = None;
 
     while let Some(ev) = events.recv().await {
+        if json_events {
+            println!("{}", serde_json::to_string(&ev)?);
+        }
         match ev {
-            Event::Ready { harness } => println!("[ready] harness={harness}"),
-            Event::SessionPath { .. } => {}
-            Event::Followups { .. } => {}
-            Event::TurnStarted { turn } => println!("[{turn}] started"),
-            Event::WorkflowSelected { title, steps, .. } => {
-                println!("[workflow] {title}");
-                for (i, step) in steps.iter().enumerate() {
-                    println!("  {}. {step}", i + 1);
+            Event::Ready { harness } => {
+                if !json_events {
+                    println!("[ready] harness={harness}");
                 }
             }
-            Event::AgentMessageDelta { text, .. } => print!("{text}"),
+            Event::SessionPath { .. } => {}
+            Event::Followups { .. } => {}
+            Event::TurnStarted { turn } => {
+                if !json_events {
+                    println!("[{turn}] started");
+                }
+            }
+            Event::WorkflowSelected { title, steps, .. } => {
+                if !json_events {
+                    println!("[workflow] {title}");
+                    for (i, step) in steps.iter().enumerate() {
+                        println!("  {}. {step}", i + 1);
+                    }
+                }
+            }
+            Event::AgentMessageDelta { text, .. } => {
+                if !json_events {
+                    print!("{text}");
+                }
+            }
             Event::ReasoningDelta { .. } => {}
             Event::ApprovalRequested {
                 request_id,
                 tool,
                 summary,
             } => {
-                println!("\n[approval] {tool}: {summary}");
+                if !json_events {
+                    println!("\n[approval] {tool}: {summary}");
+                }
                 let decision = if yes {
                     ApprovalDecision::Approve
                 } else {
                     ApprovalDecision::Reject
                 };
-                println!("[approval] -> {decision:?}");
+                if !json_events {
+                    println!("[approval] -> {decision:?}");
+                }
                 handle
                     .submit(Op::ApprovalResponse {
                         request_id,
@@ -163,87 +220,214 @@ async fn run_exec(config: Config, prompt: String, yes: bool) -> Result<()> {
                     })
                     .await?;
             }
-            Event::ToolCallBegin { tool, .. } => println!("\n[tool] {tool} …"),
+            Event::ToolCallBegin { tool, .. } => {
+                if !json_events {
+                    println!("\n[tool] {tool} …");
+                }
+            }
             Event::ToolCallEnd {
                 tool, output, ok, ..
             } => {
-                println!("[tool] {tool} ok={ok}: {output}")
+                if !json_events {
+                    println!("[tool] {tool} ok={ok}: {output}")
+                }
             }
             Event::CommandStarted { command, background, .. } => {
-                println!("[command] {}{command}", if background { "background " } else { "" });
+                if !json_events {
+                    println!("[command] {}{command}", if background { "background " } else { "" });
+                }
             }
             Event::CommandOutput { stream, chunk, .. } => {
-                if !chunk.trim().is_empty() {
+                if !json_events && !chunk.trim().is_empty() {
                     println!("[{stream}] {}", chunk.trim_end());
                 }
             }
             Event::CommandFinished { ok, exit_code, duration_ms, .. } => {
-                println!(
-                    "[command] {} exit={} duration={}ms",
-                    if ok { "done" } else { "failed" },
-                    exit_code.map(|code| code.to_string()).unwrap_or_else(|| "?".into()),
-                    duration_ms
-                );
-            }
-            Event::Todos { items } => println!("[todos] {}/{} done", items.iter().filter(|(_, s)| s == "completed").count(), items.len()),
-            Event::PatchApplied { path, .. } => println!("[patch] {path}"),
-            Event::CheckpointCreated { id, label, .. } => {
-                println!("[checkpoint] #{id}: {label}")
-            }
-            Event::RewindDone { id, restored } => {
-                println!("[rewind] #{id} restored {restored} file(s)")
-            }
-            Event::Compacted { dropped, tokens } => {
-                println!("[compacted] dropped {dropped} msg(s), ~{tokens} tokens")
-            }
-            Event::TokensUsed { input, output, .. } => {
-                println!("\n[tokens] in={input} out={output}")
-            }
-            Event::ContextWindow { limit } => println!("[context] window={limit}"),
-            Event::FileDiff { path, .. } => println!("[diff] {path}"),
-            Event::HookFired { hook, command, blocked } => {
-                println!("[hook] {hook}: {command}{}", if blocked { " (blocked)" } else { "" })
-            }
-            Event::AuditLog { kind, title, status, .. } => {
-                println!("[audit:{kind}] {status}: {title}")
-            }
-            Event::SubagentStarted { profile, task, .. } => {
-                println!("[subagent] {profile} started: {task}")
-            }
-            Event::SubagentFinished { profile, summary, ok, .. } => {
-                println!("[subagent] {profile} ok={ok}: {summary}")
-            }
-            Event::RateLimit { plan, primary_pct, secondary_pct, .. } => {
-                println!("[usage] {plan}: 5h {primary_pct}% · weekly {secondary_pct}%")
-            }
-            Event::QuestionAsked { question, options, .. } => {
-                println!("[question] {question}");
-                for (i, o) in options.iter().enumerate() {
-                    println!("  {}. {o}", i + 1);
+                if !json_events {
+                    println!(
+                        "[command] {} exit={} duration={}ms",
+                        if ok { "done" } else { "failed" },
+                        exit_code.map(|code| code.to_string()).unwrap_or_else(|| "?".into()),
+                        duration_ms
+                    );
                 }
             }
-            Event::HarnessChanged { id } => println!("[harness] {id}"),
+            Event::Todos { items } => {
+                if !json_events {
+                    println!("[todos] {}/{} done", items.iter().filter(|(_, s)| s == "completed").count(), items.len());
+                }
+            }
+            Event::PatchApplied { path, .. } => {
+                if !json_events {
+                    println!("[patch] {path}");
+                }
+            }
+            Event::CheckpointCreated { id, label, .. } => {
+                if !json_events {
+                    println!("[checkpoint] #{id}: {label}")
+                }
+            }
+            Event::RewindDone { id, restored } => {
+                if !json_events {
+                    println!("[rewind] #{id} restored {restored} file(s)")
+                }
+            }
+            Event::Compacted { dropped, tokens } => {
+                if !json_events {
+                    println!("[compacted] dropped {dropped} msg(s), ~{tokens} tokens")
+                }
+            }
+            Event::TokensUsed { input, output, .. } => {
+                if !json_events {
+                    println!("\n[tokens] in={input} out={output}")
+                }
+            }
+            Event::ContextWindow { limit } => {
+                if !json_events {
+                    println!("[context] window={limit}");
+                }
+            }
+            Event::FileDiff { path, .. } => {
+                if !json_events {
+                    println!("[diff] {path}");
+                }
+            }
+            Event::HookFired { hook, command, blocked } => {
+                if !json_events {
+                    println!("[hook] {hook}: {command}{}", if blocked { " (blocked)" } else { "" })
+                }
+            }
+            Event::AuditLog { kind, title, status, .. } => {
+                if !json_events {
+                    println!("[audit:{kind}] {status}: {title}")
+                }
+            }
+            Event::SubagentStarted { profile, task, .. } => {
+                if !json_events {
+                    println!("[subagent] {profile} started: {task}")
+                }
+            }
+            Event::SubagentFinished { profile, summary, ok, .. } => {
+                if !json_events {
+                    println!("[subagent] {profile} ok={ok}: {summary}")
+                }
+            }
+            Event::RateLimit { plan, primary_pct, secondary_pct, .. } => {
+                if !json_events {
+                    println!("[usage] {plan}: 5h {primary_pct}% · weekly {secondary_pct}%")
+                }
+            }
+            Event::QuestionAsked { request_id, question, options, .. } => {
+                if !json_events {
+                    println!("[question] {question}");
+                    for (i, o) in options.iter().enumerate() {
+                        println!("  {}. {o}", i + 1);
+                    }
+                }
+                if let Some(answer) = answer.clone() {
+                    handle.submit(Op::QuestionAnswer { request_id, answer }).await?;
+                } else {
+                    missing_answer = Some(question);
+                    handle.submit(Op::Shutdown).await.ok();
+                    break;
+                }
+            }
+            Event::HarnessChanged { id } => {
+                if !json_events {
+                    println!("[harness] {id}");
+                }
+            }
             Event::McpServerStatus {
                 name,
                 status,
                 tool_count,
                 detail,
                 ..
-            } => println!("[mcp] {name} {status} tools={tool_count}: {detail}"),
+            } => {
+                if !json_events {
+                    println!("[mcp] {name} {status} tools={tool_count}: {detail}");
+                }
+            }
             Event::BrowserTargetChanged { url, note, .. } => {
-                println!("[browser] target={url} note={note}")
+                if !json_events {
+                    println!("[browser] target={url} note={note}")
+                }
             }
             Event::BrowserSnapshotRequested { url, note, .. } => {
-                println!("[browser] snapshot={url} note={note}")
+                if !json_events {
+                    println!("[browser] snapshot={url} note={note}")
+                }
             }
-            Event::Info { text } => println!("[info] {text}"),
-            Event::Error { message } => eprintln!("[error] {message}"),
+            Event::Info { text } => {
+                if !json_events {
+                    println!("[info] {text}");
+                }
+            }
+            Event::Error { message } => {
+                if !json_events {
+                    eprintln!("[error] {message}");
+                }
+            }
             Event::TurnFinished { .. } => break,
             Event::Shutdown => break,
         }
     }
     handle.submit(Op::Shutdown).await.ok();
-    println!();
+    if let Some(question) = missing_answer {
+        anyhow::bail!("headless exec cannot answer ask_user question without --answer: {question}");
+    }
+    if !json_events {
+        println!();
+    }
+    Ok(())
+}
+
+fn run_session(action: SessionAction, config: &Config) -> Result<()> {
+    match action {
+        SessionAction::List { limit } => {
+            let workspace = config
+                .workspace
+                .clone()
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()));
+            let sessions = oxide_core::db::list(&workspace, limit);
+            if sessions.is_empty() {
+                println!("No sessions for {}", workspace.display());
+                return Ok(());
+            }
+            println!("Sessions for {}", workspace.display());
+            for session in sessions {
+                let title = if session.title.trim().is_empty() {
+                    "(untitled)"
+                } else {
+                    session.title.trim()
+                };
+                let pin = if session.pinned { "*" } else { " " };
+                let count = oxide_core::db::message_count(&session.id);
+                println!(
+                    "{pin} {}  {:<12} {:>3} msg  updated={}  {}",
+                    session.id,
+                    session.provider,
+                    count,
+                    session.updated_ms,
+                    title
+                );
+            }
+        }
+        SessionAction::Show { id } => {
+            let messages = oxide_core::db::load(&id);
+            if messages.is_empty() {
+                println!("No messages found for session {id}");
+                return Ok(());
+            }
+            for (role, content) in messages {
+                if matches!(role.as_str(), "meta" | "system" | "event") {
+                    continue;
+                }
+                println!("--- {role} ---");
+                println!("{content}");
+            }
+        }
+    }
     Ok(())
 }
 

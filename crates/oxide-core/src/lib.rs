@@ -721,6 +721,7 @@ pub fn spawn(config: Config) -> anyhow::Result<(EngineHandle, mpsc::Receiver<Eve
         mcp_clients: Vec::new(),
         mcp_tools: Vec::new(),
         mcp_instructions: Vec::new(),
+        required_mcp_unavailable: false,
         browser: None,
         ctx_window: None,
         read_files: std::collections::HashSet::new(),
@@ -798,6 +799,8 @@ struct Engine {
     mcp_tools: Vec<ToolSpec>,
     /// Server-level MCP instructions returned during initialize.
     mcp_instructions: Vec<(String, String)>,
+    /// True when a configured required MCP server failed to connect.
+    required_mcp_unavailable: bool,
     /// Lazily launched browser-automation session.
     browser: Option<browser::BrowserSession>,
     /// Model context window (tokens), reported by the provider; drives the
@@ -1095,8 +1098,9 @@ impl Engine {
         })
     }
 
-    /// Launch each configured MCP server and merge its tools. Failures are
-    /// reported but never fatal — a missing server just means fewer tools.
+    /// Launch trusted/configured MCP servers and merge their tools. External
+    /// Codex/Claude MCP servers are detected for the UI, but not auto-connected
+    /// until the user adds/trusts them in Oxide's config.
     async fn connect_mcp_servers(&mut self) {
         // Process-wide pool of live MCP connections, keyed by server config.
         // Tab switches respawn the engine; without this every switch paid the
@@ -1105,12 +1109,20 @@ impl Engine {
         static MCP_POOL: std::sync::OnceLock<tokio::sync::Mutex<Pool>> = std::sync::OnceLock::new();
         let pool = MCP_POOL.get_or_init(Default::default);
 
-        let mut servers = self.config.mcp_servers.clone();
-        // Auto-import MCP servers configured in Codex / Claude desktop so they
-        // are available in Oxide without re-declaring them.
+        self.required_mcp_unavailable = false;
+        let servers = self.config.mcp_servers.clone();
+        let configured_names: HashSet<String> = servers.iter().map(|server| server.name.clone()).collect();
         for ext in discover_external_mcp_for_workspace(&self.workspace) {
-            if !servers.iter().any(|s| s.name == ext.name) {
-                servers.push(ext);
+            if !configured_names.contains(&ext.name) {
+                let source = if ext.source.is_empty() { "external config" } else { ext.source.as_str() };
+                self.emit(Event::McpServerStatus {
+                    name: ext.name.clone(),
+                    status: "untrusted".to_string(),
+                    tool_count: 0,
+                    tools: Vec::new(),
+                    detail: format!("detected from {source}; add/trust it in MCP settings to connect"),
+                })
+                .await;
             }
         }
         // Connect all servers CONCURRENTLY with a hard per-server deadline —
@@ -1212,6 +1224,9 @@ impl Engine {
                     }
                 }
                 Err(e) => {
+                    if srv.required {
+                        self.required_mcp_unavailable = true;
+                    }
                     self.emit(Event::McpServerStatus {
                         name: srv.name.clone(),
                         status: "error".to_string(),
@@ -1221,7 +1236,11 @@ impl Engine {
                     })
                     .await;
                     self.emit(Event::Error {
-                        message: format!("mcp '{}' connect failed: {e}", srv.name),
+                        message: if srv.required {
+                            format!("required mcp '{}' connect failed: {e}", srv.name)
+                        } else {
+                            format!("mcp '{}' connect failed: {e}", srv.name)
+                        },
                     })
                     .await;
                 }
@@ -1249,16 +1268,46 @@ impl Engine {
             if !hook.status_message.is_empty() {
                 self.emit(Event::Info { text: hook.status_message.clone() }).await;
             }
-            let fut = tokio::process::Command::new("/bin/sh")
-                .arg("-c")
-                .arg(&hook.command)
-                .current_dir(&self.workspace)
-                .env("OXIDE_HOOK_EVENT", event)
-                .env("OXIDE_HOOK_MATCHER", matcher)
-                .env("OXIDE_HOOK_PAYLOAD", payload.to_string())
-                .stdin(std::process::Stdio::null())
-                .kill_on_drop(true)
-                .output();
+            if hook.background {
+                let command = hook.command.clone();
+                let workspace = self.workspace.clone();
+                let payload = payload.clone();
+                let event_name = event.to_string();
+                let matcher = matcher.to_string();
+                let timeout = hook.timeout;
+                let event_tx = self.event_tx.clone();
+                tokio::spawn(async move {
+                    let ok = run_hook_command(&workspace, &command, &event_name, &matcher, payload, timeout).await;
+                    let _ = event_tx.send(Event::AuditLog {
+                        turn: audit_turn,
+                        kind: "hook".to_string(),
+                        title: format!("Hook {event_name}"),
+                        detail: command.clone(),
+                        status: if ok { "done".to_string() } else { "failed".to_string() },
+                    }).await;
+                    let _ = event_tx.send(Event::HookFired {
+                        hook: event_name,
+                        command,
+                        blocked: false,
+                    }).await;
+                });
+                self.emit_audit(
+                    audit_turn,
+                    "hook",
+                    format!("Hook {event}"),
+                    hook.command.clone(),
+                    "background",
+                )
+                .await;
+                self.emit(Event::HookFired {
+                    hook: event.to_string(),
+                    command: hook.command.clone(),
+                    blocked: false,
+                })
+                .await;
+                continue;
+            }
+            let fut = hook_command(&self.workspace, &hook.command, event, matcher, payload.clone());
             // A hook must never wedge the agent — bound it, then kill on drop.
             let status = tokio::time::timeout(std::time::Duration::from_secs(hook.timeout), fut).await;
             let ok = matches!(&status, Ok(Ok(o)) if o.status.success());
@@ -2142,6 +2191,14 @@ Reply with text only: summarize what you changed, what you verified, and what re
         let turn = TurnId(self.next_turn);
         self.next_turn += 1;
         self.emit(Event::TurnStarted { turn }).await;
+        if self.required_mcp_unavailable {
+            self.emit(Event::Error {
+                message: "required MCP server unavailable; fix MCP settings or disable required before starting a turn".to_string(),
+            })
+            .await;
+            self.emit(Event::TurnFinished { turn }).await;
+            return;
+        }
 
         // Expand `/slash` commands from .oxide/commands/*.md before running.
         let user_text = if user_text.trim_start().starts_with('/') {
@@ -3411,6 +3468,44 @@ Do NOT read it again. Proceed now: make the edits with the edit/write_file tools
         self.emit_tool_end(turn, name, output, ok).await;
         false
     }
+}
+
+async fn run_hook_command(
+    workspace: &Path,
+    command: &str,
+    event: &str,
+    matcher: &str,
+    payload: serde_json::Value,
+    timeout: u64,
+) -> bool {
+    matches!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(timeout),
+            hook_command(workspace, command, event, matcher, payload)
+        )
+        .await,
+        Ok(Ok(output)) if output.status.success()
+    )
+}
+
+async fn hook_command(
+    workspace: &Path,
+    command: &str,
+    event: &str,
+    matcher: &str,
+    payload: serde_json::Value,
+) -> std::io::Result<std::process::Output> {
+    tokio::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(command)
+        .current_dir(workspace)
+        .env("OXIDE_HOOK_EVENT", event)
+        .env("OXIDE_HOOK_MATCHER", matcher)
+        .env("OXIDE_HOOK_PAYLOAD", payload.to_string())
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output()
+        .await
 }
 
 /// Load pinned project instructions from AGENTS.md / CLAUDE.md (first found).

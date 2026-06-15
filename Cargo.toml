@@ -15,11 +15,11 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.67"
+version = "0.0.68"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Oxide contributors"]
-repository = "https://example.com/oxide"
+repository = "https://github.com/MANFIT7/oxide"
 rust-version = "1.85"
 
 [workspace.dependencies]
@@ -57,6 +57,7 @@ base64 = "0.22"
 rfd = "0.15"
 similar = "2"
 self-replace = "1"
+sha2 = "0.10"
 portable-pty = "0.8"
 chromiumoxide = { version = "0.7", features = ["tokio-runtime"], default-features = false }
 eframe = "0.29"

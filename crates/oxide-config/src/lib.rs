@@ -320,9 +320,14 @@ impl Config {
         }
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading config {}", path.display()))?;
-        let parsed: Config =
+        let overlay: toml::Value =
             toml::from_str(&text).with_context(|| format!("parsing config {}", path.display()))?;
-        *self = parsed;
+        let mut base = toml::Value::try_from(&*self)
+            .with_context(|| format!("serializing base config before overlay {}", path.display()))?;
+        merge_toml(&mut base, overlay);
+        *self = base
+            .try_into()
+            .with_context(|| format!("merging config {}", path.display()))?;
         Ok(())
     }
 
@@ -346,6 +351,24 @@ fn fast_model_for_provider(provider: &str) -> Option<&'static str> {
         "deepseek" => Some("deepseek-v4-flash"),
         "mistral" => Some("mistral-small-4"),
         _ => None,
+    }
+}
+
+fn merge_toml(base: &mut toml::Value, overlay: toml::Value) {
+    match (base, overlay) {
+        (toml::Value::Table(base), toml::Value::Table(overlay)) => {
+            for (key, value) in overlay {
+                match base.get_mut(&key) {
+                    Some(existing) => merge_toml(existing, value),
+                    None => {
+                        base.insert(key, value);
+                    }
+                }
+            }
+        }
+        (base, overlay) => {
+            *base = overlay;
+        }
     }
 }
 
@@ -384,5 +407,27 @@ mod tests {
 
         cfg.provider = "mistral".to_string();
         assert_eq!(cfg.effective_model(), "mistral-small-4");
+    }
+
+    #[test]
+    fn overlay_file_preserves_existing_values_for_missing_keys() {
+        let dir = std::env::temp_dir().join(format!("oxide-config-overlay-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("oxide.toml");
+        std::fs::write(&path, r#"provider = "codex""#).unwrap();
+
+        let mut cfg = Config {
+            model: "gpt-custom".to_string(),
+            notification_sound: false,
+            ..Config::default()
+        };
+        cfg.overlay_file(&path).unwrap();
+
+        assert_eq!(cfg.provider, "codex");
+        assert_eq!(cfg.model, "gpt-custom");
+        assert!(!cfg.notification_sound);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

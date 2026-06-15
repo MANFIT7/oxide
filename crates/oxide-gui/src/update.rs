@@ -11,6 +11,7 @@ pub const CURRENT: &str = env!("CARGO_PKG_VERSION");
 pub struct UpdateInfo {
     pub version: String,
     pub url: String,
+    pub sha256_url: Option<String>,
     pub notes: String,
 }
 
@@ -59,7 +60,12 @@ async fn check_github(repo: &str) -> Option<UpdateInfo> {
     let notes = v["body"].as_str().unwrap_or("").lines().next().unwrap_or("").chars().take(120).collect::<String>();
     let assets = v["assets"].as_array()?;
     let asset = pick_asset(assets)?;
-    Some(UpdateInfo { version, url: asset, notes })
+    Some(UpdateInfo {
+        version,
+        sha256_url: checksum_url_for(assets, &asset),
+        url: asset,
+        notes,
+    })
 }
 
 /// Pick the release asset matching the current OS/arch (macOS-arm64 first).
@@ -68,21 +74,31 @@ fn pick_asset(assets: &[serde_json::Value]) -> Option<String> {
     let arch = std::env::consts::ARCH; // "aarch64"
     let name_of = |a: &serde_json::Value| a["name"].as_str().unwrap_or("").to_ascii_lowercase();
     let dl = |a: &serde_json::Value| a["browser_download_url"].as_str().map(String::from);
-    let os_match = |n: &str| n.contains(os) || (os == "macos" && n.contains("darwin"));
-    let arch_match = |n: &str| n.contains(arch) || (arch == "aarch64" && n.contains("arm64"));
-    // best: os + arch + gzip (smallest download)
-    if let Some(a) = assets.iter().find(|a| { let n = name_of(a); os_match(&n) && arch_match(&n) && n.ends_with(".gz") }) {
-        return dl(a);
-    }
-    // os + arch (raw binary)
-    if let Some(a) = assets.iter().find(|a| { let n = name_of(a); os_match(&n) && arch_match(&n) && !n.ends_with(".dmg") }) {
-        return dl(a);
-    }
-    // os only
-    if let Some(a) = assets.iter().find(|a| os_match(&name_of(a))) {
-        return dl(a);
-    }
-    assets.first().and_then(dl)
+    let wanted = match (os, arch) {
+        ("macos", "aarch64") => "oxide-macos-arm64.gz",
+        ("macos", "x86_64") => "oxide-macos-x64.gz",
+        ("linux", "aarch64") => "oxide-linux-arm64.gz",
+        ("linux", "x86_64") => "oxide-linux-x64.gz",
+        ("windows", "x86_64") => "oxide-windows-x64.exe.gz",
+        _ => return None,
+    };
+    assets
+        .iter()
+        .find(|a| name_of(a) == wanted)
+        .and_then(dl)
+}
+
+fn checksum_url_for(assets: &[serde_json::Value], asset_url: &str) -> Option<String> {
+    let asset_name = asset_url.rsplit('/').next()?.to_ascii_lowercase();
+    let checksum_name = format!("{asset_name}.sha256");
+    assets.iter().find_map(|a| {
+        let name = a["name"].as_str()?.to_ascii_lowercase();
+        if name == checksum_name {
+            a["browser_download_url"].as_str().map(String::from)
+        } else {
+            None
+        }
+    })
 }
 
 async fn check_manifest(manifest_url: &str) -> Option<UpdateInfo> {
@@ -94,6 +110,7 @@ async fn check_manifest(manifest_url: &str) -> Option<UpdateInfo> {
     Some(UpdateInfo {
         version,
         url: v["url"].as_str()?.to_string(),
+        sha256_url: v["sha256_url"].as_str().map(str::to_string),
         notes: v["notes"].as_str().unwrap_or("").to_string(),
     })
 }
@@ -104,6 +121,9 @@ pub async fn apply<F: Fn(f32)>(info: &UpdateInfo, on_progress: F) -> anyhow::Res
     use futures::StreamExt;
     let client = reqwest::Client::builder().user_agent("oxide-updater").build()?;
     let resp = client.get(&info.url).send().await?;
+    if !resp.status().is_success() {
+        anyhow::bail!("update download failed: {}", resp.status());
+    }
     let total = resp.content_length().unwrap_or(0);
     let mut stream = resp.bytes_stream();
     let mut buf: Vec<u8> = Vec::with_capacity(total as usize);
@@ -114,6 +134,12 @@ pub async fn apply<F: Fn(f32)>(info: &UpdateInfo, on_progress: F) -> anyhow::Res
         buf.extend_from_slice(&chunk);
         if total > 0 {
             on_progress((got as f32 / total as f32).min(0.98));
+        }
+    }
+    if let Some(expected) = expected_sha256(&client, info).await? {
+        let actual = sha256_hex(&buf);
+        if !actual.eq_ignore_ascii_case(&expected) {
+            anyhow::bail!("update checksum mismatch: expected {expected}, got {actual}");
         }
     }
     // Decompress gzip assets in memory.
@@ -137,6 +163,32 @@ pub async fn apply<F: Fn(f32)>(info: &UpdateInfo, on_progress: F) -> anyhow::Res
     let _ = std::fs::remove_file(&tmp);
     on_progress(1.0);
     Ok(())
+}
+
+async fn expected_sha256(client: &reqwest::Client, info: &UpdateInfo) -> anyhow::Result<Option<String>> {
+    let Some(url) = info.sha256_url.as_deref() else {
+        return Ok(None);
+    };
+    let resp = client.get(url).send().await?;
+    if !resp.status().is_success() {
+        anyhow::bail!("checksum download failed: {}", resp.status());
+    }
+    let text = resp.text().await?;
+    let Some(first) = text.split_whitespace().next() else {
+        anyhow::bail!("checksum file is empty");
+    };
+    if first.len() != 64 || !first.chars().all(|c| c.is_ascii_hexdigit()) {
+        anyhow::bail!("checksum file does not start with a SHA-256 hex digest");
+    }
+    Ok(Some(first.to_string()))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
 }
 
 /// Relaunch the (now-updated) executable and exit the current process.

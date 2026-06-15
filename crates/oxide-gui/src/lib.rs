@@ -1504,19 +1504,15 @@ fn slash_commands(ws: &Path, query: &str) -> Vec<(String, String)> {
 }
 
 /// Combined `@` menu: skills first, then files/folders.
-/// MCP servers (own + auto-imported) matching `query`, as `mcp:<server>` tokens.
+/// Trusted/configured MCP servers matching `query`, as `mcp:<server>` tokens.
 fn mcp_candidates(ws: &Path, query: &str) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
-    if let Ok(cfg) = Config::load() {
+    if let Ok(mut cfg) = Config::load() {
+        let _ = cfg.overlay_file(&ws.join("oxide.toml"));
         for s in cfg.mcp_servers {
             if s.enabled {
                 names.push(s.name);
             }
-        }
-    }
-    for s in oxide_core::discover_external_mcp_for_workspace(ws) {
-        if s.enabled {
-            names.push(s.name);
         }
     }
     names.sort();
@@ -1640,33 +1636,94 @@ fn relative_time(t: std::time::SystemTime) -> String {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn is_macos_volume_path(path: &Path) -> bool {
+    use std::path::Component;
+
+    let mut components = path.components();
+    matches!(components.next(), Some(Component::RootDir))
+        && matches!(components.next(), Some(Component::Normal(name)) if name == "Volumes")
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_macos_volume_path(_path: &Path) -> bool {
+    false
+}
+
+fn should_defer_recent_workspace_scan(current: &Path, workspace: &Path) -> bool {
+    if !is_macos_volume_path(workspace) {
+        return false;
+    }
+    if !current.as_os_str().is_empty() && workspace == current {
+        return false;
+    }
+    std::env::var_os("OXIDE_SCAN_RECENT_VOLUMES").is_none()
+}
+
 /// Group recent sessions by project: `(workspace, name, [(path, title, reltime)])`.
 fn build_projects(current: &Path, recents: &[PathBuf]) -> Vec<ProjectGroup> {
     let mut seen = HashSet::new();
-    let mut wss: Vec<PathBuf> = Vec::new();
+    let mut wss: Vec<(PathBuf, bool)> = Vec::new();
     // STABLE order: db recency first (only changes when you actually chat, not
     // when you click to switch), then the current workspace + recents as a
     // fallback so a brand-new project still appears. Clicking never reorders.
-    let db_ws: Vec<PathBuf> = oxide_core::db::workspaces().into_iter().map(PathBuf::from).collect();
-    for w in db_ws.into_iter().chain(std::iter::once(current.to_path_buf())).chain(recents.iter().cloned()) {
-        if !w.as_os_str().is_empty() && w.exists() && seen.insert(w.clone()) {
-            wss.push(w);
+    let db_ws: Vec<PathBuf> = oxide_core::db::workspaces()
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+    for w in db_ws
+        .into_iter()
+        .chain(std::iter::once(current.to_path_buf()))
+        .chain(recents.iter().cloned())
+    {
+        if w.as_os_str().is_empty() || !seen.insert(w.clone()) {
+            continue;
+        }
+        let deferred = should_defer_recent_workspace_scan(current, &w);
+        if deferred || w.exists() {
+            wss.push((w, deferred));
         }
     }
     let mut out = Vec::new();
-    for ws in wss {
+    for (ws, deferred) in wss {
         // Group each project's OWN chats under it (synara-style), so a chat
         // always appears under the folder it belongs to — not just the active
         // one. These are user-opened folders, so access is already granted.
-        let items: Vec<(PathBuf, String, String, String)> = recent_sessions(&ws)
-            .into_iter()
-            .take(8)
-            .map(|(p, m, t, prov)| (p, t, relative_time(m), prov))
-            .collect();
+        let items: Vec<(PathBuf, String, String, String)> = if deferred {
+            Vec::new()
+        } else {
+            recent_sessions(&ws)
+                .into_iter()
+                .take(8)
+                .map(|(p, m, t, prov)| (p, t, relative_time(m), prov))
+                .collect()
+        };
         let name = project_name(&ws);
         out.push((ws, name, items));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn active_workspace_scan_is_not_deferred() {
+        let workspace = Path::new("/Volumes/Data/oxide");
+
+        assert!(!should_defer_recent_workspace_scan(workspace, workspace));
+    }
+
+    #[test]
+    fn inactive_macos_volume_scan_is_deferred_by_default() {
+        let current = Path::new("/Users/example/project");
+        let recent = Path::new("/Volumes/Data/oxide");
+        let expected = cfg!(target_os = "macos")
+            && std::env::var_os("OXIDE_SCAN_RECENT_VOLUMES").is_none();
+
+        assert_eq!(should_defer_recent_workspace_scan(current, recent), expected);
+    }
 }
 
 /// Push a toast (kind: "ok" | "err" | "info") that auto-dismisses after 4s.
@@ -1875,6 +1932,16 @@ fn scroll_chat_bottom() {
     spawn(async move {
         let _ = dioxus::document::eval(
             "for (const delay of [0, 40, 140]) setTimeout(()=>requestAnimationFrame(()=>{const s=document.querySelector('.scroll'); if(s) s.scrollTo({top:s.scrollHeight, behavior:'auto'});}),delay);",
+        )
+        .await;
+    });
+}
+
+/// Keep the transcript pinned only when the user was already reading the tail.
+fn scroll_chat_bottom_if_sticky() {
+    spawn(async move {
+        let _ = dioxus::document::eval(
+            "requestAnimationFrame(()=>{const s=document.querySelector('.scroll'); if(!s) return; const d=s.scrollHeight-s.scrollTop-s.clientHeight; if(window.__oxstick!==false || d < 180) s.scrollTo({top:s.scrollHeight, behavior:'auto'});});",
         )
         .await;
     });
@@ -2684,11 +2751,13 @@ fn app() -> Element {
                 cur = s;
                 if (inner) { inner.disconnect(); inner = null; }
                 if (!s) return;
-                const stick = () => { if ((s.scrollHeight - s.scrollTop - s.clientHeight) < 140) s.scrollTop = s.scrollHeight; upd(); };
                 const upd = () => {
+                  const d = s.scrollHeight - s.scrollTop - s.clientHeight;
+                  window.__oxstick = d < 140;
                   const b = s.querySelector('.jump-bottom');
-                  if (b) b.classList.toggle('show', (s.scrollHeight - s.scrollTop - s.clientHeight) > 300);
+                  if (b) b.classList.toggle('show', d > 300);
                 };
+                const stick = () => { if (window.__oxstick !== false) s.scrollTop = s.scrollHeight; upd(); };
                 s.addEventListener('scroll', upd, { passive: true });
                 inner = new MutationObserver(stick);
                 inner.observe(s, { childList: true, subtree: true, characterData: true });
@@ -3587,6 +3656,7 @@ fn app() -> Element {
                                     title: format!("Subagent · {profile}"),
                                     sub: task,
                                 });
+                                scroll_chat_bottom_if_sticky();
                             }
                             Event::SubagentFinished { worker_id, profile, task, summary, ok, .. } => {
                                 {
@@ -3611,6 +3681,7 @@ fn app() -> Element {
                                     title: format!("Subagent {} · {profile}", if ok { "done" } else { "stopped" }),
                                     sub: if summary.trim().is_empty() { task } else { summary },
                                 });
+                                scroll_chat_bottom_if_sticky();
                             }
                             Event::ApprovalRequested { request_id, tool, summary } => {
                                 approvals.write().push((request_id, tool.clone(), summary.clone()));
@@ -3671,6 +3742,7 @@ fn app() -> Element {
 	                                    });
 	                                    command_rows.write().insert(command_id, idx);
 	                                }
+	                                scroll_chat_bottom_if_sticky();
 	                            }
 	                            Event::CommandOutput { command_id, worker_id, stream, chunk, .. } => {
 	                                if let Some(worker_id) = worker_id {
@@ -3714,9 +3786,11 @@ fn app() -> Element {
 	                                        append_activity_output(&mut row.text, &footer);
 	                                    }
 	                                }
+	                                scroll_chat_bottom_if_sticky();
 	                            }
 	                            Event::Todos { items } => {
 	                                todos.set(items);
+	                                scroll_chat_bottom_if_sticky();
 	                            }
                             Event::PatchApplied { path, .. } => {
                                 timeline.write().push(TimelineItem { title: "✎ patched".into(), sub: path });
@@ -6736,12 +6810,24 @@ fn McpModal(cfg: Signal<Config>, engine: Coroutine<EngineCmd>, status: Signal<st
                                 let line = if s.url.is_empty() { format!("{} {}", s.command, s.args.join(" ")) } else { s.url.clone() };
                                 let disabled = !s.enabled;
                                 let source = if s.source.is_empty() { "imported".to_string() } else { s.source.clone() };
+                                let trusted = s.clone();
                                 rsx! {
                                     div { class: "mcp-item",
                                         div { class: "mcp-top",
                                             span { class: if connected { "mcp-dot on" } else { "mcp-dot" } }
                                             span { class: "skill-name", "{s.name}" }
                                             span { class: "mcp-tag", if disabled { "disabled" } else if s.url.is_empty() { "imported" } else { "http" } }
+                                            button { class: "mcp-remove", onclick: move |_| {
+                                                let mut server = trusted.clone();
+                                                server.enabled = true;
+                                                let mut list = cfg.read().mcp_servers.clone();
+                                                if !list.iter().any(|item| item.name == server.name) {
+                                                    list.push(server);
+                                                    list.sort_by(|a, b| a.name.cmp(&b.name));
+                                                }
+                                                let mut c = cfg.read().clone(); c.mcp_servers = list; cfg.set(c.clone());
+                                                let _ = engine.send(EngineCmd::Reconfigure(c));
+                                            }, "Trust" }
                                         }
                                         div { class: "mcp-src", "{source}" }
                                         div { class: "mcp-cmd", "{line}" }

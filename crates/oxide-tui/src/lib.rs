@@ -316,7 +316,21 @@ fn apply_event(event: Event, state: &mut State) {
                 Style::default().fg(if ok { Color::Green } else { Color::Red }),
             )));
         }
-        Event::Todos { .. } => {}
+        Event::Todos { items } => {
+            let done = items.iter().filter(|(_, status)| status == "completed").count();
+            state.push(Line::from(Span::styled(
+                format!("todos {done}/{} done", items.len()),
+                Style::default().fg(Color::Blue),
+            )));
+            for (content, status) in items {
+                let mark = match status.as_str() {
+                    "completed" => "[x]",
+                    "in_progress" => "[>]",
+                    _ => "[ ]",
+                };
+                state.push(Line::from(format!("  {mark} {content}")));
+            }
+        }
         Event::PatchApplied { path, .. } => state.push(Line::from(Span::styled(
             format!("✎ patched {path}"),
             Style::default().fg(Color::Magenta),

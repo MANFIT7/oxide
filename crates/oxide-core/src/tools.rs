@@ -8,7 +8,7 @@ use crate::sandbox::{self, PathCheck};
 use oxide_protocol::{ApprovalPolicy, Event, SandboxPolicy, ToolSpec, TurnId};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt, BufReader};
 use tokio::sync::mpsc;
 
 pub struct ToolRouter {
@@ -491,9 +491,14 @@ where
     R: AsyncRead + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
-        let mut lines = BufReader::new(reader).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            let _ = tx.send((stream, format!("{line}\n")));
+        let mut reader = BufReader::new(reader);
+        let mut buf = vec![0u8; 4096];
+        while let Ok(n) = reader.read(&mut buf).await {
+            if n == 0 {
+                break;
+            }
+            let chunk = String::from_utf8_lossy(&buf[..n]).to_string();
+            let _ = tx.send((stream, chunk));
         }
     });
 }

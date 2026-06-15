@@ -20,16 +20,24 @@ permissions:
 jobs:
   release:
     runs-on: macos-14 # Apple silicon (arm64)
-    env:
-      # Job-level so the import step's `if` can see it (secrets aren't allowed
-      # directly in `if:` conditions).
-      OXIDE_CERT_P12: ${{ secrets.OXIDE_CERT_P12 }}
     steps:
-      - uses: actions/checkout@v4
-
       - name: Resolve tag
         id: tag
-        run: echo "tag=${GITHUB_REF_NAME:-${{ github.event.inputs.tag }}}" >> "$GITHUB_OUTPUT"
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="$GITHUB_REF_NAME"
+          fi
+          case "$tag" in
+            v*) ;;
+            *) echo "Release tag must start with v: $tag" >&2; exit 1 ;;
+          esac
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -37,15 +45,31 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      - name: Validate release tag
+        run: |
+          version="$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
+          expected="v$version"
+          actual="${{ steps.tag.outputs.tag }}"
+          if [ "$actual" != "$expected" ]; then
+            echo "Tag/version mismatch: tag=$actual Cargo.toml=$version" >&2
+            exit 1
+          fi
+
       # Optional: import the stable "Oxide Dev" signing identity so OTA updates
       # don't re-trigger macOS Allow prompts. Set repo secrets OXIDE_CERT_P12
       # (base64 of the .p12) and OXIDE_CERT_PASSWORD. Without them the build is
       # ad-hoc signed (still works; just prompts on each update).
       - name: Import signing certificate
-        if: ${{ env.OXIDE_CERT_P12 != '' }}
+        id: signing
         env:
+          OXIDE_CERT_P12: ${{ secrets.OXIDE_CERT_P12 }}
           OXIDE_CERT_PASSWORD: ${{ secrets.OXIDE_CERT_PASSWORD }}
         run: |
+          if [ -z "$OXIDE_CERT_P12" ]; then
+            echo "::warning title=Unsigned release::Missing OXIDE_CERT_P12; this build will be ad-hoc signed and macOS may re-ask volume permissions after updates."
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           KEYCHAIN="$RUNNER_TEMP/build.keychain"
           PW="ci-$RANDOM"
           security create-keychain -p "$PW" "$KEYCHAIN"
@@ -55,13 +79,28 @@ jobs:
           security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$OXIDE_CERT_PASSWORD" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$PW" "$KEYCHAIN" >/dev/null
           security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | sed s/\"//g)
+          security find-certificate -c "Oxide Dev" -p "$KEYCHAIN" > "$RUNNER_TEMP/oxide-dev.pem" || true
+          if [ -s "$RUNNER_TEMP/oxide-dev.pem" ]; then
+            security add-trusted-cert -r trustRoot -k "$KEYCHAIN" "$RUNNER_TEMP/oxide-dev.pem" || true
+          fi
+          security find-identity -v -p codesigning
           rm -f "$RUNNER_TEMP/cert.p12"
+          echo "available=true" >> "$GITHUB_OUTPUT"
 
       - name: Build dmg
-        run: bash scripts/make-dmg.sh
+        run: |
+          if [ "${{ steps.signing.outputs.available }}" = "true" ]; then
+            export OXIDE_REQUIRE_SIGNING=1
+          fi
+          bash scripts/make-dmg.sh
 
       - name: Package OTA binary (gzip)
         run: gzip -9 -c target/release/oxide > oxide-macos-arm64.gz
+
+      - name: Generate asset checksums
+        run: |
+          shasum -a 256 dist/Oxide.dmg > dist/Oxide.dmg.sha256
+          shasum -a 256 oxide-macos-arm64.gz > oxide-macos-arm64.gz.sha256
 
       - name: Attach assets to the release
         uses: softprops/action-gh-release@v2
@@ -70,5 +109,7 @@ jobs:
           name: ${{ steps.tag.outputs.tag }}
           files: |
             dist/Oxide.dmg
+            dist/Oxide.dmg.sha256
             oxide-macos-arm64.gz
+            oxide-macos-arm64.gz.sha256
           fail_on_unmatched_files: true
