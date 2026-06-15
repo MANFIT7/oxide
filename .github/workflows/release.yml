@@ -90,28 +90,57 @@ jobs:
           import subprocess
           import sys
 
-          try:
-              subprocess.run(
-                  [
-                      "security",
-                      "add-trusted-cert",
-                      "-r",
-                      "trustRoot",
-                      "-p",
-                      "codeSign",
-                      "-k",
-                      sys.argv[1],
-                      sys.argv[2],
-                  ],
-                  check=False,
-                  timeout=30,
-              )
-          except subprocess.TimeoutExpired:
+          commands = [
+              [
+                  "sudo",
+                  "-n",
+                  "security",
+                  "add-trusted-cert",
+                  "-d",
+                  "-r",
+                  "trustRoot",
+                  "-p",
+                  "codeSign",
+                  "-k",
+                  "/Library/Keychains/System.keychain",
+                  sys.argv[2],
+              ],
+              [
+                  "security",
+                  "add-trusted-cert",
+                  "-r",
+                  "trustRoot",
+                  "-p",
+                  "codeSign",
+                  "-k",
+                  sys.argv[1],
+                  sys.argv[2],
+              ],
+          ]
+
+          trusted = False
+          timed_out = False
+          for command in commands:
+              try:
+                  result = subprocess.run(command, check=False, timeout=30)
+              except subprocess.TimeoutExpired:
+                  timed_out = True
+                  continue
+              if result.returncode == 0:
+                  trusted = True
+                  break
+
+          if not trusted and timed_out:
               print("::warning title=Signing trust timed out::Timed out while trusting the imported signing certificate; release will fall back to ad-hoc signing if no valid identity is available.")
+          elif not trusted:
+              print("::warning title=Signing trust failed::Unable to trust the imported signing certificate; release will fall back to ad-hoc signing if no valid identity is available.")
           PY
           fi
           security find-identity -v -p codesigning "$KEYCHAIN"
           identity="$(security find-identity -v -p codesigning "$KEYCHAIN" | awk -F '\"' '/\"/ { print $2; exit }')"
+          if [ -z "$identity" ]; then
+            identity="$(security find-identity -v -p codesigning | awk -F '\"' '/\"/ { print $2; exit }')"
+          fi
           rm -f "$RUNNER_TEMP/cert.p12"
           if [ -z "$identity" ]; then
             echo "::warning title=Unsigned release::Signing certificate was imported but no valid codesigning identity was found; this build will be ad-hoc signed."
