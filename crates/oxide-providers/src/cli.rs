@@ -31,6 +31,7 @@ const CLAUDE_INTERACTIVE_POLL: Duration = Duration::from_millis(250);
 const CLAUDE_INTERACTIVE_SETTLE: Duration = Duration::from_millis(1600);
 const CLAUDE_INTERACTIVE_TURN_TIMEOUT: Duration = Duration::from_secs(45 * 60);
 const CLAUDE_INTERACTIVE_READY_TIMEOUT: Duration = Duration::from_secs(8);
+const CLAUDE_INTERACTIVE_PROMPT_ACCEPT_TIMEOUT: Duration = Duration::from_secs(12);
 
 fn session_key(bin: &str, conv: &str, cwd: &str) -> String {
     // Prefer the per-conversation id; fall back to cwd if absent.
@@ -742,6 +743,7 @@ struct ClaudeTranscriptSnapshot {
     tail: ClaudeTranscriptTail,
     tool_uses: Vec<ClaudeToolUse>,
     tool_results: Vec<ClaudeToolResult>,
+    user_prompt_seen: bool,
     turn_complete: bool,
     usage: Option<(u64, u64, Option<u64>)>,
 }
@@ -839,6 +841,8 @@ async fn run_claude_interactive_turn(
     let mut emitted_results: HashSet<String> = HashSet::new();
     let mut pending_usage: Option<(u64, u64, Option<u64>)> = None;
     let mut usage_emitted = false;
+    let mut prompt_accepted = false;
+    let mut prompt_retry_at: Option<Instant> = None;
     let mut interval = tokio::time::interval(CLAUDE_INTERACTIVE_POLL);
 
     loop {
@@ -856,6 +860,14 @@ async fn run_claude_interactive_turn(
         }
 
         let snapshot = parse_claude_transcript(transcript, baseline_lines);
+        let transcript_has_activity = snapshot.user_prompt_seen
+            || !snapshot.assistant_text.trim().is_empty()
+            || !snapshot.tool_uses.is_empty()
+            || !snapshot.tool_results.is_empty()
+            || snapshot.turn_complete;
+        if transcript_has_activity {
+            prompt_accepted = true;
+        }
         if let Some(id) = snapshot.session_id.as_deref() {
             send(sink, StreamItem::CliSession(id.to_string()));
         }
@@ -894,6 +906,36 @@ async fn run_claude_interactive_turn(
         }
         if let Some(usage) = snapshot.usage {
             pending_usage = Some(usage);
+        }
+
+        if !prompt_accepted {
+            let since_input = prompt_retry_at.map(|at| at.elapsed()).unwrap_or_else(|| started.elapsed());
+            if since_input >= CLAUDE_INTERACTIVE_PROMPT_ACCEPT_TIMEOUT {
+                if prompt_retry_at.is_none() {
+                    send(sink, StreamItem::Notice("⚠ Claude interactive prompt was not accepted; retrying input".to_string()));
+                    writer
+                        .write_all(b"\x03")
+                        .map_err(|e| anyhow::anyhow!("failed to reset interactive Claude prompt: {e}"))?;
+                    writer
+                        .flush()
+                        .map_err(|e| anyhow::anyhow!("failed to flush interactive Claude reset: {e}"))?;
+                    wait_for_claude_prompt(&pty_rx, &mut terminal_tail);
+                    writer
+                        .write_all(&interactive_retry_bytes(prompt))
+                        .map_err(|e| anyhow::anyhow!("failed to retry prompt to interactive Claude Code: {e}"))?;
+                    writer
+                        .flush()
+                        .map_err(|e| anyhow::anyhow!("failed to flush retried prompt to interactive Claude Code: {e}"))?;
+                    prompt_retry_at = Some(Instant::now());
+                    last_change = Instant::now();
+                    continue;
+                }
+                return Err(anyhow::anyhow!(
+                    "interactive Claude Code did not accept the prompt within {} seconds{}",
+                    CLAUDE_INTERACTIVE_PROMPT_ACCEPT_TIMEOUT.as_secs(),
+                    tail_context(&terminal_tail)
+                ));
+            }
         }
 
         if let Some(status) = child.try_wait()? {
@@ -1025,6 +1067,7 @@ fn parse_claude_transcript(path: &Path, baseline_lines: usize) -> ClaudeTranscri
 }
 
 fn parse_claude_user_line(v: &Value, snapshot: &mut ClaudeTranscriptSnapshot) {
+    snapshot.user_prompt_seen = true;
     if let Value::Array(blocks) = &v["message"]["content"] {
         for block in blocks {
             if block["type"].as_str() != Some("tool_result") {
@@ -1200,6 +1243,17 @@ fn interactive_paste_bytes(prompt: &str) -> Vec<u8> {
     format!("\x1b[200~{normalized}\x1b[201~\r").into_bytes()
 }
 
+fn interactive_retry_bytes(prompt: &str) -> Vec<u8> {
+    let normalized = prompt.replace("\r\n", "\n").replace('\r', "\n");
+    if normalized.trim().is_empty() {
+        return b"\r".to_vec();
+    }
+    if !normalized.contains('\n') && normalized.len() <= 2000 {
+        return format!("{normalized}\r").into_bytes();
+    }
+    interactive_paste_bytes(&normalized)
+}
+
 fn new_claude_session_id() -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1303,6 +1357,7 @@ mod claude_interactive_tests {
         assert_eq!(snapshot.session_id.as_deref(), Some("abc"));
         assert_eq!(snapshot.assistant_text, "I'll inspect.\n\nDone.");
         assert_eq!(snapshot.tail, ClaudeTranscriptTail::Other);
+        assert!(snapshot.user_prompt_seen);
         assert!(snapshot.turn_complete);
         assert_eq!(snapshot.tool_uses.len(), 1);
         assert_eq!(snapshot.tool_uses[0].command.as_deref(), Some("git status"));
@@ -1313,8 +1368,37 @@ mod claude_interactive_tests {
     }
 
     #[test]
+    fn startup_metadata_does_not_accept_interactive_prompt() {
+        let path = std::env::temp_dir().join(format!("oxide-claude-interactive-{}.jsonl", new_claude_session_id()));
+        let text = r#"{"type":"last-prompt","sessionId":"abc"}
+{"type":"mode","mode":"normal","sessionId":"abc"}
+{"type":"permission-mode","permissionMode":"bypassPermissions","sessionId":"abc"}
+"#;
+        std::fs::write(&path, text).unwrap();
+        let snapshot = parse_claude_transcript(&path, 0);
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(snapshot.session_id.as_deref(), Some("abc"));
+        assert!(!snapshot.user_prompt_seen);
+        assert!(snapshot.assistant_text.is_empty());
+        assert!(snapshot.tool_uses.is_empty());
+        assert!(!snapshot.turn_complete);
+    }
+
+    #[test]
     fn prompt_is_sent_as_bracketed_paste() {
         let bytes = interactive_paste_bytes("hello\nworld");
+        let text = String::from_utf8(bytes).unwrap();
+        assert_eq!(text, "\x1b[200~hello\nworld\x1b[201~\r");
+    }
+
+    #[test]
+    fn retry_input_uses_plain_enter_for_short_single_line_prompts() {
+        let bytes = interactive_retry_bytes("Hasilnya?");
+        let text = String::from_utf8(bytes).unwrap();
+        assert_eq!(text, "Hasilnya?\r");
+
+        let bytes = interactive_retry_bytes("hello\nworld");
         let text = String::from_utf8(bytes).unwrap();
         assert_eq!(text, "\x1b[200~hello\nworld\x1b[201~\r");
     }
