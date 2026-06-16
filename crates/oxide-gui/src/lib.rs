@@ -3904,9 +3904,10 @@ fn app() -> Element {
 	                                        bg_jobs.write().push(command.clone());
 	                                    }
 	                                    status.set(if background { format!("Background · {command}") } else { format!("Running · {command}") });
-	                                    let mut m = messages.write();
-	                                    let idx = m.len();
-	                                    m.push(ChatMsg {
+	                                    // Insert above any trailing "✓ Done" note (CLI drivers
+	                                    // like claude can surface a command row after the turn's
+	                                    // text + Done landed) so it never renders below the footer.
+	                                    let idx = push_activity!(ChatMsg {
 	                                        author: Author::Activity { running: true, ok: true },
 	                                        text: command_activity_label(&command, background),
 	                                    });
@@ -4049,6 +4050,11 @@ fn app() -> Element {
                             Event::TurnFinished { .. } => {
                                 streaming.set(false);
                                 status.set(String::new());
+                                // The workflow/skill-route card is per-turn guidance ("here's
+                                // the plan I'll follow"). Drop it when the turn ends so it
+                                // doesn't linger past completion into the next prompt — the
+                                // TurnStarted clear alone left it visible during the idle gap.
+                                workflow_cards.write().clear();
                                 // Drop any "editing…" rows that never got a real diff (e.g.
                                 // a read that was mislabeled, or a path that didn't match) so
                                 // no spinner lingers after the turn is done.

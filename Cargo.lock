@@ -5078,6 +5078,7 @@ dependencies = [
  "async-trait",
  "eventsource-stream",
  "futures",
+ "libc",
  "oxide-protocol",
  "portable-pty",
  "reqwest",

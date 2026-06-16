@@ -912,6 +912,7 @@ pub fn spawn(config: Config) -> anyhow::Result<(EngineHandle, mpsc::Receiver<Eve
         turn_reads: std::collections::HashSet::new(),
         last_tool_sig: String::new(),
         last_tool_reps: 0,
+        user_interrupted: false,
         event_tx,
     };
 
@@ -1002,6 +1003,11 @@ struct Engine {
     /// Doom-loop guard: last tool call signature + consecutive repeat count.
     last_tool_sig: String,
     last_tool_reps: u8,
+    /// Set when the user interrupts a turn. The next turn prepends a notice so
+    /// the model (esp. resumed CLI drivers, which carry their own todo/plan
+    /// state) abandons the aborted work instead of finishing it over the new
+    /// instruction. Reset once consumed.
+    user_interrupted: bool,
     event_tx: mpsc::Sender<Event>,
 }
 
@@ -2411,6 +2417,21 @@ Reply with text only: summarize what you changed, what you verified, and what re
             user_text
         };
 
+        // A turn the user interrupted leaves stale plan/todo state behind — for
+        // resumed CLI drivers (codex/claude) it lives in their own session, for
+        // API providers in the partial history. Tell the model to drop it and
+        // treat this message as the sole current instruction.
+        let user_text = if self.user_interrupted {
+            self.user_interrupted = false;
+            format!(
+                "[The previous task was interrupted by the user before it finished. \
+Abandon any unfinished plan or todo list from earlier — do not resume it. \
+Treat the following as the only current, top-priority instruction:]\n\n{user_text}"
+            )
+        } else {
+            user_text
+        };
+
         self.session.push(Message::new(Role::User, user_text.clone()));
         if let Some(store) = &self.session_store {
             let _ = store.append("user", &user_text);
@@ -2917,7 +2938,7 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                     }
                     op = op_rx.recv() => {
                         match op {
-                            Some(Op::Interrupt) => { interrupted = true; break; }
+                            Some(Op::Interrupt) => { interrupted = true; self.user_interrupted = true; break; }
                             Some(Op::Shutdown) => { interrupted = true; break; }
                             // Steering: a message sent mid-turn is injected into the
                             // conversation; the next agentic round picks it up.

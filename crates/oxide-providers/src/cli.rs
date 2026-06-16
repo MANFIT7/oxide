@@ -22,6 +22,29 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
+/// Kills a CLI driver's whole process group on drop (unless disarmed) so that
+/// when the engine aborts the stream task on interrupt, anything the CLI
+/// spawned — most importantly a long `cargo build`/test — dies with it instead
+/// of being orphaned and continuing to churn in the background.
+#[cfg(unix)]
+struct ProcessGroupGuard {
+    pgid: i32,
+    armed: bool,
+}
+
+#[cfg(unix)]
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        if self.armed && self.pgid > 1 {
+            // SAFETY: killpg with a valid pgid is sound; a dead group yields
+            // ESRCH which we ignore.
+            unsafe {
+                libc::killpg(self.pgid, libc::SIGKILL);
+            }
+        }
+    }
+}
+
 /// CLI session ids per (binary, workspace) so consecutive turns RESUME the same
 /// CLI conversation instead of starting amnesiac one-shots.
 static SESSIONS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
@@ -187,9 +210,20 @@ where
     if !cwd.is_empty() {
         cmd.current_dir(cwd);
     }
+    // Put the CLI in its own process group (it becomes the leader, so pgid ==
+    // its pid). On interrupt we SIGKILL the whole group via the guard below, so
+    // anything it spawned (e.g. a long `cargo build`) dies with it instead of
+    // being orphaned. kill_on_drop alone only reaps the direct child.
+    #[cfg(unix)]
+    cmd.process_group(0);
     let mut child = cmd
         .spawn()
         .map_err(|e| anyhow::anyhow!("failed to spawn '{program}': {e}"))?;
+    // Armed for the lifetime of this future: if it's dropped before the normal
+    // end (the engine aborts the stream task on interrupt), the group is killed.
+    // Disarmed on normal completion so backgrounded grandchildren can survive.
+    #[cfg(unix)]
+    let mut group_guard = child.id().map(|pid| ProcessGroupGuard { pgid: pid as i32, armed: true });
     let stdin_task = if let Some(input) = stdin_text.filter(|s| !s.is_empty()) {
         let mut stdin = child
             .stdin
@@ -265,6 +299,12 @@ where
                 )))
                 .await;
         }
+    }
+    // Reached the end cleanly — the child exited on its own. Don't kill the
+    // group (any backgrounded grandchild it left is intentional).
+    #[cfg(unix)]
+    if let Some(g) = group_guard.as_mut() {
+        g.armed = false;
     }
     let _ = sink.send(StreamItem::Done).await;
     Ok(())
