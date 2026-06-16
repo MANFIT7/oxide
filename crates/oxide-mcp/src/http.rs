@@ -14,6 +14,7 @@ use tokio::sync::Mutex;
 pub struct HttpTransport {
     client: reqwest::Client,
     url: String,
+    bearer_token: String,
     bearer_token_env_var: String,
     headers: BTreeMap<String, String>,
     env_headers: BTreeMap<String, String>,
@@ -33,6 +34,7 @@ impl HttpTransport {
                 .build()
                 .unwrap_or_default(),
             url: url.into(),
+            bearer_token: options.bearer_token,
             bearer_token_env_var: options.bearer_token_env_var,
             headers: options.headers,
             env_headers: options.env_headers,
@@ -47,7 +49,9 @@ impl HttpTransport {
             .post(&self.url)
             .header("Content-Type", "application/json")
             .header("Accept", "application/json, text/event-stream");
-        if !self.bearer_token_env_var.is_empty() {
+        if !self.bearer_token.is_empty() {
+            req = req.bearer_auth(&self.bearer_token);
+        } else if !self.bearer_token_env_var.is_empty() {
             if let Ok(token) = std::env::var(&self.bearer_token_env_var) {
                 if !token.is_empty() {
                     req = req.bearer_auth(token);
@@ -106,6 +110,7 @@ impl HttpTransport {
 }
 
 pub struct HttpOptions {
+    pub bearer_token: String,
     pub bearer_token_env_var: String,
     pub headers: BTreeMap<String, String>,
     pub env_headers: BTreeMap<String, String>,
@@ -115,6 +120,7 @@ pub struct HttpOptions {
 impl Default for HttpOptions {
     fn default() -> Self {
         Self {
+            bearer_token: String::new(),
             bearer_token_env_var: String::new(),
             headers: BTreeMap::new(),
             env_headers: BTreeMap::new(),

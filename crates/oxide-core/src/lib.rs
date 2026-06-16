@@ -538,6 +538,187 @@ fn duration_secs(value: Option<u64>, default_secs: u64) -> std::time::Duration {
     std::time::Duration::from_secs(value.filter(|secs| *secs > 0).unwrap_or(default_secs))
 }
 
+fn mcp_http_options(server: &McpServerConfig) -> HttpOptions {
+    let has_auth_header = server
+        .http_headers
+        .keys()
+        .chain(server.env_http_headers.keys())
+        .any(|key| key.eq_ignore_ascii_case("authorization"));
+    let bearer_token = if server.url.trim().is_empty()
+        || !server.bearer_token_env_var.trim().is_empty()
+        || has_auth_header
+    {
+        String::new()
+    } else {
+        mcp_keychain_bearer_token(&server.name, &server.url).unwrap_or_default()
+    };
+    HttpOptions {
+        bearer_token,
+        bearer_token_env_var: server.bearer_token_env_var.clone(),
+        headers: server.http_headers.clone(),
+        env_headers: server.env_http_headers.clone(),
+        request_timeout: duration_secs(server.tool_timeout_sec, 30),
+    }
+}
+
+fn mcp_keychain_bearer_token(server: &str, url: &str) -> Option<String> {
+    if server.trim().is_empty() || url.trim().is_empty() {
+        return None;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        mcp_keychain_bearer_token_macos(server, url)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (server, url);
+        None
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn mcp_keychain_bearer_token_macos(server: &str, url: &str) -> Option<String> {
+    mcp_keychain_bearer_token_macos_uncached(server, url)
+}
+
+#[cfg(target_os = "macos")]
+fn mcp_keychain_bearer_token_macos_uncached(server: &str, url: &str) -> Option<String> {
+    for account in keychain_candidate_accounts() {
+        if let Some(secret) = keychain_password("Claude Code-credentials", &account) {
+            if let Some(token) = claude_mcp_oauth_token_from_json(&secret, server) {
+                return Some(token);
+            }
+        }
+    }
+    for account in keychain_accounts_for_service("Codex MCP Credentials", server) {
+        if let Some(secret) = keychain_password("Codex MCP Credentials", &account) {
+            if let Some(token) = codex_mcp_credential_token_from_json(&secret, server, url) {
+                return Some(token);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn keychain_candidate_accounts() -> Vec<String> {
+    let mut accounts: Vec<String> = Vec::new();
+    if let Ok(user) = std::env::var("USER") {
+        if !user.trim().is_empty() {
+            accounts.push(user);
+        }
+    }
+    if let Ok(output) = std::process::Command::new("whoami").output() {
+        if output.status.success() {
+            let user = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !user.is_empty() {
+                accounts.push(user);
+            }
+        }
+    }
+    accounts.sort();
+    accounts.dedup();
+    accounts
+}
+
+#[cfg(target_os = "macos")]
+fn keychain_password(service: &str, account: &str) -> Option<String> {
+    let output = std::process::Command::new("security")
+        .args(["find-generic-password", "-s", service, "-a", account, "-w"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let secret = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    (!secret.is_empty()).then_some(secret)
+}
+
+#[cfg(target_os = "macos")]
+fn keychain_accounts_for_service(service: &str, server: &str) -> Vec<String> {
+    let output = std::process::Command::new("security").arg("dump-keychain").output().ok();
+    let Some(output) = output.filter(|out| out.status.success()) else {
+        return Vec::new();
+    };
+    let dump = String::from_utf8_lossy(&output.stdout);
+    keychain_accounts_for_service_from_dump(&dump, service, server)
+}
+
+fn claude_mcp_oauth_token_from_json(text: &str, server: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    let oauth = value.get("mcpOAuth").and_then(|v| v.as_object())?;
+    let prefix = format!("{server}|");
+    oauth.iter().find_map(|(key, entry)| {
+        if key != server && !key.starts_with(&prefix) {
+            return None;
+        }
+        entry
+            .get("accessToken")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+            .map(str::to_string)
+    })
+}
+
+fn codex_mcp_credential_token_from_json(text: &str, server: &str, url: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    let server_matches = value
+        .get("server_name")
+        .and_then(|v| v.as_str())
+        .map(|name| name == server)
+        .unwrap_or(true);
+    let url_matches = value
+        .get("url")
+        .and_then(|v| v.as_str())
+        .map(|saved| saved.trim_end_matches('/') == url.trim_end_matches('/'))
+        .unwrap_or(true);
+    if !server_matches || !url_matches {
+        return None;
+    }
+    value
+        .get("token_response")
+        .and_then(|v| v.get("access_token"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(str::to_string)
+}
+
+fn keychain_accounts_for_service_from_dump(dump: &str, service: &str, server: &str) -> Vec<String> {
+    let mut accounts = Vec::new();
+    let mut current_account: Option<String> = None;
+    let mut current_service: Option<String> = None;
+    for line in dump.lines() {
+        if let Some(account) = keychain_attribute_value(line, "acct") {
+            current_account = Some(account);
+        }
+        if let Some(found_service) = keychain_attribute_value(line, "svce") {
+            current_service = Some(found_service);
+        }
+        if current_service.as_deref() == Some(service) {
+            if let Some(account) = current_account.as_ref() {
+                if account == server || account.starts_with(&format!("{server}|")) {
+                    accounts.push(account.clone());
+                }
+            }
+            current_account = None;
+            current_service = None;
+        }
+    }
+    accounts.sort();
+    accounts.dedup();
+    accounts
+}
+
+fn keychain_attribute_value(line: &str, attr: &str) -> Option<String> {
+    let marker = format!("\"{attr}\"<blob>=");
+    let value = line.split(&marker).nth(1)?.trim();
+    let quoted = value.strip_prefix('"')?;
+    let end = quoted.find('"')?;
+    Some(quoted[..end].to_string())
+}
+
 fn mcp_pool_key(server: &McpServerConfig) -> String {
     let mut key = vec![
         server.name.clone(),
@@ -1175,12 +1356,7 @@ impl Engine {
                             McpClient::connect_http_with(
                                 &srv.name,
                                 &srv.url,
-                                HttpOptions {
-                                    bearer_token_env_var: srv.bearer_token_env_var.clone(),
-                                    headers: srv.http_headers.clone(),
-                                    env_headers: srv.env_http_headers.clone(),
-                                    request_timeout: duration_secs(srv.tool_timeout_sec, 30),
-                                },
+                                mcp_http_options(&srv),
                             ).await?
                         } else {
                             let cwd = if srv.cwd.trim().is_empty() {
@@ -3800,6 +3976,75 @@ required = true
         assert_eq!(server.enabled_tools, vec!["read"]);
         assert_eq!(server.disabled_tools, vec!["write"]);
         assert!(server.required);
+    }
+
+    #[test]
+    fn claude_mcp_oauth_token_uses_matching_server_entry() {
+        let json = r#"{
+            "claudeAiOauth": {},
+            "mcpOAuth": {
+                "other|abc": { "accessToken": "wrong" },
+                "supabase|59e4938976c99701": { "accessToken": "token-123", "refreshToken": "refresh-123" }
+            }
+        }"#;
+
+        assert_eq!(
+            super::claude_mcp_oauth_token_from_json(json, "supabase").as_deref(),
+            Some("token-123")
+        );
+        assert_eq!(super::claude_mcp_oauth_token_from_json(json, "github"), None);
+    }
+
+    #[test]
+    fn codex_mcp_credential_token_checks_server_and_url() {
+        let json = r#"{
+            "server_name": "supabase",
+            "url": "https://mcp.supabase.com/mcp",
+            "token_response": {
+                "access_token": "token-456",
+                "refresh_token": "refresh-456"
+            }
+        }"#;
+
+        assert_eq!(
+            super::codex_mcp_credential_token_from_json(
+                json,
+                "supabase",
+                "https://mcp.supabase.com/mcp/"
+            )
+            .as_deref(),
+            Some("token-456")
+        );
+        assert_eq!(
+            super::codex_mcp_credential_token_from_json(json, "supabase", "https://example.com"),
+            None
+        );
+    }
+
+    #[test]
+    fn keychain_dump_parser_finds_matching_service_accounts() {
+        let dump = r#"
+keychain: "/Users/me/Library/Keychains/login.keychain-db"
+class: "genp"
+attributes:
+    "acct"<blob>="supabase|59e4938976c99701"
+    "svce"<blob>="Codex MCP Credentials"
+keychain: "/Users/me/Library/Keychains/login.keychain-db"
+class: "genp"
+attributes:
+    "acct"<blob>="github|abc"
+    "svce"<blob>="Codex MCP Credentials"
+keychain: "/Users/me/Library/Keychains/login.keychain-db"
+class: "genp"
+attributes:
+    "acct"<blob>="supabase|ignored"
+    "svce"<blob>="Other Service"
+"#;
+
+        assert_eq!(
+            super::keychain_accounts_for_service_from_dump(dump, "Codex MCP Credentials", "supabase"),
+            vec!["supabase|59e4938976c99701".to_string()]
+        );
     }
 
     #[test]
