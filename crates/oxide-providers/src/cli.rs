@@ -19,7 +19,7 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
 /// CLI session ids per (binary, workspace) so consecutive turns RESUME the same
@@ -160,15 +160,17 @@ async fn run_jsonl<F>(
     program: &str,
     args: &[String],
     cwd: &str,
+    stdin_text: Option<String>,
     sink: &mpsc::Sender<StreamItem>,
     mut on_line: F,
 ) -> anyhow::Result<()>
 where
     F: FnMut(&Value, &mpsc::Sender<StreamItem>) -> bool,
 {
+    let pipe_stdin = stdin_text.as_ref().map(|s| !s.is_empty()).unwrap_or(false);
     let mut cmd = tokio::process::Command::new(program);
     cmd.args(args)
-        .stdin(Stdio::null())
+        .stdin(if pipe_stdin { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .kill_on_drop(true)
         .stderr(Stdio::piped());
@@ -180,6 +182,18 @@ where
     let mut child = cmd
         .spawn()
         .map_err(|e| anyhow::anyhow!("failed to spawn '{program}': {e}"))?;
+    let stdin_task = if let Some(input) = stdin_text.filter(|s| !s.is_empty()) {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("failed to open stdin for '{program}'"))?;
+        Some(tokio::spawn(async move {
+            stdin.write_all(input.as_bytes()).await?;
+            stdin.shutdown().await
+        }))
+    } else {
+        None
+    };
 
     let stdout = child
         .stdout
@@ -217,6 +231,10 @@ where
         }
     }
     let status = child.wait().await;
+    let stdin_error = match stdin_task {
+        Some(task) => task.await.ok().and_then(Result::err),
+        None => None,
+    };
     let failed = status.map(|st| !st.success()).unwrap_or(true);
     if failed {
         let tail = err_task.await.unwrap_or_default();
@@ -232,6 +250,13 @@ where
         }
     } else {
         err_task.abort();
+        if let Some(err) = stdin_error {
+            let _ = sink
+                .send(StreamItem::Notice(format!(
+                    "warning: failed to finish stdin for {program}: {err}"
+                )))
+                .await;
+        }
     }
     let _ = sink.send(StreamItem::Done).await;
     Ok(())
@@ -268,7 +293,13 @@ impl Provider for CodexCliProvider {
     }
 
     async fn stream(&self, req: TurnRequest, sink: mpsc::Sender<StreamItem>) -> anyhow::Result<()> {
-        let (prompt, images) = extract_cli_images(&req);
+        let (mut prompt, images) = extract_cli_images(&req);
+        if prompt.trim().is_empty() && !images.is_empty() {
+            prompt = "Inspect the attached image(s).".to_string();
+        }
+        if prompt.trim().is_empty() {
+            anyhow::bail!("Codex CLI prompt is empty; refusing to start codex exec without instructions");
+        }
         let skey = session_key(&self.bin, &req.conversation_id, &req.cwd);
         // Prefer the persisted link (survives app restarts) over the in-memory map.
         let resume = req.cli_resume.clone().or_else(|| session_get(&skey));
@@ -301,10 +332,12 @@ impl Provider for CodexCliProvider {
             args.push("-i".to_string());
             args.push(img.clone());
         }
-        args.push(prompt);
+        // Superconductor's codex wrapper can require stdin for `exec`/`resume`.
+        // Passing `-` makes that contract explicit and avoids a null-stdin turn.
+        args.push("-".to_string());
 
         let skey_cb = skey.clone();
-        run_jsonl(&self.bin, &args, &req.cwd, &sink, move |v, sink| {
+        run_jsonl(&self.bin, &args, &req.cwd, Some(prompt), &sink, move |v, sink| {
             match v["type"].as_str() {
                 Some("item.started") => {
                     // Live status while the CLI runs a command/edits a file.
@@ -492,7 +525,7 @@ impl Provider for ClaudeCliProvider {
         // With partial messages on, text arrives via stream_event deltas; the
         // final `assistant` message would duplicate it, so skip its text blocks.
         let mut saw_partial = false;
-        run_jsonl(&self.bin, &args, &req.cwd, &sink, move |v, sink| {
+        run_jsonl(&self.bin, &args, &req.cwd, None, &sink, move |v, sink| {
             match v["type"].as_str() {
                 Some("system") => {
                     if let Some(id) = v["session_id"].as_str() {
@@ -1401,6 +1434,32 @@ mod claude_interactive_tests {
         let bytes = interactive_retry_bytes("hello\nworld");
         let text = String::from_utf8(bytes).unwrap();
         assert_eq!(text, "\x1b[200~hello\nworld\x1b[201~\r");
+    }
+
+    #[tokio::test]
+    async fn run_jsonl_writes_prompt_to_child_stdin() {
+        let args = vec![
+            "-c".to_string(),
+            "IFS= read -r input; printf '{\"type\":\"ok\",\"text\":\"%s\"}\\n' \"$input\"".to_string(),
+        ];
+        let (tx, _rx) = mpsc::channel(8);
+        let mut seen = String::new();
+
+        run_jsonl(
+            "/bin/sh",
+            &args,
+            "",
+            Some("hello-stdin".to_string()),
+            &tx,
+            |v, _sink| {
+                seen = v["text"].as_str().unwrap_or("").to_string();
+                true
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(seen, "hello-stdin");
     }
 
     #[test]
