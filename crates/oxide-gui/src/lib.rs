@@ -358,8 +358,19 @@ enum Author {
     Note,
     /// A reviewable file diff: (path, checkpoint id to rewind).
     Diff(String, u64),
-    /// A tool activity row (terminal/edit/read/…): (running, ok).
-    Activity { running: bool, ok: bool },
+    /// A tool activity row (terminal/edit/read/…). `key` is the stable
+    /// provider id (tool call_id / command_id) so streamed updates settle the
+    /// exact row they belong to — found by id, never by Vec index, so inserts
+    /// or reordering can't pair the wrong row. `None` for id-less notices.
+    Activity { running: bool, ok: bool, key: Option<String> },
+}
+
+/// Newest-first index of the activity row carrying `key`. Replaces the old
+/// `command_id/call_id → index` side maps, which went stale whenever a row was
+/// inserted (e.g. above a trailing "Done" note) and then paired the wrong row.
+fn activity_idx(msgs: &[ChatMsg], key: &str) -> Option<usize> {
+    msgs.iter()
+        .rposition(|m| matches!(&m.author, Author::Activity { key: Some(k), .. } if k == key))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2636,11 +2647,9 @@ fn app() -> Element {
     // running state but, once the user toggles, their choice sticks across the
     // streaming re-renders that would otherwise force it back open.
     let mut act_open = use_signal(std::collections::HashMap::<usize, bool>::new);
-    let mut command_rows = use_signal(std::collections::HashMap::<String, usize>::new);
-    // call_id → activity row index, so each ToolCallEnd settles the exact row its
-    // ToolCallBegin opened (tool calls can interleave — subagents, background work —
-    // so "most recent running row" would settle the wrong spinner).
-    let mut tool_rows = use_signal(std::collections::HashMap::<String, usize>::new);
+    // Tool/command activity rows are paired to their streamed updates by a stable
+    // key stored ON the row (see `activity_idx`), not by a side index map — so a
+    // row inserted above the "Done" note can't shift another row's pairing.
     let mut status = use_signal(String::new);
     let mut turn_start = use_signal(|| None::<std::time::Instant>);
     // Seconds since the turn started (ticks while streaming, shown in the pill).
@@ -3123,8 +3132,6 @@ fn app() -> Element {
             // the UI signal (and re-schedule the sidebar) on every delta. Merged
             // back into the tab when the user switches to it.
             let mut bg_buffers: std::collections::HashMap<u64, Vec<ChatMsg>> = std::collections::HashMap::new();
-            let mut bg_command_rows: std::collections::HashMap<u64, std::collections::HashMap<String, usize>> = std::collections::HashMap::new();
-            let mut bg_tool_rows: std::collections::HashMap<u64, std::collections::HashMap<String, usize>> = std::collections::HashMap::new();
             let mut parked_appr: std::collections::HashMap<u64, Vec<(u64, String, String)>> = std::collections::HashMap::new();
             let mut parked_q: std::collections::HashMap<u64, Vec<(u64, String, Vec<String>)>> = std::collections::HashMap::new();
 
@@ -3380,8 +3387,6 @@ fn app() -> Element {
                             followups.write().clear();
                             thinking.set(String::new());
                             bg_jobs.write().clear();
-                            command_rows.write().clear();
-                            tool_rows.write().clear();
                             // The tab's snapshot + anything that streamed while it was
                             // backgrounded (drained from the bg buffer in one write).
                             let mut cur_msgs = tabs.peek().iter().find(|t| t.id == id).map(|t| t.messages.clone()).unwrap_or(msgs);
@@ -3414,8 +3419,6 @@ fn app() -> Element {
                             parked_appr.remove(&id);
                             parked_q.remove(&id);
                             bg_buffers.remove(&id);
-                            bg_command_rows.remove(&id);
-                            bg_tool_rows.remove(&id);
                             busy_tabs.write().remove(&id);
                             tab_statuses.write().remove(&id);
                         }
@@ -3514,7 +3517,10 @@ fn app() -> Element {
                                         // noise
 	                                    } else if let Some(label) = text.strip_prefix('⚙').or_else(|| text.strip_prefix('⏳')) {
 	                                        let label = label.trim().to_string();
-	                                        if label.starts_with("Running ") && bg_command_rows.get(&ev_tid).map(|rows| !rows.is_empty()).unwrap_or(false) {
+	                                        // Suppress the redundant "Running …" notice when a
+	                                        // command row is already live in this tab's buffer.
+	                                        let cmd_live = buf.iter().any(|m| matches!(m.author, Author::Activity { running: true, key: Some(_), .. }));
+	                                        if label.starts_with("Running ") && cmd_live {
 	                                            continue;
 	                                        }
 	                                        let (verb, detail) = label.split_once(' ').unwrap_or((label.as_str(), ""));
@@ -3522,7 +3528,7 @@ fn app() -> Element {
                                         if buf.last().map(|m| m.author == Author::Agent && m.text.is_empty()).unwrap_or(false) {
                                             buf.pop();
                                         }
-                                        buf.push(ChatMsg { author: Author::Activity { running: false, ok: true }, text: row });
+                                        buf.push(ChatMsg { author: Author::Activity { running: false, ok: true, key: None }, text: row });
                                     } else if text.starts_with(['🧭','🔍','🤖','🧩','🔁','✓','⚠']) {
                                         // live stage info — meaningless once backgrounded
                                     } else {
@@ -3534,12 +3540,10 @@ fn app() -> Element {
                                 }
 	                                Event::ToolCallBegin { call_id, tool, args, .. } => {
 	                                    if tool != "ask_user" && tool != "shell" {
-	                                        let idx = buf.len();
 	                                        buf.push(ChatMsg {
-                                            author: Author::Activity { running: true, ok: true },
+                                            author: Author::Activity { running: true, ok: true, key: Some(call_id) },
                                             text: activity_label(&tool, &args),
                                         });
-                                        bg_tool_rows.entry(ev_tid).or_default().insert(call_id, idx);
                                     }
                                 }
 	                                Event::ToolCallEnd { call_id, output, ok, .. } => {
@@ -3547,40 +3551,40 @@ fn app() -> Element {
 	                                    if out.chars().count() > 4000 {
 	                                        out = out.chars().take(4000).collect::<String>() + "\n… (truncated)";
 	                                    }
-                                    if let Some(idx) = bg_tool_rows.get(&ev_tid).and_then(|m| m.get(&call_id).copied()) {
-                                        if let Some(c) = buf.get_mut(idx) {
-                                            c.author = Author::Activity { running: false, ok };
-                                            if !out.is_empty() {
-                                                c.text.push('\t');
-                                                c.text.push_str(&out);
-	                                            }
+                                    if let Some(idx) = activity_idx(&buf, &call_id) {
+                                        if let Author::Activity { running, ok: o, .. } = &mut buf[idx].author {
+                                            *running = false;
+                                            *o = ok;
+                                        }
+                                        if !out.is_empty() {
+                                            buf[idx].text.push('\t');
+                                            buf[idx].text.push_str(&out);
 	                                        }
 	                                    }
 	                                }
 	                                Event::CommandStarted { command_id, command, background, .. } => {
-	                                    let idx = buf.len();
 	                                    buf.push(ChatMsg {
-	                                        author: Author::Activity { running: true, ok: true },
+	                                        author: Author::Activity { running: true, ok: true, key: Some(command_id) },
 	                                        text: command_activity_label(&command, background),
 	                                    });
-	                                    bg_command_rows.entry(ev_tid).or_default().insert(command_id, idx);
 	                                }
 	                                Event::CommandOutput { command_id, chunk, .. } => {
-	                                    let idx = bg_command_rows.get(&ev_tid).and_then(|m| m.get(&command_id).copied());
-	                                    if let Some(idx) = idx.and_then(|idx| buf.get_mut(idx).map(|_| idx)) {
+	                                    if let Some(idx) = activity_idx(&buf, &command_id) {
 	                                        append_activity_output(&mut buf[idx].text, &chunk);
 	                                    } else {
-	                                        let idx = buf.len();
 	                                        let mut text = command_activity_label(&command_id, false);
 	                                        append_activity_output(&mut text, &chunk);
-	                                        buf.push(ChatMsg { author: Author::Activity { running: true, ok: true }, text });
-	                                        bg_command_rows.entry(ev_tid).or_default().insert(command_id, idx);
+	                                        buf.push(ChatMsg { author: Author::Activity { running: true, ok: true, key: Some(command_id) }, text });
 	                                    }
 	                                }
 	                                Event::CommandFinished { command_id, ok, exit_code, .. } => {
-	                                    if let Some(idx) = bg_command_rows.get(&ev_tid).and_then(|m| m.get(&command_id).copied()) {
-	                                        if let Some(row) = buf.get_mut(idx) {
-	                                            row.author = Author::Activity { running: false, ok };
+	                                    if let Some(idx) = activity_idx(&buf, &command_id) {
+	                                        {
+	                                            let row = &mut buf[idx];
+	                                            if let Author::Activity { running, ok: o, .. } = &mut row.author {
+	                                                *running = false;
+	                                                *o = ok;
+	                                            }
 	                                            if let Some(code) = exit_code {
 	                                                append_activity_output(&mut row.text, &format!("\n[exit {code}]\n"));
 	                                            }
@@ -3670,13 +3674,16 @@ fn app() -> Element {
                                         if mw.last().map(|m| m.author == Author::Agent && m.text.is_empty()).unwrap_or(false) {
                                             mw.pop();
                                         }
-                                        mw.push(ChatMsg { author: Author::Activity { running: false, ok: true }, text: row });
+                                        mw.push(ChatMsg { author: Author::Activity { running: false, ok: true, key: None }, text: row });
                                     }
 	                                } else if text.starts_with('⚙') {
 	                                    // CLI-driver tool activity: live shimmer + an activity
 	                                    // trail row in the chat (synara-style).
 	                                    let mut label = text.trim_start_matches('⚙').trim().to_string();
-	                                    if label.starts_with("Running ") && !command_rows.read().is_empty() {
+	                                    // Suppress the redundant "Running …" notice when a command
+	                                    // row is already live (CommandStarted created one).
+	                                    let cmd_live = messages.read().iter().any(|m| matches!(m.author, Author::Activity { running: true, key: Some(_), .. }));
+	                                    if label.starts_with("Running ") && cmd_live {
 	                                        status.set(label);
 	                                        continue;
 	                                    }
@@ -3711,7 +3718,7 @@ fn app() -> Element {
                                             mw.pop();
                                         }
                                     }
-                                    push_activity!(ChatMsg { author: Author::Activity { running: false, ok: true }, text: row });
+                                    push_activity!(ChatMsg { author: Author::Activity { running: false, ok: true, key: None }, text: row });
                                     // CLI edits compute their real diff at turn end — show the
                                     // file in the "Edited files" card NOW as a pending row
                                     // (synara-style live), replaced by the diff when it lands.
@@ -3779,8 +3786,6 @@ fn app() -> Element {
                                 todos.write().clear();
 	                                workflow_cards.write().clear();
 	                                subagent_cards.write().clear();
-	                                command_rows.write().clear();
-	                                tool_rows.write().clear();
 	                                edits_expanded.set(false);
                                 edits_undone.set(false);
                                 think_open.set(None);
@@ -3859,23 +3864,24 @@ fn app() -> Element {
                                 // not just a generic verb.
                                 status.set(activity_label(&tool, &args));
 	                                if tool != "ask_user" && tool != "shell" {
-	                                    let idx = push_activity!(ChatMsg { author: Author::Activity { running: true, ok: true }, text: activity_label(&tool, &args) });
-	                                    tool_rows.write().insert(call_id, idx);
+	                                    push_activity!(ChatMsg { author: Author::Activity { running: true, ok: true, key: Some(call_id) }, text: activity_label(&tool, &args) });
 	                                }
                             }
 	                            Event::ToolCallEnd { call_id, tool, output, ok, .. } => {
 	                                timeline.write().push(TimelineItem { title: format!("⚙ {tool}"), sub: if ok { "done".into() } else { "failed".into() } });
-	                                // Settle the exact row this call opened (paired by call_id) and
-	                                // attach its output (truncated) so the row can expand it. A
-	                                // missing entry (shell/ask_user, or a row already merged from a
-	                                // backgrounded tab) is a no-op — the turn-end sweep settles it.
+	                                // Settle the exact row this call opened — found by its key
+	                                // (call_id), never by index — and attach its output. A missing
+	                                // row (shell/ask_user, or merged from a backgrounded tab) is a
+	                                // no-op; the turn-end sweep settles anything still running.
 	                                let mut out = output.trim().to_string();
 	                                if out.chars().count() > 4000 {
 	                                    out = out.chars().take(4000).collect::<String>() + "\n… (truncated)";
 	                                }
-	                                if let Some(idx) = tool_rows.write().remove(&call_id) {
-	                                    if let Some(c) = messages.write().get_mut(idx) {
-	                                        c.author = Author::Activity { running: false, ok };
+	                                let idx = activity_idx(&messages.read(), &call_id);
+	                                if let Some(idx) = idx {
+	                                    let mut m = messages.write();
+	                                    if let Some(c) = m.get_mut(idx) {
+	                                        if let Author::Activity { running, ok: o, .. } = &mut c.author { *running = false; *o = ok; }
 	                                        if !out.is_empty() && !(tool == "shell" && activity_has_output(&c.text)) {
 	                                            c.text.push('\t');
 	                                            c.text.push_str(&out);
@@ -3907,11 +3913,10 @@ fn app() -> Element {
 	                                    // Insert above any trailing "✓ Done" note (CLI drivers
 	                                    // like claude can surface a command row after the turn's
 	                                    // text + Done landed) so it never renders below the footer.
-	                                    let idx = push_activity!(ChatMsg {
-	                                        author: Author::Activity { running: true, ok: true },
+	                                    push_activity!(ChatMsg {
+	                                        author: Author::Activity { running: true, ok: true, key: Some(command_id) },
 	                                        text: command_activity_label(&command, background),
 	                                    });
-	                                    command_rows.write().insert(command_id, idx);
 	                                }
 	                                scroll_chat_bottom_if_sticky();
 	                            }
@@ -3930,7 +3935,7 @@ fn app() -> Element {
 	                                            }
 	                                        }
 	                                    }
-	                                } else if let Some(idx) = command_rows.read().get(&command_id).copied() {
+	                                } else if let Some(idx) = { let g = messages.read(); activity_idx(&g, &command_id) } {
 	                                    if let Some(row) = messages.write().get_mut(idx) {
 	                                        let chunk = if stream == "stderr" && !chunk.trim().is_empty() { format!("[stderr] {chunk}") } else { chunk };
 	                                        append_activity_output(&mut row.text, &chunk);
@@ -3951,9 +3956,9 @@ fn app() -> Element {
 	                                            log.output.push_str(&footer);
 	                                        }
 	                                    }
-	                                } else if let Some(idx) = command_rows.read().get(&command_id).copied() {
+	                                } else if let Some(idx) = { let g = messages.read(); activity_idx(&g, &command_id) } {
 	                                    if let Some(row) = messages.write().get_mut(idx) {
-	                                        row.author = Author::Activity { running: false, ok };
+	                                        if let Author::Activity { running, ok: o, .. } = &mut row.author { *running = false; *o = ok; }
 	                                        append_activity_output(&mut row.text, &footer);
 	                                    }
 	                                }
@@ -6120,7 +6125,7 @@ fn app() -> Element {
                                                 {
                                                     let rows: Vec<(String, bool, bool)> = idxs.iter().map(|&i| {
                                                         let m = &messages.read()[i];
-                                                        if let Author::Activity { running, ok } = m.author { (m.text.clone(), running, ok) } else { (m.text.clone(), false, true) }
+                                                        if let Author::Activity { running, ok, .. } = m.author { (m.text.clone(), running, ok) } else { (m.text.clone(), false, true) }
                                                     }).collect();
                                                     let label = activity_group_label(&rows);
                                                     let is_open = act_open.read().get(&group_key).copied().unwrap_or(group_live);
@@ -9173,7 +9178,7 @@ fn Message(author: Author, text: String, #[props(default)] live: bool) -> Elemen
                 }
             }
         },
-        Author::Activity { running, ok } => rsx! { ActivityRow { text, running, ok } },
+        Author::Activity { running, ok, .. } => rsx! { ActivityRow { text, running, ok } },
         Author::Diff(..) => rsx! {},
         Author::Note => {
             let is_cmd = text.starts_with('⌘') || text.starts_with('✎') || text.starts_with('🔎') || text.starts_with('⚙');
@@ -9747,8 +9752,6 @@ fn ChatPane(
                 }
                 Err(_) => return,
             };
-            // call_id → activity row index: settle the row each ToolCallEnd opened.
-            let mut tool_rows: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
             loop {
                 tokio::select! {
                     cmd = rx.next() => match cmd {
@@ -9772,19 +9775,16 @@ fn ChatPane(
                         Some(Event::ReasoningDelta { text, .. }) => { thinking.write().push_str(&text); }
                         Some(Event::ToolCallBegin { call_id, tool, args, .. }) => {
                             if tool != "ask_user" {
-                                let mut mm = messages.write();
-                                let idx = mm.len();
-                                mm.push(ChatMsg { author: Author::Activity { running: true, ok: true }, text: activity_label(&tool, &args) });
-                                drop(mm);
-                                tool_rows.insert(call_id, idx);
+                                messages.write().push(ChatMsg { author: Author::Activity { running: true, ok: true, key: Some(call_id) }, text: activity_label(&tool, &args) });
                             }
                         }
                         Some(Event::ToolCallEnd { call_id, output, ok, .. }) => {
                             let mut out = output.trim().to_string();
                             if out.chars().count() > 4000 { out = out.chars().take(4000).collect::<String>() + "\n… (truncated)"; }
-                            if let Some(idx) = tool_rows.remove(&call_id) {
+                            let idx = { let g = messages.read(); activity_idx(&g, &call_id) };
+                            if let Some(idx) = idx {
                                 if let Some(c) = messages.write().get_mut(idx) {
-                                    c.author = Author::Activity { running: false, ok };
+                                    if let Author::Activity { running, ok: o, .. } = &mut c.author { *running = false; *o = ok; }
                                     if !out.is_empty() { c.text.push('\t'); c.text.push_str(&out); }
                                 }
                             }
