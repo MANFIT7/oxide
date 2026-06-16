@@ -1149,7 +1149,7 @@ impl Engine {
         .await;
     }
 
-    async fn emit_tool_end(&self, turn: TurnId, tool: String, output: String, ok: bool) {
+    async fn emit_tool_end(&self, turn: TurnId, call_id: String, tool: String, output: String, ok: bool) {
         let status = if ok { "done" } else { "failed" };
         self.emit_audit(
             Some(turn),
@@ -1159,7 +1159,7 @@ impl Engine {
             status,
         )
         .await;
-        self.emit(Event::ToolCallEnd { turn, tool, output, ok }).await;
+        self.emit(Event::ToolCallEnd { turn, call_id, tool, output, ok }).await;
     }
 
     fn active_harness(&self) -> &dyn Harness {
@@ -3308,6 +3308,7 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
     ) -> bool {
         self.emit(Event::ToolCallBegin {
             turn,
+            call_id: call_id.clone(),
             tool: name.clone(),
             args: arguments.clone(),
         })
@@ -3339,24 +3340,24 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
                     // otherwise deadlock here.
                     Some(Op::UserTurn { text }) => break text,
                     Some(Op::Interrupt) | Some(Op::Shutdown) | None => {
-                        self.session.push(Message::tool_result("interrupted before answering", call_id));
-                        self.emit_tool_end(turn, name, "interrupted before answering".into(), false).await;
+                        self.session.push(Message::tool_result("interrupted before answering", &call_id));
+                        self.emit_tool_end(turn, call_id.clone(), name, "interrupted before answering".into(), false).await;
                         return true;
                     }
                     Some(_) => {}
                 }
             };
-            self.session.push(Message::tool_result(format!("[ask_user answer] {answer}"), call_id));
-            self.emit_tool_end(turn, name, answer, true).await;
+            self.session.push(Message::tool_result(format!("[ask_user answer] {answer}"), &call_id));
+            self.emit_tool_end(turn, call_id.clone(), name, answer, true).await;
             return false;
         }
 
         let hook_config = hooks::Hooks::load(&self.workspace);
         if hook_config.auto().guard_dangerous_shell {
             if let Some(reason) = hooks::dangerous_tool_reason(&name, &arguments) {
-                self.session.push(Message::tool_result(reason.clone(), call_id));
+                self.session.push(Message::tool_result(reason.clone(), &call_id));
                 self.emit_audit(Some(turn), "guard", "Dangerous command blocked", reason.clone(), "blocked").await;
-                self.emit_tool_end(turn, name, reason, false).await;
+                self.emit_tool_end(turn, call_id.clone(), name, reason, false).await;
                 return false;
             }
         }
@@ -3377,8 +3378,8 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
                 // Always pair the recorded tool call with a result — a dangling
                 // function_call poisons every later request on paired providers.
                 let output = format!("denied: {reason}");
-                self.session.push(Message::tool_result(output.clone(), call_id));
-                self.emit_tool_end(turn, name, output, false).await;
+                self.session.push(Message::tool_result(output.clone(), &call_id));
+                self.emit_tool_end(turn, call_id.clone(), name, output, false).await;
                 return false;
             }
             Routed::Run => {
@@ -3406,8 +3407,8 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
                             decision,
                         }) if rid == request_id => match decision {
                             ApprovalDecision::Reject => {
-                                self.session.push(Message::tool_result("rejected by user", call_id));
-                                self.emit_tool_end(turn, name, "rejected by user".into(), false).await;
+                                self.session.push(Message::tool_result("rejected by user", &call_id));
+                                self.emit_tool_end(turn, call_id.clone(), name, "rejected by user".into(), false).await;
                                 return false;
                             }
                             ApprovalDecision::ApproveForSession => {
@@ -3421,8 +3422,8 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
                             }
                         },
                         Some(Op::Interrupt) | Some(Op::Shutdown) | None => {
-                            self.session.push(Message::tool_result("interrupted before approval", call_id));
-                            self.emit_tool_end(turn, name, "interrupted before approval".into(), false).await;
+                            self.session.push(Message::tool_result("interrupted before approval", &call_id));
+                            self.emit_tool_end(turn, call_id.clone(), name, "interrupted before approval".into(), false).await;
                             return true;
                         }
                         Some(_) => {} // ignore unrelated ops while awaiting approval
@@ -3433,8 +3434,8 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
 
         // pre_tool hook — may block.
         if self.fire_hooks("pre_tool", &name, serde_json::json!({ "turn": turn.0, "tool": name.clone(), "args": arguments.clone() })).await {
-            self.session.push(Message::tool_result("blocked by pre_tool hook", call_id));
-            self.emit_tool_end(turn, name, "blocked by pre_tool hook".into(), false).await;
+            self.session.push(Message::tool_result("blocked by pre_tool hook", &call_id));
+            self.emit_tool_end(turn, call_id.clone(), name, "blocked by pre_tool hook".into(), false).await;
             return false;
         }
 
@@ -3456,8 +3457,8 @@ The result will not change. STOP repeating this call — change your approach (d
 a different tool, or ask_user if you're blocked).",
                     self.last_tool_reps + 1
                 );
-                self.session.push(Message::tool_result(msg.clone(), call_id));
-                self.emit_tool_end(turn, name, msg, false).await;
+                self.session.push(Message::tool_result(msg.clone(), &call_id));
+                self.emit_tool_end(turn, call_id.clone(), name, msg, false).await;
                 return false;
             }
         }
@@ -3471,8 +3472,8 @@ a different tool, or ask_user if you're blocked).",
                         "You already read `{p}` earlier this turn — its full content is in the conversation above. \
 Do NOT read it again. Proceed now: make the edits with the edit/write_file tools."
                     );
-                    self.session.push(Message::tool_result(format!("[tool read_file]\n{msg}"), call_id));
-                    self.emit_tool_end(turn, name, msg, true).await;
+                    self.session.push(Message::tool_result(format!("[tool read_file]\n{msg}"), &call_id));
+                    self.emit_tool_end(turn, call_id.clone(), name, msg, true).await;
                     return false;
                 }
             }
@@ -3659,8 +3660,8 @@ Do NOT read it again. Proceed now: make the edits with the edit/write_file tools
         } else {
             output.clone()
         };
-        self.session.push(Message::tool_result(format!("[tool {name}]\n{stored}"), call_id));
-        self.emit_tool_end(turn, name, output, ok).await;
+        self.session.push(Message::tool_result(format!("[tool {name}]\n{stored}"), &call_id));
+        self.emit_tool_end(turn, call_id.clone(), name, output, ok).await;
         false
     }
 }

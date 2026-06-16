@@ -81,12 +81,16 @@ pub enum Event {
     /// A tool call started executing.
     ToolCallBegin {
         turn: TurnId,
+        /// Provider-assigned call id, paired with the matching `ToolCallEnd`.
+        call_id: String,
         tool: String,
         args: serde_json::Value,
     },
     /// A tool call finished.
     ToolCallEnd {
         turn: TurnId,
+        /// Matches the `call_id` of the `ToolCallBegin` that opened this call.
+        call_id: String,
         tool: String,
         output: String,
         ok: bool,

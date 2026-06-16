@@ -108,8 +108,16 @@ fn extract_cli_images(req: &TurnRequest) -> (String, Vec<String>) {
         }
     }
     if !imgs.is_empty() {
+        // Strip exactly the "(user attached … needed)" note. It is emitted with
+        // no trailing newline before the user's typed text, so bound the removal
+        // by the note's own closing ')'. Bounding by the next '\n' (as before) ate
+        // the whole prompt when it was single-line — leaving an empty prompt that
+        // fell back to the English "Inspect the attached image(s)." instruction.
         if let Some(idx) = prompt.find("(user attached ") {
-            let end = prompt[idx..].find('\n').map(|e| idx + e).unwrap_or(prompt.len());
+            let end = prompt[idx..]
+                .find(')')
+                .map(|e| idx + e + 1)
+                .unwrap_or(prompt.len());
             prompt.replace_range(idx..end, "");
         }
     }
@@ -1372,6 +1380,7 @@ fn tail_context(tail: &str) -> String {
 #[cfg(test)]
 mod claude_interactive_tests {
     use super::*;
+    use crate::Message;
 
     #[test]
     fn parses_interactive_transcript_after_baseline() {
@@ -1472,6 +1481,37 @@ mod claude_interactive_tests {
         assert_eq!(claude_model_arg("opus"), Some("opus"));
         assert_eq!(claude_model_arg("fable"), Some("fable"));
         assert_eq!(claude_model_arg("haiku"), Some("haiku"));
+    }
+
+    #[test]
+    fn extract_cli_images_keeps_single_line_prompt_with_attachment() {
+        // Real file: extract_cli_images only keeps markers whose path exists().
+        let img = std::env::temp_dir().join(format!("oxide-cli-img-{}.png", new_claude_session_id()));
+        std::fs::write(&img, b"\x89PNG").unwrap();
+
+        // Mirrors the composer exactly: the "(user attached …)" note carries NO
+        // trailing newline before the user's single-line prompt, then a \u{2}
+        // image marker. The old newline-bounded strip ate the whole prompt here.
+        let content = format!(
+            "\n(user attached 1 image — image content is NOT visible to you; ask the user to describe it if needed)Cek struktur tim di schema\u{2}wsimg:{}",
+            img.display(),
+        );
+        let req = TurnRequest {
+            model: String::new(),
+            reasoning_effort: String::new(),
+            temperature: 0.0,
+            messages: vec![Message::new(Role::User, content)],
+            tools: Vec::new(),
+            cwd: String::new(),
+            conversation_id: String::new(),
+            cli_resume: None,
+        };
+
+        let (prompt, images) = extract_cli_images(&req);
+        let _ = std::fs::remove_file(&img);
+
+        assert_eq!(prompt, "Cek struktur tim di schema");
+        assert_eq!(images.len(), 1);
     }
 }
 
