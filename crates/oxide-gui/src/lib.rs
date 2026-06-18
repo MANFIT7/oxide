@@ -373,6 +373,22 @@ fn activity_idx(msgs: &[ChatMsg], key: &str) -> Option<usize> {
         .rposition(|m| matches!(&m.author, Author::Activity { key: Some(k), .. } if k == key))
 }
 
+/// Push an activity row into a backgrounded-tab buffer, keeping it above a
+/// trailing "✓ Done" note (the bg-loop equivalent of the `push_activity!` macro,
+/// so a late row never lands below the turn's summary once merged into the view).
+fn buf_push_activity(buf: &mut Vec<ChatMsg>, msg: ChatMsg) {
+    if buf
+        .last()
+        .map(|x| matches!(x.author, Author::Note) && x.text.starts_with("✓ Done"))
+        .unwrap_or(false)
+    {
+        let at = buf.len() - 1;
+        buf.insert(at, msg);
+    } else {
+        buf.push(msg);
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ActivityKind {
     Command,
@@ -3528,7 +3544,7 @@ fn app() -> Element {
                                         if buf.last().map(|m| m.author == Author::Agent && m.text.is_empty()).unwrap_or(false) {
                                             buf.pop();
                                         }
-                                        buf.push(ChatMsg { author: Author::Activity { running: false, ok: true, key: None }, text: row });
+                                        buf_push_activity(buf, ChatMsg { author: Author::Activity { running: false, ok: true, key: None }, text: row });
                                     } else if text.starts_with(['🧭','🔍','🤖','🧩','🔁','✓','⚠']) {
                                         // live stage info — meaningless once backgrounded
                                     } else {
@@ -3540,7 +3556,7 @@ fn app() -> Element {
                                 }
 	                                Event::ToolCallBegin { call_id, tool, args, .. } => {
 	                                    if tool != "ask_user" && tool != "shell" {
-	                                        buf.push(ChatMsg {
+	                                        buf_push_activity(buf, ChatMsg {
                                             author: Author::Activity { running: true, ok: true, key: Some(call_id) },
                                             text: activity_label(&tool, &args),
                                         });
@@ -3563,7 +3579,7 @@ fn app() -> Element {
 	                                    }
 	                                }
 	                                Event::CommandStarted { command_id, command, background, .. } => {
-	                                    buf.push(ChatMsg {
+	                                    buf_push_activity(buf, ChatMsg {
 	                                        author: Author::Activity { running: true, ok: true, key: Some(command_id) },
 	                                        text: command_activity_label(&command, background),
 	                                    });
@@ -3574,7 +3590,7 @@ fn app() -> Element {
 	                                    } else {
 	                                        let mut text = command_activity_label(&command_id, false);
 	                                        append_activity_output(&mut text, &chunk);
-	                                        buf.push(ChatMsg { author: Author::Activity { running: true, ok: true, key: Some(command_id) }, text });
+	                                        buf_push_activity(buf, ChatMsg { author: Author::Activity { running: true, ok: true, key: Some(command_id) }, text });
 	                                    }
 	                                }
 	                                Event::CommandFinished { command_id, ok, exit_code, .. } => {

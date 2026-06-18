@@ -6,6 +6,9 @@ Cargo.lock.bak
 *.log
 /dist/
 /oxide.toml
+# Runtime config oxide writes into whatever dir it's launched from (e.g. a crate
+# dir during a test run) — never tracked.
+**/oxide.toml
 .oxide/sessions/
 .oxide/memory/
 .oxide/**/.DS_Store
