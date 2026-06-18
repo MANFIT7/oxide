@@ -20,6 +20,13 @@ use tokio::sync::mpsc;
 const ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
 const DEFAULT_MODEL: &str = "gpt-5.5";
 const CONTEXT_WINDOW: u64 = 272_000;
+/// OAuth token endpoint + client id used by the codex CLI (same credentials we
+/// reuse), so an expired access token can be refreshed in place instead of
+/// dead-ending on "run codex login".
+const OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+const OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+/// Network retries for transient failures (5xx / 429 / connection errors).
+const MAX_RETRIES: u32 = 2;
 
 /// Best-known context window (tokens) for a ChatGPT-backend model, so
 /// compaction adapts automatically per model instead of a fixed number.
@@ -34,6 +41,22 @@ fn model_context_window(model: &str) -> u64 {
     } else {
         CONTEXT_WINDOW
     }
+}
+
+/// Retry delay (ms) from `retry-after-ms` or `retry-after` (seconds) headers.
+fn retry_after(resp: &reqwest::Response) -> Option<u64> {
+    let h = resp.headers();
+    if let Some(ms) = h
+        .get("retry-after-ms")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        return Some(ms);
+    }
+    h.get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(|s| s.saturating_mul(1000))
 }
 
 pub struct ChatGptProvider {
@@ -52,8 +75,9 @@ impl ChatGptProvider {
         }
     }
 
-    /// Read `(access_token, account_id)` from the codex auth file.
-    fn credentials(&self) -> anyhow::Result<(String, String)> {
+    /// Read `(access_token, account_id, refresh_token)` from the codex auth file.
+    /// `refresh_token` is empty if absent (then no in-place refresh is possible).
+    fn credentials(&self) -> anyhow::Result<(String, String, String)> {
         let text = std::fs::read_to_string(&self.auth_path).map_err(|e| {
             anyhow::anyhow!(
                 "ChatGPT subscription login not found ({}): {e}. Run `codex login` or open Codex Desktop and sign in again.",
@@ -66,7 +90,58 @@ impl ChatGptProvider {
             .ok_or_else(|| anyhow::anyhow!("ChatGPT subscription auth is missing access_token — run `codex login` to refresh it."))?
             .to_string();
         let acc = v["tokens"]["account_id"].as_str().unwrap_or("").to_string();
-        Ok((at, acc))
+        let refresh = v["tokens"]["refresh_token"].as_str().unwrap_or("").to_string();
+        Ok((at, acc, refresh))
+    }
+
+    /// Exchange a refresh token for a fresh `(access_token, refresh_token)` at the
+    /// OAuth endpoint (same flow the codex CLI uses). The refresh token may rotate.
+    async fn refresh_access(&self, refresh: &str) -> anyhow::Result<(String, String)> {
+        let body = json!({
+            "client_id": OAUTH_CLIENT_ID,
+            "grant_type": "refresh_token",
+            "refresh_token": refresh,
+            "scope": "openid profile email",
+        });
+        let resp = self
+            .client
+            .post(OAUTH_TOKEN_URL)
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("ChatGPT token refresh failed ({status}): {text}. Run `codex login` to sign in again.");
+        }
+        let v: Value = resp.json().await?;
+        let access = v["access_token"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("token refresh response missing access_token"))?
+            .to_string();
+        // refresh_token may or may not rotate; keep the old one if not returned.
+        let new_refresh = v["refresh_token"].as_str().unwrap_or(refresh).to_string();
+        Ok((access, new_refresh))
+    }
+
+    /// Write refreshed tokens back to the codex auth file, preserving every other
+    /// field (the file is shared with the codex CLI). Best-effort.
+    fn persist_refreshed(&self, access: &str, refresh: &str) {
+        let Ok(text) = std::fs::read_to_string(&self.auth_path) else { return };
+        let Ok(mut v) = serde_json::from_str::<Value>(&text) else { return };
+        if let Some(tokens) = v["tokens"].as_object_mut() {
+            tokens.insert("access_token".into(), json!(access));
+            tokens.insert("refresh_token".into(), json!(refresh));
+        }
+        // codex records the last refresh time; keep it roughly current.
+        if let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) {
+            let secs = now.as_secs();
+            v["last_refresh"] = json!(format!("{secs}"));
+        }
+        if let Ok(serialized) = serde_json::to_string_pretty(&v) {
+            let _ = std::fs::write(&self.auth_path, serialized);
+        }
     }
 }
 
@@ -177,8 +252,13 @@ fn build_body(req: &TurnRequest) -> Value {
         "stream": true,
         "store": false,
         "include": ["reasoning.encrypted_content"],
-        "reasoning": { "effort": effort }
+        // `summary: auto` streams reasoning summaries (shown live as thinking).
+        "reasoning": { "effort": effort, "summary": "auto" }
     });
+    // Stable cache key per conversation → backend prompt-cache hits across turns.
+    if !req.conversation_id.trim().is_empty() {
+        body["prompt_cache_key"] = json!(req.conversation_id);
+    }
     if !req.tools.is_empty() {
         let tools: Vec<Value> = req
             .tools
@@ -283,39 +363,70 @@ impl Provider for ChatGptProvider {
         req: TurnRequest,
         sink: mpsc::Sender<StreamItem>,
     ) -> anyhow::Result<()> {
-        let (access, account) = self.credentials()?;
+        let (mut access, account, refresh) = self.credentials()?;
         let chatgpt_session_id = session_id_for(&req.conversation_id);
-        let resp = self
-            .client
-            .post(ENDPOINT)
-            .bearer_auth(&access)
-            .header("chatgpt-account-id", account)
-            .header("Content-Type", "application/json")
-            .header("Accept", "text/event-stream")
-            .header("OpenAI-Beta", "responses=experimental")
-            .header("originator", "codex_cli_rs")
-            .header("session_id", chatgpt_session_id)
-            .json(&build_body(&req))
-            .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            if status.as_u16() == 401 {
-                anyhow::bail!("ChatGPT subscription token expired — run `codex login` or sign in again from Codex Desktop. ({text})");
+        let body = build_body(&req);
+        // POST with: a one-shot in-place token refresh on 401, and bounded
+        // backoff retries on transient 429/5xx/connection errors.
+        let mut attempt = 0u32;
+        let mut refreshed = false;
+        let resp = loop {
+            let send_result = self
+                .client
+                .post(ENDPOINT)
+                .bearer_auth(&access)
+                .header("chatgpt-account-id", &account)
+                .header("Content-Type", "application/json")
+                .header("Accept", "text/event-stream")
+                .header("OpenAI-Beta", "responses=experimental")
+                .header("originator", "codex_cli_rs")
+                .header("session_id", &chatgpt_session_id)
+                .json(&body)
+                .send()
+                .await;
+            match send_result {
+                Ok(resp) if resp.status().is_success() => break resp,
+                Ok(resp) => {
+                    let status = resp.status();
+                    // Expired access token → refresh once in place, then retry.
+                    if status.as_u16() == 401 && !refresh.is_empty() && !refreshed {
+                        refreshed = true;
+                        let (new_access, new_refresh) = self.refresh_access(&refresh).await?;
+                        self.persist_refreshed(&new_access, &new_refresh);
+                        access = new_access;
+                        continue;
+                    }
+                    // Transient → wait (honor retry-after) and retry.
+                    if (status.as_u16() == 429 || status.is_server_error()) && attempt < MAX_RETRIES {
+                        let wait = retry_after(&resp).unwrap_or(500u64 << attempt);
+                        attempt += 1;
+                        tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
+                        continue;
+                    }
+                    let text = resp.text().await.unwrap_or_default();
+                    if status.as_u16() == 401 {
+                        anyhow::bail!("ChatGPT subscription token expired — run `codex login` or sign in again from Codex Desktop. ({text})");
+                    }
+                    if status.as_u16() == 403 {
+                        anyhow::bail!("ChatGPT subscription rejected the request ({status}). Check that this account has Codex/ChatGPT subscription access and re-authenticate if needed. ({text})");
+                    }
+                    if status.as_u16() == 429 {
+                        anyhow::bail!("ChatGPT subscription rate limit reached ({status}). Wait for the plan reset shown in Usage, then retry. ({text})");
+                    }
+                    if status.as_u16() == 413 || text.to_ascii_lowercase().contains("context") {
+                        anyhow::bail!("ChatGPT subscription context is too large ({status}). Compact the chat or remove large attachments, then retry. ({text})");
+                    }
+                    anyhow::bail!("chatgpt {status}: {text}");
+                }
+                Err(_e) if attempt < MAX_RETRIES => {
+                    let wait = 500u64 << attempt;
+                    attempt += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
             }
-            if status.as_u16() == 403 {
-                anyhow::bail!("ChatGPT subscription rejected the request ({status}). Check that this account has Codex/ChatGPT subscription access and re-authenticate if needed. ({text})");
-            }
-            if status.as_u16() == 429 {
-                anyhow::bail!("ChatGPT subscription rate limit reached ({status}). Wait for the plan reset shown in Usage, then retry. ({text})");
-            }
-            if status.as_u16() == 413 || text.to_ascii_lowercase().contains("context") {
-                anyhow::bail!("ChatGPT subscription context is too large ({status}). Compact the chat or remove large attachments, then retry. ({text})");
-            }
-            anyhow::bail!("chatgpt {status}: {text}");
-        }
+        };
 
         // Subscription rate-limit snapshot from response headers.
         {
@@ -359,6 +470,21 @@ impl Provider for ChatGptProvider {
                         let _ = sink.send(StreamItem::ReasoningDelta(t.to_string())).await;
                     }
                 }
+                Some("response.output_item.added") => {
+                    // Seed a function_call's buffer at the START so later argument
+                    // deltas have a name to attach to (and the call is known even if
+                    // only deltas — no terminal arguments — arrive).
+                    let item = &v["item"];
+                    if item["type"].as_str() == Some("function_call") {
+                        if let Some(item_id) = item["id"].as_str() {
+                            let name = item["name"].as_str().unwrap_or("").to_string();
+                            let args = item["arguments"].as_str().unwrap_or("").to_string();
+                            pending_function_args
+                                .entry(item_id.to_string())
+                                .or_insert((name, args));
+                        }
+                    }
+                }
                 Some("response.output_item.done") => {
                     let item = &v["item"];
                     if item["type"].as_str() == Some("reasoning") {
@@ -370,12 +496,37 @@ impl Provider for ChatGptProvider {
                         }
                     }
                 }
+                Some("response.function_call_arguments.delta") => {
+                    // Accumulate streamed argument JSON so the call is complete even
+                    // if the terminal `.done`/`output_item.done` omits full arguments.
+                    if let Some(item_id) = v["item_id"].as_str() {
+                        if let Some(delta) = v["delta"].as_str() {
+                            let entry = pending_function_args
+                                .entry(item_id.to_string())
+                                .or_insert((String::new(), String::new()));
+                            entry.1.push_str(delta);
+                        }
+                    }
+                }
                 Some("response.function_call_arguments.done") => {
                     let item_id = v["item_id"].as_str().unwrap_or("").to_string();
-                    let name = v["name"].as_str().unwrap_or("").to_string();
-                    let arguments = v["arguments"].as_str().unwrap_or("{}").to_string();
-                    if !item_id.is_empty() && !name.is_empty() {
-                        pending_function_args.insert(item_id, (name, arguments));
+                    if item_id.is_empty() {
+                        continue;
+                    }
+                    let entry = pending_function_args
+                        .entry(item_id)
+                        .or_insert((String::new(), String::new()));
+                    if let Some(name) = v["name"].as_str() {
+                        if !name.is_empty() {
+                            entry.0 = name.to_string();
+                        }
+                    }
+                    // Prefer authoritative final arguments; otherwise keep what the
+                    // deltas accumulated.
+                    if let Some(args) = v["arguments"].as_str() {
+                        if !args.is_empty() {
+                            entry.1 = args.to_string();
+                        }
                     }
                 }
                 Some("response.completed") => {
@@ -398,10 +549,23 @@ impl Provider for ChatGptProvider {
                         .unwrap_or("unknown");
                     anyhow::bail!("ChatGPT response incomplete: {reason}. Compact context or retry with a smaller prompt.");
                 }
+                // Top-level error frame (not wrapped in a response object).
+                Some("error") => {
+                    let msg = v["message"]
+                        .as_str()
+                        .or_else(|| v["error"]["message"].as_str())
+                        .unwrap_or("stream error");
+                    anyhow::bail!("ChatGPT stream error: {msg}");
+                }
                 _ => {}
             }
         }
         for (item_id, (name, raw_args)) in pending_function_args {
+            // Skip buffers that never received a tool name (seeded by an
+            // output_item.added that never resolved) — they aren't real calls.
+            if name.is_empty() {
+                continue;
+            }
             if !send_tool_call(
                 &sink,
                 &mut sent_tools,
@@ -454,6 +618,15 @@ mod tests {
         assert_eq!(tool["strict"], false);
         assert_eq!(tool["parameters"]["required"][0], "command");
         assert_eq!(body["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn body_sets_cache_key_and_reasoning_summary() {
+        let body = build_body(&req_with_tools(Vec::new()));
+        assert_eq!(body["prompt_cache_key"], "session");
+        assert_eq!(body["reasoning"]["summary"], "auto");
+        assert_eq!(body["reasoning"]["effort"], "medium");
+        assert_eq!(body["store"], false);
     }
 
     #[test]
