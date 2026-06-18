@@ -1067,21 +1067,25 @@ fn emit_interactive_final(
 
 fn emit_claude_tool_use(sink: &mpsc::Sender<StreamItem>, tool: &ClaudeToolUse) {
     if let Some(command) = &tool.command {
+        // A command tool is fully represented by its command row (started →
+        // output → finished). Emitting a "⚙ Bash …" notice on top of it would
+        // add a second, redundant activity row that lingers after the turn.
         send(sink, StreamItem::CommandStarted {
             id: tool.id.clone(),
             command: command.clone(),
             cwd: String::new(),
             background: tool.background,
         });
-    }
-    let label = if tool.background {
-        if tool.detail.is_empty() { format!("⏳ {}", tool.name) } else { format!("⏳ {} {}", tool.name, tool.detail) }
-    } else if tool.detail.is_empty() {
-        format!("⚙ {}", tool.name)
     } else {
-        format!("⚙ {} {}", tool.name, tool.detail)
-    };
-    send(sink, StreamItem::Notice(label));
+        let label = if tool.background {
+            if tool.detail.is_empty() { format!("⏳ {}", tool.name) } else { format!("⏳ {} {}", tool.name, tool.detail) }
+        } else if tool.detail.is_empty() {
+            format!("⚙ {}", tool.name)
+        } else {
+            format!("⚙ {} {}", tool.name, tool.detail)
+        };
+        send(sink, StreamItem::Notice(label));
+    }
     if let Some(path) = &tool.file_path {
         send(sink, StreamItem::FileChanged(path.clone()));
     }
