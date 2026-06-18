@@ -3674,8 +3674,10 @@ fn app() -> Element {
                                         if mw.last().map(|m| m.author == Author::Agent && m.text.is_empty()).unwrap_or(false) {
                                             mw.pop();
                                         }
-                                        mw.push(ChatMsg { author: Author::Activity { running: false, ok: true, key: None }, text: row });
                                     }
+                                    // Route through push_activity! so it lands above a trailing
+                                    // "Done" note like every other activity row (never below it).
+                                    push_activity!(ChatMsg { author: Author::Activity { running: false, ok: true, key: None }, text: row });
 	                                } else if text.starts_with('⚙') {
 	                                    // CLI-driver tool activity: live shimmer + an activity
 	                                    // trail row in the chat (synara-style).

@@ -631,7 +631,11 @@ impl Provider for ClaudeCliProvider {
                                     // won't stream its result back — surface WHAT it's doing
                                     // with a distinct ⏳ marker so the UI can show it persistently.
 	                                    let bg = input["run_in_background"].as_bool() == Some(true);
-	                                    if matches!(name, "Bash" | "Shell") || input["command"].as_str().is_some() {
+	                                    let is_command = matches!(name, "Bash" | "Shell") || input["command"].as_str().is_some();
+	                                    if is_command {
+	                                        // A command is fully shown by its command row (started →
+	                                        // output → finished); emitting a "⚙ Bash …" notice on top
+	                                        // would leave a second, redundant activity row lingering.
 	                                        let command = input["command"].as_str().unwrap_or(detail.as_str()).to_string();
 	                                        let id = block["id"].as_str().map(str::to_string).unwrap_or_else(|| format!("claude-command-{command}"));
 	                                        send(sink, StreamItem::CommandStarted {
@@ -640,16 +644,15 @@ impl Provider for ClaudeCliProvider {
 	                                            cwd: String::new(),
 	                                            background: bg,
 	                                        });
+	                                    } else {
+	                                        let label = if detail.is_empty() {
+	                                            format!("⚙ {name}")
+	                                        } else {
+	                                            format!("⚙ {name} {detail}")
+	                                        };
+	                                        send(sink, StreamItem::Notice(label));
 	                                    }
-	                                    let label = if bg {
-	                                        if detail.is_empty() { format!("⏳ {name}") } else { format!("⏳ {name} {detail}") }
-                                    } else if detail.is_empty() {
-                                        format!("⚙ {name}")
-                                    } else {
-                                        format!("⚙ {name} {detail}")
-                                    };
-                                    send(sink, StreamItem::Notice(label));
-                                    if matches!(name, "Edit" | "Write" | "MultiEdit" | "NotebookEdit") {
+	                                    if matches!(name, "Edit" | "Write" | "MultiEdit" | "NotebookEdit") {
                                         if let Some(p) = input["file_path"].as_str() {
                                             send(sink, StreamItem::FileChanged(p.to_string()));
                                         }
