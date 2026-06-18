@@ -524,6 +524,25 @@ fn build_transcript_turns(messages: &[ChatMsg]) -> Vec<TranscriptTurn> {
             turn.groups.push(group);
         }
     }
+
+    // The "✓ Done" summary must render LAST within its turn. Activity/command
+    // rows can land in the buffer after the Done note (CLI drivers surface tool
+    // events with their own timing), which would otherwise show the trail below
+    // the footer. Floating it here is order-independent and fixes that for good.
+    let is_done = |g: &TranscriptGroup| -> bool {
+        !g.activity
+            && g.indices.len() == 1
+            && messages
+                .get(g.indices[0])
+                .map(|m| matches!(m.author, Author::Note) && m.text.starts_with("✓ Done"))
+                .unwrap_or(false)
+    };
+    for turn in turns.iter_mut() {
+        if turn.groups.len() > 1 && turn.groups.iter().any(&is_done) {
+            // Stable: keeps every other group's relative order, moves Done last.
+            turn.groups.sort_by_key(|g| is_done(g));
+        }
+    }
     turns
 }
 
@@ -1866,6 +1885,34 @@ mod tests {
             && std::env::var_os("OXIDE_SCAN_RECENT_VOLUMES").is_none();
 
         assert_eq!(should_defer_recent_workspace_scan(current, recent), expected);
+    }
+
+    fn act(text: &str) -> ChatMsg {
+        ChatMsg { author: Author::Activity { running: false, ok: true, key: None }, text: text.into() }
+    }
+    fn note(text: &str) -> ChatMsg {
+        ChatMsg { author: Author::Note, text: text.into() }
+    }
+
+    #[test]
+    fn done_summary_floats_to_end_of_turn() {
+        // Buffer order with the Done note BEFORE trailing activity rows (the bug:
+        // CLI tool events surfaced after TurnFinished landed below the footer).
+        let msgs = vec![
+            ChatMsg { author: Author::User, text: "go".into() },
+            ChatMsg { author: Author::Agent, text: "working".into() },
+            note("✓ Done · 1m"),
+            act("terminal\tBash\tgit status"),
+            act("eye\tRead\tlib.rs"),
+        ];
+        let turns = build_transcript_turns(&msgs);
+        assert_eq!(turns.len(), 1);
+        let groups = &turns[0].groups;
+        // Last group must be the Done note, with the activity group before it.
+        let last = groups.last().unwrap();
+        assert!(!last.activity);
+        assert!(msgs[last.indices[0]].text.starts_with("✓ Done"));
+        assert!(groups[groups.len() - 2].activity);
     }
 }
 
