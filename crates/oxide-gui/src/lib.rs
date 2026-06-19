@@ -6381,7 +6381,7 @@ fn app() -> Element {
                                                 let cur = think_open.read().unwrap_or(*streaming.read());
                                                 think_open.set(Some(!cur));
                                             },
-                                            "💭 Thinking"
+                                            "Reasoning"
                                         }
                                         div { class: "thinking-body", "{thinking}" }
                                     }
@@ -9904,7 +9904,7 @@ fn ChatPane(
                 }
                 if !thinking.read().is_empty() {
                     details { class: "thinking-box", open: *streaming.read(),
-                        summary { class: "thinking-sum", "💭 Thinking" }
+                        summary { class: "thinking-sum", "Reasoning" }
                         div { class: "thinking-body", "{thinking}" }
                     }
                 }

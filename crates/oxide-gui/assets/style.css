@@ -855,17 +855,18 @@ svg { width: 17px; height: 17px; flex-shrink: 0; }
 .cgpt-field .ed-save { width: 100%; }
 
 /* thinking box */
+/* Synara-style reasoning entry: a subtle left-accented inline block, not a
+   heavy card. The left accent + streaming pulse come from the rule lower down. */
 .thinking-box {
-  max-width: 720px; margin: 6px auto 18px 40px;
-  background: var(--surface); border: 1px solid var(--border); border-radius: 11px;
-  padding: 8px 12px; color: var(--muted);
+  max-width: 720px; margin: 3px auto 12px 40px;
+  padding: 1px 0 1px 10px; color: var(--muted);
 }
-.thinking-sum { cursor: pointer; font-size: 12.5px; color: var(--faint); list-style: none; }
+.thinking-sum { cursor: pointer; font-size: 12.5px; font-weight: 600; color: var(--muted); list-style: none; }
 .thinking-sum::-webkit-details-marker { display: none; }
 .thinking-body {
-  margin-top: 8px; font-size: 12.5px; line-height: 1.6; color: var(--muted);
-  white-space: pre-wrap; word-break: break-word; font-style: italic;
-  max-height: 260px; overflow-y: auto;
+  margin-top: 4px; font-size: 12px; line-height: 1.55; color: var(--faint);
+  white-space: pre-wrap; word-break: break-word;
+  max-height: 200px; overflow-y: auto;
 }
 
 /* tool / command card in chat */
@@ -890,7 +891,9 @@ svg { width: 17px; height: 17px; flex-shrink: 0; }
   display: inline-flex; align-items: center; gap: 9px;
   margin: 4px auto 16px 40px;
   background: var(--surface); border: 1px solid var(--border);
-  border-radius: 999px; padding: 7px 14px 7px 11px; width: fit-content;
+  border-radius: 999px; padding: 6px 13px 6px 10px; width: fit-content;
+  /* Keep it a compact one-line pill — long command labels get ellipsed, not wrapped. */
+  max-width: min(620px, 72%); overflow: hidden;
 }
 .status-spinner {
   width: 13px; height: 13px; border-radius: 50%;
@@ -906,6 +909,8 @@ svg { width: 17px; height: 17px; flex-shrink: 0; }
   -webkit-background-clip: text; background-clip: text;
   -webkit-text-fill-color: transparent;
   animation: shimmer 1.8s linear infinite;
+  /* One line, ellipsis on overflow (flex child needs min-width:0 to shrink). */
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0;
 }
 @keyframes shimmer { to { background-position: -200% 0; } }
 
@@ -2156,7 +2161,7 @@ details[open]::details-content { block-size: auto; }
 }
 
 /* elapsed time in the status pill */
-.status-elapsed { color: var(--faint); font-size: 11px; font-variant-numeric: tabular-nums; }
+.status-elapsed { color: var(--faint); font-size: 11px; font-variant-numeric: tabular-nums; flex-shrink: 0; white-space: nowrap; }
 /* send ↔ stop morph: circle → rounded square, icon spins in */
 .send { transition: opacity .12s ease, transform .16s cubic-bezier(.34,1.56,.64,1), border-radius .18s ease, background .12s ease; }
 .send.stop { border-radius: 9px; animation: stop-in .18s cubic-bezier(.22,1,.36,1); }
