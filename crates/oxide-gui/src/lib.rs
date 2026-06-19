@@ -4566,7 +4566,7 @@ fn app() -> Element {
                             settings_initial_tab.set("automations".to_string());
                             show_settings.set(true);
                         },
-                        Icon { name: "target" } span { "Automations" }
+                        Icon { name: "clock" } span { "Automations" }
                     }
                 }
                 div { class: "section-row",
@@ -6947,7 +6947,7 @@ fn app() -> Element {
                     };
                     let actions: Vec<(&str, &str)> = vec![
                         ("plus", "New chat"), ("folder", "Open folder…"), ("plugins", "Split view"),
-                        ("plugins", "MCP servers"), ("target", "Skills"), ("list", "Board"), ("target", "Automations"),
+                        ("plugins", "MCP servers"), ("target", "Skills"), ("list", "Board"), ("clock", "Automations"),
                         ("plugins", "Files panel"), ("terminal", "Terminal"), ("settings", "Settings…"),
                         ("spark", "Theme: Light"), ("target", "Theme: Dark"), ("settings", "Theme: System"),
                         ("list", "Toggle density"),
@@ -10120,6 +10120,7 @@ fn Icon(name: &'static str) -> Element {
             line { x1: "9", y1: "18", x2: "21", y2: "18" }
         },
         "target" => rsx! { circle { cx: "12", cy: "12", r: "9" } circle { cx: "12", cy: "12", r: "5" } circle { cx: "12", cy: "12", r: "1" } },
+        "clock" => rsx! { circle { cx: "12", cy: "12", r: "9" } polyline { points: "12 7 12 12 15 14" } },
         "pin" => rsx! { path { d: "M9 3h6l-1 6 3 3v2h-5v5l-1 2-1-2v-5H4v-2l3-3-1-6z" } },
         "brain" => rsx! {
             line { x1: "5", y1: "19", x2: "5", y2: "14" }
