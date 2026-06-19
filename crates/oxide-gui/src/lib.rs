@@ -7953,7 +7953,7 @@ fn SettingsModal(
     let mut settings_tab = use_signal(|| initial_tab.clone());
     rsx! {
         div { class: "modal-overlay", onclick: move |_| on_close.call(()),
-            div { class: "modal", onclick: move |e| e.stop_propagation(),
+            div { class: "modal settings-modal", onclick: move |e| e.stop_propagation(),
                 div { class: "modal-head",
                     h2 { "Settings" }
                     button { class: "term-x", onclick: move |_| on_close.call(()), "✕" }

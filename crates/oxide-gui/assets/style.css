@@ -1249,8 +1249,11 @@ svg { width: 17px; height: 17px; flex-shrink: 0; }
 .act-group .activity-card { margin-left: 18px; }
 
 /* ── Settings tabs ───────────────────────────────────── */
-.settings-tabs { display: flex; gap: 4px; padding: 4px 18px 0; border-bottom: 1px solid var(--border); }
-.settings-tab { background: transparent; border: none; border-bottom: 2px solid transparent; color: var(--muted); padding: 9px 14px 10px; font-size: 13px; cursor: pointer; font-family: inherit; }
+/* Wider so all six tabs (…Updates) fit without the last one being clipped. */
+.modal.settings-modal { width: 560px; }
+.settings-tabs { display: flex; gap: 2px; padding: 4px 14px 0; border-bottom: 1px solid var(--border); flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; }
+.settings-tabs::-webkit-scrollbar { display: none; }
+.settings-tab { background: transparent; border: none; border-bottom: 2px solid transparent; color: var(--muted); padding: 9px 11px 10px; font-size: 13px; cursor: pointer; font-family: inherit; white-space: nowrap; flex: 0 0 auto; }
 .settings-tab:hover { color: var(--text); }
 .settings-tab.active { color: var(--text); border-bottom-color: var(--accent); }
 
