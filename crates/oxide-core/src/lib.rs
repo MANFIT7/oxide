@@ -2445,6 +2445,13 @@ Treat the following as the only current, top-priority instruction:]\n\n{user_tex
         let harness = self.active_harness();
         let policy = harness.loop_policy();
         let mut sys = harness.system_prompt();
+        // Mirror the user's language. The codex/chatgpt backend (and most models)
+        // default to English without this; the user's prompt language should win.
+        sys.push_str(
+            "\n\n# Language\nAlways reply in the SAME language the user writes in \
+             (e.g. user writes Indonesian → reply in Indonesian). Match the user's \
+             language for every response; do not switch to English on your own.",
+        );
         // Tell the agent exactly where it is working so it never wanders to $HOME.
         let stack = detect_stack(&self.workspace);
         sys.push_str(&format!(

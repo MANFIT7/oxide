@@ -107,6 +107,27 @@ State-machine parser. Events handled (→ normalized event emitted):
 
 ---
 
+## 2b. English replies + stuck/loop (studied opencode + Synara turn loops)
+
+**English-by-default cause:** neither opencode nor Synara sends any language/locale
+instruction — they rely on the system prompt + model default, which is English-first.
+Oxide replied English because its (English, large) system prompt went out as `instructions`
+with no language cue. **Fix:** Oxide now appends a "reply in the user's language" block to
+the system prompt (oxide-core `run_turn`). Deliberate — neither reference has it, but it's
+the lever.
+
+**Stuck/loop fixes (from opencode's iterative loop):**
+- `response.completed`/`response.incomplete` now BREAK the SSE loop (chatgpt.rs) instead of
+  reading until the connection closes — opencode uses `takeUntil(terminal)`; not breaking
+  could hang the turn.
+- `response.incomplete` is a soft stop (emit a notice + end) instead of erroring the turn.
+- Dangling tool calls: oxide-core `sanitize_tool_pairs` now synthesizes an "interrupted"
+  tool result for an unanswered call (opencode's failUnsettledTools) instead of stripping it,
+  so the model is told it failed and doesn't re-issue it in a loop.
+- Stalls: covered by the http client `read_timeout(120s)` (API) + CLI driver timeouts;
+  an engine-level idle watchdog (Synara's `AcpTurnIdleWatchdog`) is a possible future add.
+- Max-steps + doom-loop guard already exist in oxide-core run_turn.
+
 ## 3. Gap analysis → prioritized Rust TODO
 
 > **Implemented in v0.0.83:** gaps 1 (token refresh on 401, persisted back to auth.json),

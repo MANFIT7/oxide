@@ -36,22 +36,34 @@ pub fn sanitize_tool_pairs(messages: &mut Vec<Message>) -> bool {
         Some(id) => call_ids.contains(id),
         None => true,
     });
-    // Neutralize assistant calls whose result is gone.
     let after_results = messages.len();
-    let mut cleared = false;
-    messages.retain_mut(|m| {
-        if let Some(call) = &m.tool_call {
-            if !result_ids.contains(&call.id) {
-                if m.content.trim().is_empty() && m.reasoning_item.is_none() {
-                    return false; // nothing but a dangling call — drop it
-                }
-                m.tool_call = None; // keep the prose, drop the orphan call
-                cleared = true;
-            }
+
+    // For each assistant tool_call with no matching result, synthesize an
+    // "interrupted" result right after it. This keeps the call/result pair valid
+    // (so the provider never 400s on an orphan) AND tells the model the call did
+    // NOT complete — so it won't silently re-issue the same call in a loop
+    // (opencode's failUnsettledTools idea). Stripping the call instead left the
+    // model free to repeat it endlessly.
+    let mut out: Vec<Message> = Vec::with_capacity(messages.len() + 1);
+    let mut synthesized = false;
+    for m in messages.drain(..) {
+        let dangling_id = m
+            .tool_call
+            .as_ref()
+            .filter(|c| !result_ids.contains(&c.id))
+            .map(|c| c.id.clone());
+        out.push(m);
+        if let Some(id) = dangling_id {
+            out.push(Message::tool_result(
+                "interrupted — the previous tool call did not complete. Do not repeat it; take a different approach or ask the user.",
+                id,
+            ));
+            synthesized = true;
         }
-        true
-    });
-    before != after_results || after_results != messages.len() || cleared
+    }
+    *messages = out;
+
+    before != after_results || synthesized
 }
 
 /// Roughly 4 characters per token for English/code.
@@ -153,10 +165,14 @@ mod pair_tests {
     }
 
     #[test]
-    fn drops_orphan_call_with_no_prose() {
+    fn synthesizes_result_for_orphan_call() {
         let mut v = vec![call("a")];
         assert!(sanitize_tool_pairs(&mut v));
-        assert!(v.is_empty());
+        // Call is kept and paired with a synthetic "interrupted" result so the
+        // model sees it didn't complete (instead of being dropped + re-issued).
+        assert_eq!(v.len(), 2);
+        assert!(v[0].tool_call.is_some());
+        assert_eq!(v[1].tool_call_id.as_deref(), Some("a"));
     }
 
     #[test]

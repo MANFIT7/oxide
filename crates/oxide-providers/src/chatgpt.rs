@@ -538,16 +538,27 @@ impl Provider for ChatGptProvider {
                             context_window: Some(model_context_window(if req.model.is_empty() { DEFAULT_MODEL } else { &req.model })),
                         })
                         .await;
+                    // Terminal event — stop reading. Don't keep the SSE loop alive
+                    // waiting for the connection to close (that can hang the turn).
+                    break;
                 }
                 Some("response.failed") => {
                     let msg = v["response"]["error"]["message"].as_str().unwrap_or("response failed");
                     anyhow::bail!("ChatGPT response failed: {msg}");
                 }
                 Some("response.incomplete") => {
+                    // A soft stop (length / content filter / etc.) — NOT an error.
+                    // Surface a note and end the turn gracefully with whatever was
+                    // produced, so a truncated response doesn't blow up the turn.
                     let reason = v["response"]["incomplete_details"]["reason"]
                         .as_str()
                         .unwrap_or("unknown");
-                    anyhow::bail!("ChatGPT response incomplete: {reason}. Compact context or retry with a smaller prompt.");
+                    let _ = sink
+                        .send(StreamItem::Notice(format!(
+                            "⚠ response incomplete ({reason}) — compact context or retry with a smaller prompt."
+                        )))
+                        .await;
+                    break;
                 }
                 // Top-level error frame (not wrapped in a response object).
                 Some("error") => {
