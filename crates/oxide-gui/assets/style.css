@@ -1239,6 +1239,7 @@ svg { width: 17px; height: 17px; flex-shrink: 0; }
 .act-group[open] .diff-caret svg { transform: rotate(180deg); }
 .act-group-head { cursor: pointer; list-style: none; display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--muted); padding: 6px 10px; background: var(--surface); border: 1px solid var(--border); border-radius: 9px; width: fit-content; }
 .act-group-head::-webkit-details-marker { display: none; }
+.act-more { font-size: 11.5px; color: var(--faint); padding: 3px 10px 1px 30px; }
 .act-group-head:hover { color: var(--text); }
 .act-group .row.activity { margin: 4px 0; }
 .act-group .activity-card { margin-left: 18px; }

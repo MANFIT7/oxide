@@ -544,7 +544,6 @@ fn build_transcript_turns(messages: &[ChatMsg]) -> Vec<TranscriptTurn> {
 
 fn activity_group_label(rows: &[(String, bool, bool)]) -> String {
     let n = rows.len();
-    let done = rows.iter().filter(|(_, running, _)| !*running).count();
     let running = rows.iter().any(|(_, running, _)| *running);
     let mut edits = 0;
     let mut commands = 0;
@@ -561,9 +560,9 @@ fn activity_group_label(rows: &[(String, bool, bool)]) -> String {
     }
 
     if running && edits > 0 {
-        format!("✎ Editing files… {done}/{n}")
+        format!("✎ Editing files… {n} action{}", if n == 1 { "" } else { "s" })
     } else if running {
-        format!("⚙ Working… {done}/{n}")
+        format!("⚙ Working… {n} action{}", if n == 1 { "" } else { "s" })
     } else if edits > 0 && edits >= commands + searches + web {
         format!("✎ {edits} file changes · {n} actions")
     } else if commands > 0 && commands >= searches + web {
@@ -6184,24 +6183,33 @@ fn app() -> Element {
                                                 rsx! {
                                             if is_act && idxs.len() > 2 {
                                                 {
+                                                    let _ = group_live;
                                                     let rows: Vec<(String, bool, bool)> = idxs.iter().map(|&i| {
                                                         let m = &messages.read()[i];
                                                         if let Author::Activity { running, ok, .. } = m.author { (m.text.clone(), running, ok) } else { (m.text.clone(), false, true) }
                                                     }).collect();
                                                     let label = activity_group_label(&rows);
-                                                    let is_open = act_open.read().get(&group_key).copied().unwrap_or(group_live);
+                                                    // Default COLLAPSED, even while live — an open group with dozens
+                                                    // of (animating) rows lags hard. The header shows live progress;
+                                                    // the user expands for detail. And cap rendered rows to the most
+                                                    // recent so expanding a huge group stays light.
+                                                    let is_open = act_open.read().get(&group_key).copied().unwrap_or(false);
+                                                    const ACT_ROW_CAP: usize = 12;
+                                                    let hidden = rows.len().saturating_sub(ACT_ROW_CAP);
+                                                    let shown: Vec<(String, bool, bool)> = rows.into_iter().skip(hidden).collect();
                                                     rsx! {
                                                         details { class: "act-group", open: is_open,
                                                             summary { class: "act-group-head",
                                                                 onclick: move |e: dioxus::prelude::MouseEvent| {
                                                                     e.prevent_default();
-                                                                    let cur = act_open.read().get(&group_key).copied().unwrap_or(group_live);
+                                                                    let cur = act_open.read().get(&group_key).copied().unwrap_or(false);
                                                                     act_open.write().insert(group_key, !cur);
                                                                 },
                                                                 span { class: "diff-caret", Icon { name: "chevron" } }
                                                                 "{label}"
                                                             }
-                                                            for (t, r, o) in rows { ActivityRow { text: t, running: r, ok: o } }
+                                                            if hidden > 0 { div { class: "act-more", "… {hidden} earlier" } }
+                                                            for (t, r, o) in shown { ActivityRow { text: t, running: r, ok: o } }
                                                         }
                                                     }
                                                 }
