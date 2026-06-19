@@ -460,6 +460,10 @@ svg { width: 17px; height: 17px; flex-shrink: 0; }
   font-family: "SF Mono", "JetBrains Mono", ui-monospace, Menlo, monospace;
   font-size: 13px; line-height: 1.6; tab-size: 4;
 }
+/* Binary previews (PDF / image) fill the editor body. */
+.editor-pdf { flex: 1; width: 100%; border: none; background: var(--bg); }
+.editor-imgwrap { flex: 1; min-height: 0; overflow: auto; display: flex; align-items: flex-start; justify-content: center; padding: 16px; background: var(--bg); }
+.editor-img { max-width: 100%; height: auto; border-radius: 6px; }
 
 /* ── Terminal ────────────────────────────────────────── */
 .terminal {

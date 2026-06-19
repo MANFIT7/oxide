@@ -2439,6 +2439,14 @@ async fn git_run(ws: PathBuf, args: Vec<String>) -> String {
 
 
 fn open_file(mut ui: Ui, path: PathBuf) {
+    // PDF/image: previewed via the asset handler, not slurped as text.
+    let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).unwrap_or_default();
+    if matches!(ext.as_str(), "pdf" | "png" | "jpg" | "jpeg" | "gif" | "svg" | "webp") {
+        ui.editor_text.set(String::new());
+        ui.open_path.set(Some(path));
+        ui.dirty.set(false);
+        return;
+    }
     match std::fs::read_to_string(&path) {
         Ok(content) => {
             ui.editor_text.set(content);
@@ -2786,7 +2794,8 @@ fn app() -> Element {
             let ct = match path.extension().and_then(|e| e.to_str()) {
                 Some("png") => "image/png", Some("jpg") | Some("jpeg") => "image/jpeg",
                 Some("gif") => "image/gif", Some("svg") => "image/svg+xml",
-                Some("webp") => "image/webp", _ => "application/octet-stream",
+                Some("webp") => "image/webp", Some("pdf") => "application/pdf",
+                _ => "application/octet-stream",
             };
             let resp = dioxus::desktop::wry::http::Response::builder()
                 .header("Content-Type", ct)
@@ -7795,35 +7804,56 @@ fn Editor() -> Element {
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
     let dirty = *ui.dirty.read();
+    // Binary files (PDF, images) are previewed via the wsimg asset handler — the
+    // webview renders a PDF natively — rather than dumped as garbage text.
+    let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).unwrap_or_default();
+    let is_pdf = ext == "pdf";
+    let is_img = matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "svg" | "webp");
+    let preview_src = {
+        // Path-encode for the asset URL (the handler percent-decodes it).
+        let enc: String = path.display().to_string().bytes().map(|b| match b {
+            b'/' | b'.' | b'-' | b'_' | b'~' | b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        }).collect();
+        format!("/wsimg/{enc}")
+    };
 
     rsx! {
         div { class: "editor",
             div { class: "editor-head",
                 span { class: "editor-title",
                     "{title}"
-                    if dirty { span { class: "dot-dirty", "●" } }
+                    if dirty && !is_pdf && !is_img { span { class: "dot-dirty", "●" } }
                 }
                 div { class: "editor-actions",
-                    button {
-                        class: "ed-save",
-                        onclick: move |_| {
-                            let p = ui.open_path.read().clone();
-                            if let Some(p) = p {
-                                let text = ui.editor_text.read().clone();
-                                let _ = std::fs::write(&p, text);
-                                ui.dirty.set(false);
-                            }
-                        },
-                        "Save"
+                    if !is_pdf && !is_img {
+                        button {
+                            class: "ed-save",
+                            onclick: move |_| {
+                                let p = ui.open_path.read().clone();
+                                if let Some(p) = p {
+                                    let text = ui.editor_text.read().clone();
+                                    let _ = std::fs::write(&p, text);
+                                    ui.dirty.set(false);
+                                }
+                            },
+                            "Save"
+                        }
                     }
                     button { class: "ed-close", onclick: move |_| ui.open_path.set(None), "Close" }
                 }
             }
-            textarea {
-                class: "editor-area",
-                spellcheck: false,
-                value: "{ui.editor_text}",
-                oninput: move |e| { ui.editor_text.set(e.value()); ui.dirty.set(true); },
+            if is_pdf {
+                embed { class: "editor-pdf", src: "{preview_src}", "type": "application/pdf" }
+            } else if is_img {
+                div { class: "editor-imgwrap", img { class: "editor-img", src: "{preview_src}" } }
+            } else {
+                textarea {
+                    class: "editor-area",
+                    spellcheck: false,
+                    value: "{ui.editor_text}",
+                    oninput: move |e| { ui.editor_text.set(e.value()); ui.dirty.set(true); },
+                }
             }
         }
     }
