@@ -3403,6 +3403,11 @@ fn app() -> Element {
                             followups.write().clear();
                             thinking.set(String::new());
                             bg_jobs.write().clear();
+                            // These are GLOBAL signals, not per-tab — clear them on tab
+                            // switch too, else the previous tab's workflow/subagent cards
+                            // linger on the newly-viewed tab ("stuck, won't disappear").
+                            workflow_cards.write().clear();
+                            subagent_cards.write().clear();
                             // The tab's snapshot + anything that streamed while it was
                             // backgrounded (drained from the bg buffer in one write).
                             let mut cur_msgs = tabs.peek().iter().find(|t| t.id == id).map(|t| t.messages.clone()).unwrap_or(msgs);
