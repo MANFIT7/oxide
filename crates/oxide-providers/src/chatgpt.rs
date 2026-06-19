@@ -197,6 +197,64 @@ fn session_id_for(conversation_id: &str) -> String {
     )
 }
 
+/// Standard base64 (with padding) — small inline encoder so we don't pull in a
+/// crate just to data-URL-encode attached images.
+fn base64_encode(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(T[((n >> 18) & 63) as usize] as char);
+        out.push(T[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 { T[((n >> 6) & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+    }
+    out
+}
+
+/// Build the multimodal `content` for a user message: the text (with attachment
+/// markers stripped) plus an `input_image` block per `wsimg:` marker (base64
+/// data URL) — matching opencode/synara, so attached images reach the model
+/// instead of the raw marker leaking as text.
+fn user_content(text_with_markers: &str, cwd: &str) -> Value {
+    let mut segs = text_with_markers.split('\u{2}');
+    let mut text = segs.next().unwrap_or("").to_string();
+    let mut images: Vec<Value> = Vec::new();
+    for seg in segs {
+        let Some(rel) = seg.strip_prefix("wsimg:") else { continue };
+        let path = if rel.starts_with('/') {
+            std::path::PathBuf::from(rel)
+        } else {
+            std::path::Path::new(cwd).join(rel)
+        };
+        let Ok(bytes) = std::fs::read(&path) else { continue };
+        let mime = match path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref() {
+            Some("jpg") | Some("jpeg") => "image/jpeg",
+            Some("gif") => "image/gif",
+            Some("webp") => "image/webp",
+            Some("svg") => "image/svg+xml",
+            _ => "image/png",
+        };
+        images.push(json!({
+            "type": "input_image",
+            "image_url": format!("data:{mime};base64,{}", base64_encode(&bytes)),
+        }));
+    }
+    // The image is now actually sent — drop the "(user attached … NOT visible)" note.
+    if !images.is_empty() {
+        if let Some(i) = text.find("(user attached ") {
+            let end = text[i..].find(')').map(|e| i + e + 1).unwrap_or(text.len());
+            text.replace_range(i..end, "");
+        }
+    }
+    let mut content = vec![json!({ "type": "input_text", "text": text.trim() })];
+    content.extend(images);
+    json!({ "type": "message", "role": "user", "content": content })
+}
+
 fn build_body(req: &TurnRequest) -> Value {
     let mut instructions = String::new();
     let mut input: Vec<Value> = Vec::new();
@@ -215,10 +273,7 @@ fn build_body(req: &TurnRequest) -> Value {
                 "call_id": m.tool_call_id.clone().unwrap_or_default(),
                 "output": m.content,
             })),
-            Role::User | Role::Tool => input.push(json!({
-                "type": "message", "role": "user",
-                "content": [{ "type": "input_text", "text": m.content }]
-            })),
+            Role::User | Role::Tool => input.push(user_content(&m.content, &req.cwd)),
             Role::Assistant => {
                 // Replay the model's own (encrypted) reasoning first so it keeps
                 // its train of thought across rounds instead of re-thinking.
@@ -690,5 +745,40 @@ mod tests {
         assert_ne!(a1, b);
         assert_eq!(a1.len(), 36);
         assert_eq!(a1.chars().filter(|c| *c == '-').count(), 4);
+    }
+
+    #[test]
+    fn base64_encodes_with_padding() {
+        assert_eq!(base64_encode(b"Man"), "TWFu");
+        assert_eq!(base64_encode(b"Ma"), "TWE=");
+        assert_eq!(base64_encode(b"M"), "TQ==");
+        assert_eq!(base64_encode(b""), "");
+    }
+
+    #[test]
+    fn user_content_emits_input_image_and_strips_note() {
+        let img = std::env::temp_dir().join("oxide-usercontent-test.png");
+        std::fs::write(&img, b"\x89PNG\r\n\x1a\n").unwrap();
+        let text = format!(
+            "Look at this (user attached 1 image — image content is NOT visible to you; ask the user to describe it if needed)\u{2}wsimg:{}",
+            img.display()
+        );
+        let v = user_content(&text, "/tmp");
+        let _ = std::fs::remove_file(&img);
+        let content = v["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "input_text");
+        let t = content[0]["text"].as_str().unwrap();
+        assert!(t.contains("Look at this"));
+        assert!(!t.contains("user attached")); // note stripped now image is sent
+        assert_eq!(content[1]["type"], "input_image");
+        assert!(content[1]["image_url"].as_str().unwrap().starts_with("data:image/png;base64,"));
+    }
+
+    #[test]
+    fn user_content_plain_text_has_no_image_block() {
+        let v = user_content("just text", "/tmp");
+        let content = v["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["text"], "just text");
     }
 }
