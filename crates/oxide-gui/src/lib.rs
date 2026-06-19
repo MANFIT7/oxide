@@ -434,6 +434,10 @@ struct TranscriptGroup {
 #[derive(Clone, PartialEq)]
 struct TranscriptTurn {
     groups: Vec<TranscriptGroup>,
+    /// The turn's "✓ Done …" summary, pulled OUT of the row list so it always
+    /// renders as the turn's last child — never below it (Synara's model: the
+    /// summary is the last child of the message, not a reorderable sibling row).
+    done_summary: Option<String>,
 }
 
 /// Count added/removed lines in a unified diff (excludes the +++/--- headers).
@@ -515,32 +519,24 @@ fn build_transcript_turns(messages: &[ChatMsg]) -> Vec<TranscriptTurn> {
         }
     }
 
+    // Assemble groups into turns (split at user messages). A standalone
+    // "✓ Done …" note is pulled OUT of the row list into `turn.done_summary`, so
+    // the render can place it as the turn's LAST child — a late tool/activity row
+    // that lands after it in the buffer can never render below it.
+    let is_done_note = |m: &ChatMsg| matches!(m.author, Author::Note) && m.text.starts_with("✓ Done");
     let mut turns: Vec<TranscriptTurn> = Vec::new();
     for group in groups {
+        if !group.activity && group.indices.len() == 1 && is_done_note(&messages[group.indices[0]]) {
+            if let Some(turn) = turns.last_mut() {
+                turn.done_summary = Some(messages[group.indices[0]].text.clone());
+                continue;
+            }
+        }
         let starts_turn = group.indices.first().map(|&idx| messages[idx].author == Author::User).unwrap_or(false);
         if starts_turn || turns.is_empty() {
-            turns.push(TranscriptTurn { groups: vec![group] });
+            turns.push(TranscriptTurn { groups: vec![group], done_summary: None });
         } else if let Some(turn) = turns.last_mut() {
             turn.groups.push(group);
-        }
-    }
-
-    // The "✓ Done" summary must render LAST within its turn. Activity/command
-    // rows can land in the buffer after the Done note (CLI drivers surface tool
-    // events with their own timing), which would otherwise show the trail below
-    // the footer. Floating it here is order-independent and fixes that for good.
-    let is_done = |g: &TranscriptGroup| -> bool {
-        !g.activity
-            && g.indices.len() == 1
-            && messages
-                .get(g.indices[0])
-                .map(|m| matches!(m.author, Author::Note) && m.text.starts_with("✓ Done"))
-                .unwrap_or(false)
-    };
-    for turn in turns.iter_mut() {
-        if turn.groups.len() > 1 && turn.groups.iter().any(&is_done) {
-            // Stable: keeps every other group's relative order, moves Done last.
-            turn.groups.sort_by_key(|g| is_done(g));
         }
     }
     turns
@@ -1895,7 +1891,7 @@ mod tests {
     }
 
     #[test]
-    fn done_summary_floats_to_end_of_turn() {
+    fn done_summary_extracted_so_trailing_activity_stays_above_it() {
         // Buffer order with the Done note BEFORE trailing activity rows (the bug:
         // CLI tool events surfaced after TurnFinished landed below the footer).
         let msgs = vec![
@@ -1907,12 +1903,12 @@ mod tests {
         ];
         let turns = build_transcript_turns(&msgs);
         assert_eq!(turns.len(), 1);
-        let groups = &turns[0].groups;
-        // Last group must be the Done note, with the activity group before it.
-        let last = groups.last().unwrap();
-        assert!(!last.activity);
-        assert!(msgs[last.indices[0]].text.starts_with("✓ Done"));
-        assert!(groups[groups.len() - 2].activity);
+        // The Done note is pulled out of the row groups into `done_summary`
+        // (the render then places it as the turn's last child), so NO group is
+        // the Done note and the trailing activity group is the last group.
+        assert_eq!(turns[0].done_summary.as_deref(), Some("✓ Done · 1m"));
+        assert!(turns[0].groups.iter().all(|g| !g.indices.iter().any(|&i| msgs[i].text.starts_with("✓ Done"))));
+        assert!(turns[0].groups.last().unwrap().activity);
     }
 }
 
@@ -6369,6 +6365,9 @@ fn app() -> Element {
                                 }
                                                 }
                                             }
+                                        }
+                                        if let Some(sum) = turn.done_summary {
+                                            div { class: "pinwrap", Message { author: Author::Note, text: sum, live: false } }
                                         }
                                         }
                                         }
