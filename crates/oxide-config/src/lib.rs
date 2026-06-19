@@ -40,6 +40,11 @@ pub struct Config {
     /// External MCP tool servers to launch and expose to the model.
     #[serde(default)]
     pub mcp_servers: Vec<McpServerConfig>,
+    /// Auto-import MCP servers configured in other agent CLIs (codex's
+    /// `~/.codex/config.toml`) on load, so existing plugins work without
+    /// re-configuring. Names already present in `mcp_servers` win.
+    #[serde(default = "default_true")]
+    pub import_external_mcp: bool,
     /// Two-stage orchestration: a front planner delegates to a backend implementer.
     #[serde(default)]
     pub orchestrate: bool,
@@ -273,6 +278,7 @@ impl Default for Config {
             persist: true,
             resume: false,
             mcp_servers: Vec::new(),
+            import_external_mcp: true,
             orchestrate: false,
             front_provider: default_front(),
             backend_provider: default_backend(),
@@ -310,7 +316,21 @@ impl Config {
         if project.exists() {
             cfg.overlay_file(&project)?;
         }
+        if cfg.import_external_mcp {
+            cfg.merge_imported_mcp(import_codex_mcp_servers());
+        }
         Ok(cfg)
+    }
+
+    /// Add imported MCP servers that aren't already configured (by name).
+    /// Explicit config in `mcp_servers` always wins over an import.
+    pub fn merge_imported_mcp(&mut self, imported: Vec<McpServerConfig>) {
+        for s in imported {
+            if self.mcp_servers.iter().any(|e| e.name == s.name) {
+                continue;
+            }
+            self.mcp_servers.push(s);
+        }
     }
 
     /// Merge a TOML file on top of the current config (missing keys keep prior values).
@@ -377,9 +397,117 @@ fn user_config_path() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".config/oxide/config.toml"))
 }
 
+/// Parse codex's `[mcp_servers.<name>]` tables into Oxide MCP configs. Codex and
+/// Oxide share the same MCP wire protocol, so a stdio (`command`/`args`/`env`)
+/// or remote (`url`) server defined for codex runs as-is in Oxide.
+fn parse_codex_mcp(text: &str) -> Vec<McpServerConfig> {
+    let Ok(root) = toml::from_str::<toml::Value>(text) else {
+        return Vec::new();
+    };
+    let Some(servers) = root.get("mcp_servers").and_then(|v| v.as_table()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (name, def) in servers {
+        let Some(def) = def.as_table() else { continue };
+        let command = def.get("command").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        let url = def.get("url").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        // Skip entries that aren't launchable (neither a command nor a URL).
+        if command.is_empty() && url.is_empty() {
+            continue;
+        }
+        let args = def
+            .get("args")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        let env = def
+            .get("env")
+            .and_then(|v| v.as_table())
+            .map(|t| t.iter().filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string()))).collect())
+            .unwrap_or_default();
+        let bearer_token_env_var = def
+            .get("bearer_token_env_var")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        out.push(McpServerConfig {
+            name: name.clone(),
+            command,
+            args,
+            url,
+            enabled: true,
+            source: "codex".to_string(),
+            env,
+            bearer_token_env_var,
+            ..Default::default()
+        });
+    }
+    out
+}
+
+/// Read + parse codex's MCP servers from `~/.codex/config.toml` (empty if absent).
+fn import_codex_mcp_servers() -> Vec<McpServerConfig> {
+    let Some(home) = std::env::var_os("HOME") else {
+        return Vec::new();
+    };
+    let path = PathBuf::from(home).join(".codex/config.toml");
+    match std::fs::read_to_string(&path) {
+        Ok(text) => parse_codex_mcp(&text),
+        Err(_) => Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_codex_mcp_servers_stdio_and_remote() {
+        let text = r#"
+[mcp_servers.github]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github"]
+env = { GITHUB_TOKEN = "x" }
+
+[mcp_servers.remote]
+url = "https://example.com/mcp"
+bearer_token_env_var = "TOK"
+
+[mcp_servers.broken]
+description = "no command or url — skipped"
+"#;
+        let mut servers = parse_codex_mcp(text);
+        servers.sort_by(|a, b| a.name.cmp(&b.name));
+        assert_eq!(servers.len(), 2); // "broken" skipped
+        let gh = servers.iter().find(|s| s.name == "github").unwrap();
+        assert_eq!(gh.command, "npx");
+        assert_eq!(gh.args, ["-y", "@modelcontextprotocol/server-github"]);
+        assert_eq!(gh.env.get("GITHUB_TOKEN").map(String::as_str), Some("x"));
+        assert_eq!(gh.source, "codex");
+        assert!(gh.enabled);
+        let r = servers.iter().find(|s| s.name == "remote").unwrap();
+        assert_eq!(r.url, "https://example.com/mcp");
+        assert_eq!(r.bearer_token_env_var, "TOK");
+    }
+
+    #[test]
+    fn merge_imported_mcp_keeps_explicit_config() {
+        let mut cfg = Config {
+            mcp_servers: vec![McpServerConfig { name: "github".into(), command: "mine".into(), ..Default::default() }],
+            ..Config::default()
+        };
+        cfg.merge_imported_mcp(vec![
+            McpServerConfig { name: "github".into(), command: "codex".into(), source: "codex".into(), ..Default::default() },
+            McpServerConfig { name: "fs".into(), command: "npx".into(), source: "codex".into(), ..Default::default() },
+        ]);
+        // Explicit "github" wins; new "fs" is added.
+        assert_eq!(cfg.mcp_servers.len(), 2);
+        let gh = cfg.mcp_servers.iter().find(|s| s.name == "github").unwrap();
+        assert_eq!(gh.command, "mine");
+        assert_eq!(gh.source, "");
+        assert!(cfg.mcp_servers.iter().any(|s| s.name == "fs" && s.source == "codex"));
+    }
 
     #[test]
     fn fast_mode_uses_latest_provider_fast_models() {
