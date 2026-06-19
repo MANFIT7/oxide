@@ -161,51 +161,9 @@ const MODEL_PRESETS: &[ModelPreset] = &[
         badge: "TTY",
         fast: true,
     },
-    ModelPreset {
-        provider: "openai",
-        model: "gpt-5.5",
-        provider_label: "OpenAI API",
-        label: "GPT-5.5",
-        summary: "Best default for coding workflows",
-        badge: "Smart",
-        fast: false,
-    },
-    ModelPreset {
-        provider: "openai",
-        model: "gpt-5.4",
-        provider_label: "OpenAI API",
-        label: "GPT-5.4",
-        summary: "Faster frontier coding lane",
-        badge: "Fast",
-        fast: true,
-    },
-    ModelPreset {
-        provider: "anthropic",
-        model: "claude-fable-5",
-        provider_label: "Anthropic API",
-        label: "Fable 5",
-        summary: "Anthropic's newest frontier coding model",
-        badge: "New",
-        fast: false,
-    },
-    ModelPreset {
-        provider: "anthropic",
-        model: "claude-opus-4-8",
-        provider_label: "Anthropic API",
-        label: "Opus 4.8",
-        summary: "Most capable Claude model",
-        badge: "Smart",
-        fast: false,
-    },
-    ModelPreset {
-        provider: "anthropic",
-        model: "claude-sonnet-4-6",
-        provider_label: "Anthropic API",
-        label: "Sonnet 4.6",
-        summary: "Fast daily agent work",
-        badge: "Fast",
-        fast: true,
-    },
+    // API-key providers (OpenAI/Anthropic) intentionally omitted — Oxide is a
+    // GUI wrapper around the user's logged-in CLIs + ChatGPT subscription, with
+    // no raw API-key entry (Synara-style).
 ];
 
 struct EffortPreset {
@@ -7914,7 +7872,9 @@ fn SettingsModal(
     let mut arch_refresh = use_signal(|| 0u64);
     let mut arch_confirm = use_signal(|| None::<String>);
 
-    let providers = ["chatgpt", "codex", "claude", "claude_interactive", "openai", "anthropic", "echo", "mock"];
+    // Oxide is a GUI wrapper around the user's logged-in agent CLIs + the ChatGPT
+    // subscription — no raw API-key providers (openai/anthropic) in the picker.
+    let providers = ["chatgpt", "codex", "claude", "claude_interactive", "echo", "mock"];
 
     let mut save = move |_| {
         let mut c = cfg.read().clone();
