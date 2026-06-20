@@ -7,8 +7,8 @@
 //! workspace and live-reconfigures the engine (persisted to `oxide.toml`).
 
 mod board;
-mod update;
 mod preview_proxy;
+mod update;
 
 use dioxus::desktop::{Config as DesktopConfig, WindowBuilder};
 use dioxus::prelude::*;
@@ -60,7 +60,9 @@ fn svg_inner(s: &str) -> String {
 /// so it is recolored for the dark UI.
 fn provider_logo(provider: &str) -> Option<String> {
     match provider {
-        "chatgpt" | "codex" | "openai" => Some(svg_inner(SVG_OPENAI).replace("#000000", "currentColor")),
+        "chatgpt" | "codex" | "openai" => {
+            Some(svg_inner(SVG_OPENAI).replace("#000000", "currentColor"))
+        }
         "claude" | "claude_interactive" | "anthropic" => Some(svg_inner(SVG_CLAUDE)),
         "cursor" => Some(svg_inner(SVG_CURSOR)),
         "mcp" => Some(svg_inner(SVG_MCP).replace("#000000", "currentColor")),
@@ -220,7 +222,10 @@ fn clamp_effort(provider: &str, effort: &str) -> String {
         return effort.to_string();
     }
     // Too high for this provider — take its ceiling.
-    levels.last().map(|p| p.value.to_string()).unwrap_or_else(|| "medium".into())
+    levels
+        .last()
+        .map(|p| p.value.to_string())
+        .unwrap_or_else(|| "medium".into())
 }
 
 fn selected_model(provider: &str, model: &str) -> Option<&'static ModelPreset> {
@@ -261,7 +266,9 @@ fn workspace_of(config: &Config) -> PathBuf {
     // so the file tree isn't the whole filesystem.
     match std::env::current_dir().ok() {
         Some(p) if p != PathBuf::from("/") => p,
-        _ => std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(".")),
+        _ => std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(".")),
     }
 }
 
@@ -303,7 +310,11 @@ pub fn run(config: Config) -> anyhow::Result<()> {
         .with_transparent(true)
         .with_inner_size(dioxus::desktop::tao::dpi::LogicalSize::new(1280.0, 820.0));
     LaunchBuilder::desktop()
-        .with_cfg(DesktopConfig::new().with_window(window).with_background_color((0, 0, 0, 0)))
+        .with_cfg(
+            DesktopConfig::new()
+                .with_window(window)
+                .with_background_color((0, 0, 0, 0)),
+        )
         .with_context(config)
         .launch(app);
     Ok(())
@@ -320,7 +331,11 @@ enum Author {
     /// provider id (tool call_id / command_id) so streamed updates settle the
     /// exact row they belong to — found by id, never by Vec index, so inserts
     /// or reordering can't pair the wrong row. `None` for id-less notices.
-    Activity { running: bool, ok: bool, key: Option<String> },
+    Activity {
+        running: bool,
+        ok: bool,
+        key: Option<String>,
+    },
 }
 
 /// Newest-first index of the activity row carrying `key`. Replaces the old
@@ -426,8 +441,16 @@ fn activity_kind(icon: &str, verb: &str, detail: &str) -> ActivityKind {
         "search" => ActivityKind::Search,
         "globe" => ActivityKind::Web,
         "brain" => ActivityKind::Memory,
-        _ if v.contains("edit") || v.contains("write") || v.contains("patch") => ActivityKind::FileChange,
-        _ if v.contains("read") || d.ends_with(".rs") || d.ends_with(".ts") || d.ends_with(".tsx") => ActivityKind::FileRead,
+        _ if v.contains("edit") || v.contains("write") || v.contains("patch") => {
+            ActivityKind::FileChange
+        }
+        _ if v.contains("read")
+            || d.ends_with(".rs")
+            || d.ends_with(".ts")
+            || d.ends_with(".tsx") =>
+        {
+            ActivityKind::FileRead
+        }
         _ if v.contains("search") || v.contains("find") => ActivityKind::Search,
         _ if v.contains("web") || v.contains("fetch") || d.starts_with("http") => ActivityKind::Web,
         _ => ActivityKind::Generic,
@@ -441,7 +464,13 @@ fn activity_view(text: &str) -> ActivityView {
     let detail = parts.next().unwrap_or("").to_string();
     let output = parts.next().unwrap_or("").to_string();
     let kind = activity_kind(&icon, &verb, &detail);
-    ActivityView { icon, verb, detail, output, kind }
+    ActivityView {
+        icon,
+        verb,
+        detail,
+        output,
+        kind,
+    }
 }
 
 fn build_transcript_turns(messages: &[ChatMsg]) -> Vec<TranscriptTurn> {
@@ -481,18 +510,27 @@ fn build_transcript_turns(messages: &[ChatMsg]) -> Vec<TranscriptTurn> {
     // "✓ Done …" note is pulled OUT of the row list into `turn.done_summary`, so
     // the render can place it as the turn's LAST child — a late tool/activity row
     // that lands after it in the buffer can never render below it.
-    let is_done_note = |m: &ChatMsg| matches!(m.author, Author::Note) && m.text.starts_with("✓ Done");
+    let is_done_note =
+        |m: &ChatMsg| matches!(m.author, Author::Note) && m.text.starts_with("✓ Done");
     let mut turns: Vec<TranscriptTurn> = Vec::new();
     for group in groups {
-        if !group.activity && group.indices.len() == 1 && is_done_note(&messages[group.indices[0]]) {
+        if !group.activity && group.indices.len() == 1 && is_done_note(&messages[group.indices[0]])
+        {
             if let Some(turn) = turns.last_mut() {
                 turn.done_summary = Some(messages[group.indices[0]].text.clone());
                 continue;
             }
         }
-        let starts_turn = group.indices.first().map(|&idx| messages[idx].author == Author::User).unwrap_or(false);
+        let starts_turn = group
+            .indices
+            .first()
+            .map(|&idx| messages[idx].author == Author::User)
+            .unwrap_or(false);
         if starts_turn || turns.is_empty() {
-            turns.push(TranscriptTurn { groups: vec![group], done_summary: None });
+            turns.push(TranscriptTurn {
+                groups: vec![group],
+                done_summary: None,
+            });
         } else if let Some(turn) = turns.last_mut() {
             turn.groups.push(group);
         }
@@ -518,7 +556,10 @@ fn activity_group_label(rows: &[(String, bool, bool)]) -> String {
     }
 
     if running && edits > 0 {
-        format!("✎ Editing files… {n} action{}", if n == 1 { "" } else { "s" })
+        format!(
+            "✎ Editing files… {n} action{}",
+            if n == 1 { "" } else { "s" }
+        )
     } else if running {
         format!("⚙ Working… {n} action{}", if n == 1 { "" } else { "s" })
     } else if edits > 0 && edits >= commands + searches + web {
@@ -555,8 +596,16 @@ fn activity_label(tool: &str, args: &serde_json::Value) -> String {
         "browser_click" => ("globe", "Click", s("selector").to_string()),
         "browser_type" => ("globe", "Type", s("selector").to_string()),
         "todo_write" => {
-            let n = args.get("todos").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
-            ("brain", "Update todo", format!("{n} item{}", if n == 1 { "" } else { "s" }))
+            let n = args
+                .get("todos")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            (
+                "brain",
+                "Update todo",
+                format!("{n} item{}", if n == 1 { "" } else { "s" }),
+            )
         }
         "ask_user" => ("brain", "Ask user", short(s("question"))),
         "remember" => ("brain", "Remember", String::new()),
@@ -566,7 +615,11 @@ fn activity_label(tool: &str, args: &serde_json::Value) -> String {
             let (server, name) = rest.split_once("__").unwrap_or(("", rest));
             ("spark", "MCP", format!("{name} · {server}"))
         }
-        t if t.starts_with("browser_") => ("globe", "Browser", t.trim_start_matches("browser_").to_string()),
+        t if t.starts_with("browser_") => (
+            "globe",
+            "Browser",
+            t.trim_start_matches("browser_").to_string(),
+        ),
         other => ("spark", "Tool", other.to_string()),
     };
     format!("{icon}\t{verb}\t{detail}")
@@ -589,14 +642,24 @@ fn append_activity_output(text: &mut String, chunk: &str) {
     let mut output = parts.next().unwrap_or("").to_string();
     output.push_str(chunk);
     if output.chars().count() > 8000 {
-        output = output.chars().rev().take(7000).collect::<Vec<_>>().into_iter().rev().collect::<String>();
+        output = output
+            .chars()
+            .rev()
+            .take(7000)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<String>();
         output.insert_str(0, "… (output truncated)\n");
     }
     *text = format!("{icon}\t{verb}\t{detail}\t{output}");
 }
 
 fn activity_has_output(text: &str) -> bool {
-    text.splitn(4, '\t').nth(3).map(|s| !s.trim().is_empty()).unwrap_or(false)
+    text.splitn(4, '\t')
+        .nth(3)
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false)
 }
 
 #[derive(Clone, PartialEq)]
@@ -609,16 +672,31 @@ struct ChatMsg {
 enum EngineCmd {
     /// `engine` is the full prompt (with mention/skill/MCP context); `display`
     /// is the clean bubble text.
-    Submit { engine: String, display: String },
+    Submit {
+        engine: String,
+        display: String,
+    },
     Reconfigure(Config),
     /// Activate tab `id`: swap the VIEW to its transcript/config. Engines are
     /// per-tab — the tab being left keeps its turn running in the background.
-    SwitchTab { id: u64, conf: Config, msgs: Vec<ChatMsg> },
+    SwitchTab {
+        id: u64,
+        conf: Config,
+        msgs: Vec<ChatMsg>,
+    },
     /// Stop and drop tab `id`'s engine (tab closed, or its session replaced).
     CloseTab(u64),
-    Approve { id: u64, decision: ApprovalDecision },
-    Answer { id: u64, text: String },
-    Rewind { id: u64 },
+    Approve {
+        id: u64,
+        decision: ApprovalDecision,
+    },
+    Answer {
+        id: u64,
+        text: String,
+    },
+    Rewind {
+        id: u64,
+    },
     SetHistory(Vec<(String, String)>),
     Interrupt,
 }
@@ -754,7 +832,6 @@ struct Ui {
     dirty: Signal<bool>,
 }
 
-
 /// Walk the workspace for files/folders matching `query` (codebase `@` picker).
 fn mention_candidates(ws: &Path, query: &str) -> Vec<String> {
     let q = query.to_ascii_lowercase();
@@ -762,7 +839,9 @@ fn mention_candidates(ws: &Path, query: &str) -> Vec<String> {
     let mut stack = vec![ws.to_path_buf()];
     let mut visited = 0usize;
     while let Some(dir) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for entry in rd.flatten() {
             visited += 1;
             if visited > 12000 {
@@ -922,11 +1001,20 @@ fn save_attachments(ws: &Path, atts: &[String]) -> Vec<String> {
         // data:image/png;base64,XXXX
         let Some(comma) = src.find(',') else { continue };
         let meta = &src[..comma];
-        let ext = if meta.contains("jpeg") || meta.contains("jpg") { "jpg" }
-            else if meta.contains("gif") { "gif" }
-            else if meta.contains("webp") { "webp" }
-            else { "png" };
-        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(src[comma + 1..].as_bytes()) else { continue };
+        let ext = if meta.contains("jpeg") || meta.contains("jpg") {
+            "jpg"
+        } else if meta.contains("gif") {
+            "gif"
+        } else if meta.contains("webp") {
+            "webp"
+        } else {
+            "png"
+        };
+        let Ok(bytes) =
+            base64::engine::general_purpose::STANDARD.decode(src[comma + 1..].as_bytes())
+        else {
+            continue;
+        };
         let name = format!("att-{stamp}-{i}.{ext}");
         if std::fs::write(dir.join(&name), &bytes).is_ok() {
             out.push(format!("wsimg:.oxide/attachments/{name}"));
@@ -971,7 +1059,11 @@ fn text_attachment_name(rel_path: &str) -> String {
 /// Human token count: 272_000 → "272k", 1_000_000 → "1M".
 fn fmt_tokens(n: u64) -> String {
     if n >= 1_000_000 {
-        if n % 1_000_000 == 0 { format!("{}M", n / 1_000_000) } else { format!("{:.1}M", n as f64 / 1_000_000.0) }
+        if n % 1_000_000 == 0 {
+            format!("{}M", n / 1_000_000)
+        } else {
+            format!("{:.1}M", n as f64 / 1_000_000.0)
+        }
     } else {
         format!("{}k", n / 1000)
     }
@@ -988,13 +1080,34 @@ fn provider_family(p: &str) -> &'static str {
 
 fn strip_scaffold(text: &str) -> String {
     const DROP_PREFIX: &[&str] = &[
-        "Context files:", "Use these MCP servers", "- `", "## Skill:",
-        "## Git context", "## Working git diff", "### status", "### recent commits",
-        "### working diff", "(Use the `", "[Preview selection", "[Plan mode]",
-        "[Pursue goal]", "(user attached", "- selector:", "- component:",
-        "- source:", "- text:", "- html:", "Selected UI element", "Run automation now",
-        "Name:", "Kind:", "Schedule:", "Status:", "Automation prompt:",
-        "## Automation request", "## Automation context",
+        "Context files:",
+        "Use these MCP servers",
+        "- `",
+        "## Skill:",
+        "## Git context",
+        "## Working git diff",
+        "### status",
+        "### recent commits",
+        "### working diff",
+        "(Use the `",
+        "[Preview selection",
+        "[Plan mode]",
+        "[Pursue goal]",
+        "(user attached",
+        "- selector:",
+        "- component:",
+        "- source:",
+        "- text:",
+        "- html:",
+        "Selected UI element",
+        "Run automation now",
+        "Name:",
+        "Kind:",
+        "Schedule:",
+        "Status:",
+        "Automation prompt:",
+        "## Automation request",
+        "## Automation context",
     ];
     // Display messages may carry image data-URLs after a \u{2} separator —
     // those are render-only; never let them leak into copies/history/titles.
@@ -1004,7 +1117,9 @@ fn strip_scaffold(text: &str) -> String {
     for line in text.lines() {
         let l = line.trim_start();
         if in_diff_fence {
-            if l.starts_with("```") { in_diff_fence = false; }
+            if l.starts_with("```") {
+                in_diff_fence = false;
+            }
             continue; // drop the whole injected ```diff block
         }
         if l.starts_with("```diff") {
@@ -1095,18 +1210,26 @@ async fn submit_ce(
     steer: bool,
     ws: PathBuf,
 ) {
-    let json = dioxus::document::eval(CE_SERIALIZE_JS).join::<String>().await.unwrap_or_default();
+    let json = dioxus::document::eval(CE_SERIALIZE_JS)
+        .join::<String>()
+        .await
+        .unwrap_or_default();
     let v: serde_json::Value = serde_json::from_str(&json).unwrap_or(serde_json::Value::Null);
     let body = v["body"].as_str().unwrap_or("").trim().to_string();
     let tokens: Vec<String> = v["tokens"]
         .as_array()
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
     let n_imgs = attachments.read().len();
     let text_files = text_attachments.read().clone();
     let n_text_files = text_files.len();
     let picked = picked_element.read().clone();
-    if body.is_empty() && tokens.is_empty() && n_imgs == 0 && n_text_files == 0 && picked.is_none() {
+    if body.is_empty() && tokens.is_empty() && n_imgs == 0 && n_text_files == 0 && picked.is_none()
+    {
         return;
     }
     // Built-in /review (Bugbot): review the working diff for bugs.
@@ -1119,13 +1242,20 @@ async fn submit_ce(
             "Act as Bugbot. Review the current working changes for bugs, security issues, \
 logic errors, and regressions. For each finding give: file:line, severity (high/med/low), \
 why it's wrong, and the concrete fix. If the diff is clean, say so plainly.{}\n\n```diff\n{}\n```",
-            if extra.is_empty() { String::new() } else { format!(" Extra focus: {extra}.") },
+            if extra.is_empty() {
+                String::new()
+            } else {
+                format!(" Extra focus: {extra}.")
+            },
             diff
         );
         if *streaming.read() {
             queue.write().push(prompt);
         } else {
-            let _ = engine.send(EngineCmd::Submit { engine: prompt, display: "/review (Bugbot)".into() });
+            let _ = engine.send(EngineCmd::Submit {
+                engine: prompt,
+                display: "/review (Bugbot)".into(),
+            });
         }
         return;
     }
@@ -1143,7 +1273,10 @@ why it's wrong, and the concrete fix. If the diff is clean, say so plainly.{}\n\
         if g.trim().is_empty() {
             text.push_str("[Pursue goal] Keep working autonomously until this is fully done.\n\n");
         } else {
-            text.push_str(&format!("[Pursue goal] Keep working autonomously until this goal is fully done: {}\n\n", g.trim()));
+            text.push_str(&format!(
+                "[Pursue goal] Keep working autonomously until this goal is fully done: {}\n\n",
+                g.trim()
+            ));
         }
     }
     let mut files = Vec::new();
@@ -1152,7 +1285,9 @@ why it's wrong, and the concrete fix. If the diff is clean, say so plainly.{}\n\
     let mut ctx_block = String::new();
     for tkn in &tokens {
         if let Some(name) = tkn.strip_prefix("mcp:") {
-            mcp_block.push_str(&format!("\n- `{name}` — call its tools via `mcp__{name}__*`"));
+            mcp_block.push_str(&format!(
+                "\n- `{name}` — call its tools via `mcp__{name}__*`"
+            ));
         } else if let Some(name) = tkn.strip_prefix("skill:") {
             let p = ws.join(".oxide/memory/skills").join(format!("{name}.md"));
             match std::fs::read_to_string(&p) {
@@ -1210,21 +1345,20 @@ why it's wrong, and the concrete fix. If the diff is clean, say so plainly.{}\n\
                         "The full pasted text is saved on disk. Use `read_file` or `search` on this path if you need content beyond the preview."
                     )
                 } else {
-                    (full.to_string(), "The full pasted text is included below and also saved at this path.")
+                    (
+                        full.to_string(),
+                        "The full pasted text is included below and also saved at this path.",
+                    )
                 };
                 text.push_str(&format!(
                     "\n## Attached text file: {}\nPath: {}\n{}\n````text\n{}\n````\n",
-                    att.name,
-                    att.rel_path,
-                    note,
-                    body
+                    att.name, att.rel_path, note, body
                 ));
             }
             Err(err) => {
                 text.push_str(&format!(
                     "\n## Attached text file: {}\nPath: {}\n[Could not read attachment: {err}]\n",
-                    att.name,
-                    att.rel_path
+                    att.name, att.rel_path
                 ));
             }
         }
@@ -1249,7 +1383,9 @@ why it's wrong, and the concrete fix. If the diff is clean, say so plainly.{}\n\
         text.push_str(&format!("\n(user attached {n_imgs} image{} — image content is NOT visible to you; ask the user to describe it if needed)", if n_imgs == 1 { "" } else { "s" }));
     }
     if let Some(p) = &picked {
-        text.push_str(&format!("\n[Preview selection — change this element]\n{p}\n"));
+        text.push_str(&format!(
+            "\n[Preview selection — change this element]\n{p}\n"
+        ));
         picked_element.set(None);
     }
     text.push_str(&body);
@@ -1260,7 +1396,10 @@ why it's wrong, and the concrete fix. If the diff is clean, say so plainly.{}\n\
     } else {
         Vec::new()
     };
-    let text_markers: Vec<String> = text_files.iter().map(|att| format!("wstxt:{}", att.rel_path)).collect();
+    let text_markers: Vec<String> = text_files
+        .iter()
+        .map(|att| format!("wstxt:{}", att.rel_path))
+        .collect();
     let marker_suffix: String = img_markers
         .iter()
         .chain(text_markers.iter())
@@ -1269,13 +1408,20 @@ why it's wrong, and the concrete fix. If the diff is clean, say so plainly.{}\n\
     if !marker_suffix.is_empty() {
         text.push_str(&marker_suffix); // persisted with the user turn → reload renders them
     }
-    let display = if marker_suffix.is_empty() { body.clone() } else { format!("{body}{marker_suffix}") };
+    let display = if marker_suffix.is_empty() {
+        body.clone()
+    } else {
+        format!("{body}{marker_suffix}")
+    };
     attachments.write().clear();
     text_attachments.write().clear();
     if !steer && *streaming.read() {
         queue.write().push(text);
     } else {
-        let _ = engine.send(EngineCmd::Submit { engine: text, display });
+        let _ = engine.send(EngineCmd::Submit {
+            engine: text,
+            display,
+        });
     }
 }
 
@@ -1301,7 +1447,9 @@ fn skill_candidates(ws: &Path, query: &str) -> Vec<String> {
 /// Parse `name:` / `description:` from a SKILL.md frontmatter block.
 fn parse_skill_md(path: &Path) -> Option<(String, String)> {
     let text = std::fs::read_to_string(path).ok()?;
-    let fm = text.strip_prefix("---").and_then(|r| r.find("\n---").map(|e| r[..e].to_string()));
+    let fm = text
+        .strip_prefix("---")
+        .and_then(|r| r.find("\n---").map(|e| r[..e].to_string()));
     let fallback = path
         .parent()
         .and_then(|p| p.file_name())
@@ -1331,10 +1479,17 @@ fn discover_skills(ws: &Path) -> Vec<(&'static str, String, String)> {
         for e in rd.flatten() {
             let p = e.path();
             if p.extension().and_then(|x| x.to_str()) == Some("md") {
-                let name = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+                let name = p
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default();
                 let desc = std::fs::read_to_string(&p)
                     .ok()
-                    .and_then(|t| t.lines().find(|l| !l.trim().is_empty()).map(|l| l.trim().trim_start_matches('#').trim().to_string()))
+                    .and_then(|t| {
+                        t.lines()
+                            .find(|l| !l.trim().is_empty())
+                            .map(|l| l.trim().trim_start_matches('#').trim().to_string())
+                    })
                     .unwrap_or_default();
                 out.push(("Oxide", name, desc));
             }
@@ -1359,7 +1514,9 @@ fn discover_skills(ws: &Path) -> Vec<(&'static str, String, String)> {
     let mut stack = vec![PathBuf::from(format!("{home}/.codex/plugins"))];
     let mut visited = 0usize;
     while let Some(dir) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for e in rd.flatten() {
             visited += 1;
             if visited > 20000 || out.len() > 400 {
@@ -1468,7 +1625,10 @@ fn run_automation_turn(
                 queue.write().push(prompt);
                 status.set(format!("Queued automation: {}", spec.name));
             } else {
-                let _ = engine.send(EngineCmd::Submit { engine: prompt, display: label });
+                let _ = engine.send(EngineCmd::Submit {
+                    engine: prompt,
+                    display: label,
+                });
                 status.set(format!("Started automation: {}", spec.name));
             }
         }
@@ -1530,45 +1690,46 @@ fn list_harnesses(dir: &Path) -> Vec<String> {
     out
 }
 
-
 /// Available slash commands `(name, description)` matching `query`.
 fn slash_commands(ws: &Path, query: &str) -> Vec<(String, String)> {
     let q = query.to_ascii_lowercase();
     // Built-in commands handled by the composer itself.
-    let builtins = [
-        ("review", "Bugbot — review the working git diff for bugs"),
-    ];
+    let builtins = [("review", "Bugbot — review the working git diff for bugs")];
     let mut v: Vec<(String, String)> = builtins
         .iter()
         .filter(|(n, _)| q.is_empty() || n.contains(&q))
         .map(|(n, d)| (n.to_string(), d.to_string()))
         .collect();
     let dir = ws.join(".oxide/commands");
-    v.extend(std::fs::read_dir(&dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("md"))
-        .filter_map(|p| {
-            let name = p.file_stem()?.to_string_lossy().to_string();
-            if !q.is_empty() && !name.to_ascii_lowercase().contains(&q) {
-                return None;
-            }
-            let desc = std::fs::read_to_string(&p)
-                .ok()
-                .and_then(|t| {
-                    t.strip_prefix("---")
-                        .and_then(|r| r.find("\n---").map(|e| r[..e].to_string()))
-                        .and_then(|fm| {
-                            fm.lines().find_map(|l| {
-                                l.trim().strip_prefix("description:").map(|d| d.trim().trim_matches('"').to_string())
+    v.extend(
+        std::fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("md"))
+            .filter_map(|p| {
+                let name = p.file_stem()?.to_string_lossy().to_string();
+                if !q.is_empty() && !name.to_ascii_lowercase().contains(&q) {
+                    return None;
+                }
+                let desc = std::fs::read_to_string(&p)
+                    .ok()
+                    .and_then(|t| {
+                        t.strip_prefix("---")
+                            .and_then(|r| r.find("\n---").map(|e| r[..e].to_string()))
+                            .and_then(|fm| {
+                                fm.lines().find_map(|l| {
+                                    l.trim()
+                                        .strip_prefix("description:")
+                                        .map(|d| d.trim().trim_matches('"').to_string())
+                                })
                             })
-                        })
-                })
-                .unwrap_or_default();
-            Some((name, desc))
-        }));
+                    })
+                    .unwrap_or_default();
+                Some((name, desc))
+            }),
+    );
     v.sort();
     v.dedup();
     v
@@ -1642,7 +1803,13 @@ fn list_sessions(ws: &Path) -> Vec<SessionListItem> {
         .map(|m| {
             let title = {
                 let clean = strip_scaffold(&m.title);
-                clean.lines().find(|x| !x.trim().is_empty()).unwrap_or("Chat").chars().take(52).collect::<String>()
+                clean
+                    .lines()
+                    .find(|x| !x.trim().is_empty())
+                    .unwrap_or("Chat")
+                    .chars()
+                    .take(52)
+                    .collect::<String>()
             };
             let count = oxide_core::db::message_count(&m.id);
             SessionListItem {
@@ -1658,7 +1825,9 @@ fn list_sessions(ws: &Path) -> Vec<SessionListItem> {
 
 /// Delete a saved session file.
 /// Session id carried in the PathBuf-typed handles the UI passes around.
-fn sid(path: &Path) -> String { path.display().to_string() }
+fn sid(path: &Path) -> String {
+    path.display().to_string()
+}
 
 fn delete_session(path: &Path) {
     oxide_core::db::delete(&sid(path));
@@ -1706,24 +1875,36 @@ fn recent_sessions(ws: &Path) -> Vec<(PathBuf, std::time::SystemTime, String, St
 
 /// Recent sessions from the global DB only. Used for inactive `/Volumes/...`
 /// projects so their chat rows stay visible without touching the volume.
-fn db_recent_sessions(ws: &Path, limit: usize) -> Vec<(PathBuf, std::time::SystemTime, String, String)> {
+fn db_recent_sessions(
+    ws: &Path,
+    limit: usize,
+) -> Vec<(PathBuf, std::time::SystemTime, String, String)> {
     oxide_core::db::list(ws, limit)
         .into_iter()
         .map(|m| {
-            let t = std::time::UNIX_EPOCH + std::time::Duration::from_millis(m.updated_ms.max(0) as u64);
+            let t = std::time::UNIX_EPOCH
+                + std::time::Duration::from_millis(m.updated_ms.max(0) as u64);
             let title = {
                 let clean = strip_scaffold(&m.title);
-                clean.lines().find(|x| !x.trim().is_empty()).unwrap_or("Chat").chars().take(38).collect::<String>()
+                clean
+                    .lines()
+                    .find(|x| !x.trim().is_empty())
+                    .unwrap_or("Chat")
+                    .chars()
+                    .take(38)
+                    .collect::<String>()
             };
             (PathBuf::from(m.id), t, title, m.provider)
         })
         .collect()
 }
 
-
 /// Short relative time like "5m", "3h", "2d", "1w".
 fn relative_time(t: std::time::SystemTime) -> String {
-    let secs = std::time::SystemTime::now().duration_since(t).map(|d| d.as_secs()).unwrap_or(0);
+    let secs = std::time::SystemTime::now()
+        .duration_since(t)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     if secs < 3600 {
         format!("{}m", (secs / 60).max(1))
     } else if secs < 86_400 {
@@ -1807,7 +1988,10 @@ fn build_projects(current: &Path, recents: &[PathBuf]) -> Vec<ProjectGroup> {
         let sessions = if deferred {
             db_recent_sessions(&ws, PROJECT_SESSION_LIMIT)
         } else {
-            recent_sessions(&ws).into_iter().take(PROJECT_SESSION_LIMIT).collect()
+            recent_sessions(&ws)
+                .into_iter()
+                .take(PROJECT_SESSION_LIMIT)
+                .collect()
         };
         let items: Vec<(PathBuf, String, String, String)> = sessions
             .into_iter()
@@ -1834,17 +2018,30 @@ mod tests {
     fn inactive_macos_volume_scan_is_deferred_by_default() {
         let current = Path::new("/Users/example/project");
         let recent = Path::new("/Volumes/Data/oxide");
-        let expected = cfg!(target_os = "macos")
-            && std::env::var_os("OXIDE_SCAN_RECENT_VOLUMES").is_none();
+        let expected =
+            cfg!(target_os = "macos") && std::env::var_os("OXIDE_SCAN_RECENT_VOLUMES").is_none();
 
-        assert_eq!(should_defer_recent_workspace_scan(current, recent), expected);
+        assert_eq!(
+            should_defer_recent_workspace_scan(current, recent),
+            expected
+        );
     }
 
     fn act(text: &str) -> ChatMsg {
-        ChatMsg { author: Author::Activity { running: false, ok: true, key: None }, text: text.into() }
+        ChatMsg {
+            author: Author::Activity {
+                running: false,
+                ok: true,
+                key: None,
+            },
+            text: text.into(),
+        }
     }
     fn note(text: &str) -> ChatMsg {
-        ChatMsg { author: Author::Note, text: text.into() }
+        ChatMsg {
+            author: Author::Note,
+            text: text.into(),
+        }
     }
 
     #[test]
@@ -1852,8 +2049,14 @@ mod tests {
         // Buffer order with the Done note BEFORE trailing activity rows (the bug:
         // CLI tool events surfaced after TurnFinished landed below the footer).
         let msgs = vec![
-            ChatMsg { author: Author::User, text: "go".into() },
-            ChatMsg { author: Author::Agent, text: "working".into() },
+            ChatMsg {
+                author: Author::User,
+                text: "go".into(),
+            },
+            ChatMsg {
+                author: Author::Agent,
+                text: "working".into(),
+            },
             note("✓ Done · 1m"),
             act("terminal\tBash\tgit status"),
             act("eye\tRead\tlib.rs"),
@@ -1864,7 +2067,10 @@ mod tests {
         // (the render then places it as the turn's last child), so NO group is
         // the Done note and the trailing activity group is the last group.
         assert_eq!(turns[0].done_summary.as_deref(), Some("✓ Done · 1m"));
-        assert!(turns[0].groups.iter().all(|g| !g.indices.iter().any(|&i| msgs[i].text.starts_with("✓ Done"))));
+        assert!(turns[0].groups.iter().all(|g| !g
+            .indices
+            .iter()
+            .any(|&i| msgs[i].text.starts_with("✓ Done"))));
         assert!(turns[0].groups.last().unwrap().activity);
     }
 }
@@ -1986,7 +2192,9 @@ fn refresh_projects_list(mut projects_list: Signal<Vec<ProjectGroup>>, cfg: Sign
     spawn(async move {
         let groups = tokio::task::spawn_blocking(move || {
             build_projects(&workspace_of(&c), &c.recent_workspaces)
-        }).await.unwrap_or_default();
+        })
+        .await
+        .unwrap_or_default();
         projects_list.set(groups);
     });
 }
@@ -2042,11 +2250,19 @@ fn thread_stem(tabs: &Signal<Vec<AgentTab>>, active_tab: &Signal<usize>) -> Stri
     let cur = *active_tab.peek();
     tabs.peek()
         .get(cur)
-        .and_then(|t| t.session.as_ref().and_then(|p| p.file_stem().map(|x| x.to_string_lossy().to_string())))
+        .and_then(|t| {
+            t.session
+                .as_ref()
+                .and_then(|p| p.file_stem().map(|x| x.to_string_lossy().to_string()))
+        })
         .unwrap_or_else(|| "default".into())
 }
 
-fn thread_json_load<T: serde::de::DeserializeOwned + Default>(ws: &Path, dir: &str, stem: &str) -> T {
+fn thread_json_load<T: serde::de::DeserializeOwned + Default>(
+    ws: &Path,
+    dir: &str,
+    stem: &str,
+) -> T {
     std::fs::read_to_string(ws.join(format!(".oxide/{dir}/{stem}.json")))
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())
@@ -2110,17 +2326,32 @@ fn open_session_tab(
     // so folder A keeps working while you go look at folder B — synara-style.
     {
         let cur = *active_tab.peek();
-        let cur_busy = tabs.peek().get(cur).map(|t| busy_tabs.peek().contains(&t.id)).unwrap_or(false);
+        let cur_busy = tabs
+            .peek()
+            .get(cur)
+            .map(|t| busy_tabs.peek().contains(&t.id))
+            .unwrap_or(false);
         if cur_busy {
             // Save the live transcript into the busy tab before leaving it.
-            if let Some(t) = tabs.write().get_mut(cur) { t.messages = messages.peek().clone(); }
+            if let Some(t) = tabs.write().get_mut(cur) {
+                t.messages = messages.peek().clone();
+            }
             let meta = oxide_core::db::meta(&sid(&path));
-            let prov = meta.as_ref().map(|m| m.provider.clone()).filter(|p| !p.is_empty())
+            let prov = meta
+                .as_ref()
+                .map(|m| m.provider.clone())
+                .filter(|p| !p.is_empty())
                 .unwrap_or_else(|| cfg.peek().provider.clone());
-            let id = *next_id.peek(); next_id.set(id + 1);
+            let id = *next_id.peek();
+            next_id.set(id + 1);
             tabs.write().push(AgentTab {
-                id, title: title.clone(), provider: prov.clone(), model: String::new(),
-                messages: loaded.clone(), mode: "gui".into(), bin: String::new(),
+                id,
+                title: title.clone(),
+                provider: prov.clone(),
+                model: String::new(),
+                messages: loaded.clone(),
+                mode: "gui".into(),
+                bin: String::new(),
                 session: Some(path.clone()),
             });
             let idx = tabs.peek().len() - 1;
@@ -2128,7 +2359,10 @@ fn open_session_tab(
             let mut c = cfg.peek().clone();
             c.provider = prov;
             c.model = String::new();
-            if let Some(ws) = oxide_core::db::meta(&sid(&path)).map(|m| PathBuf::from(m.workspace)).filter(|w| !w.as_os_str().is_empty()) {
+            if let Some(ws) = oxide_core::db::meta(&sid(&path))
+                .map(|m| PathBuf::from(m.workspace))
+                .filter(|w| !w.as_os_str().is_empty())
+            {
                 ui.workspace.set(ws.clone());
                 c.recent_workspaces.retain(|p| p != &ws);
                 c.recent_workspaces.insert(0, ws.clone());
@@ -2137,7 +2371,11 @@ fn open_session_tab(
             }
             c.resume_path = Some(path);
             cfg.set(c.clone());
-            let _ = engine.send(EngineCmd::SwitchTab { id, conf: c, msgs: loaded });
+            let _ = engine.send(EngineCmd::SwitchTab {
+                id,
+                conf: c,
+                msgs: loaded,
+            });
             scroll_chat_bottom();
             return;
         }
@@ -2148,17 +2386,24 @@ fn open_session_tab(
     // A session file lives at <workspace>/.oxide/sessions/<id>.jsonl — the
     // chat MUST run in that workspace, or the engine (in another folder)
     // appends this conversation into the wrong project.
-    let session_ws = meta.as_ref()
+    let session_ws = meta
+        .as_ref()
         .map(|m| PathBuf::from(&m.workspace))
         .filter(|w| !w.as_os_str().is_empty());
     let mut c = cfg.read().clone();
     // Adopt the session's own provider (a Claude TUI session stays Claude, not
     // whatever the composer was last set to).
-    let sess_provider = meta.as_ref().map(|m| m.provider.clone()).unwrap_or_default();
+    let sess_provider = meta
+        .as_ref()
+        .map(|m| m.provider.clone())
+        .unwrap_or_default();
     if !sess_provider.is_empty() && sess_provider != c.provider {
         c.provider = sess_provider.clone();
         c.model = String::new();
-        if let Some(t) = tabs.write().get_mut(cur) { t.provider = sess_provider; t.model = String::new(); }
+        if let Some(t) = tabs.write().get_mut(cur) {
+            t.provider = sess_provider;
+            t.model = String::new();
+        }
     }
     if let Some(ws) = session_ws {
         if c.workspace.as_deref() != Some(ws.as_path()) {
@@ -2184,7 +2429,11 @@ fn open_session_tab(
     // The tab's CONTENT changed (different session) — its old engine, if any,
     // holds the old history. Drop it; a fresh one resumes this session lazily.
     let _ = engine.send(EngineCmd::CloseTab(tab_id));
-    let _ = engine.send(EngineCmd::SwitchTab { id: tab_id, conf: c, msgs: loaded });
+    let _ = engine.send(EngineCmd::SwitchTab {
+        id: tab_id,
+        conf: c,
+        msgs: loaded,
+    });
     scroll_chat_bottom();
 }
 
@@ -2210,7 +2459,10 @@ fn load_session(path: &Path) -> Vec<ChatMsg> {
                 "assistant" => Author::Agent,
                 _ => Author::Note,
             };
-            Some(ChatMsg { author, text: content })
+            Some(ChatMsg {
+                author,
+                text: content,
+            })
         })
         .collect();
     if trimmed {
@@ -2256,7 +2508,11 @@ fn parse_replay_row(role: String, content: String) -> ReplayRow {
     let first = lines.find(|l| !l.trim().is_empty()).unwrap_or("").trim();
     ReplayRow {
         role: role.clone(),
-        title: format!("{} · {}", replay_role_label(&role), first.chars().take(80).collect::<String>()),
+        title: format!(
+            "{} · {}",
+            replay_role_label(&role),
+            first.chars().take(80).collect::<String>()
+        ),
         detail: content.chars().take(600).collect(),
     }
 }
@@ -2290,14 +2546,28 @@ fn load_session_replay(path: &Path, title: String) -> SessionReplay {
 async fn fetch_claude_usage() -> Option<(String, u8, u8)> {
     // Read the OAuth blob from the login Keychain.
     let kc = tokio::process::Command::new("security")
-        .args(["find-generic-password", "-s", "Claude Code-credentials", "-w"])
-        .output().await.ok()?;
-    if !kc.status.success() { return None; }
+        .args([
+            "find-generic-password",
+            "-s",
+            "Claude Code-credentials",
+            "-w",
+        ])
+        .output()
+        .await
+        .ok()?;
+    if !kc.status.success() {
+        return None;
+    }
     let blob: serde_json::Value = serde_json::from_slice(&kc.stdout).ok()?;
     let oauth = &blob["claudeAiOauth"];
     let token = oauth["accessToken"].as_str()?;
-    if token.is_empty() { return None; }
-    let plan = oauth["subscriptionType"].as_str().unwrap_or("claude").to_string();
+    if token.is_empty() {
+        return None;
+    }
+    let plan = oauth["subscriptionType"]
+        .as_str()
+        .unwrap_or("claude")
+        .to_string();
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
@@ -2307,8 +2577,12 @@ async fn fetch_claude_usage() -> Option<(String, u8, u8)> {
         .get("https://api.anthropic.com/api/oauth/usage")
         .header("Authorization", format!("Bearer {token}"))
         .header("anthropic-beta", "oauth-2025-04-20")
-        .send().await.ok()?;
-    if !resp.status().is_success() { return None; }
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
     let v: serde_json::Value = resp.json().await.ok()?;
     let rem = |x: &serde_json::Value| -> u8 {
         let u = x["utilization"].as_f64().unwrap_or(0.0);
@@ -2320,23 +2594,50 @@ async fn fetch_claude_usage() -> Option<(String, u8, u8)> {
 async fn scan_procs() -> Vec<(u16, String, u32)> {
     let out = match tokio::process::Command::new("lsof")
         .args(["-nP", "-iTCP", "-sTCP:LISTEN"])
-        .output().await {
+        .output()
+        .await
+    {
         Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
         Err(_) => return Vec::new(),
     };
     const DENY: &[&str] = &[
-        "spotify", "rapportd", "controlce", "sharingd", "identityser", "rapport",
-        "cloudd", "apsd", "trustd", "nsurlsess", "airplay", "wifiagent", "music",
-        "podcasts", "supercond", "remoted", "launchd", "deleted", "syncdefa",
+        "spotify",
+        "rapportd",
+        "controlce",
+        "sharingd",
+        "identityser",
+        "rapport",
+        "cloudd",
+        "apsd",
+        "trustd",
+        "nsurlsess",
+        "airplay",
+        "wifiagent",
+        "music",
+        "podcasts",
+        "supercond",
+        "remoted",
+        "launchd",
+        "deleted",
+        "syncdefa",
     ];
-    let mut found: std::collections::BTreeMap<u16, (String, u32)> = std::collections::BTreeMap::new();
+    let mut found: std::collections::BTreeMap<u16, (String, u32)> =
+        std::collections::BTreeMap::new();
     for line in out.lines().skip(1) {
         let mut cols = line.split_whitespace();
         let cmd = cols.next().unwrap_or("").to_string();
         let pid: u32 = cols.next().and_then(|p| p.parse().ok()).unwrap_or(0);
         let lc = cmd.to_ascii_lowercase();
-        if DENY.iter().any(|d| lc.starts_with(d)) { continue; }
-        if let Some(addr) = line.split_whitespace().find(|c| c.contains(':') && (c.contains("127.0.0.1") || c.starts_with("*:") || c.contains("[::1]") || c.contains("localhost"))) {
+        if DENY.iter().any(|d| lc.starts_with(d)) {
+            continue;
+        }
+        if let Some(addr) = line.split_whitespace().find(|c| {
+            c.contains(':')
+                && (c.contains("127.0.0.1")
+                    || c.starts_with("*:")
+                    || c.contains("[::1]")
+                    || c.contains("localhost"))
+        }) {
             if let Some(p) = addr.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()) {
                 if pid > 0 {
                     found.entry(p).or_insert((cmd, pid));
@@ -2344,39 +2645,70 @@ async fn scan_procs() -> Vec<(u16, String, u32)> {
             }
         }
     }
-    found.into_iter().map(|(port, (name, pid))| (port, name, pid)).collect()
+    found
+        .into_iter()
+        .map(|(port, (name, pid))| (port, name, pid))
+        .collect()
 }
 
 async fn scan_ports() -> Vec<(u16, String)> {
     let out = match tokio::process::Command::new("lsof")
         .args(["-nP", "-iTCP", "-sTCP:LISTEN"])
-        .output().await {
+        .output()
+        .await
+    {
         Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
         Err(_) => return Vec::new(),
     };
     // macOS/media daemons that squat on localhost ports — never a dev server.
     const DENY: &[&str] = &[
-        "spotify", "rapportd", "controlce", "sharingd", "identityser", "rapport",
-        "cloudd", "apsd", "trustd", "nsurlsess", "airplay", "wifiagent", "music",
-        "podcasts", "supercond", "remoted", "launchd", "deleted", "syncdefa",
+        "spotify",
+        "rapportd",
+        "controlce",
+        "sharingd",
+        "identityser",
+        "rapport",
+        "cloudd",
+        "apsd",
+        "trustd",
+        "nsurlsess",
+        "airplay",
+        "wifiagent",
+        "music",
+        "podcasts",
+        "supercond",
+        "remoted",
+        "launchd",
+        "deleted",
+        "syncdefa",
     ];
     // Runtimes that *are* dev servers — these we always surface.
     const DEV: &[&str] = &[
-        "node", "vite", "next", "bun", "deno", "python", "ruby", "php", "cargo",
-        "rustc", "webpack", "esbuild", "turbo", "npm", "pnpm", "yarn", "rails",
-        "flask", "uvicorn", "gunicorn", "caddy", "dotnet", "java", "air", "gin",
-        "hugo", "jekyll", "astro", "remix", "nuxt", "ng", "serve", "http-ser",
+        "node", "vite", "next", "bun", "deno", "python", "ruby", "php", "cargo", "rustc",
+        "webpack", "esbuild", "turbo", "npm", "pnpm", "yarn", "rails", "flask", "uvicorn",
+        "gunicorn", "caddy", "dotnet", "java", "air", "gin", "hugo", "jekyll", "astro", "remix",
+        "nuxt", "ng", "serve", "http-ser",
     ];
     let mut found: std::collections::BTreeMap<u16, String> = std::collections::BTreeMap::new();
     for line in out.lines().skip(1) {
         let mut cols = line.split_whitespace();
         let cmd = cols.next().unwrap_or("").to_string();
         let lc = cmd.to_ascii_lowercase();
-        if DENY.iter().any(|d| lc.starts_with(d)) { continue; }
+        if DENY.iter().any(|d| lc.starts_with(d)) {
+            continue;
+        }
         // NAME column holds e.g. "127.0.0.1:5173" or "*:3000".
-        if let Some(addr) = line.split_whitespace().find(|c| c.contains(':') && (c.contains("127.0.0.1") || c.starts_with("*:") || c.contains("[::1]") || c.contains("localhost"))) {
+        if let Some(addr) = line.split_whitespace().find(|c| {
+            c.contains(':')
+                && (c.contains("127.0.0.1")
+                    || c.starts_with("*:")
+                    || c.contains("[::1]")
+                    || c.contains("localhost"))
+        }) {
             if let Some(p) = addr.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()) {
-                if matches!(p, 22 | 53 | 88 | 445 | 631 | 5353 | 7000) { continue; }
+                if matches!(p, 22 | 53 | 88 | 445 | 631 | 5353 | 7000) {
+                    continue;
+                }
                 let is_dev = DEV.iter().any(|d| lc.starts_with(d));
                 let common = matches!(p, 3000..=3009 | 4000 | 4200 | 4321 | 5000..=5005 | 5173..=5180 | 8000..=8090 | 8788 | 9000 | 1234 | 5500);
                 // Keep only plausible dev servers: a known runtime, or a common
@@ -2396,23 +2728,42 @@ async fn load_changed_files(ws: &Path) -> Vec<(String, u32, u32, String)> {
     let mut out = Vec::new();
     for line in num.lines().take(40) {
         let mut it = line.split_whitespace();
-        let (Some(a), Some(d), Some(path)) = (it.next(), it.next(), it.next()) else { continue };
+        let (Some(a), Some(d), Some(path)) = (it.next(), it.next(), it.next()) else {
+            continue;
+        };
         let adds = a.parse().unwrap_or(0);
         let dels = d.parse().unwrap_or(0);
         let diff = run_cmd(ws, "git", &["diff", "--", path]).await;
-        out.push((path.to_string(), adds, dels, diff.chars().take(20000).collect()));
+        out.push((
+            path.to_string(),
+            adds,
+            dels,
+            diff.chars().take(20000).collect(),
+        ));
     }
     out
 }
 
 /// Run an arbitrary command in the workspace, returning stdout+stderr.
 async fn run_cmd(ws: &Path, cmd: &str, args: &[&str]) -> String {
-    match tokio::process::Command::new(cmd).args(args).current_dir(ws).output().await {
+    match tokio::process::Command::new(cmd)
+        .args(args)
+        .current_dir(ws)
+        .output()
+        .await
+    {
         Ok(o) => {
             let mut s = String::from_utf8_lossy(&o.stdout).to_string();
             let err = String::from_utf8_lossy(&o.stderr);
-            if !err.trim().is_empty() { s.push('\n'); s.push_str(&err); }
-            if s.trim().is_empty() { "(done)".to_string() } else { s }
+            if !err.trim().is_empty() {
+                s.push('\n');
+                s.push_str(&err);
+            }
+            if s.trim().is_empty() {
+                "(done)".to_string()
+            } else {
+                s
+            }
         }
         Err(e) => format!("{cmd} error: {e} — is it installed?"),
     }
@@ -2437,11 +2788,17 @@ async fn git_run(ws: PathBuf, args: Vec<String>) -> String {
     }
 }
 
-
 fn open_file(mut ui: Ui, path: PathBuf) {
     // PDF/image: previewed via the asset handler, not slurped as text.
-    let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).unwrap_or_default();
-    if matches!(ext.as_str(), "pdf" | "png" | "jpg" | "jpeg" | "gif" | "svg" | "webp") {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    if matches!(
+        ext.as_str(),
+        "pdf" | "png" | "jpg" | "jpeg" | "gif" | "svg" | "webp"
+    ) {
         ui.editor_text.set(String::new());
         ui.open_path.set(Some(path));
         ui.dirty.set(false);
@@ -2513,11 +2870,11 @@ fn app() -> Element {
     // Resizable side panels: (which: 1=left sidebar, 2=right inspector, start_x, start_w).
     let mut panel_drag = use_signal(|| None::<(u8, f64, f64)>);
     // Width (px) of the Environment panel (drag id 3) — persisted.
-    let mut rpanel_w = use_signal(|| { cfg.peek().env_width });
+    let mut rpanel_w = use_signal(|| cfg.peek().env_width);
     // Height (px) of the bottom terminal panel (drag id 4, vertical).
     let mut term_h = use_signal(|| 240.0f64);
-    let mut sidebar_w = use_signal(|| { cfg.peek().sidebar_width });
-    let mut insp_w = use_signal(|| { cfg.peek().inspector_width });
+    let mut sidebar_w = use_signal(|| cfg.peek().sidebar_width);
+    let mut insp_w = use_signal(|| cfg.peek().inspector_width);
     let mut palette_query = use_signal(String::new);
     let mut palette_sel = use_signal(|| 0usize);
     let mut pinned = use_signal(|| false);
@@ -2538,7 +2895,14 @@ fn app() -> Element {
     let mut design_mode = use_signal(|| false);
     let mut design_sel = use_signal(|| Option::<serde_json::Value>::None);
     let mut design_edits = use_signal(Vec::<(String, String, String)>::new);
-    let split_panes = use_signal(|| vec![(0u64, "gui".to_string(), cfg.read().provider.clone(), cfg.read().model.clone())]);
+    let split_panes = use_signal(|| {
+        vec![(
+            0u64,
+            "gui".to_string(),
+            cfg.read().provider.clone(),
+            cfg.read().model.clone(),
+        )]
+    });
     let split_layout = use_signal(|| Tile::Leaf(0));
     let split_next_id = use_signal(|| 1u64);
     let split_drag = use_signal(|| None::<u64>);
@@ -2706,7 +3070,14 @@ fn app() -> Element {
     let mut updating = use_signal(|| false);
     let mut update_pct = use_signal(|| 0.0f32);
     use_effect(move || {
-        let repo = { let r = cfg.read().github_repo.clone(); if r.trim().is_empty() { "MANFIT7/oxide".to_string() } else { r } };
+        let repo = {
+            let r = cfg.read().github_repo.clone();
+            if r.trim().is_empty() {
+                "MANFIT7/oxide".to_string()
+            } else {
+                r
+            }
+        };
         let url = cfg.read().update_url.clone();
         spawn(async move {
             if let Some(info) = update::check(&repo, &url).await {
@@ -2718,10 +3089,12 @@ fn app() -> Element {
     // Warm the syntect syntax set off-thread so the first code block in a reply
     // doesn't stall the UI mid-stream.
     use_hook(|| {
-        std::thread::spawn(|| { let _ = highlight_code("", "txt"); });
+        std::thread::spawn(|| {
+            let _ = highlight_code("", "txt");
+        });
     });
 
-        // Global keyboard shortcuts (⌘K command palette, Esc to close).
+    // Global keyboard shortcuts (⌘K command palette, Esc to close).
     use_future(move || async move {
         let mut eval = dioxus::document::eval(
             r#"
@@ -2741,10 +3114,30 @@ fn app() -> Element {
         );
         loop {
             match eval.recv::<String>().await {
-                Ok(k) if k == "palette" => { let v = !*show_palette.read(); show_palette.set(v); palette_query.set(String::new()); palette_sel.set(0); }
-                Ok(k) if k == "files" => select_env_tab(env_tab, show_env, env_tab_by_tab, tabs, active_tab, "files", true),
-                Ok(k) if k == "shortcuts" => { let v = !*show_shortcuts.read(); show_shortcuts.set(v); }
-                Ok(k) if k == "esc" => { show_palette.set(false); show_shortcuts.set(false); chat_img.set(None); }
+                Ok(k) if k == "palette" => {
+                    let v = !*show_palette.read();
+                    show_palette.set(v);
+                    palette_query.set(String::new());
+                    palette_sel.set(0);
+                }
+                Ok(k) if k == "files" => select_env_tab(
+                    env_tab,
+                    show_env,
+                    env_tab_by_tab,
+                    tabs,
+                    active_tab,
+                    "files",
+                    true,
+                ),
+                Ok(k) if k == "shortcuts" => {
+                    let v = !*show_shortcuts.read();
+                    show_shortcuts.set(v);
+                }
+                Ok(k) if k == "esc" => {
+                    show_palette.set(false);
+                    show_shortcuts.set(false);
+                    chat_img.set(None);
+                }
                 Ok(_) => {}
                 Err(_) => break,
             }
@@ -2787,14 +3180,29 @@ fn app() -> Element {
             let rel = req.uri().path().trim_start_matches("/wsimg/").to_string();
             let rel = percent_decode(&rel);
             let ws = ws_sig.peek().clone();
-            let path = if rel.starts_with('/') { std::path::PathBuf::from(&rel) } else { ws.join(&rel) };
+            let path = if rel.starts_with('/') {
+                std::path::PathBuf::from(&rel)
+            } else {
+                ws.join(&rel)
+            };
             // Confine to the workspace; refuse traversal outside it.
-            let ok = path.canonicalize().ok().map(|c| c.starts_with(&ws) || rel.starts_with('/')).unwrap_or(false);
-            let body = if ok { std::fs::read(&path).unwrap_or_default() } else { Vec::new() };
+            let ok = path
+                .canonicalize()
+                .ok()
+                .map(|c| c.starts_with(&ws) || rel.starts_with('/'))
+                .unwrap_or(false);
+            let body = if ok {
+                std::fs::read(&path).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
             let ct = match path.extension().and_then(|e| e.to_str()) {
-                Some("png") => "image/png", Some("jpg") | Some("jpeg") => "image/jpeg",
-                Some("gif") => "image/gif", Some("svg") => "image/svg+xml",
-                Some("webp") => "image/webp", Some("pdf") => "application/pdf",
+                Some("png") => "image/png",
+                Some("jpg") | Some("jpeg") => "image/jpeg",
+                Some("gif") => "image/gif",
+                Some("svg") => "image/svg+xml",
+                Some("webp") => "image/webp",
+                Some("pdf") => "application/pdf",
                 _ => "application/octet-stream",
             };
             let resp = dioxus::desktop::wry::http::Response::builder()
@@ -2868,7 +3276,11 @@ fn app() -> Element {
 
     // Load mermaid (v11, bundled) from the same-origin asset handler.
     use_future(move || async move {
-        let theme = if cfg.peek().theme != "light" { "dark" } else { "default" };
+        let theme = if cfg.peek().theme != "light" {
+            "dark"
+        } else {
+            "default"
+        };
         let js = format!(
             r#"
             (function(){{
@@ -2947,7 +3359,8 @@ fn app() -> Element {
             .as_ref()
             .and_then(|p| p.file_stem().map(|x| x.to_string_lossy().to_string()))
             .unwrap_or_else(|| "default".into());
-        let note = std::fs::read_to_string(ws.join(format!(".oxide/notes/{stem}.md"))).unwrap_or_default();
+        let note =
+            std::fs::read_to_string(ws.join(format!(".oxide/notes/{stem}.md"))).unwrap_or_default();
         note_text.set(note);
         pinned_msgs.set(thread_json_load(&ws, "pins", &stem));
         markers.set(thread_json_load(&ws, "markers", &stem));
@@ -2977,10 +3390,18 @@ fn app() -> Element {
             let switched = prov != last_prov;
             last_prov = prov;
             if is_claude
-                && (switched || last.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(120)))
+                && (switched
+                    || last.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(120)))
             {
                 if let Some((plan, r5, rw)) = fetch_claude_usage().await {
-                    usage_info.set(Some(("claude".into(), plan, r5, rw, String::new(), String::new())));
+                    usage_info.set(Some((
+                        "claude".into(),
+                        plan,
+                        r5,
+                        rw,
+                        String::new(),
+                        String::new(),
+                    )));
                 }
                 last = Some(std::time::Instant::now());
             }
@@ -2992,7 +3413,9 @@ fn app() -> Element {
     use_effect(move || {
         let ws = ui.workspace.read().clone();
         if cfg.read().workspace.is_some() {
-            spawn(async move { changed_files.set(load_changed_files(&ws).await); });
+            spawn(async move {
+                changed_files.set(load_changed_files(&ws).await);
+            });
         }
     });
 
@@ -3059,24 +3482,47 @@ fn app() -> Element {
             let do_prune = {
                 use std::sync::{Mutex, OnceLock};
                 static DONE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-                DONE.get_or_init(Default::default).lock().unwrap().insert(ws2.display().to_string())
+                DONE.get_or_init(Default::default)
+                    .lock()
+                    .unwrap()
+                    .insert(ws2.display().to_string())
             };
-            if do_prune { spawn(async move {
-                if let Ok(rd) = std::fs::read_dir(ws2.join(".oxide/worktrees")) {
-                    for e in rd.flatten() {
-                        let p = e.path();
-                        if p.file_name().and_then(|n| n.to_str()).map(|n| n.starts_with("pane-")).unwrap_or(false) {
-                            let _ = tokio::process::Command::new("git").arg("-C").arg(&ws2)
-                                .args(["worktree", "remove", "--force"]).arg(&p).output().await;
-                            if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-                                let _ = tokio::process::Command::new("git").arg("-C").arg(&ws2)
-                                    .args(["branch", "-D", &format!("oxide/{name}")]).output().await;
+            if do_prune {
+                spawn(async move {
+                    if let Ok(rd) = std::fs::read_dir(ws2.join(".oxide/worktrees")) {
+                        for e in rd.flatten() {
+                            let p = e.path();
+                            if p.file_name()
+                                .and_then(|n| n.to_str())
+                                .map(|n| n.starts_with("pane-"))
+                                .unwrap_or(false)
+                            {
+                                let _ = tokio::process::Command::new("git")
+                                    .arg("-C")
+                                    .arg(&ws2)
+                                    .args(["worktree", "remove", "--force"])
+                                    .arg(&p)
+                                    .output()
+                                    .await;
+                                if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                                    let _ = tokio::process::Command::new("git")
+                                        .arg("-C")
+                                        .arg(&ws2)
+                                        .args(["branch", "-D", &format!("oxide/{name}")])
+                                        .output()
+                                        .await;
+                                }
                             }
                         }
                     }
-                }
-                let _ = tokio::process::Command::new("git").arg("-C").arg(&ws2).args(["worktree", "prune"]).output().await;
-            }); }
+                    let _ = tokio::process::Command::new("git")
+                        .arg("-C")
+                        .arg(&ws2)
+                        .args(["worktree", "prune"])
+                        .output()
+                        .await;
+                });
+            }
         }
     });
 
@@ -3086,11 +3532,15 @@ fn app() -> Element {
     // spinner lingers after the turn ends.
     use_effect(move || {
         if !*streaming.read() {
-            let has_running = messages.peek().iter()
+            let has_running = messages
+                .peek()
+                .iter()
                 .any(|c| matches!(c.author, Author::Activity { running: true, .. }));
             if has_running {
                 for c in messages.write().iter_mut() {
-                    if let Author::Activity { running, .. } = &mut c.author { *running = false; }
+                    if let Author::Activity { running, .. } = &mut c.author {
+                        *running = false;
+                    }
                 }
             }
             // Drop any "editing…" pending row (empty diff, no checkpoint) that
@@ -3112,12 +3562,21 @@ fn app() -> Element {
             let cur = *active_tab.read();
             // Peek first — only take a write lock when the title really changes,
             // so this doesn't dirty `tabs` on every streaming delta.
-            let needs = tabs.peek().get(cur).map(|t| t.title == provider_title(&t.provider)).unwrap_or(false);
+            let needs = tabs
+                .peek()
+                .get(cur)
+                .map(|t| t.title == provider_title(&t.provider))
+                .unwrap_or(false);
             if needs {
                 let new_title = make_title(&text);
                 let mut sess = None;
-                if let Some(t) = tabs.write().get_mut(cur) { t.title = new_title.clone(); sess = t.session.clone(); }
-                if let Some(s) = sess { oxide_core::db::set_title(&sid(&s), &new_title); }
+                if let Some(t) = tabs.write().get_mut(cur) {
+                    t.title = new_title.clone();
+                    sess = t.session.clone();
+                }
+                if let Some(s) = sess {
+                    oxide_core::db::set_title(&sid(&s), &new_title);
+                }
             }
         }
     });
@@ -3146,8 +3605,10 @@ fn app() -> Element {
             // single loop serves all engines without cross-tab bleed; a stale
             // generation (engine replaced) is simply dropped.
             let (ev_tx, mut ev_rx) = tokio::sync::mpsc::channel::<(u64, u64, Event)>(256);
-            let mut handles: std::collections::HashMap<u64, EngineHandle> = std::collections::HashMap::new();
-            let mut fwds: std::collections::HashMap<u64, tokio::task::JoinHandle<()>> = std::collections::HashMap::new();
+            let mut handles: std::collections::HashMap<u64, EngineHandle> =
+                std::collections::HashMap::new();
+            let mut fwds: std::collections::HashMap<u64, tokio::task::JoinHandle<()>> =
+                std::collections::HashMap::new();
             let mut gens: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
             let mut gen_seq: u64 = 0;
             // Approvals/questions that arrived while their tab was backgrounded —
@@ -3156,9 +3617,12 @@ fn app() -> Element {
             // `tabs` signal — so a backgrounded turn's token stream doesn't dirty
             // the UI signal (and re-schedule the sidebar) on every delta. Merged
             // back into the tab when the user switches to it.
-            let mut bg_buffers: std::collections::HashMap<u64, Vec<ChatMsg>> = std::collections::HashMap::new();
-            let mut parked_appr: std::collections::HashMap<u64, Vec<(u64, String, String)>> = std::collections::HashMap::new();
-            let mut parked_q: std::collections::HashMap<u64, Vec<(u64, String, Vec<String>)>> = std::collections::HashMap::new();
+            let mut bg_buffers: std::collections::HashMap<u64, Vec<ChatMsg>> =
+                std::collections::HashMap::new();
+            let mut parked_appr: std::collections::HashMap<u64, Vec<(u64, String, String)>> =
+                std::collections::HashMap::new();
+            let mut parked_q: std::collections::HashMap<u64, Vec<(u64, String, Vec<String>)>> =
+                std::collections::HashMap::new();
 
             // (Re)spawn the engine for one tab. Replaces any previous engine of
             // that tab (its turn is interrupted — same-tab reconfigure semantics).
@@ -3178,19 +3642,26 @@ fn app() -> Element {
                         Ok((h, mut events)) => {
                             handles.insert(tid, h);
                             let tx = ev_tx.clone();
-                            fwds.insert(tid, tokio::spawn(async move {
-                                while let Some(e) = events.recv().await {
-                                    if tx.send((tid, g, e)).await.is_err() {
-                                        break;
+                            fwds.insert(
+                                tid,
+                                tokio::spawn(async move {
+                                    while let Some(e) = events.recv().await {
+                                        if tx.send((tid, g, e)).await.is_err() {
+                                            break;
+                                        }
                                     }
-                                }
-                            }));
+                                }),
+                            );
                         }
                         Err(e) => {
                             let _ = ev_tx
-                                .send((tid, g, Event::Error {
-                                    message: format!("engine: {e}"),
-                                }))
+                                .send((
+                                    tid,
+                                    g,
+                                    Event::Error {
+                                        message: format!("engine: {e}"),
+                                    },
+                                ))
                                 .await;
                         }
                     }
@@ -3226,7 +3697,13 @@ fn app() -> Element {
             macro_rules! push_activity {
                 ($msg:expr) => {{
                     let mut m = messages.write();
-                    if turn_done && m.last().map(|x| matches!(x.author, Author::Note) && x.text.starts_with("✓ Done")).unwrap_or(false) {
+                    if turn_done
+                        && m.last()
+                            .map(|x| {
+                                matches!(x.author, Author::Note) && x.text.starts_with("✓ Done")
+                            })
+                            .unwrap_or(false)
+                    {
                         let at = m.len() - 1;
                         m.insert(at, $msg);
                         at
@@ -3243,8 +3720,13 @@ fn app() -> Element {
                         let chunk = std::mem::take(&mut agent_buf);
                         let mut m = messages.write();
                         match m.last_mut() {
-                            Some(last) if last.author == Author::Agent => last.text.push_str(&chunk),
-                            _ => m.push(ChatMsg { author: Author::Agent, text: chunk }),
+                            Some(last) if last.author == Author::Agent => {
+                                last.text.push_str(&chunk)
+                            }
+                            _ => m.push(ChatMsg {
+                                author: Author::Agent,
+                                text: chunk,
+                            }),
                         }
                         last_paint = std::time::Instant::now();
                     }
@@ -3494,6 +3976,10 @@ fn app() -> Element {
                                 tab_statuses.write().remove(&t);
                             }
                             streaming.set(false);
+                            status.set(String::new());
+                            todos.write().clear();
+                            workflow_cards.write().clear();
+                            subagent_cards.write().clear();
                         }
                         None => break,
                       }
@@ -3545,15 +4031,15 @@ fn app() -> Element {
                                 Event::Info { text } => {
                                     if text.starts_with("session") || text.starts_with("mcp ") || text.starts_with("mcp '") {
                                         // noise
-	                                    } else if let Some(label) = text.strip_prefix('⚙').or_else(|| text.strip_prefix('⏳')) {
-	                                        let label = label.trim().to_string();
-	                                        // Suppress the redundant "Running …" notice when a
-	                                        // command row is already live in this tab's buffer.
-	                                        let cmd_live = buf.iter().any(|m| matches!(m.author, Author::Activity { running: true, key: Some(_), .. }));
-	                                        if label.starts_with("Running ") && cmd_live {
-	                                            continue;
-	                                        }
-	                                        let (verb, detail) = label.split_once(' ').unwrap_or((label.as_str(), ""));
+                                        } else if let Some(label) = text.strip_prefix('⚙').or_else(|| text.strip_prefix('⏳')) {
+                                            let label = label.trim().to_string();
+                                            // Suppress the redundant "Running …" notice when a
+                                            // command row is already live in this tab's buffer.
+                                            let cmd_live = buf.iter().any(|m| matches!(m.author, Author::Activity { running: true, key: Some(_), .. }));
+                                            if label.starts_with("Running ") && cmd_live {
+                                                continue;
+                                            }
+                                            let (verb, detail) = label.split_once(' ').unwrap_or((label.as_str(), ""));
                                         let row = format!("spark\t{verb}\t{detail}");
                                         if buf.last().map(|m| m.author == Author::Agent && m.text.is_empty()).unwrap_or(false) {
                                             buf.pop();
@@ -3568,19 +4054,19 @@ fn app() -> Element {
                                 Event::FileDiff { path, diff, checkpoint, .. } => {
                                     buf.push(ChatMsg { author: Author::Diff(path, checkpoint), text: diff });
                                 }
-	                                Event::ToolCallBegin { call_id, tool, args, .. } => {
-	                                    if tool != "ask_user" && tool != "shell" {
-	                                        buf_push_activity(buf, ChatMsg {
+                                    Event::ToolCallBegin { call_id, tool, args, .. } => {
+                                        if tool != "ask_user" && tool != "shell" {
+                                            buf_push_activity(buf, ChatMsg {
                                             author: Author::Activity { running: true, ok: true, key: Some(call_id) },
                                             text: activity_label(&tool, &args),
                                         });
                                     }
                                 }
-	                                Event::ToolCallEnd { call_id, output, ok, .. } => {
-	                                    let mut out = output.trim().to_string();
-	                                    if out.chars().count() > 4000 {
-	                                        out = out.chars().take(4000).collect::<String>() + "\n… (truncated)";
-	                                    }
+                                    Event::ToolCallEnd { call_id, output, ok, .. } => {
+                                        let mut out = output.trim().to_string();
+                                        if out.chars().count() > 4000 {
+                                            out = out.chars().take(4000).collect::<String>() + "\n… (truncated)";
+                                        }
                                     if let Some(idx) = activity_idx(&buf, &call_id) {
                                         if let Author::Activity { running, ok: o, .. } = &mut buf[idx].author {
                                             *running = false;
@@ -3589,39 +4075,39 @@ fn app() -> Element {
                                         if !out.is_empty() {
                                             buf[idx].text.push('\t');
                                             buf[idx].text.push_str(&out);
-	                                        }
-	                                    }
-	                                }
-	                                Event::CommandStarted { command_id, command, background, .. } => {
-	                                    buf_push_activity(buf, ChatMsg {
-	                                        author: Author::Activity { running: true, ok: true, key: Some(command_id) },
-	                                        text: command_activity_label(&command, background),
-	                                    });
-	                                }
-	                                Event::CommandOutput { command_id, chunk, .. } => {
-	                                    if let Some(idx) = activity_idx(&buf, &command_id) {
-	                                        append_activity_output(&mut buf[idx].text, &chunk);
-	                                    } else {
-	                                        let mut text = command_activity_label(&command_id, false);
-	                                        append_activity_output(&mut text, &chunk);
-	                                        buf_push_activity(buf, ChatMsg { author: Author::Activity { running: true, ok: true, key: Some(command_id) }, text });
-	                                    }
-	                                }
-	                                Event::CommandFinished { command_id, ok, exit_code, .. } => {
-	                                    if let Some(idx) = activity_idx(&buf, &command_id) {
-	                                        {
-	                                            let row = &mut buf[idx];
-	                                            if let Author::Activity { running, ok: o, .. } = &mut row.author {
-	                                                *running = false;
-	                                                *o = ok;
-	                                            }
-	                                            if let Some(code) = exit_code {
-	                                                append_activity_output(&mut row.text, &format!("\n[exit {code}]\n"));
-	                                            }
-	                                        }
-	                                    }
-	                                }
-	                                Event::SessionPath { path } => {
+                                            }
+                                        }
+                                    }
+                                    Event::CommandStarted { command_id, command, background, .. } => {
+                                        buf_push_activity(buf, ChatMsg {
+                                            author: Author::Activity { running: true, ok: true, key: Some(command_id) },
+                                            text: command_activity_label(&command, background),
+                                        });
+                                    }
+                                    Event::CommandOutput { command_id, chunk, .. } => {
+                                        if let Some(idx) = activity_idx(&buf, &command_id) {
+                                            append_activity_output(&mut buf[idx].text, &chunk);
+                                        } else {
+                                            let mut text = command_activity_label(&command_id, false);
+                                            append_activity_output(&mut text, &chunk);
+                                            buf_push_activity(buf, ChatMsg { author: Author::Activity { running: true, ok: true, key: Some(command_id) }, text });
+                                        }
+                                    }
+                                    Event::CommandFinished { command_id, ok, exit_code, .. } => {
+                                        if let Some(idx) = activity_idx(&buf, &command_id) {
+                                            {
+                                                let row = &mut buf[idx];
+                                                if let Author::Activity { running, ok: o, .. } = &mut row.author {
+                                                    *running = false;
+                                                    *o = ok;
+                                                }
+                                                if let Some(code) = exit_code {
+                                                    append_activity_output(&mut row.text, &format!("\n[exit {code}]\n"));
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Event::SessionPath { path } => {
                                     // Session binding is rare (once) — keep it on the tab itself.
                                     let pb = std::path::PathBuf::from(&path);
                                     if let Some(t) = tabs.write().iter_mut().find(|t| t.id == ev_tid) {
@@ -3708,18 +4194,18 @@ fn app() -> Element {
                                     // Route through push_activity! so it lands above a trailing
                                     // "Done" note like every other activity row (never below it).
                                     push_activity!(ChatMsg { author: Author::Activity { running: false, ok: true, key: None }, text: row });
-	                                } else if text.starts_with('⚙') {
-	                                    // CLI-driver tool activity: live shimmer + an activity
-	                                    // trail row in the chat (synara-style).
-	                                    let mut label = text.trim_start_matches('⚙').trim().to_string();
-	                                    // Suppress the redundant "Running …" notice when a command
-	                                    // row is already live (CommandStarted created one).
-	                                    let cmd_live = messages.read().iter().any(|m| matches!(m.author, Author::Activity { running: true, key: Some(_), .. }));
-	                                    if label.starts_with("Running ") && cmd_live {
-	                                        status.set(label);
-	                                        continue;
-	                                    }
-	                                    // "mcp__server__tool …" → "tool · server (MCP)".
+                                    } else if text.starts_with('⚙') {
+                                        // CLI-driver tool activity: live shimmer + an activity
+                                        // trail row in the chat (synara-style).
+                                        let mut label = text.trim_start_matches('⚙').trim().to_string();
+                                        // Suppress the redundant "Running …" notice when a command
+                                        // row is already live (CommandStarted created one).
+                                        let cmd_live = messages.read().iter().any(|m| matches!(m.author, Author::Activity { running: true, key: Some(_), .. }));
+                                        if label.starts_with("Running ") && cmd_live {
+                                            status.set(label);
+                                            continue;
+                                        }
+                                        // "mcp__server__tool …" → "tool · server (MCP)".
                                     if let Some(rest) = label.strip_prefix("mcp__") {
                                         let (srv, tail) = rest.split_once("__").unwrap_or(("", rest));
                                         let (tool, args) = tail.split_once(' ').unwrap_or((tail, ""));
@@ -3773,9 +4259,13 @@ fn app() -> Element {
                                     push_toast(toasts, toast_seq, "err", &message.chars().take(120).collect::<String>());
                                     messages.write().push(ChatMsg { author: Author::Note, text: format!("error: {message}") });
                                     // A turn-level error means no TurnFinished may come —
-                                    // unstick the composer so the user can send again.
+                                    // unstick the composer and clear per-turn progress cards
+                                    // so stale todo spinners don't survive the failed turn.
                                     streaming.set(false);
                                     status.set(String::new());
+                                    todos.write().clear();
+                                    workflow_cards.write().clear();
+                                    subagent_cards.write().clear();
                                 }
                             }
                             Event::ContextWindow { limit } => context_limit.set(Some(limit)),
@@ -3816,9 +4306,9 @@ fn app() -> Element {
                                 turn_edits.write().clear();
                                 bg_jobs.write().clear();
                                 todos.write().clear();
-	                                workflow_cards.write().clear();
-	                                subagent_cards.write().clear();
-	                                edits_expanded.set(false);
+                                    workflow_cards.write().clear();
+                                    subagent_cards.write().clear();
+                                    edits_expanded.set(false);
                                 edits_undone.set(false);
                                 think_open.set(None);
                                 timeline.write().push(TimelineItem { title: format!("Turn {turn} started"), sub: String::new() });
@@ -3850,11 +4340,11 @@ fn app() -> Element {
                                     worker_id,
                                     profile: profile.clone(),
                                     task: task.clone(),
-	                                    summary: String::new(),
-	                                    running: true,
-	                                    ok: true,
-	                                    logs: Vec::new(),
-	                                });
+                                        summary: String::new(),
+                                        running: true,
+                                        ok: true,
+                                        logs: Vec::new(),
+                                    });
                                 timeline.write().push(TimelineItem {
                                     title: format!("Subagent · {profile}"),
                                     sub: task,
@@ -3873,11 +4363,11 @@ fn app() -> Element {
                                             worker_id,
                                             profile: profile.clone(),
                                             task: task.clone(),
-	                                            summary: summary.clone(),
-	                                            running: false,
-	                                            ok,
-	                                            logs: Vec::new(),
-	                                        });
+                                                summary: summary.clone(),
+                                                running: false,
+                                                ok,
+                                                logs: Vec::new(),
+                                            });
                                     }
                                 }
                                 timeline.write().push(TimelineItem {
@@ -3895,111 +4385,111 @@ fn app() -> Element {
                                 // Live shimmer shows WHAT it's doing ("Reading src/lib.rs…"),
                                 // not just a generic verb.
                                 status.set(activity_label(&tool, &args));
-	                                if tool != "ask_user" && tool != "shell" {
-	                                    push_activity!(ChatMsg { author: Author::Activity { running: true, ok: true, key: Some(call_id) }, text: activity_label(&tool, &args) });
-	                                }
+                                    if tool != "ask_user" && tool != "shell" {
+                                        push_activity!(ChatMsg { author: Author::Activity { running: true, ok: true, key: Some(call_id) }, text: activity_label(&tool, &args) });
+                                    }
                             }
-	                            Event::ToolCallEnd { call_id, tool, output, ok, .. } => {
-	                                timeline.write().push(TimelineItem { title: format!("⚙ {tool}"), sub: if ok { "done".into() } else { "failed".into() } });
-	                                // Settle the exact row this call opened — found by its key
-	                                // (call_id), never by index — and attach its output. A missing
-	                                // row (shell/ask_user, or merged from a backgrounded tab) is a
-	                                // no-op; the turn-end sweep settles anything still running.
-	                                let mut out = output.trim().to_string();
-	                                if out.chars().count() > 4000 {
-	                                    out = out.chars().take(4000).collect::<String>() + "\n… (truncated)";
-	                                }
-	                                let idx = activity_idx(&messages.read(), &call_id);
-	                                if let Some(idx) = idx {
-	                                    let mut m = messages.write();
-	                                    if let Some(c) = m.get_mut(idx) {
-	                                        if let Author::Activity { running, ok: o, .. } = &mut c.author { *running = false; *o = ok; }
-	                                        if !out.is_empty() && !(tool == "shell" && activity_has_output(&c.text)) {
-	                                            c.text.push('\t');
-	                                            c.text.push_str(&out);
-	                                        }
-	                                    }
-	                                }
-	                            }
-	                            Event::CommandStarted { command_id, worker_id, command, cwd, background, .. } => {
-	                                timeline.write().push(TimelineItem {
-	                                    title: if background { "⌘ background command".into() } else { "⌘ command".into() },
-	                                    sub: format!("{command} · {cwd}"),
-	                                });
-	                                if let Some(worker_id) = worker_id {
-	                                    let mut cards = subagent_cards.write();
-	                                    if let Some(card) = cards.iter_mut().find(|c| c.worker_id == worker_id) {
-	                                        card.logs.push(CommandLog {
-	                                            command_id,
-	                                            command,
-	                                            output: String::new(),
-	                                            running: true,
-	                                            ok: true,
-	                                        });
-	                                    }
-	                                } else {
-	                                    if background && !bg_jobs.read().iter().any(|j| j == &command) {
-	                                        bg_jobs.write().push(command.clone());
-	                                    }
-	                                    status.set(if background { format!("Background · {command}") } else { format!("Running · {command}") });
-	                                    // Insert above any trailing "✓ Done" note (CLI drivers
-	                                    // like claude can surface a command row after the turn's
-	                                    // text + Done landed) so it never renders below the footer.
-	                                    push_activity!(ChatMsg {
-	                                        author: Author::Activity { running: true, ok: true, key: Some(command_id) },
-	                                        text: command_activity_label(&command, background),
-	                                    });
-	                                }
-	                                scroll_chat_bottom_if_sticky();
-	                            }
-	                            Event::CommandOutput { command_id, worker_id, stream, chunk, .. } => {
-	                                if let Some(worker_id) = worker_id {
-	                                    let mut cards = subagent_cards.write();
-	                                    if let Some(card) = cards.iter_mut().find(|c| c.worker_id == worker_id) {
-	                                        if let Some(log) = card.logs.iter_mut().find(|log| log.command_id == command_id) {
-	                                            if stream == "stderr" && !chunk.trim().is_empty() {
-	                                                log.output.push_str("[stderr] ");
-	                                            }
-	                                            log.output.push_str(&chunk);
-	                                            if log.output.chars().count() > 7000 {
-	                                                log.output = log.output.chars().rev().take(6000).collect::<Vec<_>>().into_iter().rev().collect();
-	                                                log.output.insert_str(0, "… (output truncated)\n");
-	                                            }
-	                                        }
-	                                    }
-	                                } else if let Some(idx) = { let g = messages.read(); activity_idx(&g, &command_id) } {
-	                                    if let Some(row) = messages.write().get_mut(idx) {
-	                                        let chunk = if stream == "stderr" && !chunk.trim().is_empty() { format!("[stderr] {chunk}") } else { chunk };
-	                                        append_activity_output(&mut row.text, &chunk);
-	                                    }
-	                                }
-	                            }
-	                            Event::CommandFinished { command_id, worker_id, ok, exit_code, duration_ms, .. } => {
-	                                let footer = match exit_code {
-	                                    Some(code) => format!("\n[exit {code} · {}ms]\n", duration_ms),
-	                                    None => format!("\n[done · {}ms]\n", duration_ms),
-	                                };
-	                                if let Some(worker_id) = worker_id {
-	                                    let mut cards = subagent_cards.write();
-	                                    if let Some(card) = cards.iter_mut().find(|c| c.worker_id == worker_id) {
-	                                        if let Some(log) = card.logs.iter_mut().find(|log| log.command_id == command_id) {
-	                                            log.running = false;
-	                                            log.ok = ok;
-	                                            log.output.push_str(&footer);
-	                                        }
-	                                    }
-	                                } else if let Some(idx) = { let g = messages.read(); activity_idx(&g, &command_id) } {
-	                                    if let Some(row) = messages.write().get_mut(idx) {
-	                                        if let Author::Activity { running, ok: o, .. } = &mut row.author { *running = false; *o = ok; }
-	                                        append_activity_output(&mut row.text, &footer);
-	                                    }
-	                                }
-	                                scroll_chat_bottom_if_sticky();
-	                            }
-	                            Event::Todos { items } => {
-	                                todos.set(items);
-	                                scroll_chat_bottom_if_sticky();
-	                            }
+                                Event::ToolCallEnd { call_id, tool, output, ok, .. } => {
+                                    timeline.write().push(TimelineItem { title: format!("⚙ {tool}"), sub: if ok { "done".into() } else { "failed".into() } });
+                                    // Settle the exact row this call opened — found by its key
+                                    // (call_id), never by index — and attach its output. A missing
+                                    // row (shell/ask_user, or merged from a backgrounded tab) is a
+                                    // no-op; the turn-end sweep settles anything still running.
+                                    let mut out = output.trim().to_string();
+                                    if out.chars().count() > 4000 {
+                                        out = out.chars().take(4000).collect::<String>() + "\n… (truncated)";
+                                    }
+                                    let idx = activity_idx(&messages.read(), &call_id);
+                                    if let Some(idx) = idx {
+                                        let mut m = messages.write();
+                                        if let Some(c) = m.get_mut(idx) {
+                                            if let Author::Activity { running, ok: o, .. } = &mut c.author { *running = false; *o = ok; }
+                                            if !out.is_empty() && !(tool == "shell" && activity_has_output(&c.text)) {
+                                                c.text.push('\t');
+                                                c.text.push_str(&out);
+                                            }
+                                        }
+                                    }
+                                }
+                                Event::CommandStarted { command_id, worker_id, command, cwd, background, .. } => {
+                                    timeline.write().push(TimelineItem {
+                                        title: if background { "⌘ background command".into() } else { "⌘ command".into() },
+                                        sub: format!("{command} · {cwd}"),
+                                    });
+                                    if let Some(worker_id) = worker_id {
+                                        let mut cards = subagent_cards.write();
+                                        if let Some(card) = cards.iter_mut().find(|c| c.worker_id == worker_id) {
+                                            card.logs.push(CommandLog {
+                                                command_id,
+                                                command,
+                                                output: String::new(),
+                                                running: true,
+                                                ok: true,
+                                            });
+                                        }
+                                    } else {
+                                        if background && !bg_jobs.read().iter().any(|j| j == &command) {
+                                            bg_jobs.write().push(command.clone());
+                                        }
+                                        status.set(if background { format!("Background · {command}") } else { format!("Running · {command}") });
+                                        // Insert above any trailing "✓ Done" note (CLI drivers
+                                        // like claude can surface a command row after the turn's
+                                        // text + Done landed) so it never renders below the footer.
+                                        push_activity!(ChatMsg {
+                                            author: Author::Activity { running: true, ok: true, key: Some(command_id) },
+                                            text: command_activity_label(&command, background),
+                                        });
+                                    }
+                                    scroll_chat_bottom_if_sticky();
+                                }
+                                Event::CommandOutput { command_id, worker_id, stream, chunk, .. } => {
+                                    if let Some(worker_id) = worker_id {
+                                        let mut cards = subagent_cards.write();
+                                        if let Some(card) = cards.iter_mut().find(|c| c.worker_id == worker_id) {
+                                            if let Some(log) = card.logs.iter_mut().find(|log| log.command_id == command_id) {
+                                                if stream == "stderr" && !chunk.trim().is_empty() {
+                                                    log.output.push_str("[stderr] ");
+                                                }
+                                                log.output.push_str(&chunk);
+                                                if log.output.chars().count() > 7000 {
+                                                    log.output = log.output.chars().rev().take(6000).collect::<Vec<_>>().into_iter().rev().collect();
+                                                    log.output.insert_str(0, "… (output truncated)\n");
+                                                }
+                                            }
+                                        }
+                                    } else if let Some(idx) = { let g = messages.read(); activity_idx(&g, &command_id) } {
+                                        if let Some(row) = messages.write().get_mut(idx) {
+                                            let chunk = if stream == "stderr" && !chunk.trim().is_empty() { format!("[stderr] {chunk}") } else { chunk };
+                                            append_activity_output(&mut row.text, &chunk);
+                                        }
+                                    }
+                                }
+                                Event::CommandFinished { command_id, worker_id, ok, exit_code, duration_ms, .. } => {
+                                    let footer = match exit_code {
+                                        Some(code) => format!("\n[exit {code} · {}ms]\n", duration_ms),
+                                        None => format!("\n[done · {}ms]\n", duration_ms),
+                                    };
+                                    if let Some(worker_id) = worker_id {
+                                        let mut cards = subagent_cards.write();
+                                        if let Some(card) = cards.iter_mut().find(|c| c.worker_id == worker_id) {
+                                            if let Some(log) = card.logs.iter_mut().find(|log| log.command_id == command_id) {
+                                                log.running = false;
+                                                log.ok = ok;
+                                                log.output.push_str(&footer);
+                                            }
+                                        }
+                                    } else if let Some(idx) = { let g = messages.read(); activity_idx(&g, &command_id) } {
+                                        if let Some(row) = messages.write().get_mut(idx) {
+                                            if let Author::Activity { running, ok: o, .. } = &mut row.author { *running = false; *o = ok; }
+                                            append_activity_output(&mut row.text, &footer);
+                                        }
+                                    }
+                                    scroll_chat_bottom_if_sticky();
+                                }
+                                Event::Todos { items } => {
+                                    todos.set(items);
+                                    scroll_chat_bottom_if_sticky();
+                                }
                             Event::PatchApplied { path, .. } => {
                                 timeline.write().push(TimelineItem { title: "✎ patched".into(), sub: path });
                                 let v = *git_refresh.read();
@@ -4087,6 +4577,10 @@ fn app() -> Element {
                             Event::TurnFinished { .. } => {
                                 streaming.set(false);
                                 status.set(String::new());
+                                // Todo/task cards are turn-scoped progress, not durable transcript
+                                // content. Clear them at finish so an interrupted/aborted model turn
+                                // cannot leave a perpetual "Tasks 0/N" spinner in the composer area.
+                                todos.write().clear();
                                 // The workflow/skill-route card is per-turn guidance ("here's
                                 // the plan I'll follow"). Drop it when the turn ends so it
                                 // doesn't linger past completion into the next prompt — the
@@ -4214,7 +4708,11 @@ fn app() -> Element {
     let project = project_name(&workspace);
     let accent_style = {
         let a = cfg.read().accent_color.clone();
-        if a.trim().is_empty() { String::new() } else { format!("--accent: {a}; --on-accent: #ffffff;") }
+        if a.trim().is_empty() {
+            String::new()
+        } else {
+            format!("--accent: {a}; --on-accent: #ffffff;")
+        }
     };
 
     // Keyboard: ⌘1–9 jump to tab N, ⌘⇧] / ⌘⇧[ cycle tabs.
@@ -4234,14 +4732,28 @@ fn app() -> Element {
             "#,
         );
         loop {
-            let msg = match eval.recv::<String>().await { Ok(m) => m, Err(_) => break };
+            let msg = match eval.recv::<String>().await {
+                Ok(m) => m,
+                Err(_) => break,
+            };
             let n = tabs.read().len();
-            if n == 0 { continue; }
+            if n == 0 {
+                continue;
+            }
             let cur = *active_tab.read();
-            let target = if msg == "next" { (cur + 1) % n }
-                else if msg == "prev" { (cur + n - 1) % n }
-                else if let Some(d) = msg.strip_prefix("jump:") { d.parse::<usize>().ok().map(|x| x.saturating_sub(1)).filter(|&x| x < n).unwrap_or(cur) }
-                else { cur };
+            let target = if msg == "next" {
+                (cur + 1) % n
+            } else if msg == "prev" {
+                (cur + n - 1) % n
+            } else if let Some(d) = msg.strip_prefix("jump:") {
+                d.parse::<usize>()
+                    .ok()
+                    .map(|x| x.saturating_sub(1))
+                    .filter(|&x| x < n)
+                    .unwrap_or(cur)
+            } else {
+                cur
+            };
             if target != cur {
                 switch_tab(tabs, active_tab, messages, cfg, engine, target);
             }
@@ -4261,8 +4773,14 @@ fn app() -> Element {
             "#,
         );
         loop {
-            let raw = match eval.recv::<String>().await { Ok(m) => m, Err(_) => break };
-            let v: serde_json::Value = match serde_json::from_str(&raw) { Ok(v) => v, Err(_) => continue };
+            let raw = match eval.recv::<String>().await {
+                Ok(m) => m,
+                Err(_) => break,
+            };
+            let v: serde_json::Value = match serde_json::from_str(&raw) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
             if *design_mode.read() {
                 design_sel.set(Some(v));
                 design_edits.set(Vec::new());
@@ -4275,10 +4793,18 @@ fn app() -> Element {
             let html = v["html"].as_str().unwrap_or("");
             let mut ctx = String::from("Selected UI element to change:\n");
             ctx.push_str(&format!("- selector: {sel}\n"));
-            if !comp.is_empty() { ctx.push_str(&format!("- component: <{comp}>\n")); }
-            if !src.is_empty() { ctx.push_str(&format!("- source: {src}\n")); }
-            if !text.is_empty() { ctx.push_str(&format!("- text: {text}\n")); }
-            if !html.is_empty() { ctx.push_str(&format!("- html: {html}\n")); }
+            if !comp.is_empty() {
+                ctx.push_str(&format!("- component: <{comp}>\n"));
+            }
+            if !src.is_empty() {
+                ctx.push_str(&format!("- source: {src}\n"));
+            }
+            if !text.is_empty() {
+                ctx.push_str(&format!("- text: {text}\n"));
+            }
+            if !html.is_empty() {
+                ctx.push_str(&format!("- html: {html}\n"));
+            }
             picked_element.set(Some(ctx));
         }
     });
@@ -6618,40 +7144,40 @@ fn app() -> Element {
                                                         }
                                                         div { class: "subagent-copy",
                                                             div { class: "subagent-title", "{card.profile} · {card.task}" }
-	                                                            if !card.summary.trim().is_empty() {
-	                                                                div { class: "subagent-summary", "{card.summary}" }
-	                                                            }
-	                                                            if !card.logs.is_empty() {
-	                                                                div { class: "subagent-logs",
-	                                                                    for log in card.logs {
-	                                                                        {
-	                                                                            let log_cls = if log.running { "subagent-log running" } else if log.ok { "subagent-log done" } else { "subagent-log fail" };
-	                                                                            let lines = log.output.lines().count();
-	                                                                            rsx! {
-	                                                                                details { class: "{log_cls}", open: log.running,
-	                                                                                    summary { class: "subagent-log-head",
-	                                                                                        span { class: "subagent-log-status",
-	                                                                                            if log.running { span { class: "syn-spinner" } }
-	                                                                                            else if log.ok { "✓" }
-	                                                                                            else { "!" }
-	                                                                                        }
-	                                                                                        span { class: "subagent-log-command", "{log.command}" }
-	                                                                                        if lines > 0 {
-	                                                                                            span { class: "subagent-log-lines", "{lines} lines" }
-	                                                                                        }
-	                                                                                    }
-	                                                                                    if !log.output.trim().is_empty() {
-	                                                                                        pre { class: "subagent-log-output", "{log.output}" }
-	                                                                                    }
-	                                                                                }
-	                                                                            }
-	                                                                        }
-	                                                                    }
-	                                                                }
-	                                                            }
-	                                                        }
-	                                                    }
-	                                                }
+                                                                if !card.summary.trim().is_empty() {
+                                                                    div { class: "subagent-summary", "{card.summary}" }
+                                                                }
+                                                                if !card.logs.is_empty() {
+                                                                    div { class: "subagent-logs",
+                                                                        for log in card.logs {
+                                                                            {
+                                                                                let log_cls = if log.running { "subagent-log running" } else if log.ok { "subagent-log done" } else { "subagent-log fail" };
+                                                                                let lines = log.output.lines().count();
+                                                                                rsx! {
+                                                                                    details { class: "{log_cls}", open: log.running,
+                                                                                        summary { class: "subagent-log-head",
+                                                                                            span { class: "subagent-log-status",
+                                                                                                if log.running { span { class: "syn-spinner" } }
+                                                                                                else if log.ok { "✓" }
+                                                                                                else { "!" }
+                                                                                            }
+                                                                                            span { class: "subagent-log-command", "{log.command}" }
+                                                                                            if lines > 0 {
+                                                                                                span { class: "subagent-log-lines", "{lines} lines" }
+                                                                                            }
+                                                                                        }
+                                                                                        if !log.output.trim().is_empty() {
+                                                                                            pre { class: "subagent-log-output", "{log.output}" }
+                                                                                        }
+                                                                                    }
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
                                             }
                                         }
                                     }
@@ -7045,16 +7571,22 @@ fn app() -> Element {
 }
 
 #[component]
-fn McpModal(cfg: Signal<Config>, engine: Coroutine<EngineCmd>, status: Signal<std::collections::HashMap<String, String>>, on_close: EventHandler<()>) -> Element {
+fn McpModal(
+    cfg: Signal<Config>,
+    engine: Coroutine<EngineCmd>,
+    status: Signal<std::collections::HashMap<String, String>>,
+    on_close: EventHandler<()>,
+) -> Element {
     let mut name = use_signal(String::new);
     let mut command = use_signal(String::new);
     let mut args = use_signal(String::new);
     let servers = cfg.read().mcp_servers.clone();
     let workspace = workspace_of(&cfg.read());
-    let imported: Vec<oxide_config::McpServerConfig> = oxide_core::discover_external_mcp_for_workspace(&workspace)
-        .into_iter()
-        .filter(|e| !servers.iter().any(|s| s.name == e.name))
-        .collect();
+    let imported: Vec<oxide_config::McpServerConfig> =
+        oxide_core::discover_external_mcp_for_workspace(&workspace)
+            .into_iter()
+            .filter(|e| !servers.iter().any(|s| s.name == e.name))
+            .collect();
     rsx! {
         div { class: "modal-overlay", onclick: move |_| on_close.call(()),
             div { class: "modal skills-modal", onclick: move |e| e.stop_propagation(),
@@ -7212,7 +7744,12 @@ fn SkillsModal(workspace: PathBuf, on_close: EventHandler<()>) -> Element {
 }
 
 /// Switch to `dir`: update workspace, recent list, tree, and reconfigure.
-fn apply_workspace(mut cfg: Signal<Config>, mut ui: Ui, engine: Coroutine<EngineCmd>, dir: PathBuf) {
+fn apply_workspace(
+    mut cfg: Signal<Config>,
+    mut ui: Ui,
+    engine: Coroutine<EngineCmd>,
+    dir: PathBuf,
+) {
     ui.workspace.set(dir.clone());
     ui.open_path.set(None);
     ui.expanded.set(HashSet::new());
@@ -7250,7 +7787,11 @@ fn switch_tab(
     c.model = t.model.clone();
     c.resume_path = t.session.clone();
     cfg.set(c.clone());
-    let _ = engine.send(EngineCmd::SwitchTab { id: t.id, conf: c, msgs: t.messages.clone() });
+    let _ = engine.send(EngineCmd::SwitchTab {
+        id: t.id,
+        conf: c,
+        msgs: t.messages.clone(),
+    });
     scroll_chat_bottom();
 }
 
@@ -7291,7 +7832,11 @@ fn new_agent_tab(
     c.resume_path = None;
     c.resume = false;
     cfg.set(c.clone());
-    let _ = engine.send(EngineCmd::SwitchTab { id, conf: c, msgs: Vec::new() });
+    let _ = engine.send(EngineCmd::SwitchTab {
+        id,
+        conf: c,
+        msgs: Vec::new(),
+    });
 }
 
 /// Open an embedded-TUI tab running `bin` (codex/claude) in a PTY.
@@ -7377,7 +7922,11 @@ fn rename_tab_title(mut tabs: Signal<Vec<AgentTab>>, id: u64, name: &str) {
 
 /// Short tab title from the first user message.
 fn make_title(text: &str) -> String {
-    let line = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+    let line = text
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim();
     let short: String = line.chars().take(32).collect();
     if line.chars().count() > 32 {
         format!("{}…", short.trim_end())
@@ -7401,7 +7950,9 @@ fn provider_title(provider: &str) -> &'static str {
 
 /// Pin / unpin a session path and persist.
 fn toggle_pin(mut cfg: Signal<Config>, path: &str) {
-    let now_pinned = oxide_core::db::meta(path).map(|m| m.pinned).unwrap_or(false);
+    let now_pinned = oxide_core::db::meta(path)
+        .map(|m| m.pinned)
+        .unwrap_or(false);
     oxide_core::db::set_pinned(path, !now_pinned);
     let c = cfg.read().clone();
     let _ = &c;
@@ -7420,7 +7971,11 @@ fn toggle_pin(mut cfg: Signal<Config>, path: &str) {
 /// Toggle UI density (comfortable ↔ compact) and persist.
 fn toggle_density(mut cfg: Signal<Config>) {
     let mut c = cfg.read().clone();
-    c.density = if c.density == "compact" { "comfortable".to_string() } else { "compact".to_string() };
+    c.density = if c.density == "compact" {
+        "comfortable".to_string()
+    } else {
+        "compact".to_string()
+    };
     cfg.set(c.clone());
     if let Ok(s) = toml::to_string(&c) {
         let ws = workspace_of(&c);
@@ -7484,7 +8039,13 @@ fn git_branches(ws: &Path) -> Vec<String> {
         .current_dir(ws)
         .output()
         .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -7538,7 +8099,7 @@ fn percent_decode(s: &str) -> String {
 }
 
 fn highlight_code(code: &str, lang: &str) -> String {
-    use syntect::html::{ClassedHTMLGenerator, ClassStyle};
+    use syntect::html::{ClassStyle, ClassedHTMLGenerator};
     use syntect::parsing::SyntaxSet;
     use syntect::util::LinesWithEndings;
     static SS: std::sync::OnceLock<SyntaxSet> = std::sync::OnceLock::new();
@@ -7549,8 +8110,14 @@ fn highlight_code(code: &str, lang: &str) -> String {
         .unwrap_or_else(|| ss.find_syntax_plain_text());
     let mut gen = ClassedHTMLGenerator::new_with_class_style(syn, ss, ClassStyle::Spaced);
     for line in LinesWithEndings::from(code) {
-        if gen.parse_html_for_line_which_includes_newline(line).is_err() {
-            return code.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+        if gen
+            .parse_html_for_line_which_includes_newline(line)
+            .is_err()
+        {
+            return code
+                .replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;");
         }
     }
     gen.finalize()
@@ -7647,7 +8214,10 @@ fn md_live_html(src: &str) -> String {
 
 fn md_to_html_uncached(src: &str, live: bool) -> String {
     use pulldown_cmark::{CodeBlockKind, Event as MdEvent, Options, Parser, Tag, TagEnd};
-    let escaped = src.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    let escaped = src
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_TABLES);
     opts.insert(Options::ENABLE_STRIKETHROUGH);
@@ -7668,7 +8238,9 @@ fn md_to_html_uncached(src: &str, live: bool) -> String {
                 in_code = true;
                 code.clear();
                 lang = match kind {
-                    CodeBlockKind::Fenced(l) => l.split_whitespace().next().unwrap_or("").to_string(),
+                    CodeBlockKind::Fenced(l) => {
+                        l.split_whitespace().next().unwrap_or("").to_string()
+                    }
                     _ => String::new(),
                 };
             }
@@ -7676,14 +8248,22 @@ fn md_to_html_uncached(src: &str, live: bool) -> String {
                 in_code = false;
                 // The source was pre-escaped; un-escape so syntect sees real code,
                 // its output re-escapes safely.
-                let raw = code.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&");
+                let raw = code
+                    .replace("&lt;", "<")
+                    .replace("&gt;", ">")
+                    .replace("&amp;", "&");
                 if lang == "mermaid" && !live {
                     // Render the diagram once the fence closes (never partial).
-                    let esc = raw.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+                    let esc = raw
+                        .replace('&', "&amp;")
+                        .replace('<', "&lt;")
+                        .replace('>', "&gt;");
                     html.push_str(&format!("<div class=\"mermaid\">{esc}</div>"));
                 } else {
                     let body = if live || lang == "mermaid" {
-                        raw.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+                        raw.replace('&', "&amp;")
+                            .replace('<', "&lt;")
+                            .replace('>', "&gt;")
                     } else {
                         highlight_code(&raw, &lang)
                     };
@@ -7706,7 +8286,9 @@ fn md_to_html_uncached(src: &str, live: bool) -> String {
 
 /// Bundled VSCode Material Icon Theme SVGs (MIT — material-extensions).
 fn material_icon(name: &str, is_dir: bool) -> &'static str {
-    if is_dir { return include_str!("../assets/ficons/folder-base.svg"); }
+    if is_dir {
+        return include_str!("../assets/ficons/folder-base.svg");
+    }
     let n = name.to_ascii_lowercase();
     let ext = n.rsplit('.').next().unwrap_or("");
     match ext {
@@ -7731,7 +8313,9 @@ fn material_icon(name: &str, is_dir: bool) -> &'static str {
         "java" | "kt" => include_str!("../assets/ficons/java.svg"),
         "c" | "h" => include_str!("../assets/ficons/c.svg"),
         "cpp" | "hpp" | "cc" | "cxx" => include_str!("../assets/ficons/cpp.svg"),
-        "png" | "jpg" | "jpeg" | "gif" | "svg" | "webp" | "ico" => include_str!("../assets/ficons/image.svg"),
+        "png" | "jpg" | "jpeg" | "gif" | "svg" | "webp" | "ico" => {
+            include_str!("../assets/ficons/image.svg")
+        }
         "lock" => include_str!("../assets/ficons/lock.svg"),
         "gitignore" => include_str!("../assets/ficons/git.svg"),
         _ => include_str!("../assets/ficons/document.svg"),
@@ -7806,15 +8390,29 @@ fn Editor() -> Element {
     let dirty = *ui.dirty.read();
     // Binary files (PDF, images) are previewed via the wsimg asset handler — the
     // webview renders a PDF natively — rather than dumped as garbage text.
-    let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).unwrap_or_default();
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
     let is_pdf = ext == "pdf";
-    let is_img = matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "svg" | "webp");
+    let is_img = matches!(
+        ext.as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "svg" | "webp"
+    );
     let preview_src = {
         // Path-encode for the asset URL (the handler percent-decodes it).
-        let enc: String = path.display().to_string().bytes().map(|b| match b {
-            b'/' | b'.' | b'-' | b'_' | b'~' | b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' => (b as char).to_string(),
-            _ => format!("%{b:02X}"),
-        }).collect();
+        let enc: String = path
+            .display()
+            .to_string()
+            .bytes()
+            .map(|b| match b {
+                b'/' | b'.' | b'-' | b'_' | b'~' | b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' => {
+                    (b as char).to_string()
+                }
+                _ => format!("%{b:02X}"),
+            })
+            .collect();
         format!("/wsimg/{enc}")
     };
 
@@ -7882,8 +8480,15 @@ fn SettingsModal(
     let mut provider = use_signal(|| base.provider.clone());
     let mut harness = use_signal(|| base.harness.clone());
     let harness_opts = {
-        let dir = base.harness_dir.clone().unwrap_or_else(|| PathBuf::from("harnesses"));
-        let dir = if dir.is_absolute() { dir } else { workspace_of(&base).join(dir) };
+        let dir = base
+            .harness_dir
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("harnesses"));
+        let dir = if dir.is_absolute() {
+            dir
+        } else {
+            workspace_of(&base).join(dir)
+        };
         list_harnesses(&dir)
     };
     let mut model = use_signal(|| base.model.clone());
@@ -7896,7 +8501,13 @@ fn SettingsModal(
     let mut backend = use_signal(|| base.backend_provider.clone());
     let mut subagents = use_signal(|| base.subagents);
     let upd_url = use_signal(|| base.update_url.clone());
-    let gh_repo = use_signal(|| if base.github_repo.trim().is_empty() { "MANFIT7/oxide".to_string() } else { base.github_repo.clone() });
+    let gh_repo = use_signal(|| {
+        if base.github_repo.trim().is_empty() {
+            "MANFIT7/oxide".to_string()
+        } else {
+            base.github_repo.clone()
+        }
+    });
     let mut upd_status = use_signal(|| "Up to date".to_string());
     let mut tab_mode = use_signal(|| base.default_tab_mode.clone());
     let mut browser_headless = use_signal(|| base.browser_headless);
@@ -7909,7 +8520,14 @@ fn SettingsModal(
 
     // Oxide is a GUI wrapper around the user's logged-in agent CLIs + the ChatGPT
     // subscription — no raw API-key providers (openai/anthropic) in the picker.
-    let providers = ["chatgpt", "codex", "claude", "claude_interactive", "echo", "mock"];
+    let providers = [
+        "chatgpt",
+        "codex",
+        "claude",
+        "claude_interactive",
+        "echo",
+        "mock",
+    ];
 
     let mut save = move |_| {
         let mut c = cfg.read().clone();
@@ -8468,8 +9086,8 @@ fn Composer(
     use_future(move || {
         let ws_paste = ws_paste.clone();
         async move {
-        let mut eval = dioxus::document::eval(
-            r#"
+            let mut eval = dioxus::document::eval(
+                r#"
             const attach = function(el){
               if (!el || el.__oxpaste) return;
               el.__oxpaste = true;
@@ -8509,32 +9127,36 @@ fn Composer(
               await new Promise(r => setTimeout(r, 700));
             }
             "#,
-        );
-        loop {
-            match eval.recv::<String>().await {
-                Ok(msg) => {
-                    if let Some(text) = msg.strip_prefix("PASTE:") {
-                        let id = *paste_seq.peek() + 1;
-                        paste_seq.set(id);
-                        match save_pasted_text_attachment(&ws_paste, id, text) {
-                            Ok(att) => {
-                                text_attachments.write().push(att);
-                                ce_empty.set(false);
+            );
+            loop {
+                match eval.recv::<String>().await {
+                    Ok(msg) => {
+                        if let Some(text) = msg.strip_prefix("PASTE:") {
+                            let id = *paste_seq.peek() + 1;
+                            paste_seq.set(id);
+                            match save_pasted_text_attachment(&ws_paste, id, text) {
+                                Ok(att) => {
+                                    text_attachments.write().push(att);
+                                    ce_empty.set(false);
+                                }
+                                Err(_) => {
+                                    let fallback = text.to_string();
+                                    spawn(async move {
+                                        let _ = dioxus::document::eval(&ce_insert_plain_text_js(
+                                            &fallback,
+                                        ))
+                                        .join::<bool>()
+                                        .await;
+                                    });
+                                }
                             }
-                            Err(_) => {
-                                let fallback = text.to_string();
-                                spawn(async move {
-                                    let _ = dioxus::document::eval(&ce_insert_plain_text_js(&fallback)).join::<bool>().await;
-                                });
-                            }
+                        } else {
+                            attachments.write().push(msg);
                         }
-                    } else {
-                        attachments.write().push(msg);
                     }
+                    Err(_) => break,
                 }
-                Err(_) => break,
             }
-        }
         }
     });
     let mention_items: Vec<String> = match mention_q.read().as_ref() {
@@ -9234,7 +9856,11 @@ fn Message(author: Author, text: String, #[props(default)] live: bool) -> Elemen
                 return rsx! {};
             }
             let copy = serde_json::to_string(&text).unwrap_or_default();
-            let body_cls = if live { "agent-text agent-md live" } else { "agent-text agent-md" };
+            let body_cls = if live {
+                "agent-text agent-md live"
+            } else {
+                "agent-text agent-md"
+            };
             rsx! {
                 div { class: "row agent",
                     img { class: "avatar", src: logo_uri() }
@@ -9244,11 +9870,14 @@ fn Message(author: Author, text: String, #[props(default)] live: bool) -> Elemen
                     }
                 }
             }
-        },
+        }
         Author::Activity { running, ok, .. } => rsx! { ActivityRow { text, running, ok } },
         Author::Diff(..) => rsx! {},
         Author::Note => {
-            let is_cmd = text.starts_with('⌘') || text.starts_with('✎') || text.starts_with('🔎') || text.starts_with('⚙');
+            let is_cmd = text.starts_with('⌘')
+                || text.starts_with('✎')
+                || text.starts_with('🔎')
+                || text.starts_with('⚙');
             if is_cmd {
                 rsx! { div { class: "row tool", pre { class: "tool-card", "{text}" } } }
             } else {
@@ -9315,7 +9944,12 @@ fn TerminalView(id: u64, bin: String, ws: String) -> Element {
             let mut eval = dioxus::document::eval(&setup);
 
             let pty = portable_pty::native_pty_system();
-            let pair = match pty.openpty(portable_pty::PtySize { rows: 32, cols: 110, pixel_width: 0, pixel_height: 0 }) {
+            let pair = match pty.openpty(portable_pty::PtySize {
+                rows: 32,
+                cols: 110,
+                pixel_width: 0,
+                pixel_height: 0,
+            }) {
                 Ok(p) => p,
                 Err(_) => return,
             };
@@ -9407,7 +10041,13 @@ enum PaneCmd {
 #[derive(Clone, PartialEq)]
 enum Tile {
     Leaf(u64),
-    Split { id: u64, vertical: bool, ratio: f64, a: Box<Tile>, b: Box<Tile> },
+    Split {
+        id: u64,
+        vertical: bool,
+        ratio: f64,
+        a: Box<Tile>,
+        b: Box<Tile>,
+    },
 }
 
 /// Replace leaf `target` with a split containing it plus a new leaf `new_pane`.
@@ -9421,7 +10061,13 @@ fn tile_split(node: &Tile, target: u64, vertical: bool, split_id: u64, new_pane:
             b: Box::new(Tile::Leaf(new_pane)),
         },
         Tile::Leaf(id) => Tile::Leaf(*id),
-        Tile::Split { id, vertical: v, ratio, a, b } => Tile::Split {
+        Tile::Split {
+            id,
+            vertical: v,
+            ratio,
+            a,
+            b,
+        } => Tile::Split {
             id: *id,
             vertical: *v,
             ratio: *ratio,
@@ -9436,19 +10082,23 @@ fn tile_close(node: &Tile, target: u64) -> Option<Tile> {
     match node {
         Tile::Leaf(id) if *id == target => None,
         Tile::Leaf(id) => Some(Tile::Leaf(*id)),
-        Tile::Split { id, vertical, ratio, a, b } => {
-            match (tile_close(a, target), tile_close(b, target)) {
-                (None, Some(x)) | (Some(x), None) => Some(x),
-                (Some(a), Some(b)) => Some(Tile::Split {
-                    id: *id,
-                    vertical: *vertical,
-                    ratio: *ratio,
-                    a: Box::new(a),
-                    b: Box::new(b),
-                }),
-                (None, None) => None,
-            }
-        }
+        Tile::Split {
+            id,
+            vertical,
+            ratio,
+            a,
+            b,
+        } => match (tile_close(a, target), tile_close(b, target)) {
+            (None, Some(x)) | (Some(x), None) => Some(x),
+            (Some(a), Some(b)) => Some(Tile::Split {
+                id: *id,
+                vertical: *vertical,
+                ratio: *ratio,
+                a: Box::new(a),
+                b: Box::new(b),
+            }),
+            (None, None) => None,
+        },
     }
 }
 
@@ -9456,10 +10106,20 @@ fn tile_close(node: &Tile, target: u64) -> Option<Tile> {
 fn tile_set_ratio(node: &Tile, split_id: u64, ratio: f64) -> Tile {
     match node {
         Tile::Leaf(id) => Tile::Leaf(*id),
-        Tile::Split { id, vertical, ratio: r, a, b } => Tile::Split {
+        Tile::Split {
+            id,
+            vertical,
+            ratio: r,
+            a,
+            b,
+        } => Tile::Split {
             id: *id,
             vertical: *vertical,
-            ratio: if *id == split_id { ratio.clamp(0.12, 0.88) } else { *r },
+            ratio: if *id == split_id {
+                ratio.clamp(0.12, 0.88)
+            } else {
+                *r
+            },
             a: Box::new(tile_set_ratio(a, split_id, ratio)),
             b: Box::new(tile_set_ratio(b, split_id, ratio)),
         },
@@ -9470,16 +10130,29 @@ fn tile_set_ratio(node: &Tile, split_id: u64, ratio: f64) -> Tile {
 fn tile_leaves(node: &Tile, out: &mut Vec<u64>) {
     match node {
         Tile::Leaf(id) => out.push(*id),
-        Tile::Split { a, b, .. } => { tile_leaves(a, out); tile_leaves(b, out); }
+        Tile::Split { a, b, .. } => {
+            tile_leaves(a, out);
+            tile_leaves(b, out);
+        }
     }
 }
 
 #[component]
 fn ActivityRow(text: String, running: bool, ok: bool) -> Element {
     let view = activity_view(&text);
-    let state = if running { "running" } else if ok { "done" } else { "fail" };
+    let state = if running {
+        "running"
+    } else if ok {
+        "done"
+    } else {
+        "fail"
+    };
     let cls = format!("activity-card {state} activity-{}", view.kind.class_name());
-    let lines = if view.output.is_empty() { 0 } else { view.output.lines().count() };
+    let lines = if view.output.is_empty() {
+        0
+    } else {
+        view.output.lines().count()
+    };
     rsx! {
         div { class: "row activity",
             if view.output.is_empty() {
@@ -9595,10 +10268,20 @@ fn SplitView(
                 }
             }
         }
-        Tile::Split { id, vertical, ratio, a, b } => {
+        Tile::Split {
+            id,
+            vertical,
+            ratio,
+            a,
+            b,
+        } => {
             let na = *a;
             let nb = *b;
-            let cls = if vertical { "split split-row" } else { "split split-col" };
+            let cls = if vertical {
+                "split split-row"
+            } else {
+                "split split-col"
+            };
             rsx! {
                 div {
                     class: "{cls}",
@@ -9650,7 +10333,11 @@ fn SplitLeaf(
 ) -> Element {
     let mut show_menu = use_signal(|| false);
     let is_tui = mode == "tui";
-    let label = if is_tui { format!("{target} · TUI") } else { target.clone() };
+    let label = if is_tui {
+        format!("{target} · TUI")
+    } else {
+        target.clone()
+    };
     rsx! {
         div { class: "pane", key: "pane{pane_id}-{mode}-{target}",
             div { class: "pane-head",
@@ -9703,8 +10390,14 @@ fn SplitLeaf(
 /// `ws` isn't a git repo (caller then shares the main workspace).
 async fn pane_worktree(ws: &Path, id: u64) -> Option<PathBuf> {
     let is_git = tokio::process::Command::new("git")
-        .arg("-C").arg(ws).args(["rev-parse", "--is-inside-work-tree"])
-        .output().await.ok().map(|o| o.status.success()).unwrap_or(false);
+        .arg("-C")
+        .arg(ws)
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .output()
+        .await
+        .ok()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
     if !is_git {
         return None;
     }
@@ -9715,9 +10408,13 @@ async fn pane_worktree(ws: &Path, id: u64) -> Option<PathBuf> {
     let _ = std::fs::create_dir_all(ws.join(".oxide/worktrees"));
     let branch = format!("oxide/pane-{id}");
     let _ = tokio::process::Command::new("git")
-        .arg("-C").arg(ws).args(["worktree", "add", "-B", &branch])
-        .arg(&wt).arg("HEAD")
-        .output().await;
+        .arg("-C")
+        .arg(ws)
+        .args(["worktree", "add", "-B", &branch])
+        .arg(&wt)
+        .arg("HEAD")
+        .output()
+        .await;
     wt.exists().then_some(wt)
 }
 
@@ -9730,11 +10427,18 @@ fn remove_pane_worktree(ws: &Path, id: u64) {
     let ws = ws.to_path_buf();
     spawn(async move {
         let _ = tokio::process::Command::new("git")
-            .arg("-C").arg(&ws).args(["worktree", "remove", "--force"]).arg(&wt)
-            .output().await;
+            .arg("-C")
+            .arg(&ws)
+            .args(["worktree", "remove", "--force"])
+            .arg(&wt)
+            .output()
+            .await;
         let _ = tokio::process::Command::new("git")
-            .arg("-C").arg(&ws).args(["branch", "-D", &format!("oxide/pane-{id}")])
-            .output().await;
+            .arg("-C")
+            .arg(&ws)
+            .args(["branch", "-D", &format!("oxide/pane-{id}")])
+            .output()
+            .await;
     });
 }
 
@@ -9793,7 +10497,9 @@ fn ChatPane(
             // Isolate non-primary panes in their own git worktree so parallel
             // agents never clobber each other's working tree.
             let ws_eff = if isolate {
-                pane_worktree(&w, pane_id).await.unwrap_or_else(|| w.clone())
+                pane_worktree(&w, pane_id)
+                    .await
+                    .unwrap_or_else(|| w.clone())
             } else {
                 w.clone()
             };
@@ -9955,7 +10661,11 @@ fn ChatPane(
     }
 }
 
-fn esc(s: &str) -> String { s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;") }
+fn esc(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
 
 /// Word-level diff for a paired -/+ line: common prefix/suffix kept, the
 /// changed middle wrapped in a highlight span (Cursor-style).
@@ -9963,17 +10673,34 @@ fn word_diff(old: &str, new: &str) -> (String, String) {
     let ob: Vec<char> = old.chars().collect();
     let nb: Vec<char> = new.chars().collect();
     let mut p = 0;
-    while p < ob.len() && p < nb.len() && ob[p] == nb[p] { p += 1; }
+    while p < ob.len() && p < nb.len() && ob[p] == nb[p] {
+        p += 1;
+    }
     let mut sfx = 0;
-    while sfx < ob.len() - p && sfx < nb.len() - p && ob[ob.len() - 1 - sfx] == nb[nb.len() - 1 - sfx] { sfx += 1; }
+    while sfx < ob.len() - p
+        && sfx < nb.len() - p
+        && ob[ob.len() - 1 - sfx] == nb[nb.len() - 1 - sfx]
+    {
+        sfx += 1;
+    }
     let seg = |c: &[char], a: usize, b: usize| -> String { c[a..b].iter().collect() };
     let o_mid = seg(&ob, p, ob.len() - sfx);
     let n_mid = seg(&nb, p, nb.len() - sfx);
     let pre = seg(&ob, 0, p);
     let suf = seg(&ob, ob.len() - sfx, ob.len());
     (
-        format!("{}<span class=\"dw del\">{}</span>{}", esc(&pre), esc(&o_mid), esc(&suf)),
-        format!("{}<span class=\"dw add\">{}</span>{}", esc(&pre), esc(&n_mid), esc(&suf)),
+        format!(
+            "{}<span class=\"dw del\">{}</span>{}",
+            esc(&pre),
+            esc(&o_mid),
+            esc(&suf)
+        ),
+        format!(
+            "{}<span class=\"dw add\">{}</span>{}",
+            esc(&pre),
+            esc(&n_mid),
+            esc(&suf)
+        ),
     )
 }
 
@@ -9999,16 +10726,35 @@ fn revert_hunk(ws: &Path, path: &str, lines: &[String]) -> bool {
     let mut old_block = String::new();
     let mut new_block = String::new();
     for l in lines {
-        let (tag, rest) = l.split_at(l.char_indices().next().map(|(_, c)| c.len_utf8()).unwrap_or(0).min(l.len()));
+        let (tag, rest) = l.split_at(
+            l.char_indices()
+                .next()
+                .map(|(_, c)| c.len_utf8())
+                .unwrap_or(0)
+                .min(l.len()),
+        );
         match tag {
-            " " => { old_block.push_str(rest); old_block.push('\n'); new_block.push_str(rest); new_block.push('\n'); }
-            "-" => { old_block.push_str(rest); old_block.push('\n'); }
-            "+" => { new_block.push_str(rest); new_block.push('\n'); }
+            " " => {
+                old_block.push_str(rest);
+                old_block.push('\n');
+                new_block.push_str(rest);
+                new_block.push('\n');
+            }
+            "-" => {
+                old_block.push_str(rest);
+                old_block.push('\n');
+            }
+            "+" => {
+                new_block.push_str(rest);
+                new_block.push('\n');
+            }
             _ => {}
         }
     }
     let file = ws.join(path);
-    let Ok(content) = std::fs::read_to_string(&file) else { return false };
+    let Ok(content) = std::fs::read_to_string(&file) else {
+        return false;
+    };
     // Match without forcing the trailing newline so end-of-file hunks work.
     let nb = new_block.trim_end_matches('\n');
     let ob = old_block.trim_end_matches('\n');
@@ -10112,9 +10858,15 @@ fn Icon(name: &'static str) -> Element {
         "shield" => rsx! { path { d: "M12 2l8 4v6c0 5-3.5 8-8 10-4.5-2-8-5-8-10V6z" } },
         "zap" => rsx! { polygon { points: "13 2 3 14 11 14 9 22 21 10 13 10 13 2" } },
         "chevron" => rsx! { polyline { points: "6 9 12 15 18 9" } },
-        "plus" => rsx! { line { x1: "12", y1: "5", x2: "12", y2: "19" } line { x1: "5", y1: "12", x2: "19", y2: "12" } },
-        "trash" => rsx! { polyline { points: "3 6 5 6 21 6" } path { d: "M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" } },
-        "paperclip" => rsx! { path { d: "M21 12.5l-8.5 8.5a5 5 0 0 1-7-7l9-9a3.3 3.3 0 0 1 4.7 4.7l-9 9a1.7 1.7 0 0 1-2.4-2.4l8-8" } },
+        "plus" => {
+            rsx! { line { x1: "12", y1: "5", x2: "12", y2: "19" } line { x1: "5", y1: "12", x2: "19", y2: "12" } }
+        }
+        "trash" => {
+            rsx! { polyline { points: "3 6 5 6 21 6" } path { d: "M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" } }
+        }
+        "paperclip" => {
+            rsx! { path { d: "M21 12.5l-8.5 8.5a5 5 0 0 1-7-7l9-9a3.3 3.3 0 0 1 4.7 4.7l-9 9a1.7 1.7 0 0 1-2.4-2.4l8-8" } }
+        }
         "list" => rsx! {
             polyline { points: "3 6 4 7 6 5" }
             polyline { points: "3 12 4 13 6 11" }
@@ -10122,8 +10874,12 @@ fn Icon(name: &'static str) -> Element {
             line { x1: "9", y1: "12", x2: "21", y2: "12" }
             line { x1: "9", y1: "18", x2: "21", y2: "18" }
         },
-        "target" => rsx! { circle { cx: "12", cy: "12", r: "9" } circle { cx: "12", cy: "12", r: "5" } circle { cx: "12", cy: "12", r: "1" } },
-        "clock" => rsx! { circle { cx: "12", cy: "12", r: "9" } polyline { points: "12 7 12 12 15 14" } },
+        "target" => {
+            rsx! { circle { cx: "12", cy: "12", r: "9" } circle { cx: "12", cy: "12", r: "5" } circle { cx: "12", cy: "12", r: "1" } }
+        }
+        "clock" => {
+            rsx! { circle { cx: "12", cy: "12", r: "9" } polyline { points: "12 7 12 12 15 14" } }
+        }
         "pin" => rsx! { path { d: "M9 3h6l-1 6 3 3v2h-5v5l-1 2-1-2v-5H4v-2l3-3-1-6z" } },
         "brain" => rsx! {
             line { x1: "5", y1: "19", x2: "5", y2: "14" }

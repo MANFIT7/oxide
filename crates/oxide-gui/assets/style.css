@@ -326,9 +326,23 @@ svg { width: 17px; height: 17px; flex-shrink: 0; }
 .suggestion svg { color: var(--faint); }
 
 /* ── Active chat ─────────────────────────────────────── */
-.scroll { flex: 1; overflow-y: auto; }
-.col { max-width: 760px; margin: 0 auto; padding: 26px 24px 20px; }
-.composer-dock { display: flex; flex-direction: column; align-items: center; padding: 6px 24px 18px; }
+.scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scroll-padding-bottom: 28px;
+  background: var(--bg);
+}
+.col { max-width: 760px; margin: 0 auto; padding: 26px 24px 28px; }
+.composer-dock {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  flex-shrink: 0;
+  padding: 6px 24px calc(18px + env(safe-area-inset-bottom));
+  background: var(--bg);
+}
 .composer-live-changes {
   width: 100%;
   max-width: 760px;
@@ -863,7 +877,8 @@ svg { width: 17px; height: 17px; flex-shrink: 0; }
    heavy card. The left accent + streaming pulse come from the rule lower down. */
 .thinking-box {
   max-width: 720px; margin: 3px auto 12px 40px;
-  padding: 1px 0 1px 10px; color: var(--muted);
+  padding: 3px 0 3px 10px; color: var(--muted);
+  contain: layout paint;
 }
 .thinking-sum { cursor: pointer; font-size: 12.5px; font-weight: 600; color: var(--muted); list-style: none; }
 .thinking-sum::-webkit-details-marker { display: none; }
@@ -871,6 +886,7 @@ svg { width: 17px; height: 17px; flex-shrink: 0; }
   margin-top: 4px; font-size: 12px; line-height: 1.55; color: var(--faint);
   white-space: pre-wrap; word-break: break-word;
   max-height: 200px; overflow-y: auto;
+  transform: translateZ(0);
 }
 
 /* tool / command card in chat */
@@ -2329,12 +2345,27 @@ details[open]::details-content { block-size: auto; }
   background-size: 200% 100%; animation: glass-sweep 1.2s ease-in-out infinite; }
 .typing span { display: none; }
 @keyframes glass-sweep { from { background-position: 180% 0; } to { background-position: -20% 0; } }
-/* thinking block: left border pulse, tertiary text */
-.thinking-box { border-left: 2px solid color-mix(in srgb, var(--text) 37%, transparent);
-  background: color-mix(in srgb, var(--text) 4%, transparent); border-radius: 6px; }
-.col.streaming .thinking-box { animation: think-pulse 1.5s ease-in-out infinite; }
-@keyframes think-pulse { 0%, 100% { border-left-color: color-mix(in srgb, var(--text) 30%, transparent); }
-  50% { border-left-color: color-mix(in srgb, var(--text) 60%, transparent); } }
+/* thinking block: left accent + transform-only live sheen */
+.thinking-box {
+  position: relative;
+  overflow: hidden;
+  border-left: 2px solid color-mix(in srgb, var(--text) 30%, transparent);
+  background: color-mix(in srgb, var(--text) 3.5%, transparent);
+  border-radius: 7px;
+  transition: border-color .22s ease, background .22s ease;
+}
+.thinking-box::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--text) 7%, transparent), transparent);
+  transform: translateX(-120%);
+  opacity: 0;
+}
+.col.streaming .thinking-box { border-left-color: color-mix(in srgb, var(--syn-accent) 60%, transparent); }
+.col.streaming .thinking-box::after { opacity: 1; animation: think-sheen 2.4s var(--ease-standard) infinite; }
+@keyframes think-sheen { to { transform: translateX(120%); } }
 .thinking-box .thinking-body { color: color-mix(in srgb, var(--text) 45%, transparent); }
 /* "Thought for Ns" persisted row */
 .thought-row { margin: 2px 8px 6px; }
@@ -2345,7 +2376,7 @@ details[open]::details-content { block-size: auto; }
 .thought-body { margin-top: 6px; padding: 8px 12px; color: color-mix(in srgb, var(--text) 45%, transparent);
   font-size: 13px; line-height: 1.6; border-left: 2px solid color-mix(in srgb, var(--text) 20%, transparent);
   white-space: pre-wrap; max-height: 280px; overflow-y: auto; }
-@media (prefers-reduced-motion: reduce) { .typing, .col.streaming .thinking-box { animation: none; } }
+@media (prefers-reduced-motion: reduce) { .typing, .col.streaming .thinking-box::after { animation: none; opacity: 0; } }
 
 /* env card usage row: never wrap */
 .env-card-row { white-space: nowrap; }

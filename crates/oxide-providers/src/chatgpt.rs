@@ -18,6 +18,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
 const ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
+const USAGE_ENDPOINT: &str = "https://chatgpt.com/backend-api/wham/usage";
 const DEFAULT_MODEL: &str = "gpt-5.5";
 const CONTEXT_WINDOW: u64 = 272_000;
 /// OAuth token endpoint + client id used by the codex CLI (same credentials we
@@ -59,6 +60,139 @@ fn retry_after(resp: &reqwest::Response) -> Option<u64> {
         .map(|s| s.saturating_mul(1000))
 }
 
+fn value_f64(v: &Value) -> Option<f64> {
+    v.as_f64()
+        .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
+}
+
+fn pct_u8(v: &Value) -> Option<u8> {
+    value_f64(v).map(|n| n.round().clamp(0.0, 100.0) as u8)
+}
+
+fn unix_now_s() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn reset_after_s(window: &Value) -> u64 {
+    if let Some(s) = window["reset_after_seconds"]
+        .as_u64()
+        .or_else(|| window["resets_in_seconds"].as_u64())
+        .or_else(|| window["reset_after"].as_u64())
+    {
+        return s;
+    }
+    let Some(mut at) = window["reset_at"]
+        .as_u64()
+        .or_else(|| window["reset_at_ms"].as_u64())
+        .or_else(|| window["resetAtMs"].as_u64())
+    else {
+        return 0;
+    };
+    if at > 10_000_000_000 {
+        at /= 1000;
+    }
+    at.saturating_sub(unix_now_s())
+}
+
+fn parse_usage_payload(v: &Value) -> Option<(String, u8, u8, u64, u64)> {
+    let root = if v["usage"].is_object() {
+        &v["usage"]
+    } else {
+        v
+    };
+    let rate = &root["rate_limit"];
+    let primary = &rate["primary_window"];
+    let secondary = &rate["secondary_window"];
+    let p = pct_u8(&primary["used_percent"])?;
+    let s = pct_u8(&secondary["used_percent"])?;
+    let plan = root["plan_type"]
+        .as_str()
+        .or_else(|| root["plan"].as_str())
+        .or_else(|| root["subscription_plan"].as_str())
+        .unwrap_or("")
+        .to_string();
+    Some((plan, p, s, reset_after_s(primary), reset_after_s(secondary)))
+}
+
+fn parse_usage_headers(resp: &reqwest::Response) -> Option<(String, u8, u8, u64, u64)> {
+    let h = resp.headers();
+    let hv = |k: &str| h.get(k).and_then(|v| v.to_str().ok());
+    let pct = |k: &str| {
+        hv(k)
+            .and_then(|s| s.parse::<f64>().ok())
+            .map(|n| n.round().clamp(0.0, 100.0) as u8)
+    };
+    let p = pct("x-codex-primary-used-percent")?;
+    let s = pct("x-codex-secondary-used-percent")?;
+    let plan = hv("x-codex-plan-type")
+        .or_else(|| hv("x-codex-active-limit"))
+        .unwrap_or("")
+        .to_string();
+    let resets = |k: &str| hv(k).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+    Some((
+        plan,
+        p,
+        s,
+        resets("x-codex-primary-reset-after-seconds"),
+        resets("x-codex-secondary-reset-after-seconds"),
+    ))
+}
+
+async fn send_rate_limit(
+    sink: &mpsc::Sender<StreamItem>,
+    plan: String,
+    primary_pct: u8,
+    secondary_pct: u8,
+    primary_reset_s: u64,
+    secondary_reset_s: u64,
+) -> bool {
+    sink.send(StreamItem::RateLimit {
+        plan,
+        primary_pct,
+        secondary_pct,
+        primary_reset_s,
+        secondary_reset_s,
+    })
+    .await
+    .is_ok()
+}
+
+/// Poll the ChatGPT/Codex subscription usage in the background (owned args so
+/// it can be spawned without borrowing `self`). Newer backends often omit
+/// x-codex-* headers on the Responses stream; this is the reliable fallback.
+async fn fetch_usage_snapshot(
+    client: reqwest::Client,
+    sink: mpsc::Sender<StreamItem>,
+    access: String,
+    account: String,
+) {
+    let mut req = client
+        .get(USAGE_ENDPOINT)
+        .bearer_auth(&access)
+        .header("Accept", "application/json")
+        .header("Origin", "https://chatgpt.com")
+        .header("Referer", "https://chatgpt.com/codex");
+    if !account.is_empty() {
+        req = req.header("ChatGPT-Account-Id", &account);
+    }
+    let Ok(resp) = req.send().await else {
+        return;
+    };
+    if !resp.status().is_success() {
+        return;
+    }
+    let Ok(v) = resp.json::<Value>().await else {
+        return;
+    };
+    let Some((plan, p, s, p_reset, s_reset)) = parse_usage_payload(&v) else {
+        return;
+    };
+    let _ = send_rate_limit(&sink, plan, p, s, p_reset, s_reset).await;
+}
+
 pub struct ChatGptProvider {
     client: reqwest::Client,
     auth_path: String,
@@ -90,7 +224,10 @@ impl ChatGptProvider {
             .ok_or_else(|| anyhow::anyhow!("ChatGPT subscription auth is missing access_token — run `codex login` to refresh it."))?
             .to_string();
         let acc = v["tokens"]["account_id"].as_str().unwrap_or("").to_string();
-        let refresh = v["tokens"]["refresh_token"].as_str().unwrap_or("").to_string();
+        let refresh = v["tokens"]["refresh_token"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
         Ok((at, acc, refresh))
     }
 
@@ -128,8 +265,12 @@ impl ChatGptProvider {
     /// Write refreshed tokens back to the codex auth file, preserving every other
     /// field (the file is shared with the codex CLI). Best-effort.
     fn persist_refreshed(&self, access: &str, refresh: &str) {
-        let Ok(text) = std::fs::read_to_string(&self.auth_path) else { return };
-        let Ok(mut v) = serde_json::from_str::<Value>(&text) else { return };
+        let Ok(text) = std::fs::read_to_string(&self.auth_path) else {
+            return;
+        };
+        let Ok(mut v) = serde_json::from_str::<Value>(&text) else {
+            return;
+        };
         if let Some(tokens) = v["tokens"].as_object_mut() {
             tokens.insert("access_token".into(), json!(access));
             tokens.insert("refresh_token".into(), json!(refresh));
@@ -143,6 +284,7 @@ impl ChatGptProvider {
             let _ = std::fs::write(&self.auth_path, serialized);
         }
     }
+
 }
 
 impl Default for ChatGptProvider {
@@ -209,8 +351,16 @@ fn base64_encode(data: &[u8]) -> String {
         let n = (b0 << 16) | (b1 << 8) | b2;
         out.push(T[((n >> 18) & 63) as usize] as char);
         out.push(T[((n >> 12) & 63) as usize] as char);
-        out.push(if chunk.len() > 1 { T[((n >> 6) & 63) as usize] as char } else { '=' });
-        out.push(if chunk.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            T[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[(n & 63) as usize] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -224,14 +374,23 @@ fn user_content(text_with_markers: &str, cwd: &str) -> Value {
     let mut text = segs.next().unwrap_or("").to_string();
     let mut images: Vec<Value> = Vec::new();
     for seg in segs {
-        let Some(rel) = seg.strip_prefix("wsimg:") else { continue };
+        let Some(rel) = seg.strip_prefix("wsimg:") else {
+            continue;
+        };
         let path = if rel.starts_with('/') {
             std::path::PathBuf::from(rel)
         } else {
             std::path::Path::new(cwd).join(rel)
         };
-        let Ok(bytes) = std::fs::read(&path) else { continue };
-        let mime = match path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref() {
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let mime = match path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .as_deref()
+        {
             Some("jpg") | Some("jpeg") => "image/jpeg",
             Some("gif") => "image/gif",
             Some("webp") => "image/webp",
@@ -243,9 +402,11 @@ fn user_content(text_with_markers: &str, cwd: &str) -> Value {
             "image_url": format!("data:{mime};base64,{}", base64_encode(&bytes)),
         }));
     }
-    // The image is now actually sent — drop the "(user attached … NOT visible)" note.
+    // The image is now actually sent — strip every "(user attached … NOT visible)"
+    // note so it doesn't leak into the model's context. Loop to handle multiple
+    // images (each adds its own parenthetical note).
     if !images.is_empty() {
-        if let Some(i) = text.find("(user attached ") {
+        while let Some(i) = text.find("(user attached ") {
             let end = text[i..].find(')').map(|e| i + e + 1).unwrap_or(text.len());
             text.replace_range(i..end, "");
         }
@@ -298,8 +459,16 @@ fn build_body(req: &TurnRequest) -> Value {
             }
         }
     }
-    let model = if req.model.is_empty() { DEFAULT_MODEL } else { req.model.as_str() };
-    let effort = if req.reasoning_effort.is_empty() { "medium" } else { req.reasoning_effort.as_str() };
+    let model = if req.model.is_empty() {
+        DEFAULT_MODEL
+    } else {
+        req.model.as_str()
+    };
+    let effort = if req.reasoning_effort.is_empty() {
+        "medium"
+    } else {
+        req.reasoning_effort.as_str()
+    };
     let mut body = json!({
         "model": model,
         "instructions": instructions,
@@ -377,7 +546,11 @@ fn response_tool_call(
             }
             let call_id = item["call_id"].as_str().unwrap_or("").to_string();
             let item_id = item["id"].as_str().unwrap_or("").to_string();
-            Some((vec![call_id, item_id], "shell".to_string(), json!({ "command": commands.join("\n") })))
+            Some((
+                vec![call_id, item_id],
+                "shell".to_string(),
+                json!({ "command": commands.join("\n") }),
+            ))
         }
         _ => None,
     }
@@ -404,7 +577,13 @@ async fn send_tool_call(
             sent.insert(alias);
         }
     }
-    sink.send(StreamItem::ToolCall { id, name, arguments }).await.is_ok()
+    sink.send(StreamItem::ToolCall {
+        id,
+        name,
+        arguments,
+    })
+    .await
+    .is_ok()
 }
 
 #[async_trait]
@@ -413,11 +592,7 @@ impl Provider for ChatGptProvider {
         "chatgpt"
     }
 
-    async fn stream(
-        &self,
-        req: TurnRequest,
-        sink: mpsc::Sender<StreamItem>,
-    ) -> anyhow::Result<()> {
+    async fn stream(&self, req: TurnRequest, sink: mpsc::Sender<StreamItem>) -> anyhow::Result<()> {
         let (mut access, account, refresh) = self.credentials()?;
         let chatgpt_session_id = session_id_for(&req.conversation_id);
         let body = build_body(&req);
@@ -452,7 +627,8 @@ impl Provider for ChatGptProvider {
                         continue;
                     }
                     // Transient → wait (honor retry-after) and retry.
-                    if (status.as_u16() == 429 || status.is_server_error()) && attempt < MAX_RETRIES {
+                    if (status.as_u16() == 429 || status.is_server_error()) && attempt < MAX_RETRIES
+                    {
                         let wait = retry_after(&resp).unwrap_or(500u64 << attempt);
                         attempt += 1;
                         tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
@@ -483,31 +659,34 @@ impl Provider for ChatGptProvider {
             }
         };
 
-        // Subscription rate-limit snapshot from response headers.
-        {
-            let h = resp.headers();
-            let hv = |k: &str| h.get(k).and_then(|v| v.to_str().ok());
-            let pct = |k: &str| hv(k).and_then(|s| s.parse::<u8>().ok());
-            if let (Some(p), Some(sec)) = (pct("x-codex-primary-used-percent"), pct("x-codex-secondary-used-percent")) {
-                let plan = hv("x-codex-plan-type").or_else(|| hv("x-codex-active-limit")).unwrap_or("").to_string();
-                let resets = |k: &str| hv(k).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
-                let _ = sink
-                    .send(StreamItem::RateLimit {
-                        plan,
-                        primary_pct: p,
-                        secondary_pct: sec,
-                        primary_reset_s: resets("x-codex-primary-reset-after-seconds"),
-                        secondary_reset_s: resets("x-codex-secondary-reset-after-seconds"),
-                    })
-                    .await;
-            }
+        // Rate-limit snapshot: prefer headers on the stream response (free, no
+        // extra RTT). If absent, spawn a background poll to /wham/usage so the
+        // SSE loop starts immediately instead of waiting for a second HTTP round-trip
+        // (which can add 1–2 s before the first token is visible to the user).
+        if let Some((plan, p, s, p_reset, s_reset)) = parse_usage_headers(&resp) {
+            let _ = send_rate_limit(&sink, plan, p, s, p_reset, s_reset).await;
+        } else {
+            tokio::spawn(fetch_usage_snapshot(
+                self.client.clone(),
+                sink.clone(),
+                access.clone(),
+                account.clone(),
+            ));
         }
 
         let mut stream = resp.bytes_stream().eventsource();
         let mut pending_function_args: HashMap<String, (String, String)> = HashMap::new();
         let mut sent_tools: HashSet<String> = HashSet::new();
+        // Track whether a terminal SSE event (`response.completed` /
+        // `response.incomplete`) was received. If the connection drops mid-stream
+        // the loop ends via `None` without one — we surface a truncation notice
+        // so the user knows the response was cut short.
+        let mut stream_completed = false;
         while let Some(ev) = stream.next().await {
-            let ev = ev?;
+            let ev = match ev {
+                Ok(e) => e,
+                Err(_) => break, // connection error — fall through to truncation notice
+            };
             let v: Value = match serde_json::from_str(&ev.data) {
                 Ok(v) => v,
                 Err(_) => continue,
@@ -515,12 +694,17 @@ impl Provider for ChatGptProvider {
             match v["type"].as_str() {
                 Some("response.output_text.delta") => {
                     if let Some(t) = v["delta"].as_str() {
-                        if sink.send(StreamItem::TextDelta(t.to_string())).await.is_err() {
+                        if sink
+                            .send(StreamItem::TextDelta(t.to_string()))
+                            .await
+                            .is_err()
+                        {
                             return Ok(());
                         }
                     }
                 }
-                Some("response.reasoning_summary_text.delta") | Some("response.reasoning_text.delta") => {
+                Some("response.reasoning_summary_text.delta")
+                | Some("response.reasoning_text.delta") => {
                     if let Some(t) = v["delta"].as_str() {
                         let _ = sink.send(StreamItem::ReasoningDelta(t.to_string())).await;
                     }
@@ -545,7 +729,9 @@ impl Provider for ChatGptProvider {
                     if item["type"].as_str() == Some("reasoning") {
                         let _ = sink.send(StreamItem::ReasoningItem(item.clone())).await;
                     }
-                    if let Some((ids, name, arguments)) = response_tool_call(item, &mut pending_function_args) {
+                    if let Some((ids, name, arguments)) =
+                        response_tool_call(item, &mut pending_function_args)
+                    {
                         if !send_tool_call(&sink, &mut sent_tools, ids, name, arguments).await {
                             return Ok(());
                         }
@@ -590,15 +776,22 @@ impl Provider for ChatGptProvider {
                         .send(StreamItem::Usage {
                             input: u["input_tokens"].as_u64().unwrap_or(0),
                             output: u["output_tokens"].as_u64().unwrap_or(0),
-                            context_window: Some(model_context_window(if req.model.is_empty() { DEFAULT_MODEL } else { &req.model })),
+                            context_window: Some(model_context_window(if req.model.is_empty() {
+                                DEFAULT_MODEL
+                            } else {
+                                &req.model
+                            })),
                         })
                         .await;
                     // Terminal event — stop reading. Don't keep the SSE loop alive
                     // waiting for the connection to close (that can hang the turn).
+                    stream_completed = true;
                     break;
                 }
                 Some("response.failed") => {
-                    let msg = v["response"]["error"]["message"].as_str().unwrap_or("response failed");
+                    let msg = v["response"]["error"]["message"]
+                        .as_str()
+                        .unwrap_or("response failed");
                     anyhow::bail!("ChatGPT response failed: {msg}");
                 }
                 Some("response.incomplete") => {
@@ -613,6 +806,7 @@ impl Provider for ChatGptProvider {
                             "⚠ response incomplete ({reason}) — compact context or retry with a smaller prompt."
                         )))
                         .await;
+                    stream_completed = true;
                     break;
                 }
                 // Top-level error frame (not wrapped in a response object).
@@ -625,6 +819,17 @@ impl Provider for ChatGptProvider {
                 }
                 _ => {}
             }
+        }
+        // If the loop ended without a terminal event, the connection dropped
+        // mid-stream — the response is incomplete. Notify the user so they
+        // don't mistake a truncated reply for a full one.
+        if !stream_completed {
+            let _ = sink
+                .send(StreamItem::Notice(
+                    "⚠ connection lost mid-stream — response may be truncated. Retry if needed."
+                        .into(),
+                ))
+                .await;
         }
         for (item_id, (name, raw_args)) in pending_function_args {
             // Skip buffers that never received a tool name (seeded by an
@@ -669,13 +874,13 @@ mod tests {
 
     #[test]
     fn body_uses_responses_function_tool_shape() {
-        let req = req_with_tools(vec![
-            ToolSpec::new("shell", "Run a shell command").mutating(true).params(json!({
+        let req = req_with_tools(vec![ToolSpec::new("shell", "Run a shell command")
+            .mutating(true)
+            .params(json!({
                 "type": "object",
                 "properties": { "command": { "type": "string" } },
                 "required": ["command"]
-            })),
-        ]);
+            }))]);
 
         let body = build_body(&req);
         let tool = &body["tools"][0];
@@ -693,6 +898,53 @@ mod tests {
         assert_eq!(body["reasoning"]["summary"], "auto");
         assert_eq!(body["reasoning"]["effort"], "medium");
         assert_eq!(body["store"], false);
+    }
+
+    #[test]
+    fn parses_wham_usage_payload() {
+        let payload = json!({
+            "plan_type": "pro",
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 29.4,
+                    "reset_after_seconds": 3600,
+                    "limit_window_seconds": 18000
+                },
+                "secondary_window": {
+                    "used_percent": "44.6",
+                    "reset_at": unix_now_s() + 86_400,
+                    "limit_window_seconds": 604800
+                }
+            }
+        });
+
+        let (plan, primary, secondary, primary_reset, secondary_reset) =
+            parse_usage_payload(&payload).unwrap();
+
+        assert_eq!(plan, "pro");
+        assert_eq!(primary, 29);
+        assert_eq!(secondary, 45);
+        assert_eq!(primary_reset, 3600);
+        assert!(secondary_reset <= 86_400);
+        assert!(secondary_reset > 86_300);
+    }
+
+    #[test]
+    fn parses_wrapped_usage_payload() {
+        let payload = json!({
+            "usage": {
+                "plan_type": "plus",
+                "rate_limit": {
+                    "primary_window": { "used_percent": 6, "reset_after_seconds": 120 },
+                    "secondary_window": { "used_percent": 24, "reset_after_seconds": 240 }
+                }
+            }
+        });
+
+        assert_eq!(
+            parse_usage_payload(&payload),
+            Some(("plus".into(), 6, 24, 120, 240))
+        );
     }
 
     #[test]
@@ -730,7 +982,10 @@ mod tests {
 
         let (ids, name, args) = response_tool_call(&item, &mut pending).unwrap();
 
-        assert_eq!(ids, vec!["call_shell".to_string(), "item_shell".to_string()]);
+        assert_eq!(
+            ids,
+            vec!["call_shell".to_string(), "item_shell".to_string()]
+        );
         assert_eq!(name, "shell");
         assert_eq!(args["command"], "pwd\nls -la");
     }
@@ -757,7 +1012,10 @@ mod tests {
 
     #[test]
     fn user_content_emits_input_image_and_strips_note() {
-        let img = std::env::temp_dir().join("oxide-usercontent-test.png");
+        let img = std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+            .join("target/tmp/oxide-usercontent-test.png");
+        std::fs::create_dir_all(img.parent().unwrap()).unwrap();
         std::fs::write(&img, b"\x89PNG\r\n\x1a\n").unwrap();
         let text = format!(
             "Look at this (user attached 1 image — image content is NOT visible to you; ask the user to describe it if needed)\u{2}wsimg:{}",
@@ -771,7 +1029,10 @@ mod tests {
         assert!(t.contains("Look at this"));
         assert!(!t.contains("user attached")); // note stripped now image is sent
         assert_eq!(content[1]["type"], "input_image");
-        assert!(content[1]["image_url"].as_str().unwrap().starts_with("data:image/png;base64,"));
+        assert!(content[1]["image_url"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:image/png;base64,"));
     }
 
     #[test]
