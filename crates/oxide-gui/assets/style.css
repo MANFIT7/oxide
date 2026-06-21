@@ -2184,10 +2184,10 @@ details[open]::details-content { block-size: auto; }
 .agent-tab.closing { max-width: 0; min-width: 0; padding-left: 0; padding-right: 0; opacity: 0; overflow: hidden;
   transition: max-width .15s ease, padding .15s ease, opacity .12s ease; }
 /* New tab slides in — mirror of the closing collapse (Cursor/Arc-style). */
-.agent-tab { animation: tab-in .2s cubic-bezier(.22,1,.36,1); }
+.agent-tab { animation: tab-in var(--dur-med) var(--ease-out); }
 @keyframes tab-in { from { max-width: 0; opacity: 0; transform: translateY(-3px); } to { max-width: 240px; opacity: 1; transform: none; } }
 /* Switching tabs crossfades the transcript instead of an instant swap. */
-.col { animation: col-cross .2s ease-out; }
+.col { animation: col-cross var(--dur-slow) var(--ease-standard); }
 @keyframes col-cross { from { opacity: .25; } to { opacity: 1; } }
 /* diff lines cascade in while the agent streams an edit */
 .diff-card .dl { animation: dl-in .16s ease-out both; }
@@ -2577,12 +2577,24 @@ details[open]::details-content { block-size: auto; }
 /* Per-file Revert inside the "Edited files" card (consolidates the old
    standalone diff boxes). */
 .edits-row-revert {
-  margin-left: auto; flex-shrink: 0;
+  margin-left: 6px; flex-shrink: 0;
   background: transparent; border: 1px solid var(--border); color: var(--muted);
   border-radius: 6px; padding: 2px 9px; font-size: 11px; cursor: pointer; font-family: inherit;
 }
 .edits-row-revert:hover { background: rgba(224,145,58,.12); color: var(--danger); border-color: rgba(224,145,58,.4); }
-.edits-row .diff-reverted { margin-left: auto; flex-shrink: 0; }
+/* Keep (Accept) — completes the Cursor-style accept/reject pair on each row. */
+.edits-row-keep {
+  margin-left: auto; flex-shrink: 0;
+  background: transparent; border: 1px solid rgba(58,210,159,.35); color: #3ad29f;
+  border-radius: 6px; padding: 2px 9px; font-size: 11px; cursor: pointer; font-family: inherit;
+}
+.edits-row-keep:hover { background: rgba(58,210,159,.12); border-color: rgba(58,210,159,.55); }
+.edits-row .diff-reverted, .edits-row .diff-kept { margin-left: auto; flex-shrink: 0; }
+.diff-kept { color: var(--ok); font-size: 12px; font-weight: 600; animation: popin .25s ease; }
+/* header action group: Keep all + Undo */
+.edits-actions { margin-left: auto; display: inline-flex; align-items: center; gap: 8px; }
+.edits-keepall { background: transparent; border: 1px solid rgba(58,210,159,.35); color: #3ad29f; border-radius: 8px; padding: 6px 12px; font-size: 12.5px; cursor: pointer; font-family: inherit; }
+.edits-keepall:hover { background: rgba(58,210,159,.12); border-color: rgba(58,210,159,.55); }
 
 /* Pending row in the Edited-files card (CLI mid-edit; diff lands at turn end). */
 .edits-row.pending { gap: 8px; cursor: default; }
@@ -2638,8 +2650,11 @@ details[open]::details-content { block-size: auto; }
    fade rather than snapping in. Ends at 55% alpha (not 0) so a short one-line
    reply never looks fully ghosted. Removed the instant `live` class clears. */
 .agent-md.live {
-  -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 20px), rgba(0,0,0,.55));
-  mask-image: linear-gradient(to bottom, #000 calc(100% - 20px), rgba(0,0,0,.55));
+  -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 16px), rgba(0,0,0,.62));
+  mask-image: linear-gradient(to bottom, #000 calc(100% - 16px), rgba(0,0,0,.62));
+}
+@media (prefers-reduced-motion: reduce) {
+  .agent-md.live { -webkit-mask-image: none; mask-image: none; }
 }
 
 /* Tabular numerals so counts/elapsed don't jiggle width as they tick. */

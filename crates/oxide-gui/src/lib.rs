@@ -3009,6 +3009,9 @@ fn app() -> Element {
     let mut questions = use_signal(Vec::<(u64, String, Vec<String>)>::new);
     let mut q_answer = use_signal(String::new);
     let mut reverted = use_signal(HashSet::<u64>::new);
+    // Checkpoints the user explicitly Kept (Cursor-style Accept) — clears the
+    // review affordance on that row so reviewed edits read as resolved.
+    let mut accepted = use_signal(HashSet::<u64>::new);
     // Edits made this turn: (path, adds, dels, checkpoint).
     let mut turn_edits = use_signal(Vec::<(String, u32, u32, u64, String)>::new);
     let mut todos = use_signal(Vec::<(String, String)>::new);
@@ -4309,6 +4312,7 @@ fn app() -> Element {
                                     subagent_cards.write().clear();
                                     edits_expanded.set(false);
                                 edits_undone.set(false);
+                                accepted.write().clear();
                                 think_open.set(None);
                                 timeline.write().push(TimelineItem { title: format!("Turn {turn} started"), sub: String::new() });
                             }
@@ -7048,10 +7052,17 @@ fn app() -> Element {
                                                     if *edits_undone.read() {
                                                         span { class: "edits-undone", "✓ Undone" }
                                                     } else {
-                                                        button { class: "edits-undo", onclick: move |_| {
-                                                            for (_, _, _, cp, _) in turn_edits.read().iter() { let _ = engine.send(EngineCmd::Rewind { id: *cp }); reverted.write().insert(*cp); }
-                                                            edits_undone.set(true);
-                                                        }, "Undo ↺" }
+                                                        div { class: "edits-actions",
+                                                            button { class: "edits-keepall", title: "Keep every change in this turn", onclick: move |_| {
+                                                                let cps: Vec<u64> = turn_edits.read().iter().map(|e| e.3).filter(|cp| *cp != 0).collect();
+                                                                let mut a = accepted.write();
+                                                                for cp in cps { a.insert(cp); }
+                                                            }, "Keep all ✓" }
+                                                            button { class: "edits-undo", onclick: move |_| {
+                                                                for (_, _, _, cp, _) in turn_edits.read().iter() { let _ = engine.send(EngineCmd::Rewind { id: *cp }); reverted.write().insert(*cp); }
+                                                                edits_undone.set(true);
+                                                            }, "Undo ↺" }
+                                                        }
                                                     }
                                                 }
                                                 for (path, a, d, cp, diff) in edits.iter().take(shown).cloned() {
@@ -7077,7 +7088,12 @@ fn app() -> Element {
                                                                         span { class: "edits-rowcounts", span { class: "diff-adds", "+{a}" } " " span { class: "diff-dels", "−{d}" } }
                                                                         if is_reverted {
                                                                             span { class: "diff-reverted", "✓ Reverted" }
+                                                                        } else if accepted.read().contains(&cp) {
+                                                                            span { class: "diff-kept", "✓ Kept" }
                                                                         } else if cp != 0 {
+                                                                            button { class: "edits-row-keep",
+                                                                                onclick: move |e: dioxus::prelude::MouseEvent| { e.prevent_default(); e.stop_propagation(); accepted.write().insert(cp); },
+                                                                                "Keep" }
                                                                             button { class: "edits-row-revert",
                                                                                 onclick: move |e: dioxus::prelude::MouseEvent| { e.prevent_default(); e.stop_propagation(); let _ = engine.send(EngineCmd::Rewind { id: cp }); reverted.write().insert(cp); },
                                                                                 "Revert" }
