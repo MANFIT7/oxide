@@ -34,7 +34,11 @@ impl StdioTransport {
     }
 
     /// Spawn `command args...` with optional cwd/env inherited from an existing MCP config.
-    pub fn spawn_with(command: &str, args: &[String], options: StdioSpawnOptions) -> anyhow::Result<Self> {
+    pub fn spawn_with(
+        command: &str,
+        args: &[String],
+        options: StdioSpawnOptions,
+    ) -> anyhow::Result<Self> {
         let mut cmd = tokio::process::Command::new(command);
         cmd.args(args)
             .stdin(Stdio::piped())

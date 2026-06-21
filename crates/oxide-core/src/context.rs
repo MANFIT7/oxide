@@ -148,7 +148,11 @@ mod pair_tests {
 
     fn call(id: &str) -> Message {
         let mut m = Message::new(Role::Assistant, "");
-        m.tool_call = Some(ToolCall { id: id.to_string(), name: "x".to_string(), arguments: serde_json::json!({}) });
+        m.tool_call = Some(ToolCall {
+            id: id.to_string(),
+            name: "x".to_string(),
+            arguments: serde_json::json!({}),
+        });
         m
     }
     fn result(id: &str) -> Message {

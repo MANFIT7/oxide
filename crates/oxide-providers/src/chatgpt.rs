@@ -509,7 +509,9 @@ fn parse_tool_args(raw: &str) -> Value {
 
 fn response_tool_call(
     item: &Value,
-    pending: &mut HashMap<String, (String, String)>,
+    // (name, args, call_id) — call_id seeded from output_item.added so the
+    // drain path can use the real call_id even when output_item.done omits it.
+    pending: &mut HashMap<String, (String, String, String)>,
 ) -> Option<(Vec<String>, String, Value)> {
     match item["type"].as_str()? {
         "function_call" => {
@@ -519,16 +521,30 @@ fn response_tool_call(
             } else {
                 pending.remove(&item_id)
             };
+            // Filter empty strings so we fall through to the pending fallback.
             let name = item["name"]
                 .as_str()
+                .filter(|s| !s.is_empty())
                 .map(str::to_string)
-                .or_else(|| pending_item.as_ref().map(|(name, _)| name.clone()))?;
+                .or_else(|| {
+                    pending_item
+                        .as_ref()
+                        .map(|(n, _, _)| n.clone())
+                        .filter(|n| !n.is_empty())
+                })?;
             let raw = item["arguments"]
                 .as_str()
                 .map(str::to_string)
-                .or_else(|| pending_item.map(|(_, args)| args))
+                .or_else(|| pending_item.as_ref().map(|(_, a, _)| a.clone()))
                 .unwrap_or_else(|| "{}".to_string());
-            let call_id = item["call_id"].as_str().unwrap_or("").to_string();
+            // Prefer the call_id from the done event; fall back to the one
+            // seeded at output_item.added time (stored in pending).
+            let call_id = item["call_id"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .or_else(|| pending_item.map(|(_, _, cid)| cid).filter(|s| !s.is_empty()))
+                .unwrap_or_default();
             Some((vec![call_id, item_id], name, parse_tool_args(&raw)))
         }
         "shell_call" => {
@@ -675,21 +691,33 @@ impl Provider for ChatGptProvider {
         }
 
         let mut stream = resp.bytes_stream().eventsource();
-        let mut pending_function_args: HashMap<String, (String, String)> = HashMap::new();
+        // (name, args, call_id) — all three seeded at output_item.added so the
+        // drain path after the loop uses the real call_id even when output_item.done
+        // arrives without one (or when the stream is cut before output_item.done fires).
+        let mut pending_function_args: HashMap<String, (String, String, String)> = HashMap::new();
         let mut sent_tools: HashSet<String> = HashSet::new();
-        // Track whether a terminal SSE event (`response.completed` /
-        // `response.incomplete`) was received. If the connection drops mid-stream
-        // the loop ends via `None` without one — we surface a truncation notice
-        // so the user knows the response was cut short.
+        // Track whether a terminal SSE event was received. If the loop ends via
+        // None / connection error, we surface a truncation notice so the user
+        // doesn't mistake a cut-short reply for a complete one.
         let mut stream_completed = false;
         while let Some(ev) = stream.next().await {
             let ev = match ev {
                 Ok(e) => e,
                 Err(_) => break, // connection error — fall through to truncation notice
             };
+            // Skip empty events (SSE keep-alive blank lines) and the [DONE]
+            // sentinel some endpoints append after response.completed.
+            if ev.data.is_empty() {
+                continue;
+            }
+            if ev.data.trim() == "[DONE]" {
+                // Treat [DONE] as a clean terminal signal (same as response.completed).
+                stream_completed = true;
+                break;
+            }
             let v: Value = match serde_json::from_str(&ev.data) {
                 Ok(v) => v,
-                Err(_) => continue,
+                Err(_) => continue, // non-JSON line (comment, malformed) — skip
             };
             match v["type"].as_str() {
                 Some("response.output_text.delta") => {
@@ -711,16 +739,17 @@ impl Provider for ChatGptProvider {
                 }
                 Some("response.output_item.added") => {
                     // Seed a function_call's buffer at the START so later argument
-                    // deltas have a name to attach to (and the call is known even if
-                    // only deltas — no terminal arguments — arrive).
+                    // deltas have a name to attach to (and the call_id is preserved for
+                    // the drain path even if output_item.done arrives without call_id).
                     let item = &v["item"];
                     if item["type"].as_str() == Some("function_call") {
-                        if let Some(item_id) = item["id"].as_str() {
+                        if let Some(item_id) = item["id"].as_str().filter(|s| !s.is_empty()) {
                             let name = item["name"].as_str().unwrap_or("").to_string();
                             let args = item["arguments"].as_str().unwrap_or("").to_string();
+                            let call_id = item["call_id"].as_str().unwrap_or("").to_string();
                             pending_function_args
                                 .entry(item_id.to_string())
-                                .or_insert((name, args));
+                                .or_insert((name, args, call_id));
                         }
                     }
                 }
@@ -739,12 +768,12 @@ impl Provider for ChatGptProvider {
                 }
                 Some("response.function_call_arguments.delta") => {
                     // Accumulate streamed argument JSON so the call is complete even
-                    // if the terminal `.done`/`output_item.done` omits full arguments.
+                    // if the terminal done event omits the full arguments.
                     if let Some(item_id) = v["item_id"].as_str() {
                         if let Some(delta) = v["delta"].as_str() {
                             let entry = pending_function_args
                                 .entry(item_id.to_string())
-                                .or_insert((String::new(), String::new()));
+                                .or_insert((String::new(), String::new(), String::new()));
                             entry.1.push_str(delta);
                         }
                     }
@@ -756,18 +785,14 @@ impl Provider for ChatGptProvider {
                     }
                     let entry = pending_function_args
                         .entry(item_id)
-                        .or_insert((String::new(), String::new()));
-                    if let Some(name) = v["name"].as_str() {
-                        if !name.is_empty() {
-                            entry.0 = name.to_string();
-                        }
+                        .or_insert((String::new(), String::new(), String::new()));
+                    if let Some(name) = v["name"].as_str().filter(|s| !s.is_empty()) {
+                        entry.0 = name.to_string();
                     }
                     // Prefer authoritative final arguments; otherwise keep what the
                     // deltas accumulated.
-                    if let Some(args) = v["arguments"].as_str() {
-                        if !args.is_empty() {
-                            entry.1 = args.to_string();
-                        }
+                    if let Some(args) = v["arguments"].as_str().filter(|s| !s.is_empty()) {
+                        entry.1 = args.to_string();
                     }
                 }
                 Some("response.completed") => {
@@ -831,20 +856,21 @@ impl Provider for ChatGptProvider {
                 ))
                 .await;
         }
-        for (item_id, (name, raw_args)) in pending_function_args {
+        for (item_id, (name, raw_args, call_id)) in pending_function_args {
             // Skip buffers that never received a tool name (seeded by an
             // output_item.added that never resolved) — they aren't real calls.
             if name.is_empty() {
                 continue;
             }
-            if !send_tool_call(
-                &sink,
-                &mut sent_tools,
-                vec![item_id],
-                name,
-                parse_tool_args(&raw_args),
-            )
-            .await
+            // Use the real call_id (seeded at output_item.added) so the replay
+            // correctly pairs function_call / function_call_output by call_id.
+            let ids = if call_id.is_empty() {
+                vec![item_id]
+            } else {
+                vec![call_id, item_id]
+            };
+            if !send_tool_call(&sink, &mut sent_tools, ids, name, parse_tool_args(&raw_args))
+                .await
             {
                 return Ok(());
             }
@@ -949,24 +975,52 @@ mod tests {
 
     #[test]
     fn output_item_uses_pending_function_arguments_when_needed() {
+        // call_id absent from the done event — must come from pending (seeded at added).
         let mut pending = HashMap::from([(
             "item_1".to_string(),
             (
                 "todo_write".to_string(),
                 r#"{"todos":[{"content":"Build","status":"in_progress"}]}"#.to_string(),
+                "call_seeded".to_string(), // call_id seeded at output_item.added
             ),
         )]);
         let item = json!({
             "type": "function_call",
-            "id": "item_1",
-            "call_id": "call_1"
+            "id": "item_1"
+            // call_id deliberately absent: must fall back to pending's call_id
         });
 
         let (ids, name, args) = response_tool_call(&item, &mut pending).unwrap();
 
-        assert_eq!(ids, vec!["call_1".to_string(), "item_1".to_string()]);
+        assert_eq!(ids, vec!["call_seeded".to_string(), "item_1".to_string()]);
         assert_eq!(name, "todo_write");
         assert_eq!(args["todos"][0]["content"], "Build");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn output_item_done_call_id_wins_over_pending() {
+        // call_id present in the done event: that wins, pending's is ignored.
+        let mut pending = HashMap::from([(
+            "item_2".to_string(),
+            (
+                "shell".to_string(),
+                r#"{"command":"ls"}"#.to_string(),
+                "call_old".to_string(),
+            ),
+        )]);
+        let item = json!({
+            "type": "function_call",
+            "id": "item_2",
+            "call_id": "call_new",
+            "name": "shell",
+            "arguments": r#"{"command":"ls"}"#
+        });
+
+        let (ids, name, _args) = response_tool_call(&item, &mut pending).unwrap();
+
+        assert_eq!(ids[0], "call_new");
+        assert_eq!(name, "shell");
         assert!(pending.is_empty());
     }
 

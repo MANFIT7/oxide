@@ -204,7 +204,13 @@ impl Provider for OpenAiProvider {
             let raw = tool_args.remove(&idx).unwrap_or_default();
             let arguments = serde_json::from_str(&raw).unwrap_or(Value::Object(Default::default()));
             let id = tool_ids.remove(&idx).unwrap_or_default();
-            let _ = sink.send(StreamItem::ToolCall { id, name, arguments }).await;
+            let _ = sink
+                .send(StreamItem::ToolCall {
+                    id,
+                    name,
+                    arguments,
+                })
+                .await;
         }
         let _ = sink.send(StreamItem::Done).await;
         Ok(())

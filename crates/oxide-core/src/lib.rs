@@ -14,16 +14,16 @@
 //!                  Provider (streaming)        ToolRouter ─▶ sandbox (Fase 2)
 //! ```
 
+pub mod automation;
 mod browser;
 mod commands;
 mod context;
+pub mod db;
 mod embed;
-mod index;
 mod hooks;
+mod index;
 mod memory;
 mod sandbox;
-pub mod automation;
-pub mod db;
 mod store;
 mod tools;
 pub use tools::{Routed, ToolRouter};
@@ -35,14 +35,29 @@ use oxide_config::{Config, McpEnvVar, McpServerConfig};
 /// "forget the codebase" in a fresh tab or invent a standalone solution).
 fn project_map(ws: &Path) -> String {
     const SKIP: &[&str] = &[
-        ".git", "node_modules", "target", "dist", ".next", ".oxide", "vendor",
-        "build", ".venv", "__pycache__", ".cache", "out", ".turbo", ".idea", ".vscode",
+        ".git",
+        "node_modules",
+        "target",
+        "dist",
+        ".next",
+        ".oxide",
+        "vendor",
+        "build",
+        ".venv",
+        "__pycache__",
+        ".cache",
+        "out",
+        ".turbo",
+        ".idea",
+        ".vscode",
     ];
     fn walk(dir: &Path, prefix: &str, depth: usize, count: &mut usize, out: &mut String) {
         if depth > 2 || *count > 120 {
             return;
         }
-        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
         let mut entries: Vec<(bool, String, std::path::PathBuf)> = rd
             .flatten()
             .filter_map(|e| {
@@ -86,23 +101,47 @@ fn project_map(ws: &Path) -> String {
 fn detect_stack(ws: &Path) -> Option<String> {
     if let Ok(pkg) = std::fs::read_to_string(ws.join("package.json")) {
         let p = pkg.to_lowercase();
-        let fw = if p.contains("\"next\"") { "Next.js (React)" }
-            else if p.contains("nuxt") { "Nuxt (Vue)" }
-            else if p.contains("@remix-run") { "Remix (React)" }
-            else if p.contains("svelte") { "Svelte/SvelteKit" }
-            else if p.contains("\"vue\"") { "Vue" }
-            else if p.contains("\"react\"") { "React" }
-            else if p.contains("\"vite\"") { "Vite" }
-            else if p.contains("\"express\"") { "Node/Express" }
-            else { "Node.js" };
-        let extra = if p.contains("supabase") { " + Supabase" } else { "" };
+        let fw = if p.contains("\"next\"") {
+            "Next.js (React)"
+        } else if p.contains("nuxt") {
+            "Nuxt (Vue)"
+        } else if p.contains("@remix-run") {
+            "Remix (React)"
+        } else if p.contains("svelte") {
+            "Svelte/SvelteKit"
+        } else if p.contains("\"vue\"") {
+            "Vue"
+        } else if p.contains("\"react\"") {
+            "React"
+        } else if p.contains("\"vite\"") {
+            "Vite"
+        } else if p.contains("\"express\"") {
+            "Node/Express"
+        } else {
+            "Node.js"
+        };
+        let extra = if p.contains("supabase") {
+            " + Supabase"
+        } else {
+            ""
+        };
         return Some(format!("{fw}{extra}"));
     }
-    if ws.join("Cargo.toml").exists() { return Some("Rust (Cargo)".into()); }
-    if ws.join("go.mod").exists() { return Some("Go".into()); }
-    if ws.join("pyproject.toml").exists() || ws.join("requirements.txt").exists() { return Some("Python".into()); }
-    if ws.join("pom.xml").exists() || ws.join("build.gradle").exists() { return Some("Java/JVM".into()); }
-    if ws.join("Gemfile").exists() { return Some("Ruby".into()); }
+    if ws.join("Cargo.toml").exists() {
+        return Some("Rust (Cargo)".into());
+    }
+    if ws.join("go.mod").exists() {
+        return Some("Go".into());
+    }
+    if ws.join("pyproject.toml").exists() || ws.join("requirements.txt").exists() {
+        return Some("Python".into());
+    }
+    if ws.join("pom.xml").exists() || ws.join("build.gradle").exists() {
+        return Some("Java/JVM".into());
+    }
+    if ws.join("Gemfile").exists() {
+        return Some("Ruby".into());
+    }
     None
 }
 
@@ -115,11 +154,15 @@ fn web_client() -> Option<reqwest::Client> {
         .ok()
 }
 
-
 /// Decode the few HTML entities that matter for plain-text output.
 fn html_decode(s: &str) -> String {
-    s.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
-        .replace("&quot;", "\"").replace("&#x27;", "'").replace("&#39;", "'").replace("&nbsp;", " ")
+    s.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#x27;", "'")
+        .replace("&#39;", "'")
+        .replace("&nbsp;", " ")
 }
 
 /// Strip HTML tags from a fragment, leaving text.
@@ -137,7 +180,6 @@ fn strip_tags(s: &str) -> String {
     out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-
 /// Extract text inside `marker … > BODY <end>` from `hay`, tags stripped.
 fn extract_between(hay: &str, marker: &str, end: &str) -> Option<String> {
     let i = hay.find(marker)?;
@@ -146,7 +188,11 @@ fn extract_between(hay: &str, marker: &str, end: &str) -> Option<String> {
     let body = &after[gt + 1..];
     let e = body.find(end)?;
     let t = html_decode(&strip_tags(&body[..e]));
-    if t.is_empty() { None } else { Some(t) }
+    if t.is_empty() {
+        None
+    } else {
+        Some(t)
+    }
 }
 
 /// Web search: prefer Exa (hosted MCP, keyless, returns page content), fall
@@ -156,8 +202,11 @@ async fn web_search(query: &str) -> (String, bool) {
     if q.is_empty() {
         return ("web_search: missing 'query'".into(), false);
     }
-    match exa_search(q).await {
-        Ok(text) if !text.trim().is_empty() => (text, true),
+    // Exa connects via MCP (initialize + list_tools + call_tool = up to 3×30s).
+    // Cap the whole thing so a slow/down server can't freeze the engine.
+    let exa = tokio::time::timeout(std::time::Duration::from_secs(20), exa_search(q)).await;
+    match exa {
+        Ok(Ok(text)) if !text.trim().is_empty() => (text, true),
         _ => brave_search(q).await,
     }
 }
@@ -174,7 +223,10 @@ async fn exa_search(query: &str) -> anyhow::Result<String> {
         .find(|n| n.contains("web_search") || n.contains("search"))
         .unwrap_or_else(|| "web_search_exa".to_string());
     let (text, ok) = client
-        .call_tool(&tool, &serde_json::json!({ "query": query, "numResults": 6 }))
+        .call_tool(
+            &tool,
+            &serde_json::json!({ "query": query, "numResults": 6 }),
+        )
         .await?;
     if !ok {
         anyhow::bail!("exa error");
@@ -184,10 +236,18 @@ async fn exa_search(query: &str) -> anyhow::Result<String> {
 
 /// Web search via Brave HTML (fallback). Returns ranked `title / url / snippet`.
 async fn brave_search(q: &str) -> (String, bool) {
-    let Some(client) = web_client() else { return ("web_search: client error".into(), false) };
-    let url = format!("https://search.brave.com/search?q={}&source=web", q.replace(' ', "+"));
+    let Some(client) = web_client() else {
+        return ("web_search: client error".into(), false);
+    };
+    let url = format!(
+        "https://search.brave.com/search?q={}&source=web",
+        q.replace(' ', "+")
+    );
     let html = match client.get(&url).send().await {
-        Ok(r) => match r.text().await { Ok(t) => t, Err(e) => return (format!("web_search: {e}"), false) },
+        Ok(r) => match r.text().await {
+            Ok(t) => t,
+            Err(e) => return (format!("web_search: {e}"), false),
+        },
         Err(e) => return (format!("web_search: {e}"), false),
     };
     let mut out = String::new();
@@ -196,11 +256,15 @@ async fn brave_search(q: &str) -> (String, bool) {
     // Each organic web result carries `data-type="web"`.
     while let Some(i) = rest.find("data-type=\"web\"") {
         rest = &rest[i + 15..];
-        let block_end = rest.find("data-type=\"").unwrap_or(rest.len().min(6000)).min(6000);
+        let block_end = rest
+            .find("data-type=\"")
+            .unwrap_or(rest.len().min(6000))
+            .min(6000);
         let block = &rest[..block_end];
-        let url = block
-            .find("href=\"https")
-            .and_then(|h| { let a = &block[h + 6..]; a.find('"').map(|e| a[..e].to_string()) });
+        let url = block.find("href=\"https").and_then(|h| {
+            let a = &block[h + 6..];
+            a.find('"').map(|e| a[..e].to_string())
+        });
         let Some(url) = url else { continue };
         if url.contains("search.brave.com") {
             continue;
@@ -211,7 +275,10 @@ async fn brave_search(q: &str) -> (String, bool) {
         n += 1;
         out.push_str(&format!("{n}. {title}\n   {url}\n"));
         if let Some(desc) = extract_between(block, "snippet-description", "</") {
-            out.push_str(&format!("   {}\n", desc.chars().take(240).collect::<String>()));
+            out.push_str(&format!(
+                "   {}\n",
+                desc.chars().take(240).collect::<String>()
+            ));
         }
         if n >= 8 {
             break;
@@ -229,29 +296,37 @@ async fn fetch_url(url: &str) -> (String, bool) {
     if !u.starts_with("http") {
         return ("fetch_url: url must start with http(s)".into(), false);
     }
-    let Some(client) = web_client() else { return ("fetch_url: client error".into(), false) };
+    let Some(client) = web_client() else {
+        return ("fetch_url: client error".into(), false);
+    };
     let html = match client.get(u).send().await {
-        Ok(r) => match r.text().await { Ok(t) => t, Err(e) => return (format!("fetch_url: {e}"), false) },
+        Ok(r) => match r.text().await {
+            Ok(t) => t,
+            Err(e) => return (format!("fetch_url: {e}"), false),
+        },
         Err(e) => return (format!("fetch_url: {e}"), false),
     };
-    // Drop <script>/<style> blocks, then strip tags.
-    let mut cleaned = String::with_capacity(html.len());
+    // Cap raw HTML before processing: large pages are expensive and the model
+    // only needs the first ~200 KB to get the gist.
+    let html = if html.len() > 200_000 { &html[..200_000] } else { &html };
+    // Drop <script>/<style> blocks with linear string scanning (not char-loop).
+    let mut cleaned = String::with_capacity(html.len().min(200_000));
     let lower = html.to_ascii_lowercase();
-    let mut i = 0;
-    while i < html.len() {
-        let drop = ["<script", "<style"].iter().find_map(|tag| {
-            if lower[i..].starts_with(tag) {
-                let close = if *tag == "<script" { "</script>" } else { "</style>" };
-                lower[i..].find(close).map(|e| i + e + close.len())
-            } else {
-                None
-            }
-        });
-        if let Some(end) = drop {
-            i = end;
+    let mut pos = 0usize;
+    while pos < html.len() {
+        let rest = &lower[pos..];
+        if let Some(rel) = rest.find("<script").or_else(|| rest.find("<style")) {
+            let abs = pos + rel;
+            // Flush everything before this tag.
+            cleaned.push_str(&html[pos..abs]);
+            let close = if lower[abs..].starts_with("<script") { "</script>" } else { "</style>" };
+            pos = match lower[abs..].find(close) {
+                Some(e) => abs + e + close.len(),
+                None => html.len(), // unclosed tag — skip rest
+            };
         } else {
-            cleaned.push(html[i..].chars().next().unwrap());
-            i += html[i..].chars().next().unwrap().len_utf8();
+            cleaned.push_str(&html[pos..]);
+            break;
         }
     }
     let text = html_decode(&strip_tags(&cleaned));
@@ -274,8 +349,9 @@ pub fn discover_external_mcp() -> Vec<McpServerConfig> {
 pub fn discover_external_mcp_for_workspace(workspace: &Path) -> Vec<McpServerConfig> {
     // Cache for 60s — engines respawn on every tab switch and ~/.claude.json
     // can be megabytes; no need to re-read + re-parse it each time.
-    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, (std::time::Instant, Vec<McpServerConfig>)>>> =
-        std::sync::OnceLock::new();
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<String, (std::time::Instant, Vec<McpServerConfig>)>>,
+    > = std::sync::OnceLock::new();
     let cache = CACHE.get_or_init(Default::default);
     let cache_key = workspace
         .canonicalize()
@@ -304,8 +380,14 @@ pub fn discover_external_mcp_for_workspace(workspace: &Path) -> Vec<McpServerCon
         }
     };
     for (path, source) in [
-        (home.join(".codex/config.toml"), "Codex user config".to_string()),
-        (workspace.join(".codex/config.toml"), "Codex project config".to_string()),
+        (
+            home.join(".codex/config.toml"),
+            "Codex user config".to_string(),
+        ),
+        (
+            workspace.join(".codex/config.toml"),
+            "Codex project config".to_string(),
+        ),
     ] {
         if let Ok(text) = std::fs::read_to_string(&path) {
             if let Ok(v) = toml::from_str::<toml::Value>(&text) {
@@ -344,7 +426,11 @@ fn collect_codex_mcp(value: &toml::Value, source: &str, push: &mut impl FnMut(Mc
         for (plugin, cfg) in plugins {
             if let Some(servers) = cfg.get("mcp_servers").and_then(|x| x.as_table()) {
                 for (name, entry) in servers {
-                    push(toml_mcp_server(name, entry, &format!("Codex plugin {plugin}")));
+                    push(toml_mcp_server(
+                        name,
+                        entry,
+                        &format!("Codex plugin {plugin}"),
+                    ));
                 }
             }
         }
@@ -352,13 +438,22 @@ fn collect_codex_mcp(value: &toml::Value, source: &str, push: &mut impl FnMut(Mc
 }
 
 fn toml_mcp_server(name: &str, entry: &toml::Value, source: &str) -> McpServerConfig {
-    let s = |key: &str| entry.get(key).and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let s = |key: &str| {
+        entry
+            .get(key)
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
     McpServerConfig {
         name: name.to_string(),
         command: s("command"),
         args: toml_string_array(entry.get("args")),
         url: s("url"),
-        enabled: entry.get("enabled").and_then(|x| x.as_bool()).unwrap_or(true),
+        enabled: entry
+            .get("enabled")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(true),
         source: source.to_string(),
         cwd: s("cwd"),
         env: toml_string_map(entry.get("env")),
@@ -370,11 +465,18 @@ fn toml_mcp_server(name: &str, entry: &toml::Value, source: &str) -> McpServerCo
         tool_timeout_sec: toml_u64(entry.get("tool_timeout_sec")),
         enabled_tools: toml_string_array(entry.get("enabled_tools")),
         disabled_tools: toml_string_array(entry.get("disabled_tools")),
-        required: entry.get("required").and_then(|x| x.as_bool()).unwrap_or(false),
+        required: entry
+            .get("required")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false),
     }
 }
 
-fn collect_json_mcp_servers(value: &serde_json::Value, source: &str, push: &mut impl FnMut(McpServerConfig)) {
+fn collect_json_mcp_servers(
+    value: &serde_json::Value,
+    source: &str,
+    push: &mut impl FnMut(McpServerConfig),
+) {
     if let Some(obj) = value.get("mcpServers").and_then(|x| x.as_object()) {
         for (name, entry) in obj {
             push(json_mcp_server(name, entry, source));
@@ -397,7 +499,11 @@ fn collect_json_mcp_servers(value: &serde_json::Value, source: &str, push: &mut 
     }
 }
 
-fn collect_claude_code_mcp(value: &serde_json::Value, workspace: &Path, push: &mut impl FnMut(McpServerConfig)) {
+fn collect_claude_code_mcp(
+    value: &serde_json::Value,
+    workspace: &Path,
+    push: &mut impl FnMut(McpServerConfig),
+) {
     if let Some(obj) = value.get("mcpServers").and_then(|x| x.as_object()) {
         for (name, entry) in obj {
             push(json_mcp_server(name, entry, "Claude Code"));
@@ -424,13 +530,22 @@ fn collect_claude_code_mcp(value: &serde_json::Value, workspace: &Path, push: &m
 }
 
 fn json_mcp_server(name: &str, entry: &serde_json::Value, source: &str) -> McpServerConfig {
-    let s = |key: &str| entry.get(key).and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let s = |key: &str| {
+        entry
+            .get(key)
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
     McpServerConfig {
         name: name.to_string(),
         command: s("command"),
         args: json_string_array(entry.get("args")),
         url: s("url"),
-        enabled: entry.get("enabled").and_then(|x| x.as_bool()).unwrap_or(true),
+        enabled: entry
+            .get("enabled")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(true),
         source: source.to_string(),
         cwd: s("cwd"),
         env: json_string_map(entry.get("env")),
@@ -442,21 +557,34 @@ fn json_mcp_server(name: &str, entry: &serde_json::Value, source: &str) -> McpSe
         tool_timeout_sec: json_u64(entry.get("tool_timeout_sec")),
         enabled_tools: json_string_array(entry.get("enabled_tools")),
         disabled_tools: json_string_array(entry.get("disabled_tools")),
-        required: entry.get("required").and_then(|x| x.as_bool()).unwrap_or(false),
+        required: entry
+            .get("required")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false),
     }
 }
 
 fn toml_string_array(value: Option<&toml::Value>) -> Vec<String> {
     value
         .and_then(|x| x.as_array())
-        .map(|items| items.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
 fn json_string_array(value: Option<&serde_json::Value>) -> Vec<String> {
     value
         .and_then(|x| x.as_array())
-        .map(|items| items.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -494,7 +622,11 @@ fn toml_env_vars(value: Option<&toml::Value>) -> Vec<McpEnvVar> {
                     } else {
                         item.as_table().and_then(|tbl| {
                             let name = tbl.get("name")?.as_str()?.to_string();
-                            let source = tbl.get("source").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            let source = tbl
+                                .get("source")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
                             Some(McpEnvVar::Named { name, source })
                         })
                     }
@@ -516,7 +648,11 @@ fn json_env_vars(value: Option<&serde_json::Value>) -> Vec<McpEnvVar> {
                     } else {
                         item.as_object().and_then(|obj| {
                             let name = obj.get("name")?.as_str()?.to_string();
-                            let source = obj.get("source").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            let source = obj
+                                .get("source")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
                             Some(McpEnvVar::Named { name, source })
                         })
                     }
@@ -527,7 +663,10 @@ fn json_env_vars(value: Option<&serde_json::Value>) -> Vec<McpEnvVar> {
 }
 
 fn toml_u64(value: Option<&toml::Value>) -> Option<u64> {
-    value.and_then(|x| x.as_integer()).and_then(|n| u64::try_from(n).ok()).filter(|n| *n > 0)
+    value
+        .and_then(|x| x.as_integer())
+        .and_then(|n| u64::try_from(n).ok())
+        .filter(|n| *n > 0)
 }
 
 fn json_u64(value: Option<&serde_json::Value>) -> Option<u64> {
@@ -636,7 +775,10 @@ fn keychain_password(service: &str, account: &str) -> Option<String> {
 
 #[cfg(target_os = "macos")]
 fn keychain_accounts_for_service(service: &str, server: &str) -> Vec<String> {
-    let output = std::process::Command::new("security").arg("dump-keychain").output().ok();
+    let output = std::process::Command::new("security")
+        .arg("dump-keychain")
+        .output()
+        .ok();
     let Some(output) = output.filter(|out| out.status.success()) else {
         return Vec::new();
     };
@@ -727,8 +869,14 @@ fn mcp_pool_key(server: &McpServerConfig) -> String {
         server.url.clone(),
         server.cwd.clone(),
         server.bearer_token_env_var.clone(),
-        server.startup_timeout_sec.map(|v| v.to_string()).unwrap_or_default(),
-        server.tool_timeout_sec.map(|v| v.to_string()).unwrap_or_default(),
+        server
+            .startup_timeout_sec
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
+        server
+            .tool_timeout_sec
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
     ];
     key.push(format!("{:?}", server.env));
     key.push(format!("{:?}", server.env_vars));
@@ -750,49 +898,7 @@ fn filter_mcp_tools(server: &McpServerConfig, tools: Vec<ToolSpec>) -> Vec<ToolS
         .collect()
 }
 
-fn selected_skill_routes(routes: Vec<SkillRoute>, user_text: &str) -> Vec<SkillRoute> {
-    let lower = user_text.to_ascii_lowercase();
-    routes
-        .into_iter()
-        .filter(|route| {
-            route
-                .triggers
-                .iter()
-                .any(|trigger| !trigger.trim().is_empty() && lower.contains(&trigger.to_ascii_lowercase()))
-        })
-        .take(3)
-        .collect()
-}
-
-fn workflow_title(id: &str) -> String {
-    match id {
-        "frontend" => "Frontend workflow",
-        "review" => "Review workflow",
-        "release" => "Release workflow",
-        "github-action" => "GitHub Actions workflow",
-        "browser-test" => "Browser test workflow",
-        other => other,
-    }
-    .to_string()
-}
-
-fn skill_routes_block(routes: &[SkillRoute]) -> String {
-    if routes.is_empty() {
-        return String::new();
-    }
-    let mut block = String::from("\n\n# Auto-selected workflow routes\n");
-    for route in routes {
-        block.push_str(&format!("\n## {}\n{}\n", route.id, route.instructions.trim()));
-        if !route.template.is_empty() {
-            block.push_str("Template checklist:\n");
-            for (idx, step) in route.template.iter().enumerate() {
-                block.push_str(&format!("{}. {}\n", idx + 1, step.trim()));
-            }
-        }
-    }
-    block
-}
-use oxide_harness::{Harness, Registry, SkillRoute};
+use oxide_harness::{Harness, Registry};
 use oxide_mcp::{is_mcp_tool, server_of, HttpOptions, McpClient, StdioSpawnOptions};
 use oxide_protocol::{ApprovalDecision, Event, Op, ToolSpec, TurnId};
 use oxide_providers::{Message, Provider, Role, StreamItem, TurnRequest};
@@ -855,7 +961,13 @@ pub fn spawn(config: Config) -> anyhow::Result<(EngineHandle, mpsc::Receiver<Eve
         .resume_path
         .as_deref()
         .map(|p| p.display().to_string())
-        .or_else(|| if config.resume { SessionStore::latest(&workspace) } else { None });
+        .or_else(|| {
+            if config.resume {
+                SessionStore::latest(&workspace)
+            } else {
+                None
+            }
+        });
     if let Some(id) = &resume_id {
         if let Ok(msgs) = SessionStore::load(id) {
             history = msgs
@@ -873,7 +985,10 @@ pub fn spawn(config: Config) -> anyhow::Result<(EngineHandle, mpsc::Receiver<Eve
         let attached = resume_id
             .as_deref()
             .and_then(|id| SessionStore::attach(id, &workspace).ok());
-        match attached.map(Ok).unwrap_or_else(|| SessionStore::open(&workspace)) {
+        match attached
+            .map(Ok)
+            .unwrap_or_else(|| SessionStore::open(&workspace))
+        {
             Ok(s) => {
                 // Stamp the provider (sidebar logos); applied now if the row
                 // exists, else carried to the first append.
@@ -1072,7 +1187,11 @@ fn worker_profile_system_block(profile: &WorkerProfile, exposed_tools: usize) ->
 
 fn subagent_profile_for(task: &str, provider: &str, effort: &str) -> WorkerProfile {
     let lower = task.to_ascii_lowercase();
-    if lower.contains("test") || lower.contains("verify") || lower.contains("lint") || lower.contains("build") {
+    if lower.contains("test")
+        || lower.contains("verify")
+        || lower.contains("lint")
+        || lower.contains("build")
+    {
         WorkerProfile {
             id: "tester".to_string(),
             provider: provider.to_string(),
@@ -1084,7 +1203,11 @@ fn subagent_profile_for(task: &str, provider: &str, effort: &str) -> WorkerProfi
             ].into_iter().map(String::from).collect(),
             max_steps: 12,
         }
-    } else if lower.contains("review") || lower.contains("audit") || lower.contains("risk") || lower.contains("risiko") {
+    } else if lower.contains("review")
+        || lower.contains("audit")
+        || lower.contains("risk")
+        || lower.contains("risiko")
+    {
         WorkerProfile {
             id: "reviewer".to_string(),
             provider: provider.to_string(),
@@ -1096,7 +1219,11 @@ fn subagent_profile_for(task: &str, provider: &str, effort: &str) -> WorkerProfi
                 .collect(),
             max_steps: 12,
         }
-    } else if lower.contains("inspect") || lower.contains("explore") || lower.contains("find") || lower.contains("research") {
+    } else if lower.contains("inspect")
+        || lower.contains("explore")
+        || lower.contains("find")
+        || lower.contains("research")
+    {
         WorkerProfile {
             id: "explorer".to_string(),
             provider: provider.to_string(),
@@ -1155,7 +1282,14 @@ impl Engine {
         .await;
     }
 
-    async fn emit_tool_end(&self, turn: TurnId, call_id: String, tool: String, output: String, ok: bool) {
+    async fn emit_tool_end(
+        &self,
+        turn: TurnId,
+        call_id: String,
+        tool: String,
+        output: String,
+        ok: bool,
+    ) {
         let status = if ok { "done" } else { "failed" };
         self.emit_audit(
             Some(turn),
@@ -1165,7 +1299,14 @@ impl Engine {
             status,
         )
         .await;
-        self.emit(Event::ToolCallEnd { turn, call_id, tool, output, ok }).await;
+        self.emit(Event::ToolCallEnd {
+            turn,
+            call_id,
+            tool,
+            output,
+            ok,
+        })
+        .await;
     }
 
     fn active_harness(&self) -> &dyn Harness {
@@ -1213,17 +1354,27 @@ impl Engine {
         tools.push(ToolSpec::new("browser_navigate", "Open a URL in the automation browser; returns the page title and visible text.")
             .mutating(true)
             .params(serde_json::json!({"type":"object","properties":{"url":{"type":"string"}},"required":["url"]})));
-        tools.push(ToolSpec::new("browser_read", "Read the current page's visible text (innerText).")
-            .params(serde_json::json!({"type":"object","properties":{}})));
+        tools.push(
+            ToolSpec::new(
+                "browser_read",
+                "Read the current page's visible text (innerText).",
+            )
+            .params(serde_json::json!({"type":"object","properties":{}})),
+        );
         tools.push(ToolSpec::new("browser_click", "Click the first element matching a CSS selector.")
             .mutating(true)
             .params(serde_json::json!({"type":"object","properties":{"selector":{"type":"string"}},"required":["selector"]})));
         tools.push(ToolSpec::new("browser_type", "Type text into the element matching a CSS selector.")
             .mutating(true)
             .params(serde_json::json!({"type":"object","properties":{"selector":{"type":"string"},"text":{"type":"string"}},"required":["selector","text"]})));
-        tools.push(ToolSpec::new("browser_screenshot", "Capture a PNG screenshot of the current page to .oxide/screenshots.")
+        tools.push(
+            ToolSpec::new(
+                "browser_screenshot",
+                "Capture a PNG screenshot of the current page to .oxide/screenshots.",
+            )
             .mutating(true)
-            .params(serde_json::json!({"type":"object","properties":{}})));
+            .params(serde_json::json!({"type":"object","properties":{}})),
+        );
         tools.push(ToolSpec::new("browser_eval", "Run JavaScript in the page and return the JSON result.")
             .mutating(true)
             .params(serde_json::json!({"type":"object","properties":{"script":{"type":"string"}},"required":["script"]})));
@@ -1271,17 +1422,30 @@ impl Engine {
         if self.browser.is_none() {
             match browser::BrowserSession::launch(self.config.browser_headless).await {
                 Ok(s) => self.browser = Some(s),
-                Err(e) => return Err(format!("browser launch failed: {e} (is a Chromium-based browser installed?)")),
+                Err(e) => {
+                    return Err(format!(
+                        "browser launch failed: {e} (is a Chromium-based browser installed?)"
+                    ))
+                }
             }
         }
         Ok(self.browser.as_ref().unwrap())
     }
 
     /// Handle a `browser_*` tool. Returns Some((output, ok)) if it was one.
-    async fn handle_browser_tool(&mut self, name: &str, args: &serde_json::Value) -> Option<(String, bool)> {
+    async fn handle_browser_tool(
+        &mut self,
+        name: &str,
+        args: &serde_json::Value,
+    ) -> Option<(String, bool)> {
         if !matches!(
             name,
-            "browser_navigate" | "browser_read" | "browser_click" | "browser_type" | "browser_screenshot" | "browser_eval"
+            "browser_navigate"
+                | "browser_read"
+                | "browser_click"
+                | "browser_type"
+                | "browser_screenshot"
+                | "browser_eval"
         ) {
             return None;
         }
@@ -1291,18 +1455,26 @@ impl Engine {
             Err(e) => return Some((e, false)),
         };
         let sa = |k: &str| args[k].as_str().unwrap_or("").to_string();
-        let res = match name {
-            "browser_navigate" => sess.navigate(&sa("url")).await,
-            "browser_read" => sess.read_text().await,
-            "browser_click" => sess.click(&sa("selector")).await,
-            "browser_type" => sess.type_text(&sa("selector"), &sa("text")).await,
-            "browser_screenshot" => sess.screenshot(&shots_dir).await,
-            "browser_eval" => sess.eval(&sa("script")).await,
-            _ => return Some((format!("unknown browser tool {name}"), false)),
+        // Each browser operation gets a hard outer cap so a stalled CDP call
+        // (hung navigation, click on a removed element, etc.) can't freeze the
+        // engine. The per-navigate timeout in browser.rs covers most hangs, but
+        // screenshot and eval can also block on heavy pages.
+        let op_future = async {
+            match name {
+                "browser_navigate" => sess.navigate(&sa("url")).await,
+                "browser_read" => sess.read_text().await,
+                "browser_click" => sess.click(&sa("selector")).await,
+                "browser_type" => sess.type_text(&sa("selector"), &sa("text")).await,
+                "browser_screenshot" => sess.screenshot(&shots_dir).await,
+                "browser_eval" => sess.eval(&sa("script")).await,
+                _ => Err(anyhow::anyhow!("unknown browser tool {name}")),
+            }
         };
+        let res = tokio::time::timeout(std::time::Duration::from_secs(45), op_future).await;
         Some(match res {
-            Ok(out) => (out, true),
-            Err(e) => (format!("browser error: {e}"), false),
+            Ok(Ok(out)) => (out, true),
+            Ok(Err(e)) => (format!("browser error: {e}"), false),
+            Err(_) => (format!("browser timeout after 45s — page may be slow or stalled"), false),
         })
     }
 
@@ -1313,22 +1485,32 @@ impl Engine {
         // Process-wide pool of live MCP connections, keyed by server config.
         // Tab switches respawn the engine; without this every switch paid the
         // full reconnect (npx cold start) for every server.
-        type Pool = std::collections::HashMap<String, (std::sync::Arc<McpClient>, Vec<oxide_protocol::ToolSpec>)>;
+        type Pool = std::collections::HashMap<
+            String,
+            (std::sync::Arc<McpClient>, Vec<oxide_protocol::ToolSpec>),
+        >;
         static MCP_POOL: std::sync::OnceLock<tokio::sync::Mutex<Pool>> = std::sync::OnceLock::new();
         let pool = MCP_POOL.get_or_init(Default::default);
 
         self.required_mcp_unavailable = false;
         let servers = self.config.mcp_servers.clone();
-        let configured_names: HashSet<String> = servers.iter().map(|server| server.name.clone()).collect();
+        let configured_names: HashSet<String> =
+            servers.iter().map(|server| server.name.clone()).collect();
         for ext in discover_external_mcp_for_workspace(&self.workspace) {
             if !configured_names.contains(&ext.name) {
-                let source = if ext.source.is_empty() { "external config" } else { ext.source.as_str() };
+                let source = if ext.source.is_empty() {
+                    "external config"
+                } else {
+                    ext.source.as_str()
+                };
                 self.emit(Event::McpServerStatus {
                     name: ext.name.clone(),
                     status: "untrusted".to_string(),
                     tool_count: 0,
                     tools: Vec::new(),
-                    detail: format!("detected from {source}; add/trust it in MCP settings to connect"),
+                    detail: format!(
+                        "detected from {source}; add/trust it in MCP settings to connect"
+                    ),
                 })
                 .await;
             }
@@ -1363,7 +1545,8 @@ impl Engine {
                                 &srv.name,
                                 &srv.url,
                                 mcp_http_options(&srv),
-                            ).await?
+                            )
+                            .await?
                         } else {
                             let cwd = if srv.cwd.trim().is_empty() {
                                 None
@@ -1377,23 +1560,33 @@ impl Engine {
                                 StdioSpawnOptions {
                                     cwd,
                                     env: srv.env.clone(),
-                                    env_vars: srv.env_vars.iter().map(|env| env.name().to_string()).collect(),
+                                    env_vars: srv
+                                        .env_vars
+                                        .iter()
+                                        .map(|env| env.name().to_string())
+                                        .collect(),
                                     request_timeout: duration_secs(srv.tool_timeout_sec, 60),
                                 },
-                            ).await?
+                            )
+                            .await?
                         };
                         let tools = filter_mcp_tools(&srv, client.list_tools().await?);
                         Ok::<_, anyhow::Error>((std::sync::Arc::new(client), tools))
                     };
-                    let res = match tokio::time::timeout(duration_secs(srv.startup_timeout_sec, 15), fut).await {
-                        Ok(r) => r,
-                        Err(_) => Err(anyhow::anyhow!(
-                            "timed out after {}s",
-                            duration_secs(srv.startup_timeout_sec, 15).as_secs()
-                        )),
-                    };
+                    let res =
+                        match tokio::time::timeout(duration_secs(srv.startup_timeout_sec, 15), fut)
+                            .await
+                        {
+                            Ok(r) => r,
+                            Err(_) => Err(anyhow::anyhow!(
+                                "timed out after {}s",
+                                duration_secs(srv.startup_timeout_sec, 15).as_secs()
+                            )),
+                        };
                     if let Ok((client, tools)) = &res {
-                        pool.lock().await.insert(key, (client.clone(), tools.clone()));
+                        pool.lock()
+                            .await
+                            .insert(key, (client.clone(), tools.clone()));
                     }
                     (srv, res)
                 }
@@ -1406,24 +1599,22 @@ impl Engine {
                 (t, instructions)
             }) {
                 Ok((tools, instructions)) => {
-                    {
-                        let tool_names = tools.iter().map(|tool| tool.name.clone()).collect();
-                        self.emit(Event::McpServerStatus {
-                            name: srv.name.clone(),
-                            status: "connected".to_string(),
-                            tool_count: tools.len(),
-                            tools: tool_names,
-                            detail: "tools/list succeeded".to_string(),
-                        })
-                        .await;
-                        self.emit(Event::Info {
-                            text: format!("mcp '{}' connected: {} tool(s)", srv.name, tools.len()),
-                        })
-                        .await;
-                        self.mcp_tools.extend(tools);
-                        if !instructions.trim().is_empty() {
-                            self.mcp_instructions.push((srv.name.clone(), instructions));
-                        }
+                    let tool_names = tools.iter().map(|tool| tool.name.clone()).collect();
+                    self.emit(Event::McpServerStatus {
+                        name: srv.name.clone(),
+                        status: "connected".to_string(),
+                        tool_count: tools.len(),
+                        tools: tool_names,
+                        detail: "tools/list succeeded".to_string(),
+                    })
+                    .await;
+                    self.emit(Event::Info {
+                        text: format!("mcp '{}' connected: {} tool(s)", srv.name, tools.len()),
+                    })
+                    .await;
+                    self.mcp_tools.extend(tools);
+                    if !instructions.trim().is_empty() {
+                        self.mcp_instructions.push((srv.name.clone(), instructions));
                     }
                 }
                 Err(e) => {
@@ -1455,7 +1646,8 @@ impl Engine {
     /// blocked (non-zero exit). Payload JSON is passed via `$OXIDE_HOOK_PAYLOAD`.
     async fn fire_hooks(&self, event: &str, matcher: &str, payload: serde_json::Value) -> bool {
         let hooks = hooks::Hooks::load(&self.workspace);
-        self.fire_hook_commands(&hooks, event, matcher, payload).await
+        self.fire_hook_commands(&hooks, event, matcher, payload)
+            .await
     }
 
     async fn fire_hook_commands(
@@ -1469,7 +1661,10 @@ impl Engine {
         let audit_turn = payload.get("turn").and_then(|v| v.as_u64()).map(TurnId);
         for hook in hooks.commands_for(event, matcher) {
             if !hook.status_message.is_empty() {
-                self.emit(Event::Info { text: hook.status_message.clone() }).await;
+                self.emit(Event::Info {
+                    text: hook.status_message.clone(),
+                })
+                .await;
             }
             if hook.background {
                 let command = hook.command.clone();
@@ -1480,19 +1675,35 @@ impl Engine {
                 let timeout = hook.timeout;
                 let event_tx = self.event_tx.clone();
                 tokio::spawn(async move {
-                    let ok = run_hook_command(&workspace, &command, &event_name, &matcher, payload, timeout).await;
-                    let _ = event_tx.send(Event::AuditLog {
-                        turn: audit_turn,
-                        kind: "hook".to_string(),
-                        title: format!("Hook {event_name}"),
-                        detail: command.clone(),
-                        status: if ok { "done".to_string() } else { "failed".to_string() },
-                    }).await;
-                    let _ = event_tx.send(Event::HookFired {
-                        hook: event_name,
-                        command,
-                        blocked: false,
-                    }).await;
+                    let ok = run_hook_command(
+                        &workspace,
+                        &command,
+                        &event_name,
+                        &matcher,
+                        payload,
+                        timeout,
+                    )
+                    .await;
+                    let _ = event_tx
+                        .send(Event::AuditLog {
+                            turn: audit_turn,
+                            kind: "hook".to_string(),
+                            title: format!("Hook {event_name}"),
+                            detail: command.clone(),
+                            status: if ok {
+                                "done".to_string()
+                            } else {
+                                "failed".to_string()
+                            },
+                        })
+                        .await;
+                    let _ = event_tx
+                        .send(Event::HookFired {
+                            hook: event_name,
+                            command,
+                            blocked: false,
+                        })
+                        .await;
                 });
                 self.emit_audit(
                     audit_turn,
@@ -1510,9 +1721,16 @@ impl Engine {
                 .await;
                 continue;
             }
-            let fut = hook_command(&self.workspace, &hook.command, event, matcher, payload.clone());
+            let fut = hook_command(
+                &self.workspace,
+                &hook.command,
+                event,
+                matcher,
+                payload.clone(),
+            );
             // A hook must never wedge the agent — bound it, then kill on drop.
-            let status = tokio::time::timeout(std::time::Duration::from_secs(hook.timeout), fut).await;
+            let status =
+                tokio::time::timeout(std::time::Duration::from_secs(hook.timeout), fut).await;
             let ok = matches!(&status, Ok(Ok(o)) if o.status.success());
             let this_blocked = event == "pre_tool" && !ok;
             if this_blocked {
@@ -1523,7 +1741,13 @@ impl Engine {
                 "hook",
                 format!("Hook {event}"),
                 hook.command.clone(),
-                if this_blocked { "blocked" } else if ok { "done" } else { "failed" },
+                if this_blocked {
+                    "blocked"
+                } else if ok {
+                    "done"
+                } else {
+                    "failed"
+                },
             )
             .await;
             self.emit(Event::HookFired {
@@ -1546,7 +1770,8 @@ impl Engine {
             "user_text": user_text,
         });
         self.run_auto_lint(&hooks, turn).await;
-        self.write_turn_summary(&hooks, turn, user_text, interrupted).await;
+        self.write_turn_summary(&hooks, turn, user_text, interrupted)
+            .await;
         self.fire_hook_commands(&hooks, "stop", "", payload).await;
     }
 
@@ -1562,8 +1787,18 @@ impl Engine {
         } else {
             hooks.auto().lint_command.clone()
         };
-        self.emit(Event::Info { text: format!("auto-lint: {command}") }).await;
-        self.emit_audit(Some(turn), "lint", "Auto lint started", command.clone(), "running").await;
+        self.emit(Event::Info {
+            text: format!("auto-lint: {command}"),
+        })
+        .await;
+        self.emit_audit(
+            Some(turn),
+            "lint",
+            "Auto lint started",
+            command.clone(),
+            "running",
+        )
+        .await;
         let fut = tokio::process::Command::new("/bin/sh")
             .arg("-c")
             .arg(&command)
@@ -1572,13 +1807,33 @@ impl Engine {
         let out = match tokio::time::timeout(std::time::Duration::from_secs(180), fut).await {
             Ok(Ok(output)) => output,
             Ok(Err(err)) => {
-                self.emit_audit(Some(turn), "lint", "Auto lint failed", err.to_string(), "failed").await;
-                self.emit(Event::Error { message: format!("auto-lint spawn failed: {err}") }).await;
+                self.emit_audit(
+                    Some(turn),
+                    "lint",
+                    "Auto lint failed",
+                    err.to_string(),
+                    "failed",
+                )
+                .await;
+                self.emit(Event::Error {
+                    message: format!("auto-lint spawn failed: {err}"),
+                })
+                .await;
                 return;
             }
             Err(_) => {
-                self.emit_audit(Some(turn), "lint", "Auto lint timed out", "after 180s", "failed").await;
-                self.emit(Event::Error { message: "auto-lint timed out after 180s".into() }).await;
+                self.emit_audit(
+                    Some(turn),
+                    "lint",
+                    "Auto lint timed out",
+                    "after 180s",
+                    "failed",
+                )
+                .await;
+                self.emit(Event::Error {
+                    message: "auto-lint timed out after 180s".into(),
+                })
+                .await;
                 return;
             }
         };
@@ -1586,12 +1841,27 @@ impl Engine {
         text.push_str(&String::from_utf8_lossy(&out.stderr));
         let text: String = text.trim().chars().take(4000).collect();
         if out.status.success() {
-            self.emit_audit(Some(turn), "lint", "Auto lint passed", command, "done").await;
-            self.emit(Event::Info { text: "auto-lint passed".into() }).await;
+            self.emit_audit(Some(turn), "lint", "Auto lint passed", command, "done")
+                .await;
+            self.emit(Event::Info {
+                text: "auto-lint passed".into(),
+            })
+            .await;
         } else {
-            self.emit_audit(Some(turn), "lint", "Auto lint failed", text.clone(), "failed").await;
+            self.emit_audit(
+                Some(turn),
+                "lint",
+                "Auto lint failed",
+                text.clone(),
+                "failed",
+            )
+            .await;
             self.emit(Event::Error {
-                message: if text.is_empty() { "auto-lint failed".into() } else { format!("auto-lint failed:\n{text}") },
+                message: if text.is_empty() {
+                    "auto-lint failed".into()
+                } else {
+                    format!("auto-lint failed:\n{text}")
+                },
             })
             .await;
         }
@@ -1610,13 +1880,22 @@ impl Engine {
         }
     }
 
-    async fn write_turn_summary(&self, hooks: &hooks::Hooks, turn: TurnId, user_text: &str, interrupted: bool) {
+    async fn write_turn_summary(
+        &self,
+        hooks: &hooks::Hooks,
+        turn: TurnId,
+        user_text: &str,
+        interrupted: bool,
+    ) {
         if !hooks.auto().summarize {
             return;
         }
         let dir = self.workspace.join(".oxide/turn-summaries");
         if let Err(err) = std::fs::create_dir_all(&dir) {
-            self.emit(Event::Error { message: format!("turn summary mkdir failed: {err}") }).await;
+            self.emit(Event::Error {
+                message: format!("turn summary mkdir failed: {err}"),
+            })
+            .await;
             return;
         }
         let now = std::time::SystemTime::now()
@@ -1639,8 +1918,18 @@ impl Engine {
         );
         let path = dir.join(format!("turn-{}-{now}.md", turn.0));
         match std::fs::write(&path, body) {
-            Ok(()) => self.emit(Event::Info { text: format!("turn summary saved: {}", path.display()) }).await,
-            Err(err) => self.emit(Event::Error { message: format!("turn summary write failed: {err}") }).await,
+            Ok(()) => {
+                self.emit(Event::Info {
+                    text: format!("turn summary saved: {}", path.display()),
+                })
+                .await
+            }
+            Err(err) => {
+                self.emit(Event::Error {
+                    message: format!("turn summary write failed: {err}"),
+                })
+                .await
+            }
         }
     }
 
@@ -1652,7 +1941,10 @@ impl Engine {
         assistant_text: &str,
         edited_paths: &[String],
     ) {
-        if !matches!(source_provider, "codex" | "claude" | "claude_interactive") || edited_paths.is_empty() || assistant_text.trim().is_empty() {
+        if !matches!(source_provider, "codex" | "claude" | "claude_interactive")
+            || edited_paths.is_empty()
+            || assistant_text.trim().is_empty()
+        {
             return;
         }
 
@@ -1660,13 +1952,22 @@ impl Engine {
             Some(turn),
             "memory",
             "CLI self-improvement",
-            format!("Analyzing {} edited path(s) for durable learning", edited_paths.len()),
+            format!(
+                "Analyzing {} edited path(s) for durable learning",
+                edited_paths.len()
+            ),
             "running",
-        ).await;
+        )
+        .await;
 
         let memory_store = memory::Memory::new(&self.workspace);
         let existing_memory = compact_chars(&memory_store.load_block(), 4000);
-        let edited = edited_paths.iter().take(20).map(|path| format!("- {path}")).collect::<Vec<_>>().join("\n");
+        let edited = edited_paths
+            .iter()
+            .take(20)
+            .map(|path| format!("- {path}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let system = "\
 You are Oxide's post-turn self-improvement bridge for native CLI providers.
 Inspect one completed coding-agent turn and decide whether anything durable should be stored in project memory.
@@ -1691,7 +1992,10 @@ Rules:
             model: String::new(),
             reasoning_effort: "low".to_string(),
             temperature: 0.0,
-            messages: vec![Message::new(Role::System, system.to_string()), Message::new(Role::User, user)],
+            messages: vec![
+                Message::new(Role::System, system.to_string()),
+                Message::new(Role::User, user),
+            ],
             tools: Vec::new(),
             cwd: self.workspace.display().to_string(),
             conversation_id: self
@@ -1705,11 +2009,25 @@ Rules:
         let raw = match collect_provider_text_silent("chatgpt", req).await {
             Ok(text) if !text.trim().is_empty() => text,
             Ok(_) => {
-                self.emit_audit(Some(turn), "memory", "CLI self-improvement skipped", "empty bridge response", "skipped").await;
+                self.emit_audit(
+                    Some(turn),
+                    "memory",
+                    "CLI self-improvement skipped",
+                    "empty bridge response",
+                    "skipped",
+                )
+                .await;
                 return;
             }
             Err(err) => {
-                self.emit_audit(Some(turn), "memory", "CLI self-improvement unavailable", err, "skipped").await;
+                self.emit_audit(
+                    Some(turn),
+                    "memory",
+                    "CLI self-improvement unavailable",
+                    err,
+                    "skipped",
+                )
+                .await;
                 return;
             }
         };
@@ -1721,7 +2039,8 @@ Rules:
                 "CLI self-improvement parse failed",
                 compact_chars(raw.trim(), 1200),
                 "failed",
-            ).await;
+            )
+            .await;
             return;
         };
 
@@ -1731,7 +2050,10 @@ Rules:
         let mut errors = Vec::new();
         for fact in capture.facts.into_iter().take(3) {
             let fact = clean_memory_fact(&fact);
-            if fact.is_empty() || looks_like_secret(&fact) || existing_lower.contains(&fact.to_ascii_lowercase()) {
+            if fact.is_empty()
+                || looks_like_secret(&fact)
+                || existing_lower.contains(&fact.to_ascii_lowercase())
+            {
                 continue;
             }
             match memory_store.remember(&fact) {
@@ -1752,9 +2074,23 @@ Rules:
         }
 
         if !errors.is_empty() {
-            self.emit_audit(Some(turn), "memory", "CLI self-improvement save failed", errors.join("\n"), "failed").await;
+            self.emit_audit(
+                Some(turn),
+                "memory",
+                "CLI self-improvement save failed",
+                errors.join("\n"),
+                "failed",
+            )
+            .await;
         } else if saved_facts == 0 && saved_skills == 0 {
-            self.emit_audit(Some(turn), "memory", "CLI self-improvement skipped", "no durable learning selected", "skipped").await;
+            self.emit_audit(
+                Some(turn),
+                "memory",
+                "CLI self-improvement skipped",
+                "no durable learning selected",
+                "skipped",
+            )
+            .await;
         } else {
             self.emit_audit(
                 Some(turn),
@@ -1762,7 +2098,8 @@ Rules:
                 "CLI self-improvement saved",
                 format!("facts: {saved_facts}, skills: {saved_skills}"),
                 "done",
-            ).await;
+            )
+            .await;
         }
     }
 
@@ -1789,7 +2126,10 @@ Rules:
         if let Some(store) = &self.session_store {
             // Tell the UI exactly which file this engine writes, so a tab binds
             // to its OWN transcript (newest-file guessing mixes tabs up).
-            self.emit(Event::SessionPath { path: store.path_str() }).await;
+            self.emit(Event::SessionPath {
+                path: store.path_str(),
+            })
+            .await;
             let resumed = if self.session.is_empty() {
                 String::new()
             } else {
@@ -1834,7 +2174,10 @@ Rules:
                         full.extend(msgs.iter().cloned());
                         let _ = store.rewrite(&full);
                     }
-                    self.emit(Event::Info { text: "history trimmed".into() }).await;
+                    self.emit(Event::Info {
+                        text: "history trimmed".into(),
+                    })
+                    .await;
                 }
                 Op::Shutdown => break,
             }
@@ -1871,7 +2214,11 @@ Rules:
         let budget = (self.budget() / 2).max(20_000);
         let dropped = context::compact(&mut self.session, budget, KEEP_RECENT);
         if dropped > 0 {
-            self.emit(Event::Compacted { dropped, tokens: context::estimate_tokens(&self.session) }).await;
+            self.emit(Event::Compacted {
+                dropped,
+                tokens: context::estimate_tokens(&self.session),
+            })
+            .await;
         }
     }
 
@@ -1915,7 +2262,11 @@ Rules:
         }
         // 1. Prune old tool outputs first (cheap, preserves the dialogue).
         if self.prune_tool_outputs() && context::estimate_tokens(&self.session) <= budget {
-            self.emit(Event::Compacted { dropped: 0, tokens: context::estimate_tokens(&self.session) }).await;
+            self.emit(Event::Compacted {
+                dropped: 0,
+                tokens: context::estimate_tokens(&self.session),
+            })
+            .await;
             return;
         }
         const KEEP_RECENT: usize = 8;
@@ -1923,7 +2274,11 @@ Rules:
             // Too short to summarize usefully — fall back to a hard trim.
             let dropped = context::compact(&mut self.session, budget, KEEP_RECENT);
             if dropped > 0 {
-                self.emit(Event::Compacted { dropped, tokens: context::estimate_tokens(&self.session) }).await;
+                self.emit(Event::Compacted {
+                    dropped,
+                    tokens: context::estimate_tokens(&self.session),
+                })
+                .await;
             }
             return;
         }
@@ -1934,17 +2289,31 @@ Rules:
             .map(|m| format!("{:?}: {}", m.role, m.content))
             .collect::<Vec<_>>()
             .join("\n\n");
-        self.emit(Event::Info { text: format!("compacting context ({} earlier messages)…", old.len()) }).await;
+        self.emit(Event::Info {
+            text: format!("compacting context ({} earlier messages)…", old.len()),
+        })
+        .await;
         let provider = self.config.provider.clone();
         let effort = self.config.reasoning_effort.clone();
         let sys = "You compress conversation history. Summarize the earlier conversation below into a concise but COMPLETE brief that lets the assistant continue seamlessly. Preserve: the user's goal/task, decisions made, files created/edited (with paths), commands run and key results, current state, and open TODOs. Terse bullet points. Output only the summary.";
-        let summary = self.stream_collect(&provider, sys, &blob, &effort, turn, false, true).await;
+        let summary = self
+            .stream_collect(&provider, sys, &blob, &effort, turn, false, true)
+            .await;
         let summary = if summary.trim().is_empty() {
-            format!("(summary unavailable; {} earlier messages folded)", old.len())
+            format!(
+                "(summary unavailable; {} earlier messages folded)",
+                old.len()
+            )
         } else {
             summary
         };
-        self.session.insert(0, Message::new(Role::Assistant, format!("## Summary of earlier conversation\n{summary}")));
+        self.session.insert(
+            0,
+            Message::new(
+                Role::Assistant,
+                format!("## Summary of earlier conversation\n{summary}"),
+            ),
+        );
         if let Some(store) = &self.session_store {
             let _ = store.append("summary", &summary);
         }
@@ -1979,8 +2348,12 @@ Rules:
             ],
             tools: vec![],
             cwd: self.workspace.display().to_string(),
-                conversation_id: self.session_store.as_ref().map(|s| s.id.clone()).unwrap_or_default(),
-                cli_resume: None,
+            conversation_id: self
+                .session_store
+                .as_ref()
+                .map(|s| s.id.clone())
+                .unwrap_or_default(),
+            cli_resume: None,
         };
         let (tx, mut rx) = mpsc::channel::<StreamItem>(STREAM_QUEUE);
         let provider = oxide_providers::build(provider_id);
@@ -2018,14 +2391,36 @@ Rules:
                 StreamItem::Notice(text) => {
                     self.emit(Event::Info { text }).await;
                 }
-                StreamItem::Usage { input, output, context_window } => {
-                    self.emit(Event::TokensUsed { turn, input, output }).await;
+                StreamItem::Usage {
+                    input,
+                    output,
+                    context_window,
+                } => {
+                    self.emit(Event::TokensUsed {
+                        turn,
+                        input,
+                        output,
+                    })
+                    .await;
                     if let Some(limit) = context_window {
                         self.emit(Event::ContextWindow { limit }).await;
                     }
                 }
-                StreamItem::RateLimit { plan, primary_pct, secondary_pct, primary_reset_s, secondary_reset_s } => {
-                    self.emit(Event::RateLimit { plan, primary_pct, secondary_pct, primary_reset_s, secondary_reset_s }).await;
+                StreamItem::RateLimit {
+                    plan,
+                    primary_pct,
+                    secondary_pct,
+                    primary_reset_s,
+                    secondary_reset_s,
+                } => {
+                    self.emit(Event::RateLimit {
+                        plan,
+                        primary_pct,
+                        secondary_pct,
+                        primary_reset_s,
+                        secondary_reset_s,
+                    })
+                    .await;
                 }
                 StreamItem::CommandStarted { .. }
                 | StreamItem::CommandOutput { .. }
@@ -2039,9 +2434,15 @@ Rules:
             }
         }
         if timed_out {
-            self.emit(Event::Error { message: format!("{provider_id}: stream timed out") }).await;
+            self.emit(Event::Error {
+                message: format!("{provider_id}: stream timed out"),
+            })
+            .await;
         } else if let Ok(Err(e)) = task.await {
-            self.emit(Event::Error { message: e.to_string() }).await;
+            self.emit(Event::Error {
+                message: e.to_string(),
+            })
+            .await;
         }
         out
     }
@@ -2101,9 +2502,15 @@ Rules:
             cfg.provider = profile.provider.clone();
             cfg.effective_model()
         });
-        let max_steps = profile.max_steps.min(policy.max_steps as usize).clamp(1, 24);
+        let max_steps = profile
+            .max_steps
+            .min(policy.max_steps as usize)
+            .clamp(1, 24);
         let tools = self.tools_for_worker_profile(&profile);
-        let cli_driver = matches!(profile.provider.as_str(), "codex" | "claude" | "claude_interactive");
+        let cli_driver = matches!(
+            profile.provider.as_str(),
+            "codex" | "claude" | "claude_interactive"
+        );
         let worker_system = format!(
             "{system}\n\n{}",
             worker_profile_system_block(&profile, tools.len())
@@ -2171,7 +2578,7 @@ Rules:
                                 );
                                 msg.reasoning_item = pending_reasoning.take();
                                 self.session.push(msg);
-	                                if self.handle_tool_call(turn, name, arguments, id, Some(worker_id), op_rx).await {
+                                    if self.handle_tool_call(turn, name, arguments, id, Some(worker_id), op_rx).await {
                                     interrupted = true;
                                     break;
                                 }
@@ -2185,40 +2592,40 @@ Rules:
                                     self.emit(Event::FileDiff { turn, path: rel, diff, checkpoint: 0 }).await;
                                 }
                             }
-	                            Some(StreamItem::Notice(text)) => {
-	                                self.emit(Event::Info { text }).await;
-	                            }
-	                            Some(StreamItem::CommandStarted { id, command, cwd, background }) => {
-	                                self.emit(Event::CommandStarted {
-	                                    turn,
-	                                    command_id: id,
-	                                    worker_id: Some(worker_id.to_string()),
-	                                    command,
-	                                    cwd: if cwd.is_empty() { self.workspace.display().to_string() } else { cwd },
-	                                    background,
-	                                }).await;
-	                            }
-	                            Some(StreamItem::CommandOutput { id, stream, chunk }) => {
-	                                self.emit(Event::CommandOutput {
-	                                    turn,
-	                                    command_id: id,
-	                                    worker_id: Some(worker_id.to_string()),
-	                                    stream,
-	                                    chunk,
-	                                }).await;
-	                            }
-	                            Some(StreamItem::CommandFinished { id, ok, exit_code, duration_ms }) => {
-	                                self.emit(Event::CommandFinished {
-	                                    turn,
-	                                    command_id: id,
-	                                    worker_id: Some(worker_id.to_string()),
-	                                    ok,
-	                                    exit_code,
-	                                    duration_ms,
-	                                }).await;
-	                            }
-	                            Some(StreamItem::Usage { input, output, context_window }) => {
-	                                self.emit(Event::TokensUsed { turn, input, output }).await;
+                                Some(StreamItem::Notice(text)) => {
+                                    self.emit(Event::Info { text }).await;
+                                }
+                                Some(StreamItem::CommandStarted { id, command, cwd, background }) => {
+                                    self.emit(Event::CommandStarted {
+                                        turn,
+                                        command_id: id,
+                                        worker_id: Some(worker_id.to_string()),
+                                        command,
+                                        cwd: if cwd.is_empty() { self.workspace.display().to_string() } else { cwd },
+                                        background,
+                                    }).await;
+                                }
+                                Some(StreamItem::CommandOutput { id, stream, chunk }) => {
+                                    self.emit(Event::CommandOutput {
+                                        turn,
+                                        command_id: id,
+                                        worker_id: Some(worker_id.to_string()),
+                                        stream,
+                                        chunk,
+                                    }).await;
+                                }
+                                Some(StreamItem::CommandFinished { id, ok, exit_code, duration_ms }) => {
+                                    self.emit(Event::CommandFinished {
+                                        turn,
+                                        command_id: id,
+                                        worker_id: Some(worker_id.to_string()),
+                                        ok,
+                                        exit_code,
+                                        duration_ms,
+                                    }).await;
+                                }
+                                Some(StreamItem::Usage { input, output, context_window }) => {
+                                    self.emit(Event::TokensUsed { turn, input, output }).await;
                                 if let Some(limit) = context_window {
                                     self.ctx_window = Some(limit);
                                     self.emit(Event::ContextWindow { limit }).await;
@@ -2260,19 +2667,32 @@ Rules:
                 stream_task.abort();
                 None
             } else {
-                stream_task.await.ok().and_then(|r| r.err()).map(|e| e.to_string())
+                stream_task
+                    .await
+                    .ok()
+                    .and_then(|r| r.err())
+                    .map(|e| e.to_string())
             };
             if let Some(err) = &stream_err {
                 let low = err.to_lowercase();
-                let overflow = low.contains("context") || low.contains("exceeds") || low.contains("too long")
-                    || low.contains("maximum") || (low.contains("token") && low.contains("limit"));
+                let overflow = low.contains("context")
+                    || low.contains("exceeds")
+                    || low.contains("too long")
+                    || low.contains("maximum")
+                    || (low.contains("token") && low.contains("limit"));
                 if overflow && round_text.is_empty() && overflow_retries < 2 {
                     overflow_retries += 1;
                     self.force_compact(turn).await;
-                    self.emit(Event::Info { text: "⚠ worker context full — compacted, retrying".into() }).await;
+                    self.emit(Event::Info {
+                        text: "⚠ worker context full — compacted, retrying".into(),
+                    })
+                    .await;
                     continue;
                 }
-                self.emit(Event::Error { message: err.clone() }).await;
+                self.emit(Event::Error {
+                    message: err.clone(),
+                })
+                .await;
             }
             if !round_text.is_empty() {
                 let mut msg = Message::new(Role::Assistant, round_text);
@@ -2313,9 +2733,11 @@ Reply with text only: summarize what you changed, what you verified, and what re
                 let mut checkpoint = 0u64;
                 if let Some(tree) = &cli_baseline {
                     let prior = tokio::process::Command::new("git")
-                        .arg("-C").arg(&self.workspace)
+                        .arg("-C")
+                        .arg(&self.workspace)
                         .args(["cat-file", "-p", &format!("{tree}:{rel}")])
-                        .output().await
+                        .output()
+                        .await
                         .ok()
                         .filter(|o| o.status.success())
                         .map(|o| o.stdout);
@@ -2328,9 +2750,21 @@ Reply with text only: summarize what you changed, what you verified, and what re
                     })
                     .await;
                 }
-                self.emit(Event::FileDiff { turn, path: rel, diff, checkpoint }).await;
+                self.emit(Event::FileDiff {
+                    turn,
+                    path: rel,
+                    diff,
+                    checkpoint,
+                })
+                .await;
             } else {
-                self.emit(Event::FileDiff { turn, path: rel, diff: String::new(), checkpoint: 0 }).await;
+                self.emit(Event::FileDiff {
+                    turn,
+                    path: rel,
+                    diff: String::new(),
+                    checkpoint: 0,
+                })
+                .await;
             }
         }
 
@@ -2346,7 +2780,10 @@ Reply with text only: summarize what you changed, what you verified, and what re
         self.last_tool_reps = saved_last_tool_reps;
 
         if interrupted {
-            self.emit(Event::Info { text: "worker interrupted".into() }).await;
+            self.emit(Event::Info {
+                text: "worker interrupted".into(),
+            })
+            .await;
         }
 
         if cli_driver && !interrupted {
@@ -2405,11 +2842,17 @@ Reply with text only: summarize what you changed, what you verified, and what re
         let user_text = if user_text.trim_start().starts_with('/') {
             match commands::expand(&self.workspace, &user_text) {
                 Some(expanded) => {
-                    self.emit(Event::Info { text: format!("▷ ran command {}", user_text.trim()) }).await;
+                    self.emit(Event::Info {
+                        text: format!("▷ ran command {}", user_text.trim()),
+                    })
+                    .await;
                     expanded
                 }
                 None => {
-                    self.emit(Event::Info { text: format!("unknown command: {}", user_text.trim()) }).await;
+                    self.emit(Event::Info {
+                        text: format!("unknown command: {}", user_text.trim()),
+                    })
+                    .await;
                     user_text
                 }
             }
@@ -2432,7 +2875,8 @@ Treat the following as the only current, top-priority instruction:]\n\n{user_tex
             user_text
         };
 
-        self.session.push(Message::new(Role::User, user_text.clone()));
+        self.session
+            .push(Message::new(Role::User, user_text.clone()));
         if let Some(store) = &self.session_store {
             let _ = store.append("user", &user_text);
         }
@@ -2469,7 +2913,9 @@ Treat the following as the only current, top-priority instruction:]\n\n{user_tex
         if !map.trim().is_empty() {
             sys.push_str("\n\n# Project structure (shallow)\n```\n");
             sys.push_str(map.trim_end());
-            sys.push_str("\n```\nWork within this existing structure; place new code where it belongs.");
+            sys.push_str(
+                "\n```\nWork within this existing structure; place new code where it belongs.",
+            );
         }
         // SOUL.md — persistent persona/identity (hermes-style), loaded first so
         // it frames everything. Lives in the workspace (or .oxide/) and can be
@@ -2489,29 +2935,6 @@ Treat the following as the only current, top-priority instruction:]\n\n{user_tex
         if let Some(agents) = load_project_instructions(&self.workspace) {
             sys.push_str("\n\n# Project instructions (AGENTS.md)\n");
             sys.push_str(&agents);
-        }
-        let selected_routes = selected_skill_routes(harness.skill_routes(), &user_text);
-        for route in &selected_routes {
-            let title = workflow_title(&route.id);
-            self.emit(Event::WorkflowSelected {
-                turn,
-                id: route.id.clone(),
-                title: title.clone(),
-                steps: route.template.clone(),
-            })
-            .await;
-            self.emit_audit(
-                Some(turn),
-                "workflow",
-                title,
-                route.template.join("\n"),
-                "selected",
-            )
-            .await;
-        }
-        let route_block = skill_routes_block(&selected_routes);
-        if !route_block.is_empty() {
-            sys.push_str(&route_block);
         }
         sys.push_str(
             "\n\n# Diagrams\n\
@@ -2544,7 +2967,10 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
             let front = self.config.front_provider.clone();
             let backend = self.config.backend_provider.clone();
             let effort = self.config.reasoning_effort.clone();
-            self.emit(Event::Info { text: format!("🧭 Planning · front: {front}") }).await;
+            self.emit(Event::Info {
+                text: format!("🧭 Planning · front: {front}"),
+            })
+            .await;
             let plan = self
                 .stream_collect(
                     &front,
@@ -2563,16 +2989,25 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                     .lines()
                     .map(|l| l.trim())
                     .filter(|l| {
-                        l.starts_with(|c: char| c.is_ascii_digit()) || l.starts_with('-') || l.starts_with('*')
+                        l.starts_with(|c: char| c.is_ascii_digit())
+                            || l.starts_with('-')
+                            || l.starts_with('*')
                     })
-                    .map(|l| l.trim_start_matches(|c: char| c.is_ascii_digit() || matches!(c, '.' | ')' | '-' | '*' | ' ')).to_string())
+                    .map(|l| {
+                        l.trim_start_matches(|c: char| {
+                            c.is_ascii_digit() || matches!(c, '.' | ')' | '-' | '*' | ' ')
+                        })
+                        .to_string()
+                    })
                     .filter(|l| !l.is_empty())
                     .take(6)
                     .collect();
 
                 if subtasks.is_empty() {
                     // No clear steps — fall back to a single implementer.
-                    let isys = format!("You are the implementer. Carry out this plan precisely.\n\nPLAN:\n{plan}");
+                    let isys = format!(
+                        "You are the implementer. Carry out this plan precisely.\n\nPLAN:\n{plan}"
+                    );
                     let worker_sys = format!("{sys}\n\n# Orchestration role\n{isys}");
                     let worker_id = format!("orchestrate-implement-{}", turn.0);
                     let (out, was_interrupted) = self
@@ -2589,10 +3024,14 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                     interrupted |= was_interrupted;
                 } else {
                     self.emit(Event::Info {
-                        text: format!("🤖 Running {} tool-capable sub-agents · backend: {backend}", subtasks.len()),
+                        text: format!(
+                            "🤖 Running {} tool-capable sub-agents · backend: {backend}",
+                            subtasks.len()
+                        ),
                     })
                     .await;
-                    let mut results: Vec<(usize, String, String)> = Vec::with_capacity(subtasks.len());
+                    let mut results: Vec<(usize, String, String)> =
+                        Vec::with_capacity(subtasks.len());
                     for (i, st) in subtasks.iter().enumerate() {
                         let profile = subagent_profile_for(st, &backend, &effort);
                         let profile_id = profile.id.clone();
@@ -2611,7 +3050,13 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                         }
                     }
                     for (i, st, _) in &results {
-                        self.emit(Event::Info { text: format!("✓ sub-agent {i}: {}", st.chars().take(60).collect::<String>()) }).await;
+                        self.emit(Event::Info {
+                            text: format!(
+                                "✓ sub-agent {i}: {}",
+                                st.chars().take(60).collect::<String>()
+                            ),
+                        })
+                        .await;
                     }
                     let joined: String = results
                         .iter()
@@ -2622,15 +3067,23 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                         assistant = joined;
                     } else {
                         // Synthesize sub-agent outputs into the final answer.
-                        self.emit(Event::Info { text: format!("🧩 Synthesizing · front: {front}") }).await;
+                        self.emit(Event::Info {
+                            text: format!("🧩 Synthesizing · front: {front}"),
+                        })
+                        .await;
                         let ssys = format!(
                             "You are the lead. Combine the sub-agent results into one coherent final answer for the user. Resolve overlaps, note anything incomplete.\n\nSUB-AGENT RESULTS:\n{joined}"
                         );
-                        assistant = self.stream_collect(&front, &ssys, &user_text, &effort, turn, false, false).await;
+                        assistant = self
+                            .stream_collect(&front, &ssys, &user_text, &effort, turn, false, false)
+                            .await;
                     }
                 }
             } else {
-                self.emit(Event::Info { text: format!("⚙ Implementing · backend: {backend}") }).await;
+                self.emit(Event::Info {
+                    text: format!("⚙ Implementing · backend: {backend}"),
+                })
+                .await;
                 let isys = format!(
                     "You are the implementer. Carry out the following plan precisely to fulfil the user's request — do the actual work, edits and commands.\n\nPLAN:\n{plan}"
                 );
@@ -2657,7 +3110,10 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                     }
                     self.session.push(Message::new(Role::Assistant, assistant));
                 }
-                self.emit(Event::Info { text: "turn interrupted".into() }).await;
+                self.emit(Event::Info {
+                    text: "turn interrupted".into(),
+                })
+                .await;
                 self.run_stop_lifecycle(turn, &user_text, true).await;
                 self.emit(Event::TurnFinished { turn }).await;
                 return;
@@ -2672,9 +3128,18 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                         break;
                     };
                     self.turn_edited = false;
-                    self.emit(Event::Info { text: format!("🧪 Auto-verify failed · fixing {verify_iter}/2 · backend: {backend}") }).await;
+                    self.emit(Event::Info {
+                        text: format!(
+                            "🧪 Auto-verify failed · fixing {verify_iter}/2 · backend: {backend}"
+                        ),
+                    })
+                    .await;
                     let header = format!("\n\n— 🧪 Auto-verify fix {verify_iter} —\n");
-                    self.emit(Event::AgentMessageDelta { turn, text: header.clone() }).await;
+                    self.emit(Event::AgentMessageDelta {
+                        turn,
+                        text: header.clone(),
+                    })
+                    .await;
                     assistant.push_str(&header);
                     let vsys = format!(
                         "{sys}\n\n# Verification fix\nA build/typecheck failed after the backend work. Fix the diagnostics below with tools, then summarize what changed. Do not just explain.\n\nPLAN:\n{plan}\n\nWORK SO FAR:\n{assistant}\n\nVERIFY FAILURE:\n{report}"
@@ -2702,7 +3167,10 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
             }
 
             if interrupted {
-                self.emit(Event::Info { text: "turn interrupted".into() }).await;
+                self.emit(Event::Info {
+                    text: "turn interrupted".into(),
+                })
+                .await;
                 if !assistant.is_empty() {
                     if let Some(store) = &self.session_store {
                         let _ = store.append("assistant", &assistant);
@@ -2718,29 +3186,52 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
             let max_iters: u32 = 3;
             let mut iter: u32 = 0;
             loop {
-                self.emit(Event::Info { text: format!("🔍 Reviewing · front: {front}") }).await;
+                self.emit(Event::Info {
+                    text: format!("🔍 Reviewing · front: {front}"),
+                })
+                .await;
                 let vsys = format!(
                     "You are the reviewer. Verify whether the implementation fulfils the user's request. On the FIRST line reply with exactly `DONE` if it is fully complete and correct, otherwise reply `GAPS` and then list the specific remaining gaps. Be concise.\n\nPLAN:\n{plan}\n\nRESULT SO FAR:\n{assistant}"
                 );
                 // Review shows in the thinking box (orchestrator's verification).
-                let review = self.stream_collect(&front, &vsys, &user_text, &effort, turn, true, false).await;
+                let review = self
+                    .stream_collect(&front, &vsys, &user_text, &effort, turn, true, false)
+                    .await;
                 let up = review.trim_start().to_ascii_uppercase();
-                let has_gaps = up.starts_with("GAPS") || (up.contains("GAP") && !up.starts_with("DONE"));
+                let has_gaps =
+                    up.starts_with("GAPS") || (up.contains("GAP") && !up.starts_with("DONE"));
                 if !has_gaps {
-                    self.emit(Event::Info { text: "✓ Review passed".to_string() }).await;
+                    self.emit(Event::Info {
+                        text: "✓ Review passed".to_string(),
+                    })
+                    .await;
                     break;
                 }
                 iter += 1;
                 if iter >= max_iters {
-                    self.emit(Event::Info { text: format!("⚠ Gaps remain after {max_iters} fixes") }).await;
+                    self.emit(Event::Info {
+                        text: format!("⚠ Gaps remain after {max_iters} fixes"),
+                    })
+                    .await;
                     let note = format!("\n\n— ⚠ Remaining gaps —\n{}", review.trim());
-                    self.emit(Event::AgentMessageDelta { turn, text: note.clone() }).await;
+                    self.emit(Event::AgentMessageDelta {
+                        turn,
+                        text: note.clone(),
+                    })
+                    .await;
                     assistant.push_str(&note);
                     break;
                 }
-                self.emit(Event::Info { text: format!("🔁 Fixing gaps · iteration {iter} · backend: {backend}") }).await;
+                self.emit(Event::Info {
+                    text: format!("🔁 Fixing gaps · iteration {iter} · backend: {backend}"),
+                })
+                .await;
                 let header = format!("\n\n— 🔁 Revision {iter} —\n");
-                self.emit(Event::AgentMessageDelta { turn, text: header.clone() }).await;
+                self.emit(Event::AgentMessageDelta {
+                    turn,
+                    text: header.clone(),
+                })
+                .await;
                 assistant.push_str(&header);
                 let fsys = format!(
                     "You are the implementer. Fix the gaps the reviewer found — make the actual edits/commands. Do not redo what already works.\n\nPLAN:\n{plan}\n\nGAPS TO FIX:\n{review}\n\nWORK SO FAR:\n{assistant}"
@@ -2765,7 +3256,10 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
             }
 
             if interrupted {
-                self.emit(Event::Info { text: "turn interrupted".into() }).await;
+                self.emit(Event::Info {
+                    text: "turn interrupted".into(),
+                })
+                .await;
             }
             if !assistant.is_empty() {
                 if let Some(store) = &self.session_store {
@@ -2791,9 +3285,16 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
         // CLI drivers (codex/claude) are self-agentic: they run their own tool
         // loop, so Oxide's nudge/wrap-up/auto-verify rounds would just respawn
         // the CLI with an out-of-context reminder as the whole prompt.
-        let cli_driver = matches!(self.config.provider.as_str(), "codex" | "claude" | "claude_interactive");
+        let cli_driver = matches!(
+            self.config.provider.as_str(),
+            "codex" | "claude" | "claude_interactive"
+        );
         let mut nudges = 0u8;
         let mut memory_nudged = false;
+        // True once ANY tool call fires in this turn — used to decide whether
+        // the nudge makes sense for API providers. For a pure text turn the
+        // nudge produces a visible second reply rather than driving more work.
+        let mut turn_had_tool = false;
         // Files a CLI driver reported changing — diffed + shown at turn end.
         let mut cli_changed: Vec<String> = Vec::new();
         // Git baseline tree of the workspace BEFORE the CLI runs, so its edits
@@ -2826,10 +3327,17 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                 messages: msgs,
                 tools: tools.clone(),
                 cwd: self.workspace.display().to_string(),
-                conversation_id: self.session_store.as_ref().map(|s| s.id.clone()).unwrap_or_default(),
+                conversation_id: self
+                    .session_store
+                    .as_ref()
+                    .map(|s| s.id.clone())
+                    .unwrap_or_default(),
                 // Seed the native CLI session id (if linked on a prior run) so a
                 // resume after restart reattaches instead of starting fresh.
-                cli_resume: self.session_store.as_ref().and_then(|s| db::cli_session(&s.id)),
+                cli_resume: self
+                    .session_store
+                    .as_ref()
+                    .and_then(|s| db::cli_session(&s.id)),
             };
 
             let (stream_tx, mut stream_rx) = mpsc::channel::<StreamItem>(STREAM_QUEUE);
@@ -2861,6 +3369,7 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                             }
                             Some(StreamItem::ToolCall { id, name, arguments }) => {
                                 did_tool = true;
+                                turn_had_tool = true;
                                 // Record the assistant's tool call structurally so the model
                                 // sees a real function_call/tool_use (with id) on replay — not
                                 // flattened text. This is what stops the re-plan/re-read loop.
@@ -2873,7 +3382,7 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                                 // of thought instead of re-thinking every round.
                                 msg.reasoning_item = pending_reasoning.take();
                                 self.session.push(msg);
-	                                if self.handle_tool_call(turn, name, arguments, id, None, op_rx).await {
+                                    if self.handle_tool_call(turn, name, arguments, id, None, op_rx).await {
                                     interrupted = true;
                                     break;
                                 }
@@ -2891,40 +3400,40 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                                     self.emit(Event::FileDiff { turn, path: rel, diff, checkpoint: 0 }).await;
                                 }
                             }
-	                            Some(StreamItem::Notice(text)) => {
-	                                self.emit(Event::Info { text }).await;
-	                            }
-	                            Some(StreamItem::CommandStarted { id, command, cwd, background }) => {
-	                                self.emit(Event::CommandStarted {
-	                                    turn,
-	                                    command_id: id,
-	                                    worker_id: None,
-	                                    command,
-	                                    cwd: if cwd.is_empty() { self.workspace.display().to_string() } else { cwd },
-	                                    background,
-	                                }).await;
-	                            }
-	                            Some(StreamItem::CommandOutput { id, stream, chunk }) => {
-	                                self.emit(Event::CommandOutput {
-	                                    turn,
-	                                    command_id: id,
-	                                    worker_id: None,
-	                                    stream,
-	                                    chunk,
-	                                }).await;
-	                            }
-	                            Some(StreamItem::CommandFinished { id, ok, exit_code, duration_ms }) => {
-	                                self.emit(Event::CommandFinished {
-	                                    turn,
-	                                    command_id: id,
-	                                    worker_id: None,
-	                                    ok,
-	                                    exit_code,
-	                                    duration_ms,
-	                                }).await;
-	                            }
-	                            Some(StreamItem::Usage { input, output, context_window }) => {
-	                                self.emit(Event::TokensUsed { turn, input, output }).await;
+                                Some(StreamItem::Notice(text)) => {
+                                    self.emit(Event::Info { text }).await;
+                                }
+                                Some(StreamItem::CommandStarted { id, command, cwd, background }) => {
+                                    self.emit(Event::CommandStarted {
+                                        turn,
+                                        command_id: id,
+                                        worker_id: None,
+                                        command,
+                                        cwd: if cwd.is_empty() { self.workspace.display().to_string() } else { cwd },
+                                        background,
+                                    }).await;
+                                }
+                                Some(StreamItem::CommandOutput { id, stream, chunk }) => {
+                                    self.emit(Event::CommandOutput {
+                                        turn,
+                                        command_id: id,
+                                        worker_id: None,
+                                        stream,
+                                        chunk,
+                                    }).await;
+                                }
+                                Some(StreamItem::CommandFinished { id, ok, exit_code, duration_ms }) => {
+                                    self.emit(Event::CommandFinished {
+                                        turn,
+                                        command_id: id,
+                                        worker_id: None,
+                                        ok,
+                                        exit_code,
+                                        duration_ms,
+                                    }).await;
+                                }
+                                Some(StreamItem::Usage { input, output, context_window }) => {
+                                    self.emit(Event::TokensUsed { turn, input, output }).await;
                                 if let Some(limit) = context_window {
                                     self.ctx_window = Some(limit);
                                     self.emit(Event::ContextWindow { limit }).await;
@@ -2979,19 +3488,32 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                 stream_task.abort();
                 None
             } else {
-                stream_task.await.ok().and_then(|r| r.err()).map(|e| e.to_string())
+                stream_task
+                    .await
+                    .ok()
+                    .and_then(|r| r.err())
+                    .map(|e| e.to_string())
             };
             if let Some(err) = &stream_err {
                 let low = err.to_lowercase();
-                let overflow = low.contains("context") || low.contains("exceeds") || low.contains("too long")
-                    || low.contains("maximum") || (low.contains("token") && low.contains("limit"));
+                let overflow = low.contains("context")
+                    || low.contains("exceeds")
+                    || low.contains("too long")
+                    || low.contains("maximum")
+                    || (low.contains("token") && low.contains("limit"));
                 if overflow && round_text.is_empty() && overflow_retries < 3 {
                     overflow_retries += 1;
                     self.force_compact(turn).await;
-                    self.emit(Event::Info { text: "⚠ context full — compacted, retrying".into() }).await;
+                    self.emit(Event::Info {
+                        text: "⚠ context full — compacted, retrying".into(),
+                    })
+                    .await;
                     continue;
                 }
-                self.emit(Event::Error { message: err.clone() }).await;
+                self.emit(Event::Error {
+                    message: err.clone(),
+                })
+                .await;
             }
             if !round_text.is_empty() {
                 assistant.push_str(&round_text);
@@ -3027,7 +3549,10 @@ any remaining tasks and the recommended next step.\n</system-reminder>"));
             if !did_tool && !steered {
                 // The model produced prose but took no action. If it likely owes
                 // an edit, nudge it once to actually do the work before ending.
-                if nudges < 1 {
+                // For non-CLI API providers skip the nudge when no tool was called
+                // anywhere in this turn: the response is conversational, and a
+                // nudge produces a second visible reply rather than driving action.
+                if nudges < 1 && (cli_driver || turn_had_tool) {
                     nudges += 1;
                     self.session.push(Message::new(Role::User,
                         "<system-reminder>\nYou stopped, but the task may not be fully done. Check honestly:\n\
@@ -3064,7 +3589,10 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
             }
         }
         if interrupted {
-            self.emit(Event::Info { text: "turn interrupted".into() }).await;
+            self.emit(Event::Info {
+                text: "turn interrupted".into(),
+            })
+            .await;
         }
         // CLI drivers edit inside their own process — reconstruct the diffs from
         // git at turn end so the UI gets the same per-file cards + summary.
@@ -3081,9 +3609,11 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
                 let mut checkpoint = 0u64;
                 if let Some(tree) = &cli_baseline {
                     let prior = tokio::process::Command::new("git")
-                        .arg("-C").arg(&self.workspace)
+                        .arg("-C")
+                        .arg(&self.workspace)
                         .args(["cat-file", "-p", &format!("{tree}:{rel}")])
-                        .output().await
+                        .output()
+                        .await
                         .ok()
                         .filter(|o| o.status.success())
                         .map(|o| o.stdout);
@@ -3096,12 +3626,24 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
                     })
                     .await;
                 }
-                self.emit(Event::FileDiff { turn, path: rel, diff, checkpoint }).await;
+                self.emit(Event::FileDiff {
+                    turn,
+                    path: rel,
+                    diff,
+                    checkpoint,
+                })
+                .await;
             } else {
                 // Touched but no textual change (identical write / already
                 // committed). Emit an EMPTY FileDiff so the frontend can clear
                 // its pending "editing…" row instead of spinning forever.
-                self.emit(Event::FileDiff { turn, path: rel, diff: String::new(), checkpoint: 0 }).await;
+                self.emit(Event::FileDiff {
+                    turn,
+                    path: rel,
+                    diff: String::new(),
+                    checkpoint: 0,
+                })
+                .await;
             }
         }
         if cli_driver && !interrupted {
@@ -3120,12 +3662,23 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
         // Context-aware follow-up suggestions, generated off-turn on the fast
         // lane. CLI drivers are skipped (a cold CLI spawn for 3 chips isn't
         // worth the cost) — the UI keeps its heuristic chips there.
-        if !interrupted && !matches!(self.config.provider.as_str(), "codex" | "claude" | "claude_interactive" | "echo") {
-            let last_user = self.session.iter().rev()
+        if !interrupted
+            && !matches!(
+                self.config.provider.as_str(),
+                "codex" | "claude" | "claude_interactive" | "echo"
+            )
+        {
+            let last_user = self
+                .session
+                .iter()
+                .rev()
                 .find(|m| m.role == Role::User && !m.content.starts_with("<system-reminder>"))
                 .map(|m| m.content.chars().take(1200).collect::<String>())
                 .unwrap_or_default();
-            let last_reply = self.session.iter().rev()
+            let last_reply = self
+                .session
+                .iter()
+                .rev()
                 .find(|m| m.role == Role::Assistant && !m.content.trim().is_empty())
                 .map(|m| m.content.chars().take(1500).collect::<String>())
                 .unwrap_or_default();
@@ -3157,7 +3710,9 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
                     let (stx, mut srx) = mpsc::channel::<StreamItem>(64);
                     let task = tokio::spawn(async move { provider.stream(req, stx).await });
                     let mut out = String::new();
-                    while let Ok(Some(item)) = tokio::time::timeout(std::time::Duration::from_secs(20), srx.recv()).await {
+                    while let Ok(Some(item)) =
+                        tokio::time::timeout(std::time::Duration::from_secs(20), srx.recv()).await
+                    {
                         match item {
                             StreamItem::TextDelta(t) => out.push_str(&t),
                             StreamItem::Done => break,
@@ -3165,8 +3720,14 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
                         }
                     }
                     task.abort();
-                    let items: Vec<String> = out.lines()
-                        .map(|l| l.trim().trim_start_matches(['-', '*', '•']).trim().to_string())
+                    let items: Vec<String> = out
+                        .lines()
+                        .map(|l| {
+                            l.trim()
+                                .trim_start_matches(['-', '*', '•'])
+                                .trim()
+                                .to_string()
+                        })
                         .filter(|l| !l.is_empty() && l.len() < 90)
                         .take(3)
                         .collect();
@@ -3215,7 +3776,10 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
                         let (stx, mut srx) = mpsc::channel::<StreamItem>(64);
                         let task = tokio::spawn(async move { provider.stream(req, stx).await });
                         let mut out = String::new();
-                        while let Ok(Some(item)) = tokio::time::timeout(std::time::Duration::from_secs(15), srx.recv()).await {
+                        while let Ok(Some(item)) =
+                            tokio::time::timeout(std::time::Duration::from_secs(15), srx.recv())
+                                .await
+                        {
                             match item {
                                 StreamItem::TextDelta(t) => out.push_str(&t),
                                 StreamItem::Done => break,
@@ -3223,8 +3787,14 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
                             }
                         }
                         task.abort();
-                        let title = out.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim()
-                            .trim_matches(['"', '\'', '.', '*']).trim().to_string();
+                        let title = out
+                            .lines()
+                            .find(|l| !l.trim().is_empty())
+                            .unwrap_or("")
+                            .trim()
+                            .trim_matches(['"', '\'', '.', '*'])
+                            .trim()
+                            .to_string();
                         if !title.is_empty() {
                             crate::db::set_title(&sid, &title);
                         }
@@ -3245,23 +3815,45 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
         // edit (e.g. README.md) must NOT trigger a project-wide typecheck that
         // surfaces pre-existing errors in unrelated files and drags the agent
         // off-task. Extension of any edited path drives the language choice.
-        let ext = |p: &str| std::path::Path::new(p).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+        let ext = |p: &str| {
+            std::path::Path::new(p)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase()
+        };
         let edited: Vec<String> = self.turn_edit_paths.iter().map(|p| ext(p)).collect();
         let has = |exts: &[&str]| edited.iter().any(|e| exts.contains(&e.as_str()));
         let (prog, args): (String, Vec<String>) = if !self.config.verify_command.trim().is_empty() {
-            ("sh".into(), vec!["-c".into(), self.config.verify_command.clone()])
+            (
+                "sh".into(),
+                vec!["-c".into(), self.config.verify_command.clone()],
+            )
         } else if ws.join("Cargo.toml").exists() && has(&["rs"]) {
-            ("cargo".into(), vec!["check".into(), "--message-format".into(), "short".into()])
+            (
+                "cargo".into(),
+                vec!["check".into(), "--message-format".into(), "short".into()],
+            )
         } else if ws.join("tsconfig.json").exists() && has(&["ts", "tsx"]) {
             ("npx".into(), vec!["tsc".into(), "--noEmit".into()])
-        } else if ws.join("package.json").exists() && has(&["ts", "tsx", "js", "jsx", "mjs", "cjs", "vue", "svelte"]) {
-            ("npm".into(), vec!["run".into(), "build".into(), "--if-present".into()])
-        } else if (ws.join("pyproject.toml").exists() || ws.join("requirements.txt").exists()) && has(&["py"]) {
+        } else if ws.join("package.json").exists()
+            && has(&["ts", "tsx", "js", "jsx", "mjs", "cjs", "vue", "svelte"])
+        {
+            (
+                "npm".into(),
+                vec!["run".into(), "build".into(), "--if-present".into()],
+            )
+        } else if (ws.join("pyproject.toml").exists() || ws.join("requirements.txt").exists())
+            && has(&["py"])
+        {
             ("ruff".into(), vec!["check".into(), ".".into()])
         } else {
             return None;
         };
-        self.emit(Event::Info { text: format!("auto-verify: {prog} {}", args.join(" ")) }).await;
+        self.emit(Event::Info {
+            text: format!("auto-verify: {prog} {}", args.join(" ")),
+        })
+        .await;
         let fut = tokio::process::Command::new(&prog)
             .args(&args)
             .current_dir(ws)
@@ -3282,11 +3874,18 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
         // Surface ONLY diagnostics that reference a file edited this turn — a
         // build failing on pre-existing errors elsewhere isn't this turn's job
         // (opencode does per-edited-file diagnostics, not project-wide chasing).
-        let names: Vec<String> = self.turn_edit_paths.iter()
-            .filter_map(|p| std::path::Path::new(p).file_name().map(|n| n.to_string_lossy().to_string()))
+        let names: Vec<String> = self
+            .turn_edit_paths
+            .iter()
+            .filter_map(|p| {
+                std::path::Path::new(p)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+            })
             .collect();
         if !names.is_empty() && self.config.verify_command.trim().is_empty() {
-            let relevant: String = s.lines()
+            let relevant: String = s
+                .lines()
                 .filter(|l| names.iter().any(|n| l.contains(n.as_str())))
                 .collect::<Vec<_>>()
                 .join("\n");
@@ -3302,16 +3901,25 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
 
     /// Validate an `edit` and compute the resulting full file content.
     fn compute_edit(&self, args: &serde_json::Value) -> Result<(String, String), String> {
-        let path = args["path"].as_str().ok_or("edit: missing 'path'")?.to_string();
-        let old = args["old_string"].as_str().ok_or("edit: missing 'old_string'")?;
+        let path = args["path"]
+            .as_str()
+            .ok_or("edit: missing 'path'")?
+            .to_string();
+        let old = args["old_string"]
+            .as_str()
+            .ok_or("edit: missing 'old_string'")?;
         let new = args["new_string"].as_str().unwrap_or("");
         let replace_all = args["replace_all"].as_bool().unwrap_or(false);
         if old.is_empty() {
-            return Err("edit: 'old_string' is empty — use write_file to create a whole file.".into());
+            return Err(
+                "edit: 'old_string' is empty — use write_file to create a whole file.".into(),
+            );
         }
         let abs = self.workspace.join(&path);
         if abs.exists() && !self.read_files.contains(&path) {
-            return Err(format!("edit: you must read_file '{path}' before editing it."));
+            return Err(format!(
+                "edit: you must read_file '{path}' before editing it."
+            ));
         }
         let content = std::fs::read_to_string(&abs).unwrap_or_default();
         let count = content.matches(old).count();
@@ -3321,7 +3929,11 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
         if count > 1 && !replace_all {
             return Err(format!("edit: old_string appears {count} times in '{path}' — add surrounding lines to make it unique, or set replace_all=true."));
         }
-        let new_content = if replace_all { content.replace(old, new) } else { content.replacen(old, new, 1) };
+        let new_content = if replace_all {
+            content.replace(old, new)
+        } else {
+            content.replacen(old, new, 1)
+        };
         Ok((path, new_content))
     }
 
@@ -3357,35 +3969,70 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
             let question = arguments["question"].as_str().unwrap_or("").to_string();
             let options = arguments["options"]
                 .as_array()
-                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect::<Vec<_>>())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect::<Vec<_>>()
+                })
                 .unwrap_or_default();
-            self.emit(Event::QuestionAsked { request_id, question, options }).await;
+            self.emit(Event::QuestionAsked {
+                request_id,
+                question,
+                options,
+            })
+            .await;
             let answer = loop {
                 match op_rx.recv().await {
-                    Some(Op::QuestionAnswer { request_id: rid, answer }) if rid == request_id => break answer,
+                    Some(Op::QuestionAnswer {
+                        request_id: rid,
+                        answer,
+                    }) if rid == request_id => break answer,
                     // A typed message while a question is pending IS the answer —
                     // frontends without a dedicated answer UI (TUI, panes) would
                     // otherwise deadlock here.
                     Some(Op::UserTurn { text }) => break text,
                     Some(Op::Interrupt) | Some(Op::Shutdown) | None => {
-                        self.session.push(Message::tool_result("interrupted before answering", &call_id));
-                        self.emit_tool_end(turn, call_id.clone(), name, "interrupted before answering".into(), false).await;
+                        self.session.push(Message::tool_result(
+                            "interrupted before answering",
+                            &call_id,
+                        ));
+                        self.emit_tool_end(
+                            turn,
+                            call_id.clone(),
+                            name,
+                            "interrupted before answering".into(),
+                            false,
+                        )
+                        .await;
                         return true;
                     }
                     Some(_) => {}
                 }
             };
-            self.session.push(Message::tool_result(format!("[ask_user answer] {answer}"), &call_id));
-            self.emit_tool_end(turn, call_id.clone(), name, answer, true).await;
+            self.session.push(Message::tool_result(
+                format!("[ask_user answer] {answer}"),
+                &call_id,
+            ));
+            self.emit_tool_end(turn, call_id.clone(), name, answer, true)
+                .await;
             return false;
         }
 
         let hook_config = hooks::Hooks::load(&self.workspace);
         if hook_config.auto().guard_dangerous_shell {
             if let Some(reason) = hooks::dangerous_tool_reason(&name, &arguments) {
-                self.session.push(Message::tool_result(reason.clone(), &call_id));
-                self.emit_audit(Some(turn), "guard", "Dangerous command blocked", reason.clone(), "blocked").await;
-                self.emit_tool_end(turn, call_id.clone(), name, reason, false).await;
+                self.session
+                    .push(Message::tool_result(reason.clone(), &call_id));
+                self.emit_audit(
+                    Some(turn),
+                    "guard",
+                    "Dangerous command blocked",
+                    reason.clone(),
+                    "blocked",
+                )
+                .await;
+                self.emit_tool_end(turn, call_id.clone(), name, reason, false)
+                    .await;
                 return false;
             }
         }
@@ -3406,8 +4053,10 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
                 // Always pair the recorded tool call with a result — a dangling
                 // function_call poisons every later request on paired providers.
                 let output = format!("denied: {reason}");
-                self.session.push(Message::tool_result(output.clone(), &call_id));
-                self.emit_tool_end(turn, call_id.clone(), name, output, false).await;
+                self.session
+                    .push(Message::tool_result(output.clone(), &call_id));
+                self.emit_tool_end(turn, call_id.clone(), name, output, false)
+                    .await;
                 return false;
             }
             Routed::Run => {
@@ -3435,8 +4084,16 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
                             decision,
                         }) if rid == request_id => match decision {
                             ApprovalDecision::Reject => {
-                                self.session.push(Message::tool_result("rejected by user", &call_id));
-                                self.emit_tool_end(turn, call_id.clone(), name, "rejected by user".into(), false).await;
+                                self.session
+                                    .push(Message::tool_result("rejected by user", &call_id));
+                                self.emit_tool_end(
+                                    turn,
+                                    call_id.clone(),
+                                    name,
+                                    "rejected by user".into(),
+                                    false,
+                                )
+                                .await;
                                 return false;
                             }
                             ApprovalDecision::ApproveForSession => {
@@ -3450,8 +4107,18 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
                             }
                         },
                         Some(Op::Interrupt) | Some(Op::Shutdown) | None => {
-                            self.session.push(Message::tool_result("interrupted before approval", &call_id));
-                            self.emit_tool_end(turn, call_id.clone(), name, "interrupted before approval".into(), false).await;
+                            self.session.push(Message::tool_result(
+                                "interrupted before approval",
+                                &call_id,
+                            ));
+                            self.emit_tool_end(
+                                turn,
+                                call_id.clone(),
+                                name,
+                                "interrupted before approval".into(),
+                                false,
+                            )
+                            .await;
                             return true;
                         }
                         Some(_) => {} // ignore unrelated ops while awaiting approval
@@ -3485,8 +4152,10 @@ The result will not change. STOP repeating this call — change your approach (d
 a different tool, or ask_user if you're blocked).",
                     self.last_tool_reps + 1
                 );
-                self.session.push(Message::tool_result(msg.clone(), &call_id));
-                self.emit_tool_end(turn, call_id.clone(), name, msg, false).await;
+                self.session
+                    .push(Message::tool_result(msg.clone(), &call_id));
+                self.emit_tool_end(turn, call_id.clone(), name, msg, false)
+                    .await;
                 return false;
             }
         }
@@ -3500,8 +4169,12 @@ a different tool, or ask_user if you're blocked).",
                         "You already read `{p}` earlier this turn — its full content is in the conversation above. \
 Do NOT read it again. Proceed now: make the edits with the edit/write_file tools."
                     );
-                    self.session.push(Message::tool_result(format!("[tool read_file]\n{msg}"), &call_id));
-                    self.emit_tool_end(turn, call_id.clone(), name, msg, true).await;
+                    self.session.push(Message::tool_result(
+                        format!("[tool read_file]\n{msg}"),
+                        &call_id,
+                    ));
+                    self.emit_tool_end(turn, call_id.clone(), name, msg, true)
+                        .await;
                     return false;
                 }
             }
@@ -3554,16 +4227,28 @@ Do NOT read it again. Proceed now: make the edits with the edit/write_file tools
                 Err(e) => (format!("memory error: {e}"), false),
             }
         } else if name == "todo_write" {
-            let items: Vec<(String, String)> = arguments["todos"].as_array()
-                .map(|a| a.iter().filter_map(|t| {
-                    let c = t["content"].as_str()?.to_string();
-                    let s = normalize_todo_status(t["status"].as_str().unwrap_or("pending"));
-                    Some((c, s))
-                }).collect())
+            let items: Vec<(String, String)> = arguments["todos"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|t| {
+                            let c = t["content"].as_str()?.to_string();
+                            let s =
+                                normalize_todo_status(t["status"].as_str().unwrap_or("pending"));
+                            Some((c, s))
+                        })
+                        .collect()
+                })
                 .unwrap_or_default();
-            self.emit(Event::Todos { items: items.clone() }).await;
+            self.emit(Event::Todos {
+                items: items.clone(),
+            })
+            .await;
             let done = items.iter().filter(|(_, s)| s == "completed").count();
-            (format!("todo list updated ({done}/{} done)", items.len()), true)
+            (
+                format!("todo list updated ({done}/{} done)", items.len()),
+                true,
+            )
         } else if name == "shell" {
             let command = arguments["command"].as_str().unwrap_or("").to_string();
             let command_id = if call_id.trim().is_empty() {
@@ -3578,15 +4263,18 @@ Do NOT read it again. Proceed now: make the edits with the edit/write_file tools
                 command,
                 cwd: self.workspace.display().to_string(),
                 background: false,
-            }).await;
+            })
+            .await;
             let started = std::time::Instant::now();
-            let (output, ok) = router.exec_shell_streaming(
-                &arguments,
-                turn,
-                command_id.clone(),
-                worker_id.map(str::to_string),
-                self.event_tx.clone(),
-            ).await;
+            let (output, ok) = router
+                .exec_shell_streaming(
+                    &arguments,
+                    turn,
+                    command_id.clone(),
+                    worker_id.map(str::to_string),
+                    self.event_tx.clone(),
+                )
+                .await;
             let exit_code = shell_exit_code(&output);
             self.emit(Event::CommandFinished {
                 turn,
@@ -3595,7 +4283,8 @@ Do NOT read it again. Proceed now: make the edits with the edit/write_file tools
                 ok,
                 exit_code,
                 duration_ms: started.elapsed().as_millis() as u64,
-            }).await;
+            })
+            .await;
             (output, ok)
         } else if name == "web_search" {
             web_search(arguments["query"].as_str().unwrap_or("")).await
@@ -3661,7 +4350,11 @@ Do NOT read it again. Proceed now: make the edits with the edit/write_file tools
                 self.turn_edit_paths.push(p.to_string());
             }
             if let Some((path, prior, id)) = &write_ctx {
-                self.emit(Event::PatchApplied { turn, path: path.clone() }).await;
+                self.emit(Event::PatchApplied {
+                    turn,
+                    path: path.clone(),
+                })
+                .await;
                 let new = arguments["content"].as_str().unwrap_or("");
                 let diff = unified_diff(prior, new, path);
                 self.emit(Event::FileDiff {
@@ -3688,8 +4381,12 @@ Do NOT read it again. Proceed now: make the edits with the edit/write_file tools
         } else {
             output.clone()
         };
-        self.session.push(Message::tool_result(format!("[tool {name}]\n{stored}"), &call_id));
-        self.emit_tool_end(turn, call_id.clone(), name, output, ok).await;
+        self.session.push(Message::tool_result(
+            format!("[tool {name}]\n{stored}"),
+            &call_id,
+        ));
+        self.emit_tool_end(turn, call_id.clone(), name, output, ok)
+            .await;
         false
     }
 }
@@ -3741,33 +4438,49 @@ async fn git_baseline_tree(ws: &std::path::Path) -> Option<String> {
     let idx = ws.join(format!(".oxide/tmp-index-{}", std::process::id()));
     let _ = std::fs::create_dir_all(ws.join(".oxide"));
     let add = tokio::process::Command::new("git")
-        .arg("-C").arg(ws)
+        .arg("-C")
+        .arg(ws)
         .env("GIT_INDEX_FILE", &idx)
         .args(["add", "-A", "."])
-        .output().await.ok()?;
+        .output()
+        .await
+        .ok()?;
     if !add.status.success() {
         let _ = std::fs::remove_file(&idx);
         return None;
     }
     let out = tokio::process::Command::new("git")
-        .arg("-C").arg(ws)
+        .arg("-C")
+        .arg(ws)
         .env("GIT_INDEX_FILE", &idx)
         .args(["write-tree"])
-        .output().await.ok();
+        .output()
+        .await
+        .ok();
     let _ = std::fs::remove_file(&idx);
     let out = out?;
     if !out.status.success() {
         return None;
     }
     let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if sha.is_empty() { None } else { Some(sha) }
+    if sha.is_empty() {
+        None
+    } else {
+        Some(sha)
+    }
 }
 
 fn load_project_instructions(workspace: &std::path::Path) -> Option<String> {
     let mut combined = String::new();
     // Single-file instructions — first match among the conventional names wins
     // (they're usually the same doc under different ecosystems' names).
-    for name in ["AGENTS.md", "CLAUDE.md", ".oxide/AGENTS.md", ".cursorrules", ".windsurfrules"] {
+    for name in [
+        "AGENTS.md",
+        "CLAUDE.md",
+        ".oxide/AGENTS.md",
+        ".cursorrules",
+        ".windsurfrules",
+    ] {
         if let Ok(text) = std::fs::read_to_string(workspace.join(name)) {
             let t = text.trim();
             if !t.is_empty() {
@@ -3781,7 +4494,9 @@ fn load_project_instructions(workspace: &std::path::Path) -> Option<String> {
     // and Oxide's own `.oxide/rules/*.md`.
     for (dir, ext) in [(".cursor/rules", "mdc"), (".oxide/rules", "md")] {
         if let Ok(rd) = std::fs::read_dir(workspace.join(dir)) {
-            let mut paths: Vec<_> = rd.flatten().map(|e| e.path())
+            let mut paths: Vec<_> = rd
+                .flatten()
+                .map(|e| e.path())
                 .filter(|p| p.extension().and_then(|x| x.to_str()) == Some(ext))
                 .collect();
             paths.sort();
@@ -3797,7 +4512,11 @@ fn load_project_instructions(workspace: &std::path::Path) -> Option<String> {
         }
     }
     let t = combined.trim();
-    if t.is_empty() { None } else { Some(t.chars().take(12000).collect()) }
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.chars().take(12000).collect())
+    }
 }
 
 /// Unified diff between two file contents.
@@ -3820,9 +4539,12 @@ async fn cli_file_diff(workspace: &std::path::Path, path: &str) -> (String, Stri
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| path.to_string());
     let out = tokio::process::Command::new("git")
-        .arg("-C").arg(workspace)
-        .args(["diff", "--no-color", "--"]).arg(&rel)
-        .output().await;
+        .arg("-C")
+        .arg(workspace)
+        .args(["diff", "--no-color", "--"])
+        .arg(&rel)
+        .output()
+        .await;
     let mut diff = out
         .ok()
         .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
@@ -3839,20 +4561,25 @@ async fn cli_file_diff(workspace: &std::path::Path, path: &str) -> (String, Stri
     (rel, diff)
 }
 
-async fn collect_provider_text_silent(provider_id: &str, req: TurnRequest) -> Result<String, String> {
+async fn collect_provider_text_silent(
+    provider_id: &str,
+    req: TurnRequest,
+) -> Result<String, String> {
     let (tx, mut rx) = mpsc::channel::<StreamItem>(STREAM_QUEUE);
     let provider = oxide_providers::build(provider_id);
     let task = tokio::spawn(async move { provider.stream(req, tx).await });
     let mut out = String::new();
     let mut timed_out = false;
-    while let Some(item) = match tokio::time::timeout(std::time::Duration::from_secs(60), rx.recv()).await {
-        Ok(item) => item,
-        Err(_) => {
-            timed_out = true;
-            task.abort();
-            None
+    while let Some(item) =
+        match tokio::time::timeout(std::time::Duration::from_secs(60), rx.recv()).await {
+            Ok(item) => item,
+            Err(_) => {
+                timed_out = true;
+                task.abort();
+                None
+            }
         }
-    } {
+    {
         match item {
             StreamItem::TextDelta(text) => out.push_str(&text),
             StreamItem::Done => break,
@@ -3914,7 +4641,10 @@ fn looks_like_secret(text: &str) -> bool {
 
 fn shell_exit_code(output: &str) -> Option<i32> {
     let line = output.lines().find(|line| line.starts_with("[exit "))?;
-    let raw = line.trim_start_matches("[exit ").split_whitespace().next()?;
+    let raw = line
+        .trim_start_matches("[exit ")
+        .split_whitespace()
+        .next()?;
     raw.parse::<i32>().ok()
 }
 
@@ -3923,7 +4653,12 @@ fn tool_arg_string(args: &serde_json::Value, key: &str) -> String {
 }
 
 fn normalize_todo_status(status: &str) -> String {
-    match status.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+    match status
+        .trim()
+        .to_ascii_lowercase()
+        .replace('-', "_")
+        .as_str()
+    {
         "completed" | "complete" | "done" => "completed".to_string(),
         "in_progress" | "in progress" | "active" | "doing" => "in_progress".to_string(),
         _ => "pending".to_string(),
@@ -3933,7 +4668,6 @@ fn normalize_todo_status(status: &str) -> String {
 #[cfg(test)]
 mod map_test {
     use oxide_config::{McpEnvVar, McpServerConfig};
-    use oxide_harness::SkillRoute;
     use oxide_protocol::ToolSpec;
 
     #[test]
@@ -3956,9 +4690,16 @@ mod map_test {
 
     #[test]
     fn map_shows_structure() {
-        let ws = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
+        let ws = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
         let m = super::project_map(ws);
-        assert!(m.contains("crates/") && m.contains("Cargo.toml"), "map:\n{m}");
+        assert!(
+            m.contains("crates/") && m.contains("Cargo.toml"),
+            "map:\n{m}"
+        );
         eprintln!("--- project map sample ---\n{}", &m[..m.len().min(400)]);
     }
 
@@ -3991,15 +4732,26 @@ required = true
         assert_eq!(server.args, vec!["-y", "pkg"]);
         assert!(!server.enabled);
         assert_eq!(server.cwd, "/tmp/project");
-        assert_eq!(server.env.get("STATIC_TOKEN").map(String::as_str), Some("abc"));
-        assert!(matches!(server.env_vars.first(), Some(McpEnvVar::Name(name)) if name == "LOCAL_TOKEN"));
+        assert_eq!(
+            server.env.get("STATIC_TOKEN").map(String::as_str),
+            Some("abc")
+        );
+        assert!(
+            matches!(server.env_vars.first(), Some(McpEnvVar::Name(name)) if name == "LOCAL_TOKEN")
+        );
         assert!(matches!(
             server.env_vars.get(1),
             Some(McpEnvVar::Named { name, source }) if name == "REMOTE_TOKEN" && source == "remote"
         ));
         assert_eq!(server.bearer_token_env_var, "HTTP_TOKEN");
-        assert_eq!(server.http_headers.get("X-Team").map(String::as_str), Some("oxide"));
-        assert_eq!(server.env_http_headers.get("X-Secret").map(String::as_str), Some("SECRET_ENV"));
+        assert_eq!(
+            server.http_headers.get("X-Team").map(String::as_str),
+            Some("oxide")
+        );
+        assert_eq!(
+            server.env_http_headers.get("X-Secret").map(String::as_str),
+            Some("SECRET_ENV")
+        );
         assert_eq!(server.startup_timeout_sec, Some(12));
         assert_eq!(server.tool_timeout_sec, Some(34));
         assert_eq!(server.enabled_tools, vec!["read"]);
@@ -4021,7 +4773,10 @@ required = true
             super::claude_mcp_oauth_token_from_json(json, "supabase").as_deref(),
             Some("token-123")
         );
-        assert_eq!(super::claude_mcp_oauth_token_from_json(json, "github"), None);
+        assert_eq!(
+            super::claude_mcp_oauth_token_from_json(json, "github"),
+            None
+        );
     }
 
     #[test]
@@ -4071,7 +4826,11 @@ attributes:
 "#;
 
         assert_eq!(
-            super::keychain_accounts_for_service_from_dump(dump, "Codex MCP Credentials", "supabase"),
+            super::keychain_accounts_for_service_from_dump(
+                dump,
+                "Codex MCP Credentials",
+                "supabase"
+            ),
             vec!["supabase|59e4938976c99701".to_string()]
         );
     }
@@ -4097,24 +4856,6 @@ attributes:
     }
 
     #[test]
-    fn skill_router_selects_matching_workflow() {
-        let selected = super::selected_skill_routes(
-            vec![SkillRoute {
-                id: "frontend".to_string(),
-                triggers: vec!["ui".to_string()],
-                instructions: "Use browser verification.".to_string(),
-                template: vec!["Open browser".to_string()],
-            }],
-            "Perbaiki UI composer",
-        );
-        let block = super::skill_routes_block(&selected);
-
-        assert!(block.contains("frontend"));
-        assert!(block.contains("browser verification"));
-        assert!(block.contains("Open browser"));
-    }
-
-    #[test]
     fn subagent_profile_limits_reviewer_tools() {
         let profile = super::subagent_profile_for("review the diff for risks", "codex", "medium");
 
@@ -4131,9 +4872,7 @@ attributes:
 
         assert!(block.contains("Sub-agent default operating mode"));
         assert!(block.contains("Operate with high agency"));
-        assert!(block.contains(
-            "staying within safety, permission, sandbox, and tool policies"
-        ));
+        assert!(block.contains("staying within safety, permission, sandbox, and tool policies"));
         assert!(block.contains("Sub-agent profile: implementer"));
         assert!(block.contains("8 tool(s) exposed"));
     }

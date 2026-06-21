@@ -61,13 +61,6 @@ pub enum Event {
     Followups { items: Vec<String> },
     /// A new turn began.
     TurnStarted { turn: TurnId },
-    /// A workflow route/template was auto-selected for this turn.
-    WorkflowSelected {
-        turn: TurnId,
-        id: String,
-        title: String,
-        steps: Vec<String>,
-    },
     /// A chunk of the assistant's streamed message.
     AgentMessageDelta { turn: TurnId, text: String },
     /// Model reasoning/thinking delta (optional to render).

@@ -76,8 +76,21 @@ fn tokenize(s: &str) -> Vec<String> {
 fn symbol_on(line: &str) -> Option<String> {
     let t = line.trim_start();
     for kw in [
-        "fn ", "struct ", "enum ", "trait ", "impl ", "type ", "const ", "static ",
-        "class ", "def ", "function ", "interface ", "func ", "public ", "private ",
+        "fn ",
+        "struct ",
+        "enum ",
+        "trait ",
+        "impl ",
+        "type ",
+        "const ",
+        "static ",
+        "class ",
+        "def ",
+        "function ",
+        "interface ",
+        "func ",
+        "public ",
+        "private ",
     ] {
         if let Some(rest) = t.strip_prefix(kw) {
             let name: String = rest
@@ -104,8 +117,16 @@ fn chunk_file(text: &str) -> Vec<Chunk> {
         for tk in tokenize(&body) {
             *terms.entry(tk).or_insert(0) += 1;
         }
-        let symbols: Vec<String> = lines[start..end].iter().filter_map(|l| symbol_on(l)).collect();
-        chunks.push(Chunk { start: start + 1, text: body, terms, symbols });
+        let symbols: Vec<String> = lines[start..end]
+            .iter()
+            .filter_map(|l| symbol_on(l))
+            .collect();
+        chunks.push(Chunk {
+            start: start + 1,
+            text: body,
+            terms,
+            symbols,
+        });
         if end == lines.len() {
             break;
         }
@@ -119,15 +140,27 @@ fn collect(root: &Path, out: &mut Vec<std::path::PathBuf>) {
         return;
     }
     const SKIP: &[&str] = &[
-        ".git", "target", "node_modules", ".oxide", "dist", "build", ".next",
-        "vendor", ".venv", "__pycache__", ".cache", "out",
+        ".git",
+        "target",
+        "node_modules",
+        ".oxide",
+        "dist",
+        "build",
+        ".next",
+        "vendor",
+        ".venv",
+        "__pycache__",
+        ".cache",
+        "out",
     ];
     const EXT: &[&str] = &[
-        "rs", "ts", "tsx", "js", "jsx", "mjs", "cjs", "py", "go", "java", "c", "h",
-        "cpp", "hpp", "rb", "php", "swift", "kt", "cs", "scala", "sh", "toml", "md",
-        "css", "html", "vue", "svelte", "sql",
+        "rs", "ts", "tsx", "js", "jsx", "mjs", "cjs", "py", "go", "java", "c", "h", "cpp", "hpp",
+        "rb", "php", "swift", "kt", "cs", "scala", "sh", "toml", "md", "css", "html", "vue",
+        "svelte", "sql",
     ];
-    let Ok(rd) = std::fs::read_dir(root) else { return };
+    let Ok(rd) = std::fs::read_dir(root) else {
+        return;
+    };
     for e in rd.flatten() {
         let p = e.path();
         let name = e.file_name().to_string_lossy().to_string();
@@ -138,7 +171,12 @@ fn collect(root: &Path, out: &mut Vec<std::path::PathBuf>) {
             if !SKIP.contains(&name.as_str()) {
                 collect(&p, out);
             }
-        } else if p.extension().and_then(|x| x.to_str()).map(|x| EXT.contains(&x)).unwrap_or(false) {
+        } else if p
+            .extension()
+            .and_then(|x| x.to_str())
+            .map(|x| EXT.contains(&x))
+            .unwrap_or(false)
+        {
             out.push(p);
         }
     }
@@ -161,13 +199,20 @@ fn update(ws: &Path, idx: &mut CodeIndex) -> bool {
     let mut present = std::collections::HashSet::new();
     let mut dirty = false;
     for f in &files {
-        let rel = f.strip_prefix(ws).unwrap_or(f).to_string_lossy().replace('\\', "/");
+        let rel = f
+            .strip_prefix(ws)
+            .unwrap_or(f)
+            .to_string_lossy()
+            .replace('\\', "/");
         present.insert(rel.clone());
         let mt = mtime_of(f);
         if idx.files.get(&rel).map(|e| e.mtime) == Some(mt) {
             continue; // unchanged
         }
-        if std::fs::metadata(f).map(|m| m.len() > MAX_FILE_BYTES).unwrap_or(true) {
+        if std::fs::metadata(f)
+            .map(|m| m.len() > MAX_FILE_BYTES)
+            .unwrap_or(true)
+        {
             dirty |= idx.files.remove(&rel).is_some();
             continue;
         }
@@ -178,7 +223,13 @@ fn update(ws: &Path, idx: &mut CodeIndex) -> bool {
                 dirty |= idx.files.remove(&rel).is_some();
                 continue;
             }
-            idx.files.insert(rel, FileEntry { mtime: mt, chunks: chunk_file(&text) });
+            idx.files.insert(
+                rel,
+                FileEntry {
+                    mtime: mt,
+                    chunks: chunk_file(&text),
+                },
+            );
             dirty = true;
         }
     }
@@ -199,7 +250,12 @@ fn query(idx: &CodeIndex, q: &str) -> String {
     if terms.is_empty() {
         return "codebase_search: provide a query of 1+ words".to_string();
     }
-    let n_chunks: usize = idx.files.values().map(|f| f.chunks.len()).sum::<usize>().max(1);
+    let n_chunks: usize = idx
+        .files
+        .values()
+        .map(|f| f.chunks.len())
+        .sum::<usize>()
+        .max(1);
     // document frequency per term
     let mut df: HashMap<&str, u32> = HashMap::new();
     for f in idx.files.values() {
@@ -245,8 +301,8 @@ fn query(idx: &CodeIndex, q: &str) -> String {
     // embeddings rerank them by meaning (falls back to TF-IDF order offline).
     hits.truncate(50);
     let texts: Vec<String> = hits.iter().map(|h| h.3.to_string()).collect();
-    let order: Vec<usize> = crate::embed::rerank(q, &texts)
-        .unwrap_or_else(|| (0..hits.len()).collect());
+    let order: Vec<usize> =
+        crate::embed::rerank(q, &texts).unwrap_or_else(|| (0..hits.len()).collect());
     let mut out = String::new();
     for &i in order.iter().take(8) {
         let (_, path, line, text) = &hits[i];
@@ -305,8 +361,16 @@ mod tests {
     use super::*;
     #[test]
     fn finds_relevant_code() {
-        let ws = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
+        let ws = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
         let out = search(ws, "persistent codebase index search");
-        assert!(out.contains("index.rs") || out.contains(".rs:"), "got: {}", &out[..out.len().min(200)]);
+        assert!(
+            out.contains("index.rs") || out.contains(".rs:"),
+            "got: {}",
+            &out[..out.len().min(200)]
+        );
     }
 }

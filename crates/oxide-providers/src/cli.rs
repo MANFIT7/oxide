@@ -58,11 +58,20 @@ const CLAUDE_INTERACTIVE_PROMPT_ACCEPT_TIMEOUT: Duration = Duration::from_secs(1
 
 fn session_key(bin: &str, conv: &str, cwd: &str) -> String {
     // Prefer the per-conversation id; fall back to cwd if absent.
-    if conv.is_empty() { format!("{bin}|{cwd}") } else { format!("{bin}|{conv}") }
+    if conv.is_empty() {
+        format!("{bin}|{cwd}")
+    } else {
+        format!("{bin}|{conv}")
+    }
 }
 
 fn session_get(key: &str) -> Option<String> {
-    SESSIONS.get_or_init(Default::default).lock().ok()?.get(key).cloned()
+    SESSIONS
+        .get_or_init(Default::default)
+        .lock()
+        .ok()?
+        .get(key)
+        .cloned()
 }
 
 fn session_set(key: &str, id: &str) {
@@ -174,7 +183,11 @@ fn cli_item_id(item: &Value, fallback: &str) -> String {
 fn cli_exit_code(item: &Value) -> Option<i32> {
     item["exit_code"]
         .as_i64()
-        .or_else(|| item["exit_code"].as_str().and_then(|s| s.parse::<i64>().ok()))
+        .or_else(|| {
+            item["exit_code"]
+                .as_str()
+                .and_then(|s| s.parse::<i64>().ok())
+        })
         .and_then(|code| i32::try_from(code).ok())
 }
 
@@ -201,7 +214,11 @@ where
     let pipe_stdin = stdin_text.as_ref().map(|s| !s.is_empty()).unwrap_or(false);
     let mut cmd = tokio::process::Command::new(program);
     cmd.args(args)
-        .stdin(if pipe_stdin { Stdio::piped() } else { Stdio::null() })
+        .stdin(if pipe_stdin {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .kill_on_drop(true)
         .stderr(Stdio::piped());
@@ -223,7 +240,10 @@ where
     // end (the engine aborts the stream task on interrupt), the group is killed.
     // Disarmed on normal completion so backgrounded grandchildren can survive.
     #[cfg(unix)]
-    let mut group_guard = child.id().map(|pid| ProcessGroupGuard { pgid: pid as i32, armed: true });
+    let mut group_guard = child.id().map(|pid| ProcessGroupGuard {
+        pgid: pid as i32,
+        armed: true,
+    });
     let stdin_task = if let Some(input) = stdin_text.filter(|s| !s.is_empty()) {
         let mut stdin = child
             .stdin
@@ -346,7 +366,9 @@ impl Provider for CodexCliProvider {
             prompt = "Inspect the attached image(s).".to_string();
         }
         if prompt.trim().is_empty() {
-            anyhow::bail!("Codex CLI prompt is empty; refusing to start codex exec without instructions");
+            anyhow::bail!(
+                "Codex CLI prompt is empty; refusing to start codex exec without instructions"
+            );
         }
         let skey = session_key(&self.bin, &req.conversation_id, &req.cwd);
         // Prefer the persisted link (survives app restarts) over the in-memory map.
@@ -385,120 +407,148 @@ impl Provider for CodexCliProvider {
         args.push("-".to_string());
 
         let skey_cb = skey.clone();
-        run_jsonl(&self.bin, &args, &req.cwd, Some(prompt), &sink, move |v, sink| {
-            match v["type"].as_str() {
-                Some("item.started") => {
-                    // Live status while the CLI runs a command/edits a file.
-	                    let item = &v["item"];
-	                    match item["type"].as_str() {
-	                        Some("command_execution") => {
-	                            let cmd = clean_cli_command(item["command"].as_str().unwrap_or(""));
-	                            let id = cli_item_id(item, &format!("codex-command-{cmd}"));
-	                            send(sink, StreamItem::CommandStarted {
-	                                id,
-	                                command: cmd.clone(),
-	                                cwd: String::new(),
-	                                background: false,
-	                            });
-	                            let cmd: String = cmd.chars().take(80).collect();
-	                            send(sink, StreamItem::Notice(format!("⚙ Running {cmd}")));
-	                        }
-                        Some("file_change") => {
-                            let p = item["path"].as_str().or_else(|| item["text"].as_str()).unwrap_or("file");
-                            send(sink, StreamItem::Notice(format!("⚙ Editing {p}")));
+        run_jsonl(
+            &self.bin,
+            &args,
+            &req.cwd,
+            Some(prompt),
+            &sink,
+            move |v, sink| {
+                match v["type"].as_str() {
+                    Some("item.started") => {
+                        // Live status while the CLI runs a command/edits a file.
+                        let item = &v["item"];
+                        match item["type"].as_str() {
+                            Some("command_execution") => {
+                                let cmd = clean_cli_command(item["command"].as_str().unwrap_or(""));
+                                let id = cli_item_id(item, &format!("codex-command-{cmd}"));
+                                send(
+                                    sink,
+                                    StreamItem::CommandStarted {
+                                        id,
+                                        command: cmd.clone(),
+                                        cwd: String::new(),
+                                        background: false,
+                                    },
+                                );
+                                let cmd: String = cmd.chars().take(80).collect();
+                                send(sink, StreamItem::Notice(format!("⚙ Running {cmd}")));
+                            }
+                            Some("file_change") => {
+                                let p = item["path"]
+                                    .as_str()
+                                    .or_else(|| item["text"].as_str())
+                                    .unwrap_or("file");
+                                send(sink, StreamItem::Notice(format!("⚙ Editing {p}")));
+                            }
+                            Some("web_search") => {
+                                let q = item["query"].as_str().unwrap_or("");
+                                send(sink, StreamItem::Notice(format!("⚙ Searching {q}")));
+                            }
+                            _ => {}
                         }
-                        Some("web_search") => {
-                            let q = item["query"].as_str().unwrap_or("");
-                            send(sink, StreamItem::Notice(format!("⚙ Searching {q}")));
-                        }
-                        _ => {}
                     }
-                }
-                Some("thread.started") => {
-                    if let Some(id) = v["thread_id"].as_str() {
-                        session_set(&skey_cb, id);
-                        send(sink, StreamItem::CliSession(id.to_string()));
+                    Some("thread.started") => {
+                        if let Some(id) = v["thread_id"].as_str() {
+                            session_set(&skey_cb, id);
+                            send(sink, StreamItem::CliSession(id.to_string()));
+                        }
                     }
-                }
-                Some("item.completed") => {
-                    let item = &v["item"];
-                    match item["type"].as_str() {
-                        Some("agent_message") => {
-                            if let Some(t) = item["text"].as_str() {
-                                send(sink, StreamItem::TextDelta(t.to_string()));
+                    Some("item.completed") => {
+                        let item = &v["item"];
+                        match item["type"].as_str() {
+                            Some("agent_message") => {
+                                if let Some(t) = item["text"].as_str() {
+                                    send(sink, StreamItem::TextDelta(t.to_string()));
+                                }
                             }
-                        }
-                        Some("reasoning") => {
-                            if let Some(t) = item["text"].as_str() {
-                                send(sink, StreamItem::ReasoningDelta(t.to_string()));
+                            Some("reasoning") => {
+                                if let Some(t) = item["text"].as_str() {
+                                    send(sink, StreamItem::ReasoningDelta(t.to_string()));
+                                }
                             }
-                        }
-	                        Some("command_execution") => {
-	                            let cmd = clean_cli_command(item["command"].as_str().unwrap_or(""));
-	                            let id = cli_item_id(item, &format!("codex-command-{cmd}"));
-	                            let out = item["aggregated_output"].as_str().unwrap_or("");
-	                            if !out.is_empty() {
-	                                send(sink, StreamItem::CommandOutput {
-	                                    id: id.clone(),
-	                                    stream: "stdout".to_string(),
-	                                    chunk: out.to_string(),
-	                                });
-	                            }
-	                            let exit_code = cli_exit_code(item);
-	                            let ok = exit_code.map(|code| code == 0).unwrap_or(true);
-	                            send(sink, StreamItem::CommandFinished {
-	                                id,
-	                                ok,
-	                                exit_code,
-	                                duration_ms: cli_duration_ms(item),
-	                            });
-	                            let out: String = out.chars().take(800).collect();
-	                            send(sink, StreamItem::Notice(format!("⌘ {cmd}\n{out}").trim_end().to_string()));
-	                        }
-                        Some("file_change") => {
-                            let summary = item["text"].as_str()
-                                .or_else(|| item["path"].as_str())
-                                .unwrap_or("file change");
-                            send(sink, StreamItem::Notice(format!("✎ {summary}")));
-                            // Single path or a changes[] list, depending on codex version.
-                            if let Some(p) = item["path"].as_str() {
-                                send(sink, StreamItem::FileChanged(p.to_string()));
+                            Some("command_execution") => {
+                                let cmd = clean_cli_command(item["command"].as_str().unwrap_or(""));
+                                let id = cli_item_id(item, &format!("codex-command-{cmd}"));
+                                let out = item["aggregated_output"].as_str().unwrap_or("");
+                                if !out.is_empty() {
+                                    send(
+                                        sink,
+                                        StreamItem::CommandOutput {
+                                            id: id.clone(),
+                                            stream: "stdout".to_string(),
+                                            chunk: out.to_string(),
+                                        },
+                                    );
+                                }
+                                let exit_code = cli_exit_code(item);
+                                let ok = exit_code.map(|code| code == 0).unwrap_or(true);
+                                send(
+                                    sink,
+                                    StreamItem::CommandFinished {
+                                        id,
+                                        ok,
+                                        exit_code,
+                                        duration_ms: cli_duration_ms(item),
+                                    },
+                                );
+                                let out: String = out.chars().take(800).collect();
+                                send(
+                                    sink,
+                                    StreamItem::Notice(
+                                        format!("⌘ {cmd}\n{out}").trim_end().to_string(),
+                                    ),
+                                );
                             }
-                            if let Some(arr) = item["changes"].as_array() {
-                                for c in arr {
-                                    if let Some(p) = c["path"].as_str() {
-                                        send(sink, StreamItem::FileChanged(p.to_string()));
+                            Some("file_change") => {
+                                let summary = item["text"]
+                                    .as_str()
+                                    .or_else(|| item["path"].as_str())
+                                    .unwrap_or("file change");
+                                send(sink, StreamItem::Notice(format!("✎ {summary}")));
+                                // Single path or a changes[] list, depending on codex version.
+                                if let Some(p) = item["path"].as_str() {
+                                    send(sink, StreamItem::FileChanged(p.to_string()));
+                                }
+                                if let Some(arr) = item["changes"].as_array() {
+                                    for c in arr {
+                                        if let Some(p) = c["path"].as_str() {
+                                            send(sink, StreamItem::FileChanged(p.to_string()));
+                                        }
                                     }
                                 }
                             }
+                            Some("web_search") => {
+                                let q = item["query"]
+                                    .as_str()
+                                    .or_else(|| item["text"].as_str())
+                                    .unwrap_or("");
+                                send(sink, StreamItem::Notice(format!("🔎 {q}")));
+                            }
+                            Some(_) | None => {}
                         }
-                        Some("web_search") => {
-                            let q = item["query"].as_str().or_else(|| item["text"].as_str()).unwrap_or("");
-                            send(sink, StreamItem::Notice(format!("🔎 {q}")));
-                        }
-                        Some(_) | None => {}
                     }
+                    Some("turn.completed") => {
+                        let u = &v["usage"];
+                        send(
+                            sink,
+                            StreamItem::Usage {
+                                input: u["input_tokens"].as_u64().unwrap_or(0),
+                                output: u["output_tokens"].as_u64().unwrap_or(0),
+                                // codex doesn't report the window here; default 272k.
+                                context_window: Some(272_000),
+                            },
+                        );
+                    }
+                    Some("error") => {
+                        let msg = v["message"].as_str().unwrap_or("codex error");
+                        send(sink, StreamItem::Notice(format!("error: {msg}")));
+                    }
+                    _ => {}
                 }
-                Some("turn.completed") => {
-                    let u = &v["usage"];
-                    send(
-                        sink,
-                        StreamItem::Usage {
-                            input: u["input_tokens"].as_u64().unwrap_or(0),
-                            output: u["output_tokens"].as_u64().unwrap_or(0),
-                            // codex doesn't report the window here; default 272k.
-                            context_window: Some(272_000),
-                        },
-                    );
-                }
-                Some("error") => {
-                    let msg = v["message"].as_str().unwrap_or("codex error");
-                    send(sink, StreamItem::Notice(format!("error: {msg}")));
-                }
-                _ => {}
-            }
-            true
-        })
+                true
+            },
+        )
         .await
     }
 }
@@ -542,9 +592,15 @@ impl Provider for ClaudeCliProvider {
         // Continuing an imported Claude TUI session ("claude-<uuid>") resumes
         // claude's OWN native session by that uuid → full context, no replay.
         // The persisted link (survives restarts) wins over the in-memory map.
-        let resume = req.cli_resume.clone()
+        let resume = req
+            .cli_resume
+            .clone()
             .or_else(|| session_get(&skey))
-            .or_else(|| req.conversation_id.strip_prefix("claude-").map(str::to_string));
+            .or_else(|| {
+                req.conversation_id
+                    .strip_prefix("claude-")
+                    .map(str::to_string)
+            });
         let mut args = vec![
             "-p".to_string(),
             prompt,
@@ -617,42 +673,63 @@ impl Provider for ClaudeCliProvider {
                                         }
                                     }
                                 }
-	                                Some("tool_use") => {
-	                                    let name = block["name"].as_str().unwrap_or("tool");
+                                Some("tool_use") => {
+                                    let name = block["name"].as_str().unwrap_or("tool");
                                     // Pull the human-relevant arg so the live status reads
                                     // "⚙ Read src/lib.rs", not a bare tool name.
                                     let input = &block["input"];
-                                    let detail = ["file_path", "path", "command", "pattern", "query", "url", "description"]
-                                        .iter()
-                                        .find_map(|k| input[k].as_str())
-                                        .unwrap_or("");
+                                    let detail = [
+                                        "file_path",
+                                        "path",
+                                        "command",
+                                        "pattern",
+                                        "query",
+                                        "url",
+                                        "description",
+                                    ]
+                                    .iter()
+                                    .find_map(|k| input[k].as_str())
+                                    .unwrap_or("");
                                     let detail: String = detail.chars().take(80).collect();
                                     // A backgrounded command ("I'll let you know when done")
                                     // won't stream its result back — surface WHAT it's doing
                                     // with a distinct ⏳ marker so the UI can show it persistently.
-	                                    let bg = input["run_in_background"].as_bool() == Some(true);
-	                                    let is_command = matches!(name, "Bash" | "Shell") || input["command"].as_str().is_some();
-	                                    if is_command {
-	                                        // A command is fully shown by its command row (started →
-	                                        // output → finished); emitting a "⚙ Bash …" notice on top
-	                                        // would leave a second, redundant activity row lingering.
-	                                        let command = input["command"].as_str().unwrap_or(detail.as_str()).to_string();
-	                                        let id = block["id"].as_str().map(str::to_string).unwrap_or_else(|| format!("claude-command-{command}"));
-	                                        send(sink, StreamItem::CommandStarted {
-	                                            id,
-	                                            command,
-	                                            cwd: String::new(),
-	                                            background: bg,
-	                                        });
-	                                    } else {
-	                                        let label = if detail.is_empty() {
-	                                            format!("⚙ {name}")
-	                                        } else {
-	                                            format!("⚙ {name} {detail}")
-	                                        };
-	                                        send(sink, StreamItem::Notice(label));
-	                                    }
-	                                    if matches!(name, "Edit" | "Write" | "MultiEdit" | "NotebookEdit") {
+                                    let bg = input["run_in_background"].as_bool() == Some(true);
+                                    let is_command = matches!(name, "Bash" | "Shell")
+                                        || input["command"].as_str().is_some();
+                                    if is_command {
+                                        // A command is fully shown by its command row (started →
+                                        // output → finished); emitting a "⚙ Bash …" notice on top
+                                        // would leave a second, redundant activity row lingering.
+                                        let command = input["command"]
+                                            .as_str()
+                                            .unwrap_or(detail.as_str())
+                                            .to_string();
+                                        let id = block["id"]
+                                            .as_str()
+                                            .map(str::to_string)
+                                            .unwrap_or_else(|| format!("claude-command-{command}"));
+                                        send(
+                                            sink,
+                                            StreamItem::CommandStarted {
+                                                id,
+                                                command,
+                                                cwd: String::new(),
+                                                background: bg,
+                                            },
+                                        );
+                                    } else {
+                                        let label = if detail.is_empty() {
+                                            format!("⚙ {name}")
+                                        } else {
+                                            format!("⚙ {name} {detail}")
+                                        };
+                                        send(sink, StreamItem::Notice(label));
+                                    }
+                                    if matches!(
+                                        name,
+                                        "Edit" | "Write" | "MultiEdit" | "NotebookEdit"
+                                    ) {
                                         if let Some(p) = input["file_path"].as_str() {
                                             send(sink, StreamItem::FileChanged(p.to_string()));
                                         }
@@ -732,9 +809,15 @@ impl Provider for ClaudeInteractiveProvider {
             }
         }
         let skey = session_key(&self.bin, &req.conversation_id, &req.cwd);
-        let resume = req.cli_resume.clone()
+        let resume = req
+            .cli_resume
+            .clone()
             .or_else(|| session_get(&skey))
-            .or_else(|| req.conversation_id.strip_prefix("claude-").map(str::to_string));
+            .or_else(|| {
+                req.conversation_id
+                    .strip_prefix("claude-")
+                    .map(str::to_string)
+            });
         let session_id = resume.clone().unwrap_or_else(new_claude_session_id);
         session_set(&skey, &session_id);
         send(&sink, StreamItem::CliSession(session_id.clone()));
@@ -844,7 +927,12 @@ async fn run_claude_interactive_turn(
 ) -> anyhow::Result<()> {
     let pty = portable_pty::native_pty_system();
     let pair = pty
-        .openpty(portable_pty::PtySize { rows: 36, cols: 120, pixel_width: 0, pixel_height: 0 })
+        .openpty(portable_pty::PtySize {
+            rows: 36,
+            cols: 120,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
         .map_err(|e| anyhow::anyhow!("failed to open Claude interactive PTY: {e}"))?;
 
     let mut cmd = portable_pty::CommandBuilder::new(bin);
@@ -913,7 +1001,10 @@ async fn run_claude_interactive_turn(
         .flush()
         .map_err(|e| anyhow::anyhow!("failed to flush prompt to interactive Claude Code: {e}"))?;
 
-    send(sink, StreamItem::Notice("Claude Code interactive session started".to_string()));
+    send(
+        sink,
+        StreamItem::Notice("Claude Code interactive session started".to_string()),
+    );
 
     let started = Instant::now();
     let mut last_change = Instant::now();
@@ -970,18 +1061,24 @@ async fn run_claude_interactive_turn(
                 continue;
             }
             if !result.content.is_empty() {
-                send(sink, StreamItem::CommandOutput {
-                    id: result.id.clone(),
-                    stream: if result.is_error { "stderr" } else { "stdout" }.to_string(),
-                    chunk: result.content,
-                });
+                send(
+                    sink,
+                    StreamItem::CommandOutput {
+                        id: result.id.clone(),
+                        stream: if result.is_error { "stderr" } else { "stdout" }.to_string(),
+                        chunk: result.content,
+                    },
+                );
             }
-            send(sink, StreamItem::CommandFinished {
-                id: result.id,
-                ok: !result.is_error,
-                exit_code: None,
-                duration_ms: 0,
-            });
+            send(
+                sink,
+                StreamItem::CommandFinished {
+                    id: result.id,
+                    ok: !result.is_error,
+                    exit_code: None,
+                    duration_ms: 0,
+                },
+            );
             last_change = Instant::now();
         }
         if snapshot.assistant_text != pending_text {
@@ -993,23 +1090,37 @@ async fn run_claude_interactive_turn(
         }
 
         if !prompt_accepted {
-            let since_input = prompt_retry_at.map(|at| at.elapsed()).unwrap_or_else(|| started.elapsed());
+            let since_input = prompt_retry_at
+                .map(|at| at.elapsed())
+                .unwrap_or_else(|| started.elapsed());
             if since_input >= CLAUDE_INTERACTIVE_PROMPT_ACCEPT_TIMEOUT {
                 if prompt_retry_at.is_none() {
-                    send(sink, StreamItem::Notice("⚠ Claude interactive prompt was not accepted; retrying input".to_string()));
-                    writer
-                        .write_all(b"\x03")
-                        .map_err(|e| anyhow::anyhow!("failed to reset interactive Claude prompt: {e}"))?;
-                    writer
-                        .flush()
-                        .map_err(|e| anyhow::anyhow!("failed to flush interactive Claude reset: {e}"))?;
+                    send(
+                        sink,
+                        StreamItem::Notice(
+                            "⚠ Claude interactive prompt was not accepted; retrying input"
+                                .to_string(),
+                        ),
+                    );
+                    writer.write_all(b"\x03").map_err(|e| {
+                        anyhow::anyhow!("failed to reset interactive Claude prompt: {e}")
+                    })?;
+                    writer.flush().map_err(|e| {
+                        anyhow::anyhow!("failed to flush interactive Claude reset: {e}")
+                    })?;
                     wait_for_claude_prompt(&pty_rx, &mut terminal_tail);
                     writer
                         .write_all(&interactive_retry_bytes(prompt))
-                        .map_err(|e| anyhow::anyhow!("failed to retry prompt to interactive Claude Code: {e}"))?;
-                    writer
-                        .flush()
-                        .map_err(|e| anyhow::anyhow!("failed to flush retried prompt to interactive Claude Code: {e}"))?;
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "failed to retry prompt to interactive Claude Code: {e}"
+                            )
+                        })?;
+                    writer.flush().map_err(|e| {
+                        anyhow::anyhow!(
+                            "failed to flush retried prompt to interactive Claude Code: {e}"
+                        )
+                    })?;
                     prompt_retry_at = Some(Instant::now());
                     last_change = Instant::now();
                     continue;
@@ -1030,7 +1141,13 @@ async fn run_claude_interactive_turn(
                     tail_context(&terminal_tail)
                 ));
             }
-            emit_interactive_final(sink, &pending_text, pending_usage, &mut text_emitted, &mut usage_emitted);
+            emit_interactive_final(
+                sink,
+                &pending_text,
+                pending_usage,
+                &mut text_emitted,
+                &mut usage_emitted,
+            );
             break;
         }
 
@@ -1040,7 +1157,13 @@ async fn run_claude_interactive_turn(
                 || (snapshot.tail == ClaudeTranscriptTail::AssistantText
                     && last_pty_output.elapsed() >= CLAUDE_INTERACTIVE_SETTLE));
         if final_text_ready {
-            emit_interactive_final(sink, &pending_text, pending_usage, &mut text_emitted, &mut usage_emitted);
+            emit_interactive_final(
+                sink,
+                &pending_text,
+                pending_usage,
+                &mut text_emitted,
+                &mut usage_emitted,
+            );
             break;
         }
     }
@@ -1062,7 +1185,14 @@ fn emit_interactive_final(
     }
     if !*usage_emitted {
         if let Some((input, output, context_window)) = usage {
-            send(sink, StreamItem::Usage { input, output, context_window });
+            send(
+                sink,
+                StreamItem::Usage {
+                    input,
+                    output,
+                    context_window,
+                },
+            );
             *usage_emitted = true;
         }
     }
@@ -1073,15 +1203,22 @@ fn emit_claude_tool_use(sink: &mpsc::Sender<StreamItem>, tool: &ClaudeToolUse) {
         // A command tool is fully represented by its command row (started →
         // output → finished). Emitting a "⚙ Bash …" notice on top of it would
         // add a second, redundant activity row that lingers after the turn.
-        send(sink, StreamItem::CommandStarted {
-            id: tool.id.clone(),
-            command: command.clone(),
-            cwd: String::new(),
-            background: tool.background,
-        });
+        send(
+            sink,
+            StreamItem::CommandStarted {
+                id: tool.id.clone(),
+                command: command.clone(),
+                cwd: String::new(),
+                background: tool.background,
+            },
+        );
     } else {
         let label = if tool.background {
-            if tool.detail.is_empty() { format!("⏳ {}", tool.name) } else { format!("⏳ {} {}", tool.name, tool.detail) }
+            if tool.detail.is_empty() {
+                format!("⏳ {}", tool.name)
+            } else {
+                format!("⏳ {} {}", tool.name, tool.detail)
+            }
         } else if tool.detail.is_empty() {
             format!("⚙ {}", tool.name)
         } else {
@@ -1100,7 +1237,9 @@ fn wait_for_claude_prompt(rx: &std::sync::mpsc::Receiver<Vec<u8>>, terminal_tail
         while let Ok(bytes) = rx.try_recv() {
             push_tail(terminal_tail, &bytes);
         }
-        if claude_prompt_ready(terminal_tail) || started.elapsed() >= CLAUDE_INTERACTIVE_READY_TIMEOUT {
+        if claude_prompt_ready(terminal_tail)
+            || started.elapsed() >= CLAUDE_INTERACTIVE_READY_TIMEOUT
+        {
             std::thread::sleep(Duration::from_millis(250));
             while let Ok(bytes) = rx.try_recv() {
                 push_tail(terminal_tail, &bytes);
@@ -1175,7 +1314,11 @@ fn parse_claude_user_line(v: &Value, snapshot: &mut ClaudeTranscriptSnapshot) {
     snapshot.tail = ClaudeTranscriptTail::User;
 }
 
-fn parse_claude_assistant_line(v: &Value, line_idx: usize, snapshot: &mut ClaudeTranscriptSnapshot) {
+fn parse_claude_assistant_line(
+    v: &Value,
+    line_idx: usize,
+    snapshot: &mut ClaudeTranscriptSnapshot,
+) {
     let content = &v["message"]["content"];
     let mut text_parts: Vec<String> = Vec::new();
     let mut has_tool_use = false;
@@ -1197,7 +1340,9 @@ fn parse_claude_assistant_line(v: &Value, line_idx: usize, snapshot: &mut Claude
                     }
                     Some("tool_use") => {
                         has_tool_use = true;
-                        snapshot.tool_uses.push(parse_claude_tool_use(block, line_idx, block_idx));
+                        snapshot
+                            .tool_uses
+                            .push(parse_claude_tool_use(block, line_idx, block_idx));
                     }
                     _ => {}
                 }
@@ -1221,15 +1366,26 @@ fn parse_claude_assistant_line(v: &Value, line_idx: usize, snapshot: &mut Claude
 fn parse_claude_tool_use(block: &Value, line_idx: usize, block_idx: usize) -> ClaudeToolUse {
     let name = block["name"].as_str().unwrap_or("tool").to_string();
     let input = &block["input"];
-    let detail = ["file_path", "path", "command", "pattern", "query", "url", "description"]
-        .iter()
-        .find_map(|k| input[*k].as_str())
-        .unwrap_or("")
-        .chars()
-        .take(120)
-        .collect::<String>();
+    let detail = [
+        "file_path",
+        "path",
+        "command",
+        "pattern",
+        "query",
+        "url",
+        "description",
+    ]
+    .iter()
+    .find_map(|k| input[*k].as_str())
+    .unwrap_or("")
+    .chars()
+    .take(120)
+    .collect::<String>();
     let command = input["command"].as_str().map(str::to_string);
-    let file_path = if matches!(name.as_str(), "Edit" | "Write" | "MultiEdit" | "NotebookEdit") {
+    let file_path = if matches!(
+        name.as_str(),
+        "Edit" | "Write" | "MultiEdit" | "NotebookEdit"
+    ) {
         input["file_path"].as_str().map(str::to_string)
     } else {
         None
@@ -1313,8 +1469,15 @@ fn claude_transcript_path(cwd: &str, session_id: &str) -> anyhow::Result<PathBuf
     } else {
         PathBuf::from(cwd)
     };
-    let slug = workspace.display().to_string().replace('/', "-").replace('.', "-");
-    Ok(home.join(".claude/projects").join(slug).join(format!("{session_id}.jsonl")))
+    let slug = workspace
+        .display()
+        .to_string()
+        .replace('/', "-")
+        .replace('.', "-");
+    Ok(home
+        .join(".claude/projects")
+        .join(slug)
+        .join(format!("{session_id}.jsonl")))
 }
 
 fn count_file_lines(path: &Path) -> usize {
@@ -1431,7 +1594,10 @@ mod claude_interactive_tests {
 
     #[test]
     fn parses_interactive_transcript_after_baseline() {
-        let path = std::env::temp_dir().join(format!("oxide-claude-interactive-{}.jsonl", new_claude_session_id()));
+        let path = std::env::temp_dir().join(format!(
+            "oxide-claude-interactive-{}.jsonl",
+            new_claude_session_id()
+        ));
         let text = r#"{"type":"assistant","sessionId":"old","message":{"content":[{"type":"text","text":"old"}]}}
 {"type":"user","sessionId":"abc","message":{"content":"check"}}
 {"type":"assistant","sessionId":"abc","message":{"content":[{"type":"text","text":"I'll inspect."},{"type":"tool_use","id":"tool-1","name":"Bash","input":{"command":"git status"}}],"usage":{"input_tokens":10,"output_tokens":20}}}
@@ -1458,7 +1624,10 @@ mod claude_interactive_tests {
 
     #[test]
     fn startup_metadata_does_not_accept_interactive_prompt() {
-        let path = std::env::temp_dir().join(format!("oxide-claude-interactive-{}.jsonl", new_claude_session_id()));
+        let path = std::env::temp_dir().join(format!(
+            "oxide-claude-interactive-{}.jsonl",
+            new_claude_session_id()
+        ));
         let text = r#"{"type":"last-prompt","sessionId":"abc"}
 {"type":"mode","mode":"normal","sessionId":"abc"}
 {"type":"permission-mode","permissionMode":"bypassPermissions","sessionId":"abc"}
@@ -1496,7 +1665,8 @@ mod claude_interactive_tests {
     async fn run_jsonl_writes_prompt_to_child_stdin() {
         let args = vec![
             "-c".to_string(),
-            "IFS= read -r input; printf '{\"type\":\"ok\",\"text\":\"%s\"}\\n' \"$input\"".to_string(),
+            "IFS= read -r input; printf '{\"type\":\"ok\",\"text\":\"%s\"}\\n' \"$input\""
+                .to_string(),
         ];
         let (tx, _rx) = mpsc::channel(8);
         let mut seen = String::new();
@@ -1523,7 +1693,10 @@ mod claude_interactive_tests {
         assert_eq!(claude_model_arg(""), None);
         assert_eq!(claude_model_arg("gpt-5.5"), None);
         assert_eq!(claude_model_arg("gpt-5.3-codex-spark"), None);
-        assert_eq!(claude_model_arg("claude-sonnet-4-6"), Some("claude-sonnet-4-6"));
+        assert_eq!(
+            claude_model_arg("claude-sonnet-4-6"),
+            Some("claude-sonnet-4-6")
+        );
         assert_eq!(claude_model_arg("sonnet"), Some("sonnet"));
         assert_eq!(claude_model_arg("opus"), Some("opus"));
         assert_eq!(claude_model_arg("fable"), Some("fable"));
@@ -1533,7 +1706,8 @@ mod claude_interactive_tests {
     #[test]
     fn extract_cli_images_keeps_single_line_prompt_with_attachment() {
         // Real file: extract_cli_images only keeps markers whose path exists().
-        let img = std::env::temp_dir().join(format!("oxide-cli-img-{}.png", new_claude_session_id()));
+        let img =
+            std::env::temp_dir().join(format!("oxide-cli-img-{}.png", new_claude_session_id()));
         std::fs::write(&img, b"\x89PNG").unwrap();
 
         // Mirrors the composer exactly: the "(user attached …)" note carries NO
@@ -1577,7 +1751,9 @@ fn claude_model_arg(model: &str) -> Option<&str> {
         return None;
     }
     let lower = model.to_ascii_lowercase();
-    if lower.starts_with("claude-") || matches!(lower.as_str(), "fable" | "opus" | "sonnet" | "haiku") {
+    if lower.starts_with("claude-")
+        || matches!(lower.as_str(), "fable" | "opus" | "sonnet" | "haiku")
+    {
         Some(model)
     } else {
         None

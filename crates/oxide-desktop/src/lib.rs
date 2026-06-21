@@ -977,14 +977,6 @@ impl OxideDesktop {
                     request_id: None,
                 });
             }
-            Event::WorkflowSelected { title, steps, .. } => {
-                self.timeline.push(TimelineItem {
-                    title,
-                    detail: steps.join("\n"),
-                    state: TimelineState::Done,
-                    request_id: None,
-                });
-            }
             Event::AgentMessageDelta { text, .. } => {
                 if let Some(last) = self.chat.last_mut() {
                     if last.kind == MsgKind::Agent {
@@ -1220,13 +1212,23 @@ impl OxideDesktop {
                     });
                 }
             }
-            Event::AuditLog { kind, title, detail, status, .. } => {
+            Event::AuditLog {
+                kind,
+                title,
+                detail,
+                status,
+                ..
+            } => {
                 let state = match status.as_str() {
                     "failed" | "blocked" | "interrupted" => TimelineState::Error,
                     "running" => TimelineState::Running,
                     _ => TimelineState::Done,
                 };
-                let detail = if detail.trim().is_empty() { status } else { format!("{status} · {detail}") };
+                let detail = if detail.trim().is_empty() {
+                    status
+                } else {
+                    format!("{status} · {detail}")
+                };
                 self.timeline.push(TimelineItem {
                     title: format!("{kind}: {title}"),
                     detail,
@@ -1242,11 +1244,20 @@ impl OxideDesktop {
                     request_id: None,
                 });
             }
-            Event::SubagentFinished { profile, summary, ok, .. } => {
+            Event::SubagentFinished {
+                profile,
+                summary,
+                ok,
+                ..
+            } => {
                 self.timeline.push(TimelineItem {
                     title: format!("Subagent finished: {profile}"),
                     detail: summary,
-                    state: if ok { TimelineState::Done } else { TimelineState::Error },
+                    state: if ok {
+                        TimelineState::Done
+                    } else {
+                        TimelineState::Error
+                    },
                     request_id: None,
                 });
             }
@@ -1284,9 +1295,17 @@ impl OxideDesktop {
             Event::Shutdown => {
                 self.streaming = false;
             }
-            Event::CommandStarted { command, background, .. } => {
+            Event::CommandStarted {
+                command,
+                background,
+                ..
+            } => {
                 self.timeline.push(TimelineItem {
-                    title: if background { "Background command".to_string() } else { "Command started".to_string() },
+                    title: if background {
+                        "Background command".to_string()
+                    } else {
+                        "Command started".to_string()
+                    },
                     detail: command,
                     state: TimelineState::Running,
                     request_id: None,
@@ -1304,13 +1323,26 @@ impl OxideDesktop {
             }
             Event::CommandFinished { ok, exit_code, .. } => {
                 self.timeline.push(TimelineItem {
-                    title: if ok { "Command finished".to_string() } else { "Command failed".to_string() },
-                    detail: exit_code.map(|code| format!("exit {code}")).unwrap_or_else(|| "exit unknown".to_string()),
-                    state: if ok { TimelineState::Done } else { TimelineState::Error },
+                    title: if ok {
+                        "Command finished".to_string()
+                    } else {
+                        "Command failed".to_string()
+                    },
+                    detail: exit_code
+                        .map(|code| format!("exit {code}"))
+                        .unwrap_or_else(|| "exit unknown".to_string()),
+                    state: if ok {
+                        TimelineState::Done
+                    } else {
+                        TimelineState::Error
+                    },
                     request_id: None,
                 });
             }
-            Event::FileDiff { .. } | Event::HookFired { .. } | Event::QuestionAsked { .. } | Event::RateLimit { .. } => {}
+            Event::FileDiff { .. }
+            | Event::HookFired { .. }
+            | Event::QuestionAsked { .. }
+            | Event::RateLimit { .. } => {}
         }
     }
 
@@ -5814,11 +5846,21 @@ fn install_style(ctx: &Context) {
     style.spacing.indent = 18.0;
 
     // ── Typography ──────────────────────────────────────────
-    style.text_styles.insert(TextStyle::Body, FontId::proportional(14.5));
-    style.text_styles.insert(TextStyle::Button, FontId::proportional(14.0));
-    style.text_styles.insert(TextStyle::Heading, FontId::proportional(23.0));
-    style.text_styles.insert(TextStyle::Small, FontId::proportional(12.0));
-    style.text_styles.insert(TextStyle::Monospace, FontId::monospace(12.5));
+    style
+        .text_styles
+        .insert(TextStyle::Body, FontId::proportional(14.5));
+    style
+        .text_styles
+        .insert(TextStyle::Button, FontId::proportional(14.0));
+    style
+        .text_styles
+        .insert(TextStyle::Heading, FontId::proportional(23.0));
+    style
+        .text_styles
+        .insert(TextStyle::Small, FontId::proportional(12.0));
+    style
+        .text_styles
+        .insert(TextStyle::Monospace, FontId::monospace(12.5));
 
     ctx.set_style(style);
 }
@@ -9650,8 +9692,7 @@ mod tests {
             },
         ];
 
-        let next =
-            upsert_recent_workspace(existing, Path::new("/tmp/oxide"), "oxide", 99, 8);
+        let next = upsert_recent_workspace(existing, Path::new("/tmp/oxide"), "oxide", 99, 8);
 
         assert_eq!(next.len(), 2);
         assert_eq!(next[0].path, "/tmp/oxide");
@@ -10088,9 +10129,7 @@ mod tests {
         assert_eq!(draft.browser_action_id, "agent-snapshot-request-42");
         assert_eq!(
             PathBuf::from(&draft.path),
-            PathBuf::from(
-                "/tmp/oxide/.oxide/appshots/files/browser-snapshot-login-99.png"
-            )
+            PathBuf::from("/tmp/oxide/.oxide/appshots/files/browser-snapshot-login-99.png")
         );
     }
 

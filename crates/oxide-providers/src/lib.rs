@@ -44,15 +44,33 @@ pub struct Message {
 impl Message {
     /// A plain text message (no tool call).
     pub fn new(role: Role, content: impl Into<String>) -> Self {
-        Self { role, content: content.into(), tool_call: None, tool_call_id: None, reasoning_item: None }
+        Self {
+            role,
+            content: content.into(),
+            tool_call: None,
+            tool_call_id: None,
+            reasoning_item: None,
+        }
     }
     /// An assistant message that issued a tool call.
     pub fn with_tool_call(content: impl Into<String>, call: ToolCall) -> Self {
-        Self { role: Role::Assistant, content: content.into(), tool_call: Some(call), tool_call_id: None, reasoning_item: None }
+        Self {
+            role: Role::Assistant,
+            content: content.into(),
+            tool_call: Some(call),
+            tool_call_id: None,
+            reasoning_item: None,
+        }
     }
     /// A tool result paired to the assistant call `id`.
     pub fn tool_result(content: impl Into<String>, id: impl Into<String>) -> Self {
-        Self { role: Role::Tool, content: content.into(), tool_call: None, tool_call_id: Some(id.into()), reasoning_item: None }
+        Self {
+            role: Role::Tool,
+            content: content.into(),
+            tool_call: None,
+            tool_call_id: Some(id.into()),
+            reasoning_item: None,
+        }
     }
 }
 
@@ -213,7 +231,11 @@ impl Provider for MockPlanProvider {
         "mock_plan"
     }
 
-    async fn stream(&self, _req: TurnRequest, sink: mpsc::Sender<StreamItem>) -> anyhow::Result<()> {
+    async fn stream(
+        &self,
+        _req: TurnRequest,
+        sink: mpsc::Sender<StreamItem>,
+    ) -> anyhow::Result<()> {
         let _ = sink
             .send(StreamItem::TextDelta(
                 "1. Write the requested file\n2. Report what changed".to_string(),
@@ -235,11 +257,7 @@ impl Provider for MockToolProvider {
         "mock"
     }
 
-    async fn stream(
-        &self,
-        req: TurnRequest,
-        sink: mpsc::Sender<StreamItem>,
-    ) -> anyhow::Result<()> {
+    async fn stream(&self, req: TurnRequest, sink: mpsc::Sender<StreamItem>) -> anyhow::Result<()> {
         // Terminate the agentic loop once the tool has run.
         if req.messages.iter().any(|m| matches!(m.role, Role::Tool)) {
             let _ = sink.send(StreamItem::TextDelta("done.".to_string())).await;
@@ -271,11 +289,7 @@ impl Provider for MockMcpProvider {
         "mock_mcp"
     }
 
-    async fn stream(
-        &self,
-        req: TurnRequest,
-        sink: mpsc::Sender<StreamItem>,
-    ) -> anyhow::Result<()> {
+    async fn stream(&self, req: TurnRequest, sink: mpsc::Sender<StreamItem>) -> anyhow::Result<()> {
         if req.messages.iter().any(|m| matches!(m.role, Role::Tool)) {
             let _ = sink.send(StreamItem::Done).await;
             return Ok(());
@@ -301,11 +315,7 @@ impl Provider for MockBrowserProvider {
         "mock_browser"
     }
 
-    async fn stream(
-        &self,
-        req: TurnRequest,
-        sink: mpsc::Sender<StreamItem>,
-    ) -> anyhow::Result<()> {
+    async fn stream(&self, req: TurnRequest, sink: mpsc::Sender<StreamItem>) -> anyhow::Result<()> {
         if req.messages.iter().any(|m| matches!(m.role, Role::Tool)) {
             let _ = sink.send(StreamItem::Done).await;
             return Ok(());

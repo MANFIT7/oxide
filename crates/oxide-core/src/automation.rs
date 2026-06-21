@@ -73,7 +73,9 @@ pub fn write_spec(workspace: &Path, spec: &AutomationSpec) -> anyhow::Result<()>
 }
 
 pub fn delete_spec(workspace: &Path, id: &str) -> anyhow::Result<()> {
-    let path = workspace.join(".oxide/automations").join(format!("{id}.toml"));
+    let path = workspace
+        .join(".oxide/automations")
+        .join(format!("{id}.toml"));
     if path.exists() {
         std::fs::remove_file(path)?;
     }
@@ -192,7 +194,11 @@ pub fn latest_run<'a>(
 
 pub fn id_from_name(name: &str, now_ms: u64) -> String {
     let slug = slug_fragment(name);
-    let stem = if slug == "branch" { "automation" } else { slug.as_str() };
+    let stem = if slug == "branch" {
+        "automation"
+    } else {
+        slug.as_str()
+    };
     format!("{stem}-{now_ms}")
 }
 

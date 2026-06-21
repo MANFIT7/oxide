@@ -72,23 +72,47 @@ impl BrowserSession {
         if let Some(bin) = detect_browser() {
             builder = builder.chrome_executable(bin);
         }
-        let config = builder.build().map_err(|e| anyhow!("browser config: {e}"))?;
+        let config = builder
+            .build()
+            .map_err(|e| anyhow!("browser config: {e}"))?;
         let (browser, mut handler) = Browser::launch(config).await?;
         let pump = tokio::spawn(async move { while handler.next().await.is_some() {} });
         let page = browser.new_page("about:blank").await?;
-        Ok(Self { _browser: browser, page, _pump: pump })
+        Ok(Self {
+            _browser: browser,
+            page,
+            _pump: pump,
+        })
     }
 
     pub async fn navigate(&self, url: &str) -> Result<String> {
         self.page.goto(url).await?;
-        let _ = self.page.wait_for_navigation().await;
-        let title = self.page.get_title().await.ok().flatten().unwrap_or_default();
+        // wait_for_navigation has no built-in timeout — cap it so a stalled
+        // page load can't freeze the engine indefinitely.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            self.page.wait_for_navigation(),
+        )
+        .await;
+        let title = self
+            .page
+            .get_title()
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default();
         let text = self.read_text().await.unwrap_or_default();
-        Ok(format!("navigated → {url}\ntitle: {title}\n\n{}", truncate(&text, 1800)))
+        Ok(format!(
+            "navigated → {url}\ntitle: {title}\n\n{}",
+            truncate(&text, 1800)
+        ))
     }
 
     pub async fn read_text(&self) -> Result<String> {
-        let v = self.page.evaluate("document.body ? document.body.innerText : ''").await?;
+        let v = self
+            .page
+            .evaluate("document.body ? document.body.innerText : ''")
+            .await?;
         Ok(v.into_value::<String>().unwrap_or_default())
     }
 
@@ -108,8 +132,14 @@ impl BrowserSession {
 
     pub async fn screenshot(&self, dir: &std::path::Path) -> Result<String> {
         std::fs::create_dir_all(dir).ok();
-        let data = self.page.screenshot(ScreenshotParams::builder().build()).await?;
-        let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+        let data = self
+            .page
+            .screenshot(ScreenshotParams::builder().build())
+            .await?;
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
         let path = dir.join(format!("shot-{ts}.png"));
         std::fs::write(&path, data)?;
         Ok(format!("screenshot saved → {}", path.display()))

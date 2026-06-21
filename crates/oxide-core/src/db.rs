@@ -9,7 +9,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 fn db_path() -> PathBuf {
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default();
     let dir = home.join(".config/oxide");
     let _ = std::fs::create_dir_all(&dir);
     dir.join("oxide.db")
@@ -22,9 +24,8 @@ fn conn() -> &'static Mutex<Connection> {
         let c = if cfg!(test) {
             Connection::open_in_memory().expect("sqlite in-memory")
         } else {
-            Connection::open(db_path()).unwrap_or_else(|_| {
-                Connection::open_in_memory().expect("sqlite in-memory")
-            })
+            Connection::open(db_path())
+                .unwrap_or_else(|_| Connection::open_in_memory().expect("sqlite in-memory"))
         };
 
         let _ = c.execute_batch(
@@ -125,7 +126,8 @@ pub fn exists(id: &str) -> bool {
 pub fn append(id: &str, workspace: &Path, provider: &str, role: &str, content: &str) {
     // Never record throwaway workspaces (test temp dirs) in the global db.
     let wss = workspace.to_string_lossy();
-    let throwaway = is_throwaway_workspace(wss.as_ref()) || std::env::var_os("OXIDE_NO_DB").is_some();
+    let throwaway =
+        is_throwaway_workspace(wss.as_ref()) || std::env::var_os("OXIDE_NO_DB").is_some();
     if throwaway && !cfg!(test) {
         return;
     }
@@ -149,8 +151,20 @@ pub fn append(id: &str, workspace: &Path, provider: &str, role: &str, content: &
         let first = content
             .lines()
             .map(|l| l.trim())
-            .find(|l| !l.is_empty() && !l.starts_with("Context files") && !l.starts_with('[') && !l.starts_with('@') && !l.starts_with("<system-reminder>"))
-            .unwrap_or_else(|| content.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim());
+            .find(|l| {
+                !l.is_empty()
+                    && !l.starts_with("Context files")
+                    && !l.starts_with('[')
+                    && !l.starts_with('@')
+                    && !l.starts_with("<system-reminder>")
+            })
+            .unwrap_or_else(|| {
+                content
+                    .lines()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or("")
+                    .trim()
+            });
         let title: String = first.chars().take(60).collect();
         let _ = c.execute(
             "UPDATE sessions SET title=?2 WHERE id=?1 AND title=''",
@@ -163,9 +177,14 @@ pub fn append(id: &str, workspace: &Path, provider: &str, role: &str, content: &
 /// Overwrite a session title (LLM-generated summary, or a cleaned first line).
 pub fn set_title(id: &str, title: &str) {
     let t: String = title.trim().chars().take(60).collect();
-    if t.is_empty() { return; }
+    if t.is_empty() {
+        return;
+    }
     let c = conn().lock().unwrap();
-    let _ = c.execute("UPDATE sessions SET title=?2 WHERE id=?1", rusqlite::params![id, t]);
+    let _ = c.execute(
+        "UPDATE sessions SET title=?2 WHERE id=?1",
+        rusqlite::params![id, t],
+    );
 }
 
 /// Current title (empty if unset).
@@ -311,7 +330,9 @@ fn list_where(cond: &str, params: impl rusqlite::Params, limit: usize) -> Vec<Se
 
 /// Metadata of one session.
 pub fn meta(id: &str) -> Option<SessionMeta> {
-    list_where("id=?1", rusqlite::params![id], 1).into_iter().next()
+    list_where("id=?1", rusqlite::params![id], 1)
+        .into_iter()
+        .next()
 }
 
 /// Newest active session in a workspace.
@@ -419,7 +440,9 @@ where
     {
         let mut g = LAST.get_or_init(Default::default).lock().unwrap();
         if let Some(t) = *g {
-            if t.elapsed() < std::time::Duration::from_secs(5) { return; }
+            if t.elapsed() < std::time::Duration::from_secs(5) {
+                return;
+            }
         }
         *g = Some(std::time::Instant::now());
     }
@@ -433,7 +456,9 @@ where
         return;
     }
 
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else { return };
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return;
+    };
     let path = home.join(".codex/state_5.sqlite");
     import_codex_desktop_threads_from(&path, &allowed, limit);
 }
@@ -443,8 +468,12 @@ fn import_codex_desktop_threads_from(
     allowed: &std::collections::HashSet<String>,
     limit: usize,
 ) {
-    if !path.exists() { return; }
-    let Ok(codex) = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY) else { return };
+    if !path.exists() {
+        return;
+    }
+    let Ok(codex) = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY) else {
+        return;
+    };
     let _ = codex.busy_timeout(std::time::Duration::from_millis(250));
 
     let sql = "
@@ -458,7 +487,9 @@ fn import_codex_desktop_threads_from(
           AND source NOT LIKE '%subagent%'
         ORDER BY COALESCE(updated_at_ms, updated_at * 1000) DESC
         LIMIT ?1";
-    let Ok(mut st) = codex.prepare(sql) else { return };
+    let Ok(mut st) = codex.prepare(sql) else {
+        return;
+    };
     let Ok(rows) = st.query_map(rusqlite::params![limit as i64], |r| {
         Ok((
             r.get::<_, String>(0)?,
@@ -467,7 +498,9 @@ fn import_codex_desktop_threads_from(
             r.get::<_, i64>(3)?,
             r.get::<_, i64>(4)?,
         ))
-    }) else { return };
+    }) else {
+        return;
+    };
 
     let c = conn().lock().unwrap();
     for row in rows.flatten() {
@@ -513,29 +546,48 @@ fn import_codex_desktop_threads_from(
 /// Re-imported each call (claude appends live) — cheap, keyed by a stable id.
 pub fn import_claude_sessions(workspace: &Path) {
     // Throttle: re-scan a workspace's claude dir at most every 5s.
-    static LAST: OnceLock<Mutex<std::collections::HashMap<String, std::time::Instant>>> = OnceLock::new();
+    static LAST: OnceLock<Mutex<std::collections::HashMap<String, std::time::Instant>>> =
+        OnceLock::new();
     {
         let mut g = LAST.get_or_init(Default::default).lock().unwrap();
         let key = workspace.display().to_string();
         if let Some(t) = g.get(&key) {
-            if t.elapsed() < std::time::Duration::from_secs(5) { return; }
+            if t.elapsed() < std::time::Duration::from_secs(5) {
+                return;
+            }
         }
         g.insert(key, std::time::Instant::now());
     }
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else { return };
-    let slug = workspace.display().to_string().replace('/', "-").replace('.', "-");
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return;
+    };
+    let slug = workspace
+        .display()
+        .to_string()
+        .replace('/', "-")
+        .replace('.', "-");
     let dir = home.join(".claude/projects").join(&slug);
-    let Ok(rd) = std::fs::read_dir(&dir) else { return };
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return;
+    };
     for e in rd.flatten() {
         let path = e.path();
-        if path.extension().and_then(|x| x.to_str()) != Some("jsonl") { continue; }
+        if path.extension().and_then(|x| x.to_str()) != Some("jsonl") {
+            continue;
+        }
         let stem = path.file_stem().and_then(|x| x.to_str()).unwrap_or("");
-        if stem.is_empty() { continue; }
+        if stem.is_empty() {
+            continue;
+        }
         let id = format!("claude-{stem}");
-        let Ok(text) = std::fs::read_to_string(&path) else { continue };
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
         let mut msgs: Vec<(String, String)> = Vec::new();
         for line in text.lines() {
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
             let role = match v["type"].as_str() {
                 Some("user") => "user",
                 Some("assistant") => "assistant",
@@ -543,9 +595,17 @@ pub fn import_claude_sessions(workspace: &Path) {
             };
             let content = match &v["message"]["content"] {
                 serde_json::Value::String(s) => s.clone(),
-                serde_json::Value::Array(a) => a.iter()
-                    .filter_map(|x| if x["type"] == "text" { x["text"].as_str() } else { None })
-                    .collect::<Vec<_>>().join("\n"),
+                serde_json::Value::Array(a) => a
+                    .iter()
+                    .filter_map(|x| {
+                        if x["type"] == "text" {
+                            x["text"].as_str()
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
                 _ => String::new(),
             };
             let content = content.trim().to_string();
@@ -553,10 +613,14 @@ pub fn import_claude_sessions(workspace: &Path) {
                 msgs.push((role.to_string(), content));
             }
         }
-        if msgs.is_empty() { continue; }
+        if msgs.is_empty() {
+            continue;
+        }
         // Only rewrite when the message count changed (claude appended).
         let existing = load(&id).len();
-        if existing == msgs.len() { continue; }
+        if existing == msgs.len() {
+            continue;
+        }
         rewrite(&id, workspace, "claude", &msgs);
         // Preserve order by file mtime.
         if let Ok(meta) = std::fs::metadata(&path) {
@@ -564,7 +628,10 @@ pub fn import_claude_sessions(workspace: &Path) {
                 if let Ok(d) = mt.duration_since(std::time::UNIX_EPOCH) {
                     let ms = d.as_millis() as i64;
                     let c = conn().lock().unwrap();
-                    let _ = c.execute("UPDATE sessions SET created_ms=?2, updated_ms=?2 WHERE id=?1", rusqlite::params![id, ms]);
+                    let _ = c.execute(
+                        "UPDATE sessions SET created_ms=?2, updated_ms=?2 WHERE id=?1",
+                        rusqlite::params![id, ms],
+                    );
                 }
             }
         }
@@ -584,7 +651,9 @@ pub fn import_workspace(ws: &Path) {
         }
     }
     let dir = ws.join(".oxide/sessions");
-    let Ok(rd) = std::fs::read_dir(&dir) else { return };
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return;
+    };
     for e in rd.flatten() {
         let p = e.path();
         if p.extension().and_then(|x| x.to_str()) != Some("jsonl") {
@@ -598,11 +667,15 @@ pub fn import_workspace(ws: &Path) {
         if id.is_empty() || exists(&id) {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(&p) else { continue };
+        let Ok(text) = std::fs::read_to_string(&p) else {
+            continue;
+        };
         let mut provider = String::new();
         let mut msgs: Vec<(String, String)> = Vec::new();
         for line in text.lines() {
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
             let role = v["role"].as_str().unwrap_or("");
             let content = v["content"].as_str().unwrap_or("");
             if role == "meta" {
@@ -647,8 +720,9 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&path);
         let codex = Connection::open(&path).expect("open temp codex db");
-        codex.execute_batch(
-            "CREATE TABLE threads (
+        codex
+            .execute_batch(
+                "CREATE TABLE threads (
                id TEXT NOT NULL,
                cwd TEXT NOT NULL,
                title TEXT NOT NULL,
@@ -659,7 +733,8 @@ mod tests {
                archived INTEGER NOT NULL,
                source TEXT NOT NULL
              );",
-        ).expect("create threads table");
+            )
+            .expect("create threads table");
         codex.execute(
             "INSERT INTO threads (id, cwd, title, created_at, updated_at, created_at_ms, updated_at_ms, archived, source)
              VALUES (?1, ?2, ?3, 10, 20, 10000, 20000, 0, 'vscode')",
@@ -690,7 +765,10 @@ mod tests {
         assert_eq!(sessions[0].id, "codex:native-thread-1");
         assert_eq!(sessions[0].provider, "codex");
         assert_eq!(sessions[0].title, "Read README");
-        assert_eq!(cli_session(&sessions[0].id).as_deref(), Some("native-thread-1"));
+        assert_eq!(
+            cli_session(&sessions[0].id).as_deref(),
+            Some("native-thread-1")
+        );
         assert!(list(Path::new("/private/var/folders/tmp-project"), 10).is_empty());
         assert!(list(Path::new("/Volumes/Data/unopened-by-oxide"), 10).is_empty());
 
@@ -699,7 +777,10 @@ mod tests {
         assert!(list(Path::new("/Volumes/Data/oxide-test-import"), 10).is_empty());
 
         restore("codex:native-thread-1");
-        assert_eq!(list(Path::new("/Volumes/Data/oxide-test-import"), 10).len(), 1);
+        assert_eq!(
+            list(Path::new("/Volumes/Data/oxide-test-import"), 10).len(),
+            1
+        );
 
         delete("codex:native-thread-1");
         import_codex_desktop_threads_from(&path, &allowed, 10);

@@ -81,7 +81,10 @@ impl ToolRouter {
                 args["new_string"].as_str().map(|s| s.len()).unwrap_or(0)
             ),
             "shell" => {
-                let timeout = args["timeout_seconds"].as_u64().unwrap_or(120).clamp(1, 600);
+                let timeout = args["timeout_seconds"]
+                    .as_u64()
+                    .unwrap_or(120)
+                    .clamp(1, 600);
                 format!(
                     "Command:\n{}\n\nWorking directory:\n{}\nTimeout: {timeout}s\n\nThis can modify files, run networked commands, or affect git depending on the command.",
                     args["command"].as_str().unwrap_or("?"),
@@ -93,16 +96,28 @@ impl ToolRouter {
                 format!("Update task checklist:\n{n} item(s)")
             }
             "browser_navigate" | "browser_open" => {
-                format!("Open browser target:\n{}", args["url"].as_str().unwrap_or("?"))
+                format!(
+                    "Open browser target:\n{}",
+                    args["url"].as_str().unwrap_or("?")
+                )
             }
             "browser_snapshot" => {
-                format!("Request browser snapshot:\n{}", args["url"].as_str().unwrap_or("?"))
+                format!(
+                    "Request browser snapshot:\n{}",
+                    args["url"].as_str().unwrap_or("?")
+                )
             }
-            "browser_click" => format!("Click browser selector:\n{}", args["selector"].as_str().unwrap_or("?")),
+            "browser_click" => format!(
+                "Click browser selector:\n{}",
+                args["selector"].as_str().unwrap_or("?")
+            ),
             "browser_type" => format!(
                 "Type into browser selector:\n{}\n\nText: {} chars",
                 args["selector"].as_str().unwrap_or("?"),
-                args["text"].as_str().map(|s| s.chars().count()).unwrap_or(0)
+                args["text"]
+                    .as_str()
+                    .map(|s| s.chars().count())
+                    .unwrap_or(0)
             ),
             "web_search" => format!("Search web:\n{}", args["query"].as_str().unwrap_or("?")),
             "fetch_url" => format!("Fetch URL:\n{}", args["url"].as_str().unwrap_or("?")),
@@ -156,7 +171,10 @@ impl ToolRouter {
                 // stall the engine. Both showed up as a "stuck" turn.
                 match std::fs::metadata(&abs) {
                     Ok(m) if !m.is_file() => {
-                        return (format!("read_file: '{path}' is not a regular file (skipped)"), false);
+                        return (
+                            format!("read_file: '{path}' is not a regular file (skipped)"),
+                            false,
+                        );
                     }
                     Ok(m) if m.len() > 10_000_000 => {
                         return (format!("read_file: '{path}' is {} MB — too large to read whole. Use `search` to locate the region.", m.len() / 1_000_000), false);
@@ -164,17 +182,17 @@ impl ToolRouter {
                     _ => {}
                 }
                 match std::fs::read_to_string(&abs) {
-                Ok(content) => {
-                    // Cap very large reads, but TELL the model it was truncated so
-                    // it edits with what it has instead of re-reading blindly.
-                    if content.chars().count() > 20_000 {
-                        let capped: String = content.chars().take(20_000).collect();
-                        (format!("{capped}\n\n… [truncated at 20000 chars — this file is larger; use `search` to locate the exact region instead of re-reading the whole file]"), true)
-                    } else {
-                        (content, true)
+                    Ok(content) => {
+                        // Cap very large reads, but TELL the model it was truncated so
+                        // it edits with what it has instead of re-reading blindly.
+                        if content.chars().count() > 20_000 {
+                            let capped: String = content.chars().take(20_000).collect();
+                            (format!("{capped}\n\n… [truncated at 20000 chars — this file is larger; use `search` to locate the exact region instead of re-reading the whole file]"), true)
+                        } else {
+                            (content, true)
+                        }
                     }
-                }
-                Err(e) => (format!("read_file error: {e}"), false),
+                    Err(e) => (format!("read_file error: {e}"), false),
                 }
             }
         }
@@ -210,8 +228,19 @@ impl ToolRouter {
             return ("search: missing 'query'".into(), false);
         };
         const SKIP: &[&str] = &[
-            ".git", "target", ".oxide", "node_modules", "dist", "build",
-            ".next", "vendor", ".venv", "__pycache__", ".cache", "out", ".turbo",
+            ".git",
+            "target",
+            ".oxide",
+            "node_modules",
+            "dist",
+            "build",
+            ".next",
+            "vendor",
+            ".venv",
+            "__pycache__",
+            ".cache",
+            "out",
+            ".turbo",
         ];
         let mut hits = Vec::new();
         let mut stack = vec![self.workspace.clone()];
@@ -237,7 +266,10 @@ impl ToolRouter {
                     continue;
                 }
                 // Skip big/binary files: never slurp a >2MB file into a String.
-                if std::fs::metadata(&p).map(|m| m.len() > 2_000_000).unwrap_or(true) {
+                if std::fs::metadata(&p)
+                    .map(|m| m.len() > 2_000_000)
+                    .unwrap_or(true)
+                {
                     continue;
                 }
                 if let Ok(text) = std::fs::read_to_string(&p) {
@@ -286,7 +318,10 @@ impl ToolRouter {
         let Some(command) = args["command"].as_str() else {
             return ("shell: missing 'command'".into(), false);
         };
-        let timeout_s = args["timeout_seconds"].as_u64().unwrap_or(120).clamp(1, 600);
+        let timeout_s = args["timeout_seconds"]
+            .as_u64()
+            .unwrap_or(120)
+            .clamp(1, 600);
         let started = std::time::Instant::now();
         let mut cmd = self.build_shell_command(command);
         cmd.current_dir(&self.workspace);
@@ -317,21 +352,30 @@ impl ToolRouter {
                 }
                 let ok = out.status.success();
                 let capped: String = s.chars().take(20_000).collect();
-                let code = out.status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".to_string());
+                let code = out
+                    .status
+                    .code()
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "signal".to_string());
                 let elapsed = format_elapsed(started.elapsed());
                 let body = if capped.trim().is_empty() {
                     "(no output)".to_string()
                 } else {
                     capped
                 };
-                (format!("$ {command}\n[exit {code} · {elapsed}]\n{body}"), ok)
+                (
+                    format!("$ {command}\n[exit {code} · {elapsed}]\n{body}"),
+                    ok,
+                )
             }
             Ok(Err(e)) => (format!("shell error: {e}"), false),
             Err(_) => {
                 // Kill the whole process group so grandchildren die too.
                 #[cfg(unix)]
                 if let Some(pg) = pgid {
-                    unsafe { libc::killpg(pg, libc::SIGKILL); }
+                    unsafe {
+                        libc::killpg(pg, libc::SIGKILL);
+                    }
                 }
                 (
                     format!(
@@ -358,7 +402,10 @@ impl ToolRouter {
         let Some(command) = args["command"].as_str() else {
             return ("shell: missing 'command'".into(), false);
         };
-        let timeout_s = args["timeout_seconds"].as_u64().unwrap_or(120).clamp(1, 600);
+        let timeout_s = args["timeout_seconds"]
+            .as_u64()
+            .unwrap_or(120)
+            .clamp(1, 600);
         let started = std::time::Instant::now();
         let mut cmd = self.build_shell_command(command);
         cmd.current_dir(&self.workspace);
@@ -430,15 +477,26 @@ impl ToolRouter {
             }
         };
 
-        while let Ok(Some((stream, chunk))) = tokio::time::timeout(std::time::Duration::from_millis(50), line_rx.recv()).await {
-            append_shell_chunk(if stream == "stderr" { &mut stderr } else { &mut stdout }, &chunk);
-            let _ = event_tx.send(Event::CommandOutput {
-                turn,
-                command_id: command_id.clone(),
-                worker_id: worker_id.clone(),
-                stream: stream.to_string(),
-                chunk,
-            }).await;
+        while let Ok(Some((stream, chunk))) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), line_rx.recv()).await
+        {
+            append_shell_chunk(
+                if stream == "stderr" {
+                    &mut stderr
+                } else {
+                    &mut stdout
+                },
+                &chunk,
+            );
+            let _ = event_tx
+                .send(Event::CommandOutput {
+                    turn,
+                    command_id: command_id.clone(),
+                    worker_id: worker_id.clone(),
+                    stream: stream.to_string(),
+                    chunk,
+                })
+                .await;
         }
 
         match status {
@@ -447,7 +505,10 @@ impl ToolRouter {
                 let code = exit.status_code_string();
                 let elapsed = format_elapsed(started.elapsed());
                 let body = shell_output_body(&stdout, &stderr);
-                (format!("$ {command}\n[exit {code} · {elapsed}]\n{body}"), ok)
+                (
+                    format!("$ {command}\n[exit {code} · {elapsed}]\n{body}"),
+                    ok,
+                )
             }
             Err(e) => (format!("shell error: {e}"), false),
         }
@@ -486,8 +547,11 @@ impl ToolRouter {
     }
 }
 
-fn spawn_shell_reader<R>(reader: R, stream: &'static str, tx: mpsc::UnboundedSender<(&'static str, String)>)
-where
+fn spawn_shell_reader<R>(
+    reader: R,
+    stream: &'static str,
+    tx: mpsc::UnboundedSender<(&'static str, String)>,
+) where
     R: AsyncRead + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
@@ -506,7 +570,14 @@ where
 fn append_shell_chunk(buf: &mut String, chunk: &str) {
     buf.push_str(chunk);
     if buf.len() > 24_000 {
-        let keep: String = buf.chars().rev().take(20_000).collect::<Vec<_>>().into_iter().rev().collect();
+        let keep: String = buf
+            .chars()
+            .rev()
+            .take(20_000)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
         *buf = keep;
     }
 }
@@ -521,7 +592,11 @@ fn shell_output_body(stdout: &str, stderr: &str) -> String {
         s.push_str(stderr);
     }
     let capped: String = s.chars().take(20_000).collect();
-    if capped.trim().is_empty() { "(no output)".to_string() } else { capped }
+    if capped.trim().is_empty() {
+        "(no output)".to_string()
+    } else {
+        capped
+    }
 }
 
 trait ExitStatusExt {
@@ -530,7 +605,9 @@ trait ExitStatusExt {
 
 impl ExitStatusExt for std::process::ExitStatus {
     fn status_code_string(&self) -> String {
-        self.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".to_string())
+        self.code()
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "signal".to_string())
     }
 }
 
@@ -592,7 +669,11 @@ fn launchd_ssh_auth_sock() -> Option<String> {
             .output()
             .ok()?;
         let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if s.is_empty() { None } else { Some(s) }
+        if s.is_empty() {
+            None
+        } else {
+            Some(s)
+        }
     })
     .clone()
 }

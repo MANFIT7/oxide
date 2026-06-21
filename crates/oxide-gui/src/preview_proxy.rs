@@ -110,7 +110,11 @@ async fn handle(mut sock: tokio::net::TcpStream, client: reqwest::Client) -> std
 
     let target = TARGET.load(Ordering::Relaxed);
     if target == 0 {
-        let _ = sock.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+        let _ = sock
+            .write_all(
+                b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await;
         return Ok(());
     }
 
@@ -126,7 +130,9 @@ async fn handle(mut sock: tokio::net::TcpStream, client: reqwest::Client) -> std
 
     let url = format!("http://127.0.0.1:{target}{path}");
     let m = reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET);
-    let mut rb = client.request(m, &url).header("Accept-Encoding", "identity");
+    let mut rb = client
+        .request(m, &url)
+        .header("Accept-Encoding", "identity");
     if !body.is_empty() {
         rb = rb.body(body);
     }

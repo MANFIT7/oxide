@@ -114,12 +114,20 @@ pub struct Config {
     pub editor_app: String,
 }
 
-fn default_editor() -> String { "Visual Studio Code".to_string() }
+fn default_editor() -> String {
+    "Visual Studio Code".to_string()
+}
 
-fn default_env_w() -> f64 { 560.0 }
+fn default_env_w() -> f64 {
+    560.0
+}
 
-fn default_sidebar_w() -> f64 { 250.0 }
-fn default_insp_w() -> f64 { 280.0 }
+fn default_sidebar_w() -> f64 {
+    250.0
+}
+fn default_insp_w() -> f64 {
+    280.0
+}
 
 fn default_true() -> bool {
     true
@@ -251,8 +259,8 @@ impl Default for McpServerConfig {
 
 impl McpServerConfig {
     pub fn tool_allowed(&self, bare_name: &str) -> bool {
-        let explicitly_enabled =
-            self.enabled_tools.is_empty() || self.enabled_tools.iter().any(|name| name == bare_name);
+        let explicitly_enabled = self.enabled_tools.is_empty()
+            || self.enabled_tools.iter().any(|name| name == bare_name);
         explicitly_enabled && !self.disabled_tools.iter().any(|name| name == bare_name)
     }
 }
@@ -342,8 +350,9 @@ impl Config {
             .with_context(|| format!("reading config {}", path.display()))?;
         let overlay: toml::Value =
             toml::from_str(&text).with_context(|| format!("parsing config {}", path.display()))?;
-        let mut base = toml::Value::try_from(&*self)
-            .with_context(|| format!("serializing base config before overlay {}", path.display()))?;
+        let mut base = toml::Value::try_from(&*self).with_context(|| {
+            format!("serializing base config before overlay {}", path.display())
+        })?;
         merge_toml(&mut base, overlay);
         *self = base
             .try_into()
@@ -410,8 +419,16 @@ fn parse_codex_mcp(text: &str) -> Vec<McpServerConfig> {
     let mut out = Vec::new();
     for (name, def) in servers {
         let Some(def) = def.as_table() else { continue };
-        let command = def.get("command").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-        let url = def.get("url").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        let command = def
+            .get("command")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let url = def
+            .get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
         // Skip entries that aren't launchable (neither a command nor a URL).
         if command.is_empty() && url.is_empty() {
             continue;
@@ -419,12 +436,20 @@ fn parse_codex_mcp(text: &str) -> Vec<McpServerConfig> {
         let args = def
             .get("args")
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
         let env = def
             .get("env")
             .and_then(|v| v.as_table())
-            .map(|t| t.iter().filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string()))).collect())
+            .map(|t| {
+                t.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            })
             .unwrap_or_default();
         let bearer_token_env_var = def
             .get("bearer_token_env_var")
@@ -494,19 +519,36 @@ description = "no command or url — skipped"
     #[test]
     fn merge_imported_mcp_keeps_explicit_config() {
         let mut cfg = Config {
-            mcp_servers: vec![McpServerConfig { name: "github".into(), command: "mine".into(), ..Default::default() }],
+            mcp_servers: vec![McpServerConfig {
+                name: "github".into(),
+                command: "mine".into(),
+                ..Default::default()
+            }],
             ..Config::default()
         };
         cfg.merge_imported_mcp(vec![
-            McpServerConfig { name: "github".into(), command: "codex".into(), source: "codex".into(), ..Default::default() },
-            McpServerConfig { name: "fs".into(), command: "npx".into(), source: "codex".into(), ..Default::default() },
+            McpServerConfig {
+                name: "github".into(),
+                command: "codex".into(),
+                source: "codex".into(),
+                ..Default::default()
+            },
+            McpServerConfig {
+                name: "fs".into(),
+                command: "npx".into(),
+                source: "codex".into(),
+                ..Default::default()
+            },
         ]);
         // Explicit "github" wins; new "fs" is added.
         assert_eq!(cfg.mcp_servers.len(), 2);
         let gh = cfg.mcp_servers.iter().find(|s| s.name == "github").unwrap();
         assert_eq!(gh.command, "mine");
         assert_eq!(gh.source, "");
-        assert!(cfg.mcp_servers.iter().any(|s| s.name == "fs" && s.source == "codex"));
+        assert!(cfg
+            .mcp_servers
+            .iter()
+            .any(|s| s.name == "fs" && s.source == "codex"));
     }
 
     #[test]

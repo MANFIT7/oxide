@@ -137,9 +137,12 @@ fn main() -> Result<()> {
             rt.block_on(async move {
                 match other {
                     Command::Tui => run_tui(config).await,
-                    Command::Exec { prompt, yes, json_events, answer } => {
-                        run_exec(config, prompt, yes, json_events, answer).await
-                    }
+                    Command::Exec {
+                        prompt,
+                        yes,
+                        json_events,
+                        answer,
+                    } => run_exec(config, prompt, yes, json_events, answer).await,
                     Command::Harness { action } => match action {
                         HarnessAction::List => list_harnesses(&config),
                     },
@@ -183,14 +186,6 @@ async fn run_exec(
                     println!("[{turn}] started");
                 }
             }
-            Event::WorkflowSelected { title, steps, .. } => {
-                if !json_events {
-                    println!("[workflow] {title}");
-                    for (i, step) in steps.iter().enumerate() {
-                        println!("  {}. {step}", i + 1);
-                    }
-                }
-            }
             Event::AgentMessageDelta { text, .. } => {
                 if !json_events {
                     print!("{text}");
@@ -232,9 +227,16 @@ async fn run_exec(
                     println!("[tool] {tool} ok={ok}: {output}")
                 }
             }
-            Event::CommandStarted { command, background, .. } => {
+            Event::CommandStarted {
+                command,
+                background,
+                ..
+            } => {
                 if !json_events {
-                    println!("[command] {}{command}", if background { "background " } else { "" });
+                    println!(
+                        "[command] {}{command}",
+                        if background { "background " } else { "" }
+                    );
                 }
             }
             Event::CommandOutput { stream, chunk, .. } => {
@@ -242,19 +244,30 @@ async fn run_exec(
                     println!("[{stream}] {}", chunk.trim_end());
                 }
             }
-            Event::CommandFinished { ok, exit_code, duration_ms, .. } => {
+            Event::CommandFinished {
+                ok,
+                exit_code,
+                duration_ms,
+                ..
+            } => {
                 if !json_events {
                     println!(
                         "[command] {} exit={} duration={}ms",
                         if ok { "done" } else { "failed" },
-                        exit_code.map(|code| code.to_string()).unwrap_or_else(|| "?".into()),
+                        exit_code
+                            .map(|code| code.to_string())
+                            .unwrap_or_else(|| "?".into()),
                         duration_ms
                     );
                 }
             }
             Event::Todos { items } => {
                 if !json_events {
-                    println!("[todos] {}/{} done", items.iter().filter(|(_, s)| s == "completed").count(), items.len());
+                    println!(
+                        "[todos] {}/{} done",
+                        items.iter().filter(|(_, s)| s == "completed").count(),
+                        items.len()
+                    );
                 }
             }
             Event::PatchApplied { path, .. } => {
@@ -292,12 +305,24 @@ async fn run_exec(
                     println!("[diff] {path}");
                 }
             }
-            Event::HookFired { hook, command, blocked } => {
+            Event::HookFired {
+                hook,
+                command,
+                blocked,
+            } => {
                 if !json_events {
-                    println!("[hook] {hook}: {command}{}", if blocked { " (blocked)" } else { "" })
+                    println!(
+                        "[hook] {hook}: {command}{}",
+                        if blocked { " (blocked)" } else { "" }
+                    )
                 }
             }
-            Event::AuditLog { kind, title, status, .. } => {
+            Event::AuditLog {
+                kind,
+                title,
+                status,
+                ..
+            } => {
                 if !json_events {
                     println!("[audit:{kind}] {status}: {title}")
                 }
@@ -307,17 +332,32 @@ async fn run_exec(
                     println!("[subagent] {profile} started: {task}")
                 }
             }
-            Event::SubagentFinished { profile, summary, ok, .. } => {
+            Event::SubagentFinished {
+                profile,
+                summary,
+                ok,
+                ..
+            } => {
                 if !json_events {
                     println!("[subagent] {profile} ok={ok}: {summary}")
                 }
             }
-            Event::RateLimit { plan, primary_pct, secondary_pct, .. } => {
+            Event::RateLimit {
+                plan,
+                primary_pct,
+                secondary_pct,
+                ..
+            } => {
                 if !json_events {
                     println!("[usage] {plan}: 5h {primary_pct}% · weekly {secondary_pct}%")
                 }
             }
-            Event::QuestionAsked { request_id, question, options, .. } => {
+            Event::QuestionAsked {
+                request_id,
+                question,
+                options,
+                ..
+            } => {
                 if !json_events {
                     println!("[question] {question}");
                     for (i, o) in options.iter().enumerate() {
@@ -325,7 +365,9 @@ async fn run_exec(
                     }
                 }
                 if let Some(answer) = answer.clone() {
-                    handle.submit(Op::QuestionAnswer { request_id, answer }).await?;
+                    handle
+                        .submit(Op::QuestionAnswer { request_id, answer })
+                        .await?;
                 } else {
                     missing_answer = Some(question);
                     handle.submit(Op::Shutdown).await.ok();
@@ -405,11 +447,7 @@ fn run_session(action: SessionAction, config: &Config) -> Result<()> {
                 let count = oxide_core::db::message_count(&session.id);
                 println!(
                     "{pin} {}  {:<12} {:>3} msg  updated={}  {}",
-                    session.id,
-                    session.provider,
-                    count,
-                    session.updated_ms,
-                    title
+                    session.id, session.provider, count, session.updated_ms, title
                 );
             }
         }

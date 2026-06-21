@@ -39,7 +39,10 @@ impl SessionStore {
     /// Attach to an EXISTING session by id — appends continue it.
     pub fn attach(id: &str, workspace: &Path) -> std::io::Result<Self> {
         if !crate::db::exists(id) {
-            return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "session not found"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "session not found",
+            ));
         }
         Ok(Self {
             id: id.to_string(),
@@ -56,7 +59,10 @@ impl SessionStore {
     /// Provider stamp (sidebar logos). Applied immediately if the session
     /// already exists, and to every future append.
     pub fn set_meta(&self, content: &str) {
-        let p = content.strip_prefix("provider=").unwrap_or(content).to_string();
+        let p = content
+            .strip_prefix("provider=")
+            .unwrap_or(content)
+            .to_string();
         if crate::db::exists(&self.id) {
             crate::db::set_provider(&self.id, &p);
         }
@@ -82,11 +88,18 @@ impl SessionStore {
     pub fn load(id: &str) -> std::io::Result<Vec<StoredMessage>> {
         let rows = crate::db::load(id);
         if rows.is_empty() && !crate::db::exists(id) {
-            return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "session not found"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "session not found",
+            ));
         }
         Ok(rows
             .into_iter()
-            .map(|(role, content)| StoredMessage { role, content, ts_ms: 0 })
+            .map(|(role, content)| StoredMessage {
+                role,
+                content,
+                ts_ms: 0,
+            })
             .collect())
     }
 
@@ -96,7 +109,6 @@ impl SessionStore {
         crate::db::latest(workspace)
     }
 }
-
 
 /// Snapshot of one file's prior state, taken before a mutating tool runs.
 struct FileSnapshot {
@@ -125,7 +137,10 @@ impl CheckpointStore {
         let id = self.next_id;
         self.checkpoints.push(Checkpoint {
             id,
-            files: vec![FileSnapshot { path: path.to_path_buf(), prior }],
+            files: vec![FileSnapshot {
+                path: path.to_path_buf(),
+                prior,
+            }],
         });
         id
     }

@@ -192,15 +192,32 @@ impl Card {
 }
 
 /// Run one card end-to-end in an isolated git worktree. Returns `(result, branch)`.
-pub async fn run_card(base: Config, title: String, desc: String, id: u64, root: PathBuf) -> (String, String) {
+pub async fn run_card(
+    base: Config,
+    title: String,
+    desc: String,
+    id: u64,
+    root: PathBuf,
+) -> (String, String) {
     let branch = format!("oxide/card-{id}");
     let wt = root.join(format!(".oxide/worktrees/card-{id}"));
     let _ = tokio::process::Command::new("git")
-        .args(["worktree", "add", "-B", &branch, &wt.to_string_lossy(), "HEAD"])
+        .args([
+            "worktree",
+            "add",
+            "-B",
+            &branch,
+            &wt.to_string_lossy(),
+            "HEAD",
+        ])
         .current_dir(&root)
         .output()
         .await;
-    let workspace = if wt.exists() { wt.clone() } else { root.clone() };
+    let workspace = if wt.exists() {
+        wt.clone()
+    } else {
+        root.clone()
+    };
 
     let mut cfg = base;
     cfg.workspace = Some(workspace.clone());
@@ -215,7 +232,11 @@ pub async fn run_card(base: Config, title: String, desc: String, id: u64, root: 
         Ok(x) => x,
         Err(e) => return (format!("spawn error: {e}"), branch),
     };
-    let prompt = if desc.trim().is_empty() { title.clone() } else { format!("{title}\n\n{desc}") };
+    let prompt = if desc.trim().is_empty() {
+        title.clone()
+    } else {
+        format!("{title}\n\n{desc}")
+    };
     let _ = handle.submit(Op::UserTurn { text: prompt }).await;
 
     let mut out = String::new();

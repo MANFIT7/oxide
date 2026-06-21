@@ -16,7 +16,9 @@ pub struct Memory {
 
 impl Memory {
     pub fn new(workspace: &Path) -> Self {
-        Self { dir: workspace.join(".oxide/memory") }
+        Self {
+            dir: workspace.join(".oxide/memory"),
+        }
     }
 
     fn ensure(&self) {
@@ -59,9 +61,19 @@ impl Memory {
         self.ensure();
         let safe: String = name
             .chars()
-            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '-'
+                }
+            })
             .collect();
-        let safe = if safe.trim_matches('-').is_empty() { "skill".to_string() } else { safe };
+        let safe = if safe.trim_matches('-').is_empty() {
+            "skill".to_string()
+        } else {
+            safe
+        };
         std::fs::write(self.dir.join("skills").join(format!("{safe}.md")), content)
     }
 
@@ -81,9 +93,14 @@ impl Memory {
                 let summary = std::fs::read_to_string(&p)
                     .ok()
                     .and_then(|t| {
-                        t.lines()
-                            .find(|l| !l.trim().is_empty())
-                            .map(|l| l.trim().trim_start_matches('#').trim().chars().take(80).collect::<String>())
+                        t.lines().find(|l| !l.trim().is_empty()).map(|l| {
+                            l.trim()
+                                .trim_start_matches('#')
+                                .trim()
+                                .chars()
+                                .take(80)
+                                .collect::<String>()
+                        })
                     })
                     .unwrap_or_default();
                 v.push((name, summary));
@@ -104,7 +121,8 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let m = Memory::new(&tmp);
         m.remember("user prefers Rust").unwrap();
-        m.save_skill("deploy", "# Deploy\nrun cargo build then ship").unwrap();
+        m.save_skill("deploy", "# Deploy\nrun cargo build then ship")
+            .unwrap();
         let block = m.load_block();
         assert!(block.contains("user prefers Rust"));
         assert!(block.contains("deploy"));

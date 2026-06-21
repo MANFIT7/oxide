@@ -79,10 +79,7 @@ impl McpClient {
     }
 
     /// Connect to a remote MCP server over Streamable HTTP/SSE.
-    pub async fn connect_http(
-        server: impl Into<String>,
-        url: &str,
-    ) -> anyhow::Result<Self> {
+    pub async fn connect_http(server: impl Into<String>, url: &str) -> anyhow::Result<Self> {
         Self::connect(server, Box::new(HttpTransport::new(url))).await
     }
 
@@ -104,7 +101,8 @@ impl McpClient {
     }
 
     async fn initialize(&self) -> anyhow::Result<String> {
-        let result = self.transport
+        let result = self
+            .transport
             .call(
                 "initialize",
                 json!({

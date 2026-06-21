@@ -143,15 +143,15 @@ impl Hooks {
                     for command in simple_commands(value) {
                         self.push(
                             &event,
-                        HookCommand {
-                            command,
-                            matcher: String::new(),
-                            timeout: 60,
-                            status_message: String::new(),
-                            background: false,
-                        },
-                    );
-                }
+                            HookCommand {
+                                command,
+                                matcher: String::new(),
+                                timeout: 60,
+                                status_message: String::new(),
+                                background: false,
+                            },
+                        );
+                    }
                 }
                 toml::Value::Table(table) => {
                     for command in command_hooks(table, "") {
@@ -210,11 +210,11 @@ pub fn dangerous_tool_reason(tool: &str, args: &serde_json::Value) -> Option<Str
         ("chmod -r 777", "broad permission weakening"),
         (":(){", "fork bomb"),
     ];
-    dangerous
-        .iter()
-        .find_map(|(needle, reason)| lower.contains(needle).then(|| {
-            format!("blocked dangerous shell command ({reason}): {command}")
-        }))
+    dangerous.iter().find_map(|(needle, reason)| {
+        lower
+            .contains(needle)
+            .then(|| format!("blocked dangerous shell command ({reason}): {command}"))
+    })
 }
 
 fn simple_commands(value: &toml::Value) -> Vec<String> {
@@ -228,7 +228,10 @@ fn simple_commands(value: &toml::Value) -> Vec<String> {
     }
 }
 
-fn command_hooks(table: &toml::map::Map<String, toml::Value>, inherited_matcher: &str) -> Vec<HookCommand> {
+fn command_hooks(
+    table: &toml::map::Map<String, toml::Value>,
+    inherited_matcher: &str,
+) -> Vec<HookCommand> {
     let hook_type = table
         .get("type")
         .and_then(|value| value.as_str())
@@ -318,7 +321,13 @@ statusMessage = "Guard"
             map: HashMap::new(),
             auto: HookAuto::default(),
         };
-        hooks.load_table(text.parse::<toml::Value>().unwrap().as_table().unwrap().clone());
+        hooks.load_table(
+            text.parse::<toml::Value>()
+                .unwrap()
+                .as_table()
+                .unwrap()
+                .clone(),
+        );
 
         let shell = hooks.commands_for("pre_tool", "shell");
         let read = hooks.commands_for("pre_tool", "read_file");
@@ -343,7 +352,13 @@ async = true
             map: HashMap::new(),
             auto: HookAuto::default(),
         };
-        hooks.load_table(text.parse::<toml::Value>().unwrap().as_table().unwrap().clone());
+        hooks.load_table(
+            text.parse::<toml::Value>()
+                .unwrap()
+                .as_table()
+                .unwrap()
+                .clone(),
+        );
 
         let stop = hooks.commands_for("stop", "");
 

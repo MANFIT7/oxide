@@ -70,7 +70,11 @@ impl HttpTransport {
             req = req.header("Mcp-Session-Id", sid);
         }
         let resp = req.json(body).send().await?;
-        if let Some(sid) = resp.headers().get("Mcp-Session-Id").and_then(|v| v.to_str().ok()) {
+        if let Some(sid) = resp
+            .headers()
+            .get("Mcp-Session-Id")
+            .and_then(|v| v.to_str().ok())
+        {
             *self.session.lock().await = Some(sid.to_string());
         }
         if !resp.status().is_success() {
@@ -85,7 +89,9 @@ impl HttpTransport {
             .unwrap_or("")
             .to_string();
         let text = resp.text().await?;
-        let Some(want_id) = want_id else { return Ok(Value::Null) };
+        let Some(want_id) = want_id else {
+            return Ok(Value::Null);
+        };
 
         // Collect candidate JSON-RPC messages: either a single JSON body, or the
         // `data:` payloads of an SSE stream.

@@ -107,7 +107,9 @@ impl Frontend for Tui {
 /// opens on the last chat instead of a blank screen.
 fn load_last_session(workspace: &std::path::Path, state: &mut State) {
     let dir = workspace.join(".oxide/sessions");
-    let Ok(rd) = std::fs::read_dir(&dir) else { return };
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return;
+    };
     let mut files: Vec<std::path::PathBuf> = rd
         .flatten()
         .map(|e| e.path())
@@ -115,10 +117,14 @@ fn load_last_session(workspace: &std::path::Path, state: &mut State) {
         .collect();
     files.sort();
     let Some(latest) = files.last() else { return };
-    let Ok(text) = std::fs::read_to_string(latest) else { return };
+    let Ok(text) = std::fs::read_to_string(latest) else {
+        return;
+    };
     let mut shown = 0;
     for line in text.lines() {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
         let role = v["role"].as_str().unwrap_or("");
         let content = v["content"].as_str().unwrap_or("").trim();
         if content.is_empty() {
@@ -132,7 +138,10 @@ fn load_last_session(workspace: &std::path::Path, state: &mut State) {
         for (i, l) in content.lines().enumerate() {
             let prefix = if i == 0 { label } else { "  " };
             state.push(Line::from(vec![
-                Span::styled(prefix.to_string(), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    prefix.to_string(),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
                 Span::raw(l.to_string()),
             ]));
         }
@@ -253,15 +262,6 @@ fn apply_event(event: Event, state: &mut State) {
         Event::SessionPath { .. } => {}
         Event::Followups { .. } => {}
         Event::TurnStarted { turn } => state.status = format!("{turn} running…"),
-        Event::WorkflowSelected { title, steps, .. } => {
-            state.push(Line::from(Span::styled(
-                format!("workflow: {title}"),
-                Style::default().fg(Color::Blue),
-            )));
-            for (i, step) in steps.iter().enumerate() {
-                state.push(Line::from(format!("  {}. {step}", i + 1)));
-            }
-        }
         Event::ApprovalRequested {
             request_id,
             tool,
@@ -295,7 +295,11 @@ fn apply_event(event: Event, state: &mut State) {
                 Style::default().fg(color),
             )));
         }
-        Event::CommandStarted { command, background, .. } => {
+        Event::CommandStarted {
+            command,
+            background,
+            ..
+        } => {
             state.push(Line::from(Span::styled(
                 format!("⌘ {}{command}", if background { "background " } else { "" }),
                 Style::default().fg(Color::Yellow),
@@ -310,14 +314,28 @@ fn apply_event(event: Event, state: &mut State) {
                 )));
             }
         }
-        Event::CommandFinished { ok, exit_code, duration_ms, .. } => {
+        Event::CommandFinished {
+            ok,
+            exit_code,
+            duration_ms,
+            ..
+        } => {
             state.push(Line::from(Span::styled(
-                format!("⌘ {} · exit {} · {duration_ms}ms", if ok { "done" } else { "failed" }, exit_code.map(|c| c.to_string()).unwrap_or_else(|| "?".into())),
+                format!(
+                    "⌘ {} · exit {} · {duration_ms}ms",
+                    if ok { "done" } else { "failed" },
+                    exit_code
+                        .map(|c| c.to_string())
+                        .unwrap_or_else(|| "?".into())
+                ),
                 Style::default().fg(if ok { Color::Green } else { Color::Red }),
             )));
         }
         Event::Todos { items } => {
-            let done = items.iter().filter(|(_, status)| status == "completed").count();
+            let done = items
+                .iter()
+                .filter(|(_, status)| status == "completed")
+                .count();
             state.push(Line::from(Span::styled(
                 format!("todos {done}/{} done", items.len()),
                 Style::default().fg(Color::Blue),
@@ -402,11 +420,23 @@ fn apply_event(event: Event, state: &mut State) {
             format!("± diff {path}"),
             Style::default().fg(Color::Magenta),
         ))),
-        Event::HookFired { hook, command, blocked } => state.push(Line::from(Span::styled(
-            format!("hook {hook}: {command}{}", if blocked { " (blocked)" } else { "" }),
+        Event::HookFired {
+            hook,
+            command,
+            blocked,
+        } => state.push(Line::from(Span::styled(
+            format!(
+                "hook {hook}: {command}{}",
+                if blocked { " (blocked)" } else { "" }
+            ),
             Style::default().fg(Color::DarkGray),
         ))),
-        Event::AuditLog { kind, title, status, .. } => state.push(Line::from(Span::styled(
+        Event::AuditLog {
+            kind,
+            title,
+            status,
+            ..
+        } => state.push(Line::from(Span::styled(
             format!("audit {kind}: {status} · {title}"),
             Style::default().fg(Color::DarkGray),
         ))),
@@ -414,18 +444,36 @@ fn apply_event(event: Event, state: &mut State) {
             format!("subagent {profile}: {task}"),
             Style::default().fg(Color::Blue),
         ))),
-        Event::SubagentFinished { profile, summary, ok, .. } => state.push(Line::from(Span::styled(
-            format!("subagent {profile} {}: {summary}", if ok { "done" } else { "stopped" }),
+        Event::SubagentFinished {
+            profile,
+            summary,
+            ok,
+            ..
+        } => state.push(Line::from(Span::styled(
+            format!(
+                "subagent {profile} {}: {summary}",
+                if ok { "done" } else { "stopped" }
+            ),
             Style::default().fg(if ok { Color::Green } else { Color::Red }),
         ))),
-        Event::RateLimit { plan, primary_pct, secondary_pct, .. } => {
+        Event::RateLimit {
+            plan,
+            primary_pct,
+            secondary_pct,
+            ..
+        } => {
             state.push(Line::from(Span::styled(
                 format!("usage [{plan}] 5h {primary_pct}% · weekly {secondary_pct}%"),
                 Style::default().fg(Color::DarkGray),
             )));
         }
-        Event::QuestionAsked { question, options, .. } => {
-            state.push(Line::from(Span::styled(format!("❓ {question}"), Style::default().fg(Color::Yellow))));
+        Event::QuestionAsked {
+            question, options, ..
+        } => {
+            state.push(Line::from(Span::styled(
+                format!("❓ {question}"),
+                Style::default().fg(Color::Yellow),
+            )));
             for (i, o) in options.iter().enumerate() {
                 state.push(Line::from(format!("  {}. {o}", i + 1)));
             }

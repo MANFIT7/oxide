@@ -26,16 +26,19 @@ fn model() -> Option<&'static StaticModel> {
         2 => MODEL.get(),
         3 => None,
         _ => {
-            if STATE.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-                std::thread::spawn(|| {
-                    match StaticModel::from_pretrained(REPO, None, None, None) {
+            if STATE
+                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                std::thread::spawn(
+                    || match StaticModel::from_pretrained(REPO, None, None, None) {
                         Ok(m) => {
                             let _ = MODEL.set(m);
                             STATE.store(2, Ordering::Release);
                         }
                         Err(_) => STATE.store(3, Ordering::Release),
-                    }
-                });
+                    },
+                );
             }
             None
         }

@@ -781,13 +781,6 @@ struct TimelineItem {
 }
 
 #[derive(Clone, PartialEq)]
-struct WorkflowCard {
-    id: String,
-    title: String,
-    steps: Vec<String>,
-}
-
-#[derive(Clone, PartialEq)]
 struct SubagentCard {
     worker_id: String,
     profile: String,
@@ -2990,7 +2983,6 @@ fn app() -> Element {
     // Inspector (right panel) state — ported from the desktop command center.
     let mut inspector_tab = use_signal(|| "files".to_string());
     let mut timeline = use_signal(Vec::<TimelineItem>::new);
-    let mut workflow_cards = use_signal(Vec::<WorkflowCard>::new);
     let mut subagent_cards = use_signal(Vec::<SubagentCard>::new);
     let mut session_replay = use_signal(|| None::<SessionReplay>);
     let mut approvals = use_signal(Vec::<(u64, String, String)>::new);
@@ -3332,7 +3324,18 @@ fn app() -> Element {
                   const b = s.querySelector('.jump-bottom');
                   if (b) b.classList.toggle('show', d > 300);
                 };
-                const stick = () => { if (window.__oxstick !== false) s.scrollTop = s.scrollHeight; upd(); };
+                const stick = () => {
+                  if (window.__oxstick !== false) s.scrollTop = s.scrollHeight;
+                  // Keep the LIVE reasoning panel pinned to its latest line as it
+                  // streams (Cursor-style), but only when already near the bottom
+                  // so a manual scroll-up to re-read isn't yanked back down.
+                  const tb = s.querySelector('.thinking-box[open] .thinking-body');
+                  if (tb) {
+                    const dd = tb.scrollHeight - tb.scrollTop - tb.clientHeight;
+                    if (dd < 60) tb.scrollTop = tb.scrollHeight;
+                  }
+                  upd();
+                };
                 s.addEventListener('scroll', upd, { passive: true });
                 inner = new MutationObserver(stick);
                 inner.observe(s, { childList: true, subtree: true, characterData: true });
@@ -3895,9 +3898,8 @@ fn app() -> Element {
                             thinking.set(String::new());
                             bg_jobs.write().clear();
                             // These are GLOBAL signals, not per-tab — clear them on tab
-                            // switch too, else the previous tab's workflow/subagent cards
+                            // switch too, else the previous tab's subagent cards
                             // linger on the newly-viewed tab ("stuck, won't disappear").
-                            workflow_cards.write().clear();
                             subagent_cards.write().clear();
                             // The tab's snapshot + anything that streamed while it was
                             // backgrounded (drained from the bg buffer in one write).
@@ -3978,7 +3980,6 @@ fn app() -> Element {
                             streaming.set(false);
                             status.set(String::new());
                             todos.write().clear();
-                            workflow_cards.write().clear();
                             subagent_cards.write().clear();
                         }
                         None => break,
@@ -4264,7 +4265,6 @@ fn app() -> Element {
                                     streaming.set(false);
                                     status.set(String::new());
                                     todos.write().clear();
-                                    workflow_cards.write().clear();
                                     subagent_cards.write().clear();
                                 }
                             }
@@ -4306,23 +4306,11 @@ fn app() -> Element {
                                 turn_edits.write().clear();
                                 bg_jobs.write().clear();
                                 todos.write().clear();
-                                    workflow_cards.write().clear();
                                     subagent_cards.write().clear();
                                     edits_expanded.set(false);
                                 edits_undone.set(false);
                                 think_open.set(None);
                                 timeline.write().push(TimelineItem { title: format!("Turn {turn} started"), sub: String::new() });
-                            }
-                            Event::WorkflowSelected { id, title, steps, .. } => {
-                                workflow_cards.write().push(WorkflowCard {
-                                    id,
-                                    title: title.clone(),
-                                    steps: steps.clone(),
-                                });
-                                timeline.write().push(TimelineItem {
-                                    title: format!("Workflow · {title}"),
-                                    sub: steps.join(" · "),
-                                });
                             }
                             Event::AuditLog { kind, title, detail, status, .. } => {
                                 let sub = if detail.trim().is_empty() {
@@ -4581,11 +4569,6 @@ fn app() -> Element {
                                 // content. Clear them at finish so an interrupted/aborted model turn
                                 // cannot leave a perpetual "Tasks 0/N" spinner in the composer area.
                                 todos.write().clear();
-                                // The workflow/skill-route card is per-turn guidance ("here's
-                                // the plan I'll follow"). Drop it when the turn ends so it
-                                // doesn't linger past completion into the next prompt — the
-                                // TurnStarted clear alone left it visible during the idle gap.
-                                workflow_cards.write().clear();
                                 // Drop any "editing…" rows that never got a real diff (e.g.
                                 // a read that was mislabeled, or a path that didn't match) so
                                 // no spinner lingers after the turn is done.
@@ -6662,7 +6645,12 @@ fn app() -> Element {
                                     "↓"
                                 }
                             }
-                            div { class: if *streaming.read() { "col streaming" } else { "col" },
+                            div {
+                                // Key on the active tab so switching tabs remounts the
+                                // transcript and replays the crossfade (col-cross), instead
+                                // of an instant content swap.
+                                key: "col-{active_tab}",
+                                class: if *streaming.read() { "col streaming" } else { "col" },
                                 {
                                     let last_user_idx = messages.read().iter().rposition(|m| m.author == Author::User);
                                     let turns = {
@@ -6880,16 +6868,36 @@ fn app() -> Element {
                                     }
                                 }
                                 if !thinking.read().is_empty() {
-                                    details { class: "thinking-box", open: think_open.read().unwrap_or(*streaming.read()),
-                                        summary { class: "thinking-sum",
-                                            onclick: move |e: dioxus::prelude::MouseEvent| {
-                                                e.prevent_default();
-                                                let cur = think_open.read().unwrap_or(*streaming.read());
-                                                think_open.set(Some(!cur));
-                                            },
-                                            "Reasoning"
+                                    {
+                                        let live = *streaming.read();
+                                        rsx! {
+                                            details { class: "thinking-box", open: think_open.read().unwrap_or(live),
+                                                summary {
+                                                    class: if live { "thinking-sum live" } else { "thinking-sum" },
+                                                    onclick: move |e: dioxus::prelude::MouseEvent| {
+                                                        e.prevent_default();
+                                                        let cur = think_open.read().unwrap_or(live);
+                                                        think_open.set(Some(!cur));
+                                                    },
+                                                    // Cursor-style: shimmering "Reasoning" + live timer while
+                                                    // thinking; settles to a plain label once the turn ends.
+                                                    if live {
+                                                        span { class: "thinking-glow", "Reasoning" }
+                                                        {
+                                                            let el = *elapsed_s.read();
+                                                            if el >= 1 {
+                                                                rsx! { span { class: "thinking-secs", "{el}s" } }
+                                                            } else {
+                                                                rsx! {}
+                                                            }
+                                                        }
+                                                    } else {
+                                                        "Reasoning"
+                                                    }
+                                                }
+                                                div { class: "thinking-body", "{thinking}" }
+                                            }
                                         }
-                                        div { class: "thinking-body", "{thinking}" }
                                     }
                                 }
                                 if *streaming.read() {
@@ -7085,34 +7093,6 @@ fn app() -> Element {
                                                     button { class: "edits-more", onclick: move |_| { let v = *edits_expanded.read(); edits_expanded.set(!v); },
                                                         "{more_txt}"
                                                         Icon { name: "chevron" }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        if !workflow_cards.read().is_empty() {
-                            {
-                                let cards = workflow_cards.read().clone();
-                                rsx! {
-                                    div { class: "workflow-stack",
-                                        for card in cards {
-                                            div { class: "workflow-card",
-                                                div { class: "workflow-head",
-                                                    span { class: "workflow-ic", Icon { name: "list" } }
-                                                    span { class: "workflow-title", "{card.title}" }
-                                                    span { class: "workflow-id", "{card.id}" }
-                                                }
-                                                if !card.steps.is_empty() {
-                                                    div { class: "workflow-steps",
-                                                        for (i, step) in card.steps.iter().enumerate() {
-                                                            div { class: "workflow-step",
-                                                                span { class: "workflow-num", "{i + 1}" }
-                                                                span { "{step}" }
-                                                            }
-                                                        }
                                                     }
                                                 }
                                             }
@@ -10571,8 +10551,7 @@ fn ChatPane(
                             messages.write().push(ChatMsg { author: Author::Note, text: format!("❓ {question}") });
                             pane_question.set(Some((question, options)));
                         }
-                        Some(Event::WorkflowSelected { .. })
-                        | Some(Event::AuditLog { .. })
+                        Some(Event::AuditLog { .. })
                         | Some(Event::SubagentStarted { .. })
                         | Some(Event::SubagentFinished { .. }) => {}
                         Some(Event::Shutdown) | None => break,

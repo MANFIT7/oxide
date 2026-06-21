@@ -196,7 +196,13 @@ impl Provider for AnthropicProvider {
                         let arguments = serde_json::from_str(&cur_args)
                             .unwrap_or(Value::Object(Default::default()));
                         let id = std::mem::take(&mut cur_tool_id);
-                        let _ = sink.send(StreamItem::ToolCall { id, name, arguments }).await;
+                        let _ = sink
+                            .send(StreamItem::ToolCall {
+                                id,
+                                name,
+                                arguments,
+                            })
+                            .await;
                         cur_args.clear();
                     }
                 }

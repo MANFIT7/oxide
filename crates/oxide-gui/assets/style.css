@@ -882,6 +882,23 @@ svg { width: 17px; height: 17px; flex-shrink: 0; }
 }
 .thinking-sum { cursor: pointer; font-size: 12.5px; font-weight: 600; color: var(--muted); list-style: none; }
 .thinking-sum::-webkit-details-marker { display: none; }
+/* Cursor-style live reasoning header: gradient sweep over "Reasoning" + a
+   live elapsed timer while the model is actively thinking. */
+.thinking-sum.live { display: inline-flex; align-items: center; gap: 8px; }
+.thinking-glow {
+  background: linear-gradient(90deg, var(--muted) 0%, var(--muted) 38%, var(--text) 50%, var(--muted) 62%, var(--muted) 100%);
+  background-size: 220% 100%;
+  -webkit-background-clip: text; background-clip: text;
+  color: transparent;
+  animation: ox-shimmer 1.7s linear infinite;
+}
+.thinking-secs {
+  font-size: 11px; font-weight: 500; color: var(--faint);
+  font-variant-numeric: tabular-nums; opacity: .75;
+}
+@media (prefers-reduced-motion: reduce) {
+  .thinking-glow { animation: none; color: var(--muted); -webkit-text-fill-color: currentColor; }
+}
 .thinking-body {
   margin-top: 4px; font-size: 12px; line-height: 1.55; color: var(--faint);
   white-space: pre-wrap; word-break: break-word;
@@ -1871,7 +1888,7 @@ details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
 .act-group-head { font-size: 12px; color: var(--muted); }
 
 /* cards: elevation via bg, not borders */
-.edits-card, .todo-card, .question-card, .approval-card, .thinking-box, .diff-card {
+.edits-card, .todo-card, .question-card, .approval-card, .diff-card {
   border-color: transparent; background: color-mix(in srgb, var(--text) 4%, transparent);
 }
 
@@ -2166,6 +2183,12 @@ details[open]::details-content { block-size: auto; }
 .agent-tab { transition: background .12s ease; }
 .agent-tab.closing { max-width: 0; min-width: 0; padding-left: 0; padding-right: 0; opacity: 0; overflow: hidden;
   transition: max-width .15s ease, padding .15s ease, opacity .12s ease; }
+/* New tab slides in — mirror of the closing collapse (Cursor/Arc-style). */
+.agent-tab { animation: tab-in .2s cubic-bezier(.22,1,.36,1); }
+@keyframes tab-in { from { max-width: 0; opacity: 0; transform: translateY(-3px); } to { max-width: 240px; opacity: 1; transform: none; } }
+/* Switching tabs crossfades the transcript instead of an instant swap. */
+.col { animation: col-cross .2s ease-out; }
+@keyframes col-cross { from { opacity: .25; } to { opacity: 1; } }
 /* diff lines cascade in while the agent streams an edit */
 .diff-card .dl { animation: dl-in .16s ease-out both; }
 @keyframes dl-in { from { opacity: 0; transform: translateX(-3px); } to { opacity: 1; transform: none; } }
@@ -2179,7 +2202,7 @@ details[open]::details-content { block-size: auto; }
 .composer, #ce-input { interpolate-size: allow-keywords; transition: block-size .15s ease; }
 /* Rows animate only through the canonical motion layer at the end of the file. */
 @media (prefers-reduced-motion: reduce) {
-  .toast, .diff-card .dl, .row { animation: none; }
+  .toast, .diff-card .dl, .row, .agent-tab, .col { animation: none; }
   .scroll.smooth { scroll-behavior: auto; }
   .agent-tab.closing { transition: none; }
 }
@@ -2346,26 +2369,16 @@ details[open]::details-content { block-size: auto; }
 .typing span { display: none; }
 @keyframes glass-sweep { from { background-position: 180% 0; } to { background-position: -20% 0; } }
 /* thinking block: left accent + transform-only live sheen */
+/* Cursor-style: NO block. The live reasoning is just flowing faded text under
+   a shimmering header — no border, background, card, or sheen sweep. It streams
+   in, then collapses to a "Thought for Ns" line when the turn ends. */
 .thinking-box {
   position: relative;
   overflow: hidden;
-  border-left: 2px solid color-mix(in srgb, var(--text) 30%, transparent);
-  background: color-mix(in srgb, var(--text) 3.5%, transparent);
-  border-radius: 7px;
-  transition: border-color .22s ease, background .22s ease;
+  border: none;
+  background: none;
+  border-radius: 0;
 }
-.thinking-box::after {
-  content: "";
-  position: absolute;
-  inset: 0;
-  pointer-events: none;
-  background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--text) 7%, transparent), transparent);
-  transform: translateX(-120%);
-  opacity: 0;
-}
-.col.streaming .thinking-box { border-left-color: color-mix(in srgb, var(--syn-accent) 60%, transparent); }
-.col.streaming .thinking-box::after { opacity: 1; animation: think-sheen 2.4s var(--ease-standard) infinite; }
-@keyframes think-sheen { to { transform: translateX(120%); } }
 .thinking-box .thinking-body { color: color-mix(in srgb, var(--text) 45%, transparent); }
 /* "Thought for Ns" persisted row */
 .thought-row { margin: 2px 8px 6px; }
@@ -2376,7 +2389,7 @@ details[open]::details-content { block-size: auto; }
 .thought-body { margin-top: 6px; padding: 8px 12px; color: color-mix(in srgb, var(--text) 45%, transparent);
   font-size: 13px; line-height: 1.6; border-left: 2px solid color-mix(in srgb, var(--text) 20%, transparent);
   white-space: pre-wrap; max-height: 280px; overflow-y: auto; }
-@media (prefers-reduced-motion: reduce) { .typing, .col.streaming .thinking-box::after { animation: none; opacity: 0; } }
+@media (prefers-reduced-motion: reduce) { .typing { animation: none; } }
 
 /* env card usage row: never wrap */
 .env-card-row { white-space: nowrap; }
@@ -2619,6 +2632,15 @@ details[open]::details-content { block-size: auto; }
 /* Streaming bubble: soft blur-to-sharp on first paint (focus-pull feel). */
 @keyframes oxide-focus-in { from { opacity: 0; filter: blur(6px); } to { opacity: 1; filter: blur(0); } }
 .col.streaming .row.agent:last-of-type .agent-md:not(.live) { animation: oxide-focus-in .42s ease-out both; }
+
+/* Streaming text emerges from a soft bottom fade (Cursor/ChatGPT feel): the
+   last line stays slightly dimmed while live, so new tokens "rise" out of the
+   fade rather than snapping in. Ends at 55% alpha (not 0) so a short one-line
+   reply never looks fully ghosted. Removed the instant `live` class clears. */
+.agent-md.live {
+  -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 20px), rgba(0,0,0,.55));
+  mask-image: linear-gradient(to bottom, #000 calc(100% - 20px), rgba(0,0,0,.55));
+}
 
 /* Tabular numerals so counts/elapsed don't jiggle width as they tick. */
 .diff-adds, .diff-dels, .status-elapsed, .usage-v, .edits-counts, .live-changes-counts,
