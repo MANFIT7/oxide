@@ -605,7 +605,6 @@ fn build_body(req: &TurnRequest) -> Value {
         "input": input,
         "stream": true,
         "store": false,
-        "temperature": req.temperature,
         "include": ["reasoning.encrypted_content"],
         // `summary: auto` streams reasoning summaries (shown live as thinking).
         "reasoning": { "effort": effort, "summary": "auto" }
@@ -1140,7 +1139,7 @@ mod tests {
         assert_eq!(body["prompt_cache_key"], "session");
         assert_eq!(body["reasoning"]["summary"], "auto");
         assert_eq!(body["reasoning"]["effort"], "medium");
-        assert!((body["temperature"].as_f64().unwrap() - 0.2).abs() < 0.0001);
+        assert!(body.get("temperature").is_none());
         assert_eq!(body["store"], false);
     }
 
