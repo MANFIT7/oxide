@@ -274,21 +274,22 @@ def main() -> int:
         f"{rel(CSS)} removes the empty pre-token skeleton and compacts the active status pill under Reduce Motion",
     )
     require(
-        "reduced-motion uses static spinner rings",
+        "reduced-motion keeps spinner rings active",
         contains_all(
             css,
             [
-                ".status-spinner, .activity-spin,",
-                ".syn-spinner, .status-shimmer, .typing, .typing span",
+                ".status-shimmer, .typing,",
                 "animation: none !important;",
                 "box-sizing: border-box;",
                 "border-top-color: var(--syn-accent);",
                 "background: transparent;",
+                "animation: spin .7s linear infinite !important;",
+                "animation: syn-spin 1.6s linear infinite !important;",
                 "-webkit-mask: none;",
                 "-webkit-text-fill-color: currentColor;",
             ],
         ),
-        f"{rel(CSS)} keeps spinner-shaped rings static and disables shimmer text under Reduce Motion",
+        f"{rel(CSS)} keeps spinner-shaped rings rotating while disabling shimmer text under Reduce Motion",
     )
     require(
         "reduced-motion freezes edit shimmer",

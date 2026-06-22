@@ -3298,12 +3298,12 @@ details::details-content { overflow: clip; }
 
 @media (prefers-reduced-motion: reduce) {
   /* Reduce Motion keeps textual state visible, removes decorative loading
-     sweep rows, and freezes loader rings in a spinner shape instead of turning
-     them into solid dots. */
+     sweep rows, and keeps active loader rings spinning so Working does not
+     read as a frozen or stuck turn. */
   .toast, .palette, .palette-list .palette-item, .env-panel, .env-body > *,
   .queue-chip, .tab-state, .palette-status, .thread-anchor.restored .thread,
-  .tab-dot.busy, .diff-reverted, .diff-kept, .status-spinner, .activity-spin,
-  .syn-spinner, .status-shimmer, .typing, .typing span, .slot-char {
+  .tab-dot.busy, .diff-reverted, .diff-kept, .status-shimmer, .typing,
+  .typing span, .slot-char {
     animation: none !important;
   }
   .status-pill {
@@ -3319,6 +3319,12 @@ details::details-content { overflow: clip; }
     -webkit-mask: none;
     mask: none;
     will-change: auto;
+  }
+  .status-spinner, .activity-spin {
+    animation: spin .7s linear infinite !important;
+  }
+  .syn-spinner {
+    animation: syn-spin 1.6s linear infinite !important;
   }
   .status-shimmer {
     background: none;
