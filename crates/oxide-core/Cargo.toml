@@ -25,3 +25,4 @@ chromiumoxide = { workspace = true }
 model2vec-rs = "0.2.1"
 libc = "0.2.186"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
+turso = { version = "0.7.0-pre.10", default-features = false }
