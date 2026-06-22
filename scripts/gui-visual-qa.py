@@ -169,14 +169,14 @@ def write_fixture(css: str) -> None:
         <div class="agents-section">
           <div class="agents-section-head"><span>Agent sessions</span><span class="agents-section-meta">local</span></div>
           <div class="agents-session-list">
-            <button class="agents-session active"><span class="agents-session-logo">✦</span><span class="agents-session-copy"><span class="agents-session-title">Codex</span><span class="agents-session-sub">codex · default · medium</span></span><span class="agents-session-meta"><span class="agents-status running">running</span><span>8 msgs</span></span></button>
+            <button class="agents-session active"><span class="agents-session-logo fixture-icon"></span><span class="agents-session-copy"><span class="agents-session-title">Codex</span><span class="agents-session-sub">codex · default · medium</span></span><span class="agents-session-meta"><span class="agents-status running">running</span><span>8 msgs</span></span></button>
           </div>
         </div>
         <div class="agents-work-grid">
-          <button class="agents-work-card"><span>⎇</span><span class="agents-work-title">Review queue</span><span class="agents-work-sub">2 file(s)</span></button>
-          <button class="agents-work-card"><span>✎</span><span class="agents-work-title">Changes</span><span class="agents-work-sub">git diff + commit</span></button>
-          <button class="agents-work-card"><span>⌁</span><span class="agents-work-title">Preview</span><span class="agents-work-sub">browser + design mode</span></button>
-          <button class="agents-work-card"><span>◈</span><span class="agents-work-title">Bugbot review</span><span class="agents-work-sub">local git diff</span></button>
+          <button class="agents-work-card"><span class="fixture-icon"></span><span class="agents-work-title">Review queue</span><span class="agents-work-sub">2 file(s)</span></button>
+          <button class="agents-work-card"><span class="fixture-icon"></span><span class="agents-work-title">Changes</span><span class="agents-work-sub">git diff + commit</span></button>
+          <button class="agents-work-card"><span class="fixture-icon"></span><span class="agents-work-title">Preview</span><span class="agents-work-sub">browser + design mode</span></button>
+          <button class="agents-work-card"><span class="fixture-icon"></span><span class="agents-work-title">Bugbot review</span><span class="agents-work-sub">local git diff</span></button>
         </div>
         <div class="agents-worker running"><span class="agents-worker-status"><span class="syn-spinner"></span></span><span class="agents-worker-copy"><span class="agents-worker-title">reviewer · GUI parity</span><span class="agents-worker-sub">Auditing local non-cloud controls.</span></span></div>
       </div>
@@ -365,10 +365,25 @@ def main() -> int:
     )
     require(
         "slot-style edit/remove labels",
-        contains_all(gui, ["fn SlotText", "SlotText { text: \"Reject\".to_string()", "SlotText { text: \"✓ Reverted\".to_string()"])
+        contains_all(gui, ["fn SlotText", "SlotText { text: \"Reject\".to_string()", "SlotText { text: \"Reverted\".to_string()", "SlotText { text: \"Kept\".to_string()"])
         and contains_all(css, ["@keyframes slot-roll-up", "@keyframes slot-roll-down", ".slot-char", ".slot-text.down"])
+        and contains_all(gui, ['Icon { name: "check" }', 'Icon { name: "undo" }'])
         and "v.remove(idx)" not in re.sub(r"fn SlotText[\\s\\S]*?\\n}\\n", "", gui),
         "edit/revert labels use native slot-roll motion and rejected review rows resolve visually",
+    )
+    banned_status_glyphs = (
+        "\u2715\u21a9\u21aa\u2191\u2193\u25a0\u25b6\u21bb\u2753"
+        "\U0001f4cd\U0001f6e0\u29d6\u232b\u276f\u229e\u229f"
+        "\U0001f9ed\U0001f50d\U0001f916\U0001f9e9\U0001f501"
+        "\u2699\u26a0\u23f3\u23f8\U0001f310\U0001f4f8\U0001fa9d"
+        "\U0001f9ea\u2b06\u27f3\u2197"
+    )
+    require(
+        "user-facing emoji glyphs use icons",
+        re.search(rf'"[^"\\n]*(?:[{re.escape(banned_status_glyphs)}])[^"\\n]*"', gui) is None
+        and contains_all(gui, ["fn StatusPill", "fn ToolNote", "is_stage_status", "prefixed_icon_text"])
+        and contains_all(gui, ['Icon { name: "x" }', 'Icon { name: "arrow-up" }', 'Icon { name: "help" }']),
+        "GUI user-facing controls render icons instead of hardcoded emoji/status glyph text",
     )
     require(
         "activity copy output uses awaited helper",
@@ -376,6 +391,29 @@ def main() -> int:
         and "fn copy_text_to_clipboard(text: String)" in gui
         and ".join::<bool>().await" in gui,
         f"{rel(GUI)} uses the async clipboard helper for activity output",
+    )
+    require(
+        "message copy controls use icon",
+        "\u29c9" not in gui
+        and 'Icon { name: "copy" }' in gui
+        and '"copy" => rsx!' in gui
+        and contains_all(css, [".msg-copy svg", ".msg-act svg", ".copy-btn svg"]),
+        "message/activity copy controls render the shared copy icon instead of a raw text glyph",
+    )
+    require(
+        "done note uses icon and hides duplicate duration",
+        contains_all(
+            gui,
+            [
+                "fn DoneNote",
+                "done_note_display_parts",
+                "looks_like_done_duration",
+                'span { class: "done-icon", Icon { name: "check" } }',
+            ],
+        )
+        and contains_all(css, [".done-note", ".done-icon", ".done-label"])
+        and '"check" => rsx!' in gui,
+        "Done notes render with an SVG check icon and drop the already-shown turn duration",
     )
     require(
         "session runtime metadata survives replay",

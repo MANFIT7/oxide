@@ -531,7 +531,7 @@ impl Provider for CodexCliProvider {
                 codex_effort(&req.reasoning_effort)
             ));
         }
-        // Pasted/attached images → native codex attachments (one -i per file).
+        // Pasted/attached images become native codex attachments (one -i per file).
         for img in &images {
             args.push("-i".to_string());
             args.push(img.clone());
@@ -568,18 +568,27 @@ impl Provider for CodexCliProvider {
                                     },
                                 );
                                 let cmd: String = cmd.chars().take(80).collect();
-                                send(sink, StreamItem::Notice(format!("⚙ Running {cmd}")));
+                                send(
+                                    sink,
+                                    StreamItem::Notice(format!("{} Running {cmd}", '\u{2699}')),
+                                );
                             }
                             Some("file_change") => {
                                 let p = item["path"]
                                     .as_str()
                                     .or_else(|| item["text"].as_str())
                                     .unwrap_or("file");
-                                send(sink, StreamItem::Notice(format!("⚙ Editing {p}")));
+                                send(
+                                    sink,
+                                    StreamItem::Notice(format!("{} Editing {p}", '\u{2699}')),
+                                );
                             }
                             Some("web_search") => {
                                 let q = item["query"].as_str().unwrap_or("");
-                                send(sink, StreamItem::Notice(format!("⚙ Searching {q}")));
+                                send(
+                                    sink,
+                                    StreamItem::Notice(format!("{} Searching {q}", '\u{2699}')),
+                                );
                             }
                             _ => {}
                         }
@@ -632,7 +641,9 @@ impl Provider for CodexCliProvider {
                                 send(
                                     sink,
                                     StreamItem::Notice(
-                                        format!("⌘ {cmd}\n{out}").trim_end().to_string(),
+                                        format!("{} {cmd}\n{out}", '\u{2318}')
+                                            .trim_end()
+                                            .to_string(),
                                     ),
                                 );
                             }
@@ -641,7 +652,10 @@ impl Provider for CodexCliProvider {
                                     .as_str()
                                     .or_else(|| item["path"].as_str())
                                     .unwrap_or("file change");
-                                send(sink, StreamItem::Notice(format!("✎ {summary}")));
+                                send(
+                                    sink,
+                                    StreamItem::Notice(format!("{} {summary}", '\u{270e}')),
+                                );
                                 // Single path or a changes[] list, depending on codex version.
                                 if let Some(p) = item["path"].as_str() {
                                     send(sink, StreamItem::FileChanged(p.to_string()));
@@ -659,7 +673,7 @@ impl Provider for CodexCliProvider {
                                     .as_str()
                                     .or_else(|| item["text"].as_str())
                                     .unwrap_or("");
-                                send(sink, StreamItem::Notice(format!("🔎 {q}")));
+                                send(sink, StreamItem::Notice(format!("{} {q}", '\u{1f50e}')));
                             }
                             Some(_) | None => {}
                         }
@@ -726,7 +740,7 @@ impl Provider for ClaudeCliProvider {
         }
         let skey = session_key(&self.bin, &req.conversation_id, &req.cwd);
         // Continuing an imported Claude TUI session ("claude-<uuid>") resumes
-        // claude's OWN native session by that uuid → full context, no replay.
+        // claude's OWN native session by that uuid, with full context and no replay.
         // The persisted link (survives restarts) wins over the in-memory map.
         let resume = req
             .cli_resume
@@ -820,7 +834,7 @@ impl Provider for ClaudeCliProvider {
                                     Some("tool_use") => {
                                         let name = block["name"].as_str().unwrap_or("tool");
                                         // Pull the human-relevant arg so the live status reads
-                                        // "⚙ Read src/lib.rs", not a bare tool name.
+                                        // "Read src/lib.rs", not a bare tool name.
                                         let input = &block["input"];
                                         let detail = [
                                             "file_path",
@@ -837,13 +851,13 @@ impl Provider for ClaudeCliProvider {
                                         let detail: String = detail.chars().take(80).collect();
                                         // A backgrounded command ("I'll let you know when done")
                                         // won't stream its result back — surface WHAT it's doing
-                                        // with a distinct ⏳ marker so the UI can show it persistently.
+                                        // with a distinct clock marker so the UI can show it persistently.
                                         let bg = input["run_in_background"].as_bool() == Some(true);
                                         let is_command = matches!(name, "Bash" | "Shell")
                                             || input["command"].as_str().is_some();
                                         if is_command {
-                                            // A command is fully shown by its command row (started →
-                                            // output → finished); emitting a "⚙ Bash …" notice on top
+                                            // A command is fully shown by its command row (started,
+                                            // output, finished); emitting a duplicate Bash notice on top
                                             // would leave a second, redundant activity row lingering.
                                             let command = input["command"]
                                                 .as_str()
@@ -866,9 +880,9 @@ impl Provider for ClaudeCliProvider {
                                             );
                                         } else {
                                             let label = if detail.is_empty() {
-                                                format!("⚙ {name}")
+                                                format!("{} {name}", '\u{2699}')
                                             } else {
-                                                format!("⚙ {name} {detail}")
+                                                format!("{} {name} {detail}", '\u{2699}')
                                             };
                                             send(sink, StreamItem::Notice(label));
                                         }
@@ -1257,7 +1271,7 @@ async fn run_claude_interactive_turn(turn: ClaudeInteractiveTurn<'_>) -> anyhow:
                     send(
                         sink,
                         StreamItem::Notice(
-                            "⚠ Claude interactive prompt was not accepted; retrying input"
+                            "Claude interactive prompt was not accepted; retrying input"
                                 .to_string(),
                         ),
                     );
@@ -1359,8 +1373,8 @@ fn emit_interactive_final(
 
 fn emit_claude_tool_use(sink: &mpsc::Sender<StreamItem>, tool: &ClaudeToolUse) {
     if let Some(command) = &tool.command {
-        // A command tool is fully represented by its command row (started →
-        // output → finished). Emitting a "⚙ Bash …" notice on top of it would
+        // A command tool is fully represented by its command row (started,
+        // output, finished). Emitting a duplicate Bash notice on top of it would
         // add a second, redundant activity row that lingers after the turn.
         send(
             sink,
@@ -1374,14 +1388,14 @@ fn emit_claude_tool_use(sink: &mpsc::Sender<StreamItem>, tool: &ClaudeToolUse) {
     } else {
         let label = if tool.background {
             if tool.detail.is_empty() {
-                format!("⏳ {}", tool.name)
+                format!("{} {}", '\u{23f3}', tool.name)
             } else {
-                format!("⏳ {} {}", tool.name, tool.detail)
+                format!("{} {} {}", '\u{23f3}', tool.name, tool.detail)
             }
         } else if tool.detail.is_empty() {
-            format!("⚙ {}", tool.name)
+            format!("{} {}", '\u{2699}', tool.name)
         } else {
-            format!("⚙ {} {}", tool.name, tool.detail)
+            format!("{} {} {}", '\u{2699}', tool.name, tool.detail)
         };
         send(sink, StreamItem::Notice(label));
     }
@@ -1414,7 +1428,7 @@ fn claude_prompt_ready(tail: &str) -> bool {
         && (tail.contains("Try")
             || tail.contains("bypass permissions")
             || tail.contains("/effort")
-            || tail.contains("❯"))
+            || tail.contains('\u{276f}'))
 }
 
 fn parse_claude_transcript(path: &Path, baseline_lines: usize) -> ClaudeTranscriptSnapshot {

@@ -288,6 +288,7 @@ svg { width: 17px; height: 17px; flex-shrink: 0; }
 .send:hover { opacity: .9; }
 .send:active { transform: scale(.93); }
 .send:disabled { opacity: .35; cursor: default; }
+.send svg { width: 15px; height: 15px; flex-shrink: 0; }
 
 /* context selectors under composer */
 .selectors {
@@ -417,6 +418,47 @@ svg { width: 17px; height: 17px; flex-shrink: 0; }
   background: var(--surface); border-radius: 10px;
   padding: 6px 12px; max-width: 92%; text-align: center; white-space: pre-wrap;
 }
+.done-note {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  white-space: nowrap;
+}
+.done-icon {
+  width: 14px;
+  height: 14px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  color: var(--muted);
+}
+.done-icon svg { width: 14px; height: 14px; }
+.tool-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  white-space: normal;
+}
+.tool-note-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+.tool-note-icon svg { width: 14px; height: 14px; }
+.tool-note-text {
+  margin: 0;
+  min-width: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font: inherit;
+  color: inherit;
+}
+.done-label { color: var(--muted); }
+.done-sep, .done-meta { color: var(--faint); }
 .typing { display: flex; gap: 5px; padding: 8px 0; }
 .typing span { width: 7px; height: 7px; border-radius: 50%; background: var(--faint);
   animation: blink 1.3s infinite ease-in-out both; }
@@ -869,6 +911,14 @@ svg { width: 17px; height: 17px; flex-shrink: 0; }
   width: 15px;
   height: 15px;
 }
+.fixture-icon {
+  display: inline-flex;
+  width: 15px;
+  height: 15px;
+  border-radius: 5px;
+  background: currentColor;
+  opacity: .7;
+}
 .agents-session-copy,
 .agents-timeline-copy,
 .agents-worker-copy {
@@ -1260,6 +1310,14 @@ svg { width: 17px; height: 17px; flex-shrink: 0; }
   /* One line, ellipsis on overflow (flex child needs min-width:0 to shrink). */
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0;
 }
+.status-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+  flex-shrink: 0;
+}
+.status-icon svg { width: 13px; height: 13px; }
 @keyframes shimmer { to { background-position: -200% 0; } }
 
 /* pulsing avatar while the agent works */
@@ -1350,6 +1408,14 @@ svg { width: 17px; height: 17px; flex-shrink: 0; }
   border-bottom: 1px solid color-mix(in srgb, var(--syn-accent) 30%, transparent);
 }
 .update-text { font-size: 13px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.update-ic {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--syn-accent);
+  flex-shrink: 0;
+}
+.update-ic svg { width: 14px; height: 14px; }
 .update-notes { color: var(--muted); }
 .update-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
 .update-btn {
@@ -1359,6 +1425,7 @@ svg { width: 17px; height: 17px; flex-shrink: 0; }
 .update-btn:hover { opacity: .9; }
 .update-btn:disabled { opacity: .5; cursor: default; }
 .update-x { background: transparent; border: none; color: var(--muted); cursor: pointer; font-size: 13px; padding: 4px 8px; }
+.update-x svg { width: 13px; height: 13px; }
 .field-hint { font-size: 11.5px; color: var(--faint); margin-top: 5px; line-height: 1.4; }
 
 /* ── Welcome (no folder chosen) ──────────────────────── */
@@ -1922,7 +1989,7 @@ details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
 .thread .thread-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* copy button on tool output */
-.copy-btn { background: transparent; border: none; color: var(--faint); cursor: pointer; font-size: 13px; padding: 0 4px; margin-left: 4px; border-radius: 5px; }
+.copy-btn { background: transparent; border: none; color: var(--faint); cursor: pointer; font-size: 13px; padding: 0 4px; margin-left: 4px; border-radius: 5px; display: inline-flex; align-items: center; justify-content: center; }
 .copy-btn:hover { color: var(--text); background: var(--surface-hi); }
 
 /* clickable project headers — switch between opened folders */
@@ -2075,7 +2142,8 @@ details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
 .preview-bar { display: flex; align-items: center; gap: 6px; padding: 8px 10px; border-bottom: 1px solid var(--border); }
 .preview-addr { flex: 1; background: var(--surface-hi); border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px; font-size: 12.5px; color: var(--text); font-family: ui-monospace, Menlo, monospace; }
 .preview-addr:focus { outline: none; border-color: var(--syn-accent); }
-.preview-btn { background: var(--surface-hi); border: 1px solid var(--border); color: var(--text); border-radius: 8px; padding: 6px 10px; font-size: 12px; cursor: pointer; white-space: nowrap; font-family: inherit; }
+.preview-btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; background: var(--surface-hi); border: 1px solid var(--border); color: var(--text); border-radius: 8px; padding: 6px 10px; font-size: 12px; cursor: pointer; white-space: nowrap; font-family: inherit; }
+.preview-btn svg { width: 13px; height: 13px; flex-shrink: 0; }
 .preview-btn:hover { border-color: var(--syn-accent); }
 .preview-ports { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px 10px; border-bottom: 1px solid var(--border); max-height: 84px; overflow-y: auto; }
 .preview-hint, .preview-empty { font-size: 12.5px; color: var(--muted); }
@@ -2102,9 +2170,10 @@ details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
 
 /* message hover copy (synara MessageActionButton) */
 .row { position: relative; }
-.msg-copy { position: absolute; bottom: -13px; right: 6px; opacity: 0; background: var(--surface-hi); border: 1px solid var(--border); color: var(--muted); border-radius: 6px; width: 24px; height: 22px; font-size: 11px; cursor: pointer; transition: opacity .12s; z-index: 3; }
+.msg-copy { position: absolute; bottom: -13px; right: 6px; opacity: 0; background: var(--surface-hi); border: 1px solid var(--border); color: var(--muted); border-radius: 6px; width: 24px; height: 22px; font-size: 11px; cursor: pointer; transition: opacity .12s; z-index: 3; display: inline-flex; align-items: center; justify-content: center; }
 .row:hover .msg-copy { opacity: 1; }
 .msg-copy:hover { color: var(--text); border-color: var(--syn-accent); }
+.msg-copy svg, .msg-act svg, .copy-btn svg { width: 13px; height: 13px; }
 
 /* per-hunk accept/reject */
 .hunked { display: flex; flex-direction: column; gap: 6px; margin-top: 6px; }
@@ -2349,7 +2418,9 @@ svg { stroke-width: 1.6; }
 .design-pending-title { color: var(--text); font-size: 11.5px; font-weight: 650; }
 .design-pending-row { display: grid; grid-template-columns: 86px minmax(0, 1fr); gap: 7px; align-items: center; font-size: 11px; }
 .design-pending-prop { color: var(--muted); font-family: ui-monospace, Menlo, monospace; }
-.design-pending-val { color: var(--text); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, Menlo, monospace; }
+.design-pending-val { display: inline-flex; align-items: center; gap: 5px; color: var(--text); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, Menlo, monospace; }
+.design-pending-val span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.design-pending-val svg { width: 11px; height: 11px; color: var(--faint); flex-shrink: 0; }
 .design-note { width: 100%; min-height: 54px; resize: vertical; margin-top: 8px; background: var(--surface-hi); border: 1px solid var(--border); border-radius: 7px; padding: 6px 8px; color: var(--text); font-size: 12px; font-family: inherit; box-sizing: border-box; }
 .design-note:focus { outline: none; border-color: var(--syn-accent); }
 .design-actions { display: flex; gap: 8px; margin-top: 8px; }
@@ -2668,6 +2739,8 @@ details::details-content { overflow: clip; }
 .env-card-row.static:hover { background: none; }
 .env-card-row svg { width: 14px; height: 14px; color: var(--muted); flex-shrink: 0; }
 .env-card-badge { margin-left: auto; font-size: 11px; color: var(--faint); font-variant-numeric: tabular-nums; }
+.env-card-badge svg { width: 12px; height: 12px; }
+.env-card-badge.open svg { transform: rotate(180deg); }
 .env-card-sep { height: 1px; background: var(--border); margin: 8px 8px; }
 .env-card-label { padding: 0 8px 4px; color: var(--faint); font-size: 11.5px; letter-spacing: .04em; }
 @media (max-width: 980px) { .env-card { display: none; } }

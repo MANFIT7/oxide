@@ -344,21 +344,24 @@ enum Author {
     },
 }
 
+const DONE_NOTE_PREFIX: char = '\u{2713}';
+const DONE_NOTE_MARK: &str = "\u{2713} Done";
+
 /// Newest-first index of the activity row carrying `key`. Replaces the old
-/// `command_id/call_id → index` side maps, which went stale whenever a row was
-/// inserted (e.g. above a trailing "Done" note) and then paired the wrong row.
+/// `command_id/call_id` side maps, which went stale whenever a row was
+/// inserted (e.g. above a trailing Done note) and then paired the wrong row.
 fn activity_idx(msgs: &[ChatMsg], key: &str) -> Option<usize> {
     msgs.iter()
         .rposition(|m| matches!(&m.author, Author::Activity { key: Some(k), .. } if k == key))
 }
 
 /// Push an activity row into a backgrounded-tab buffer, keeping it above a
-/// trailing "✓ Done" note (the bg-loop equivalent of the `push_activity!` macro,
+/// trailing Done note (the bg-loop equivalent of the `push_activity!` macro,
 /// so a late row never lands below the turn's summary once merged into the view).
 fn buf_push_activity(buf: &mut Vec<ChatMsg>, msg: ChatMsg) {
     if buf
         .last()
-        .map(|x| matches!(x.author, Author::Note) && x.text.starts_with("✓ Done"))
+        .map(|x| matches!(x.author, Author::Note) && x.text.starts_with(DONE_NOTE_MARK))
         .unwrap_or(false)
     {
         let at = buf.len() - 1;
@@ -366,6 +369,42 @@ fn buf_push_activity(buf: &mut Vec<ChatMsg>, msg: ChatMsg) {
     } else {
         buf.push(msg);
     }
+}
+
+fn looks_like_done_duration(part: &str) -> bool {
+    let mut saw_unit = false;
+    for token in part.split_whitespace() {
+        let Some(unit) = token.chars().last() else {
+            return false;
+        };
+        if !matches!(unit, 's' | 'm' | 'h') {
+            return false;
+        }
+        let digits = &token[..token.len().saturating_sub(unit.len_utf8())];
+        if digits.is_empty() || !digits.chars().all(|ch| ch.is_ascii_digit()) {
+            return false;
+        }
+        saw_unit = true;
+    }
+    saw_unit
+}
+
+fn done_note_display_parts(text: &str) -> (String, Vec<String>) {
+    let clean = text.strip_prefix(DONE_NOTE_PREFIX).unwrap_or(text).trim();
+    let mut parts: Vec<String> = clean
+        .split(" · ")
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(ToString::to_string)
+        .collect();
+    if parts.is_empty() {
+        return ("Done".to_string(), Vec::new());
+    }
+    if parts.len() > 1 && looks_like_done_duration(&parts[1]) {
+        parts.remove(1);
+    }
+    let label = parts.remove(0);
+    (label, parts)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -413,7 +452,7 @@ struct TranscriptGroup {
 #[derive(Clone, PartialEq)]
 struct TranscriptTurn {
     groups: Vec<TranscriptGroup>,
-    /// The turn's "✓ Done …" summary, pulled OUT of the row list so it always
+    /// The turn's Done summary is pulled OUT of the row list so it always
     /// renders as the turn's last child — never below it (Synara's model: the
     /// summary is the last child of the message, not a reorderable sibling row).
     done_summary: Option<String>,
@@ -513,11 +552,11 @@ fn build_transcript_turns(messages: &[ChatMsg]) -> Vec<TranscriptTurn> {
     }
 
     // Assemble groups into turns (split at user messages). A standalone
-    // "✓ Done …" note is pulled OUT of the row list into `turn.done_summary`, so
+    // Done note is pulled OUT of the row list into `turn.done_summary`, so
     // the render can place it as the turn's LAST child — a late tool/activity row
     // that lands after it in the buffer can never render below it.
     let is_done_note =
-        |m: &ChatMsg| matches!(m.author, Author::Note) && m.text.starts_with("✓ Done");
+        |m: &ChatMsg| matches!(m.author, Author::Note) && m.text.starts_with(DONE_NOTE_MARK);
     let mut turns: Vec<TranscriptTurn> = Vec::new();
     for group in groups {
         if !group.activity && group.indices.len() == 1 && is_done_note(&messages[group.indices[0]])
@@ -544,7 +583,7 @@ fn build_transcript_turns(messages: &[ChatMsg]) -> Vec<TranscriptTurn> {
     turns
 }
 
-fn activity_group_label(rows: &[(String, bool, bool)]) -> String {
+fn activity_group_display(rows: &[(String, bool, bool)]) -> (&'static str, String) {
     let n = rows.len();
     let running = rows.iter().any(|(_, running, _)| *running);
     let mut edits = 0;
@@ -562,23 +601,97 @@ fn activity_group_label(rows: &[(String, bool, bool)]) -> String {
     }
 
     if running && edits > 0 {
-        format!(
-            "✎ Editing files… {n} action{}",
-            if n == 1 { "" } else { "s" }
+        (
+            "edit",
+            format!("Editing files… {n} action{}", if n == 1 { "" } else { "s" }),
         )
     } else if running {
-        format!("⚙ Working… {n} action{}", if n == 1 { "" } else { "s" })
+        (
+            "settings",
+            format!("Working… {n} action{}", if n == 1 { "" } else { "s" }),
+        )
     } else if edits > 0 && edits >= commands + searches + web {
-        format!("✎ {edits} file changes · {n} actions")
+        ("edit", format!("{edits} file changes · {n} actions"))
     } else if commands > 0 && commands >= searches + web {
-        format!("⌘ {commands} commands · {n} actions")
+        ("terminal", format!("{commands} commands · {n} actions"))
     } else if searches > 0 {
-        format!("🔎 {searches} searches · {n} actions")
+        ("search", format!("{searches} searches · {n} actions"))
     } else if web > 0 {
-        format!("🌐 {web} web actions · {n} actions")
+        ("browser", format!("{web} web actions · {n} actions"))
     } else {
-        format!("⚙ {n} actions")
+        ("settings", format!("{n} actions"))
     }
+}
+
+fn prefixed_icon_text(text: &str) -> Option<(&'static str, String)> {
+    let trimmed = text.trim_start();
+    let mut chars = trimmed.chars();
+    let ch = chars.next()?;
+    let icon = match ch {
+        '\u{2318}' => "terminal",
+        '\u{270e}' => "edit",
+        '\u{1f50e}' => "search",
+        '\u{2699}' => "settings",
+        '\u{23f3}' | '\u{29d6}' => "clock",
+        '\u{26a0}' => "alert",
+        '\u{23f8}' => "pause",
+        '\u{2753}' => "help",
+        '\u{1f9ed}' => "target",
+        '\u{1f916}' => "spark",
+        '\u{1f9e9}' => "plugins",
+        '\u{1f501}' => "refresh",
+        '\u{1f9ea}' => "flask",
+        '\u{1f310}' => "browser",
+        '\u{1fa9d}' => "hook",
+        '\u{1f4f8}' => "camera",
+        '\u{1f6e0}' => "tool",
+        '\u{1f4cd}' => "pin",
+        '\u{2713}' => "check",
+        _ => return None,
+    };
+    let label = chars.as_str().trim_start().to_string();
+    Some((icon, label))
+}
+
+fn plain_status_icon_text(text: &str) -> Option<(&'static str, String)> {
+    let trimmed = text.trim_start();
+    let icon = if trimmed.starts_with("Planning") {
+        "target"
+    } else if trimmed.starts_with("Running") || trimmed.starts_with("Sub-agent") {
+        "spark"
+    } else if trimmed.starts_with("Synthesizing") {
+        "plugins"
+    } else if trimmed.starts_with("Implementing") || trimmed.starts_with("Preparing") {
+        "settings"
+    } else if trimmed.starts_with("Steering") {
+        "corner-up-right"
+    } else if trimmed.starts_with("Auto-verify") {
+        "flask"
+    } else if trimmed.starts_with("Reviewing") {
+        "search"
+    } else if trimmed.starts_with("Review passed") {
+        "check"
+    } else if trimmed.starts_with("Gaps remain")
+        || trimmed.starts_with("context full")
+        || trimmed.starts_with("worker context full")
+    {
+        "alert"
+    } else if trimmed.starts_with("Fixing gaps") {
+        "refresh"
+    } else if trimmed.starts_with("Background") {
+        "clock"
+    } else {
+        return None;
+    };
+    Some((icon, trimmed.to_string()))
+}
+
+fn icon_text(text: &str) -> Option<(&'static str, String)> {
+    prefixed_icon_text(text).or_else(|| plain_status_icon_text(text))
+}
+
+fn is_stage_status(text: &str) -> bool {
+    prefixed_icon_text(text).is_some() || plain_status_icon_text(text).is_some()
 }
 
 /// `(icon, verb, detail)` for a tool activity row, joined as "icon\tverb\tdetail".
@@ -1486,7 +1599,7 @@ fn text_attachment_name(rel_path: &str) -> String {
         .unwrap_or_else(|| "Pasted text.txt".to_string())
 }
 
-/// Human token count: 272_000 → "272k", 1_000_000 → "1M".
+/// Human token count: 272_000 to "272k", 1_000_000 to "1M".
 fn fmt_tokens(n: u64) -> String {
     if n >= 1_000_000 {
         if n.is_multiple_of(1_000_000) {
@@ -1834,7 +1947,7 @@ why it's wrong, and the concrete fix. If the diff is clean, say so plainly.{}\n\
         .map(|m| format!("\u{2}{m}"))
         .collect();
     if !marker_suffix.is_empty() {
-        text.push_str(&marker_suffix); // persisted with the user turn → reload renders them
+        text.push_str(&marker_suffix); // persisted with the user turn; reload renders them
     }
     let display = if marker_suffix.is_empty() {
         body.clone()
@@ -2442,6 +2555,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn done_note_display_strips_duration_and_raw_check() {
+        let text = format!("{DONE_NOTE_MARK} · 3m 1s · 2 file(s) +4 −1");
+        let (label, meta) = done_note_display_parts(&text);
+
+        assert_eq!(label, "Done");
+        assert_eq!(meta, vec!["2 file(s) +4 −1"]);
+    }
+
+    #[test]
+    fn done_note_display_keeps_non_duration_meta() {
+        let text = format!("{DONE_NOTE_MARK} · 2 file(s) +4 −1");
+        let (label, meta) = done_note_display_parts(&text);
+
+        assert_eq!(label, "Done");
+        assert_eq!(meta, vec!["2 file(s) +4 −1"]);
+    }
+
     fn act(text: &str) -> ChatMsg {
         ChatMsg {
             author: Author::Activity {
@@ -2463,6 +2594,7 @@ mod tests {
     fn done_summary_extracted_so_trailing_activity_stays_above_it() {
         // Buffer order with the Done note BEFORE trailing activity rows (the bug:
         // CLI tool events surfaced after TurnFinished landed below the footer).
+        let done = format!("{DONE_NOTE_MARK} · 1m");
         let msgs = vec![
             ChatMsg {
                 author: Author::User,
@@ -2472,7 +2604,7 @@ mod tests {
                 author: Author::Agent,
                 text: "working".into(),
             },
-            note("✓ Done · 1m"),
+            note(&done),
             act("terminal\tBash\tgit status"),
             act("eye\tRead\tlib.rs"),
         ];
@@ -2481,11 +2613,11 @@ mod tests {
         // The Done note is pulled out of the row groups into `done_summary`
         // (the render then places it as the turn's last child), so NO group is
         // the Done note and the trailing activity group is the last group.
-        assert_eq!(turns[0].done_summary.as_deref(), Some("✓ Done · 1m"));
+        assert_eq!(turns[0].done_summary.as_deref(), Some(done.as_str()));
         assert!(turns[0].groups.iter().all(|g| !g
             .indices
             .iter()
-            .any(|&i| msgs[i].text.starts_with("✓ Done"))));
+            .any(|&i| msgs[i].text.starts_with(DONE_NOTE_MARK))));
         assert!(turns[0].groups.last().unwrap().activity);
     }
 }
@@ -3357,7 +3489,7 @@ fn app() -> Element {
     let mut show_mcp = use_signal(|| false);
     let mut show_theme_menu = use_signal(|| false);
     let mut theme_menu_pos = use_signal(|| (12.0f64, 44.0f64));
-    // ⌘K command palette.
+    // Cmd-K command palette.
     let mut show_palette = use_signal(|| false);
     let mut show_shortcuts = use_signal(|| false);
     // Cursor-style icon rail: sidebar collapses to a thin strip.
@@ -3614,7 +3746,7 @@ fn app() -> Element {
         });
     });
 
-    // Global keyboard shortcuts (⌘K command palette, Esc to close).
+    // Global keyboard shortcuts (Cmd-K command palette, Esc to close).
     use_future(move || async move {
         let mut eval = dioxus::document::eval(
             r#"
@@ -3867,7 +3999,7 @@ fn app() -> Element {
                 s.addEventListener('scroll', upd, { passive: true });
                 inner = new MutationObserver(stick);
                 inner.observe(s, { childList: true, subtree: true, characterData: true });
-                // Fresh transcript mount (app start, welcome→chat): start at the bottom.
+                // Fresh transcript mount (app start, welcome to chat): start at the bottom.
                 s.scrollTop = s.scrollHeight;
                 upd();
               };
@@ -4219,18 +4351,19 @@ fn app() -> Element {
             // streaming-UI practice).
             let mut agent_buf = String::new();
             let mut last_paint = std::time::Instant::now();
-            // True between a turn's "✓ Done" note and the next TurnStarted. A late
+            // True between a turn's Done note and the next TurnStarted. A late
             // activity arriving in this window is inserted ABOVE the Done note so
             // it never dangles below the summary.
             let mut turn_done = false;
-            // Insert an activity row, keeping it above a trailing "✓ Done" note.
+            // Insert an activity row, keeping it above a trailing Done note.
             macro_rules! push_activity {
                 ($msg:expr) => {{
                     let mut m = messages.write();
                     if turn_done
                         && m.last()
                             .map(|x| {
-                                matches!(x.author, Author::Note) && x.text.starts_with("✓ Done")
+                                matches!(x.author, Author::Note)
+                                    && x.text.starts_with(DONE_NOTE_MARK)
                             })
                             .unwrap_or(false)
                     {
@@ -4290,7 +4423,7 @@ fn app() -> Element {
                             } else {
                                 // Engine failed to start — don't eat the message silently.
                                 messages.write().push(ChatMsg { author: Author::User, text: display });
-                                messages.write().push(ChatMsg { author: Author::Note, text: "⚠ engine not running — check provider/settings, or switch model to restart it".into() });
+                                messages.write().push(ChatMsg { author: Author::Note, text: format!("{} engine not running — check provider/settings, or switch model to restart it", '\u{26a0}') });
                                 scroll_chat_bottom();
                             }
                         }
@@ -4299,7 +4432,7 @@ fn app() -> Element {
                             let mut conf = conf;
                             conf.reasoning_effort = clamp_effort(&conf.provider, &conf.reasoning_effort);
                             // Provider the active tab had BEFORE this reconfigure — used to
-                            // drop stale usage when the quota source changes (e.g. ChatGPT→Claude).
+                            // drop stale usage when the quota source changes (e.g. ChatGPT to Claude).
                             let prev_provider = tabs
                                 .peek()
                                 .get(*active_tab.peek())
@@ -4345,7 +4478,7 @@ fn app() -> Element {
                                 }
                             }
                             // Keep the active tab's provider/logo/title in sync with
-                            // the picker — switching ChatGPT→Claude must restyle the tab.
+                            // the picker — switching ChatGPT to Claude must restyle the tab.
                             {
                                 let cur = *active_tab.peek();
                                 let mut tw = tabs.write();
@@ -4567,7 +4700,7 @@ fn app() -> Element {
                                 Event::Info { text } => {
                                     if text.starts_with("session") || text.starts_with("mcp ") || text.starts_with("mcp '") {
                                         // noise
-                                        } else if let Some(label) = text.strip_prefix('⚙').or_else(|| text.strip_prefix('⏳')) {
+                                        } else if let Some(label) = text.strip_prefix('\u{2699}').or_else(|| text.strip_prefix('\u{23f3}')) {
                                             let label = label.trim().to_string();
                                             // Suppress the redundant "Running …" notice when a
                                             // command row is already live in this tab's buffer.
@@ -4581,7 +4714,7 @@ fn app() -> Element {
                                             buf.pop();
                                         }
                                         buf_push_activity(buf, ChatMsg { author: Author::Activity { running: false, ok: true, key: None }, text: row });
-                                    } else if text.starts_with(['🧭','🔍','🤖','🧩','🔁','✓','⚠']) {
+                                    } else if is_stage_status(&text) {
                                         // live stage info — meaningless once backgrounded
                                     } else {
                                         buf.push(ChatMsg { author: Author::Note, text });
@@ -4667,11 +4800,11 @@ fn app() -> Element {
                                 }
                                 Event::ApprovalRequested { request_id, tool, summary } => {
                                     parked_appr.entry(ev_tid).or_default().push((request_id, tool.clone(), summary));
-                                    buf.push(ChatMsg { author: Author::Note, text: format!("⏸ waiting for approval ({tool}) — open this tab to respond") });
+                                    buf.push(ChatMsg { author: Author::Note, text: format!("{} waiting for approval ({tool}) — open this tab to respond", '\u{23f8}') });
                                 }
                                 Event::QuestionAsked { request_id, question, options } => {
                                     parked_q.entry(ev_tid).or_default().push((request_id, question.clone(), options));
-                                    buf.push(ChatMsg { author: Author::Note, text: format!("❓ {question} — open this tab to answer") });
+                                    buf.push(ChatMsg { author: Author::Note, text: format!("{} {question} — open this tab to answer", '\u{2753}') });
                                 }
                                 Event::TurnFinished { .. } => {
                                     if buf.last().map(|m| m.author == Author::Agent && m.text.is_empty()).unwrap_or(false) {
@@ -4680,7 +4813,7 @@ fn app() -> Element {
                                     for c in buf.iter_mut() {
                                         if let Author::Activity { running, .. } = &mut c.author { *running = false; }
                                     }
-                                    buf.push(ChatMsg { author: Author::Note, text: "✓ Done".into() });
+                                    buf.push(ChatMsg { author: Author::Note, text: DONE_NOTE_MARK.into() });
                                     let title = tabs.peek().iter().find(|t| t.id == ev_tid).map(|t| t.title.clone()).unwrap_or_default();
                                     if !title.is_empty() {
                                         push_toast(toasts, toast_seq, "ok", &format!("{title} — finished"));
@@ -4723,11 +4856,11 @@ fn app() -> Element {
                             Event::Info { text } => {
                                 if text.starts_with("session") || text.starts_with("mcp ") || text.starts_with("mcp '") {
                                     // internal/MCP noise — status shown in the MCP manager, not chat
-                                } else if text.starts_with('⏳') {
+                                } else if text.starts_with('\u{23f3}') {
                                     // Background task the agent started. Surface it as a
                                     // persistent chip + activity row so the user sees what's
                                     // running (its result won't stream back this turn).
-                                    let label = text.trim_start_matches('⏳').trim().to_string();
+                                    let label = text.trim_start_matches('\u{23f3}').trim().to_string();
                                     if !label.is_empty() && !bg_jobs.read().contains(&label) {
                                         bg_jobs.write().push(label.clone());
                                     }
@@ -4744,10 +4877,10 @@ fn app() -> Element {
                                     // "Done" note like every other activity row (never below it).
                                     let running = verb.eq_ignore_ascii_case("running");
                                     push_activity!(ChatMsg { author: Author::Activity { running, ok: true, key: None }, text: row });
-                                    } else if text.starts_with('⚙') {
+                                    } else if text.starts_with('\u{2699}') {
                                         // CLI-driver tool activity: live shimmer + an activity
                                         // trail row in the chat (synara-style).
-                                        let mut label = text.trim_start_matches('⚙').trim().to_string();
+                                        let mut label = text.trim_start_matches('\u{2699}').trim().to_string();
                                         // Suppress the redundant "Running …" notice when a command
                                         // row is already live (CommandStarted created one).
                                         let cmd_live = messages.read().iter().any(|m| matches!(m.author, Author::Activity { running: true, key: Some(_), .. }));
@@ -4755,7 +4888,7 @@ fn app() -> Element {
                                             status.set(label);
                                             continue;
                                         }
-                                        // "mcp__server__tool …" → "tool · server (MCP)".
+                                        // "mcp__server__tool …" to "tool · server (MCP)".
                                     if let Some(rest) = label.strip_prefix("mcp__") {
                                         let (srv, tail) = rest.split_once("__").unwrap_or(("", rest));
                                         let (tool, args) = tail.split_once(' ').unwrap_or((tail, ""));
@@ -4796,8 +4929,8 @@ fn app() -> Element {
                                             turn_edits.write().push((p, 0, 0, 0, String::new()));
                                         }
                                     }
-                                } else if text.starts_with(['🧭','🔍','🤖','🧩','🔁','✓','⚠']) {
-                                    // pipeline stage → live animated status, not a chat note
+                                } else if is_stage_status(&text) {
+                                    // pipeline stage becomes live animated status, not a chat note
                                     status.set(text);
                                 } else {
                                     messages.write().push(ChatMsg { author: Author::Note, text });
@@ -4961,7 +5094,7 @@ fn app() -> Element {
                                 scroll_chat_bottom_if_sticky();
                             }
                             Event::ToolCallBegin { call_id, tool, args, .. } => {
-                                timeline.write().push(TimelineItem { title: format!("⚙ {tool}"), sub: "running…".into() });
+                                timeline.write().push(TimelineItem { title: format!("Tool · {tool}"), sub: "running…".into() });
                                 // Live shimmer shows WHAT it's doing ("Reading src/lib.rs…"),
                                 // not just a generic verb.
                                 status.set(activity_label(&tool, &args));
@@ -4983,7 +5116,7 @@ fn app() -> Element {
                                     }
                             }
                                 Event::ToolCallEnd { call_id, tool, output, ok, .. } => {
-                                    timeline.write().push(TimelineItem { title: format!("⚙ {tool}"), sub: if ok { "done".into() } else { "failed".into() } });
+                                    timeline.write().push(TimelineItem { title: format!("Tool · {tool}"), sub: if ok { "done".into() } else { "failed".into() } });
                                     // Settle the exact row this call opened — found by its key
                                     // (call_id), never by index — and attach its output. A missing
                                     // row (shell/ask_user, or merged from a backgrounded tab) is a
@@ -5006,7 +5139,7 @@ fn app() -> Element {
                                 }
                                 Event::CommandStarted { command_id, worker_id, command, cwd, background, .. } => {
                                     timeline.write().push(TimelineItem {
-                                        title: if background { "⌘ background command".into() } else { "⌘ command".into() },
+                                        title: if background { "Background command".into() } else { "Command".into() },
                                         sub: format!("{command} · {cwd}"),
                                     });
                                     if let Some(worker_id) = worker_id {
@@ -5025,7 +5158,7 @@ fn app() -> Element {
                                             bg_jobs.write().push(command.clone());
                                         }
                                         status.set(if background { format!("Background · {command}") } else { format!("Running · {command}") });
-                                        // Insert above any trailing "✓ Done" note (CLI drivers
+                                        // Insert above any trailing Done note (CLI drivers
                                         // like claude can surface a command row after the turn's
                                         // text + Done landed) so it never renders below the footer.
                                         push_activity!(ChatMsg {
@@ -5084,7 +5217,7 @@ fn app() -> Element {
                                     scroll_chat_bottom_if_sticky();
                                 }
                             Event::PatchApplied { path, .. } => {
-                                timeline.write().push(TimelineItem { title: "✎ patched".into(), sub: path });
+                                timeline.write().push(TimelineItem { title: "Patched".into(), sub: path });
                                 let v = *git_refresh.read();
                                 git_refresh.set(v + 1); // trigger git-tab auto-refresh
                             }
@@ -5092,7 +5225,7 @@ fn app() -> Element {
                                 let base = |p: &str| p.rsplit('/').next().unwrap_or(p).to_string();
                                 let nb = base(&path);
                                 if diff.trim().is_empty() {
-                                    // Touched but no textual change → drop the pending
+                                    // Touched but no textual change, so drop the pending
                                     // "editing…" row so its spinner doesn't linger.
                                     turn_edits.write().retain(|e| !(e.4.is_empty() && e.3 == 0 && base(&e.0) == nb));
                                 } else {
@@ -5117,15 +5250,15 @@ fn app() -> Element {
                             }
                             Event::HookFired { hook, command, blocked } => {
                                 timeline.write().push(TimelineItem {
-                                    title: format!("🪝 {hook}{}", if blocked { " · blocked" } else { "" }),
+                                    title: format!("Hook · {hook}{}", if blocked { " · blocked" } else { "" }),
                                     sub: command,
                                 });
                             }
                             Event::BrowserTargetChanged { url, note, .. } => {
-                                timeline.write().push(TimelineItem { title: format!("🌐 open {url}"), sub: note });
+                                timeline.write().push(TimelineItem { title: format!("Browser open · {url}"), sub: note });
                             }
                             Event::BrowserSnapshotRequested { url, note, .. } => {
-                                timeline.write().push(TimelineItem { title: format!("📸 snapshot {url}"), sub: note });
+                                timeline.write().push(TimelineItem { title: format!("Browser snapshot · {url}"), sub: note });
                             }
                             Event::DesignSnapshotRequested { url, note, .. } => {
                                 if !url.trim().is_empty() {
@@ -5271,7 +5404,7 @@ fn app() -> Element {
                                 // "I'll let you know when done" never silently dangles.
                                 if !bg_jobs.peek().is_empty() {
                                     let jobs = bg_jobs.peek().join(", ");
-                                    messages.write().push(ChatMsg { author: Author::Note, text: format!("⏳ Background task(s) still running: {jobs} — the result won't return automatically. Ask the agent to check the output, or check the Environment → Terminals panel.") });
+                                    messages.write().push(ChatMsg { author: Author::Note, text: format!("{} Background task(s) still running: {jobs} — the result won't return automatically. Ask the agent to check the output, or check the Environment / Terminals panel.", '\u{23f3}') });
                                 }
                                 if let Some(start) = turn_start.write().take() {
                                     let secs = start.elapsed().as_secs();
@@ -5281,7 +5414,7 @@ fn app() -> Element {
                                         let e = turn_edits.read();
                                         (e.len(), e.iter().map(|x| x.1).sum::<u32>(), e.iter().map(|x| x.2).sum::<u32>())
                                     };
-                                    let sum = if nf > 0 { format!("✓ Done · {dur} · {nf} file(s) +{ta} −{td}") } else { format!("✓ Done · {dur}") };
+                                    let sum = if nf > 0 { format!("{DONE_NOTE_MARK} · {dur} · {nf} file(s) +{ta} −{td}") } else { format!("{DONE_NOTE_MARK} · {dur}") };
                                     messages.write().push(ChatMsg { author: Author::Note, text: sum });
                                 }
                                 // From here, late activities slot above the Done note.
@@ -5325,7 +5458,7 @@ fn app() -> Element {
         }
     };
 
-    // Keyboard: ⌘1–9 jump to tab N, ⌘⇧] / ⌘⇧[ cycle tabs.
+    // Keyboard: Cmd-1 through Cmd-9 jump to tab N, Cmd-Shift-] / Cmd-Shift-[ cycle tabs.
     use_future(move || async move {
         let mut eval = dioxus::document::eval(
             r#"
@@ -5576,7 +5709,7 @@ fn app() -> Element {
                             move |_| { let v = !*pinned.read(); pinned.set(v); win.set_always_on_top(v); show_theme_menu.set(false); }
                         },
                             Icon { name: "target" } span { class: "menu-name", "Pin window" }
-                            if *pinned.read() { span { class: "menu-check", "✓" } }
+                            if *pinned.read() { span { class: "menu-check", Icon { name: "check" } } }
                         }
                         button { class: "menu-item", onclick: {
                             let win = win.clone();
@@ -5607,15 +5740,15 @@ fn app() -> Element {
                         div { class: "menu-label", "Theme" }
                         button { class: "menu-item", onclick: move |_| { set_theme(cfg, "light"); show_theme_menu.set(false); },
                             Icon { name: "spark" } span { class: "menu-name", "Light" }
-                            if cfg.read().theme == "light" { span { class: "menu-check", "✓" } }
+                            if cfg.read().theme == "light" { span { class: "menu-check", Icon { name: "check" } } }
                         }
                         button { class: "menu-item", onclick: move |_| { set_theme(cfg, "dark"); show_theme_menu.set(false); },
                             Icon { name: "target" } span { class: "menu-name", "Dark" }
-                            if cfg.read().theme == "dark" { span { class: "menu-check", "✓" } }
+                            if cfg.read().theme == "dark" { span { class: "menu-check", Icon { name: "check" } } }
                         }
                         button { class: "menu-item", onclick: move |_| { set_theme(cfg, "system"); show_theme_menu.set(false); },
                             Icon { name: "settings" } span { class: "menu-name", "System" }
-                            if cfg.read().theme == "system" { span { class: "menu-check", "✓" } }
+                            if cfg.read().theme == "system" { span { class: "menu-check", Icon { name: "check" } } }
                         }
                         div { class: "plus-divider" }
                         div { class: "menu-label", "Accent" }
@@ -5890,10 +6023,10 @@ fn app() -> Element {
                                                                 "Restore",
                                                                 ToastAction::RestoreSessions(vec![path_str_archive.clone()]),
                                                             );
-                                                        }, "⊟" }
+                                                        }, Icon { name: "archive" } }
                                                         // Delete is non-destructive here — the visible row action only
                                                         // archives (hides). Permanent delete lives in the right-click
-                                                        // menu and in Settings → Archived sessions, so a stray click
+                                                        // menu and in Settings / Archived sessions, so a stray click
                                                         // never destroys a CLI-backed session.
                                                     }
                                                     div { class: "thread recent sub", title: "right-click / double-click for options",
@@ -6020,8 +6153,9 @@ fn app() -> Element {
                     let pct = (*update_pct.read() * 100.0) as u32;
                     rsx! {
                     div { class: "update-banner",
+                        span { class: "update-ic", Icon { name: "arrow-up" } }
                         span { class: "update-text",
-                            "⬆ Update available · v{info.version}"
+                            "Update available · v{info.version}"
                         }
                         if *updating.read() {
                             div { class: "update-progress",
@@ -6043,7 +6177,7 @@ fn app() -> Element {
                                 },
                                 if *updating.read() { "Updating… {pct}%" } else { "Update & restart" }
                             }
-                            button { class: "update-x", onclick: move |_| update_info.set(None), "✕" }
+                            button { class: "update-x", onclick: move |_| update_info.set(None), Icon { name: "x" } }
                         }
                     }
                     }
@@ -6091,7 +6225,7 @@ fn app() -> Element {
                                                     if let Some(idx) = idx { close_tab(tabs, active_tab, messages, cfg, engine, idx); }
                                                     closing_tab.set(None);
                                                 });
-                                            }, "✕" }
+                                            }, Icon { name: "x" } }
                                         }
                                     }
                                 }
@@ -6105,7 +6239,7 @@ fn app() -> Element {
                             if *show_newtab.read() {
                                 div { class: "menu-backdrop", onclick: move |_| show_newtab.set(false) }
                                 div { class: "newtab-menu",
-                                    div { class: "menu-label", "New agent · ⌘-click for TUI" }
+                                    div { class: "menu-label", "New agent · Cmd-click for TUI" }
                                     button { class: "menu-item", onclick: move |e| {
                                             show_newtab.set(false);
                                             let tui = e.modifiers().meta() || cfg.read().default_tab_mode == "tui";
@@ -6249,7 +6383,7 @@ fn app() -> Element {
                                                         });
                                                     }
                                                 },
-                                                Icon { name: "terminal" } span { "{mode_label}" } span { class: "env-card-badge", "⌄" }
+                                                Icon { name: "terminal" } span { "{mode_label}" } span { class: "env-card-badge", Icon { name: "chevron" } }
                                             }
                                         }
                                     }
@@ -6264,7 +6398,7 @@ fn app() -> Element {
                                                     });
                                                 }
                                             },
-                                            Icon { name: "branch" } span { "{br}" } span { class: "env-card-badge", "⌄" }
+                                            Icon { name: "branch" } span { "{br}" } span { class: "env-card-badge", Icon { name: "chevron" } }
                                         }
                                         if *branch_menu.read() {
                                             div { class: "env-procs",
@@ -6285,7 +6419,7 @@ fn app() -> Element {
                                                                     });
                                                                 },
                                                                 span { class: "env-proc-name", "{b}" }
-                                                                if b == cur_b { span { class: "env-card-badge", "✓" } }
+                                                                if b == cur_b { span { class: "env-card-badge", Icon { name: "check" } } }
                                                             }
                                                         }
                                                     }
@@ -6295,7 +6429,7 @@ fn app() -> Element {
                                     }
                                     div { class: "env-card-anchor",
                                         button { class: "env-card-row", onclick: move |_| { let v = *git_menu.read(); git_menu.set(!v); },
-                                            Icon { name: "spark" } span { "Commit or push" } span { class: "env-card-badge", "⌄" }
+                                            Icon { name: "spark" } span { "Commit or push" } span { class: "env-card-badge", Icon { name: "chevron" } }
                                         }
                                         if *git_menu.read() {
                                             div { class: "env-procs",
@@ -6328,7 +6462,9 @@ fn app() -> Element {
                                                             push_toast(toasts, toast_seq, if ok { "ok" } else { "err" }, if ok { "Pulled" } else { "Pull failed" });
                                                         });
                                                     }, span { class: "env-proc-name", "Pull (ff-only)" } }
-                                                button { class: "env-proc-open", onclick: move |_| { git_menu.set(false); select_env_tab(env_tab, show_env, env_tab_by_tab, tabs, active_tab, "changes", false); }, "Open diffs / PR →" }
+                                                button { class: "env-proc-open", onclick: move |_| { git_menu.set(false); select_env_tab(env_tab, show_env, env_tab_by_tab, tabs, active_tab, "changes", false); },
+                                                    "Open diffs / PR" Icon { name: "corner-up-right" }
+                                                }
                                             }
                                         }
                                     }
@@ -6354,7 +6490,7 @@ fn app() -> Element {
                                                 let _ = tokio::process::Command::new("open").arg(&https).output().await;
                                             });
                                         },
-                                        Icon { name: "browser" } span { "Repository" } span { class: "env-card-badge", "↗" }
+                                        Icon { name: "browser" } span { "Repository" } span { class: "env-card-badge", Icon { name: "external-link" } }
                                     }
                                     div { class: "env-card-sep" }
                                     div { class: "env-card-label", "Sources" }
@@ -6371,7 +6507,7 @@ fn app() -> Element {
                                                 procs_menu.set(!v);
                                                 if !v { spawn(async move { procs_list.set(scan_procs().await); }); }
                                             },
-                                            Icon { name: "terminal" } span { "Terminals" } span { class: "env-card-badge", "{n_terms} · ⌄" }
+                                            Icon { name: "terminal" } span { "Terminals" } span { class: "env-card-badge", "{n_terms} · " Icon { name: "chevron" } }
                                         }
                                         if *procs_menu.read() {
                                             div { class: "env-procs",
@@ -6390,10 +6526,12 @@ fn app() -> Element {
                                                                     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                                                                     procs_list.set(scan_procs().await);
                                                                 });
-                                                            }, "✕" }
+                                                            }, Icon { name: "x" } }
                                                     }
                                                 }
-                                                button { class: "env-proc-open", onclick: move |_| { procs_menu.set(false); select_env_tab(env_tab, show_env, env_tab_by_tab, tabs, active_tab, "term", false); }, "Open terminals →" }
+                                                button { class: "env-proc-open", onclick: move |_| { procs_menu.set(false); select_env_tab(env_tab, show_env, env_tab_by_tab, tabs, active_tab, "term", false); },
+                                                    "Open terminals" Icon { name: "corner-up-right" }
+                                                }
                                             }
                                         }
                                     }
@@ -6420,7 +6558,7 @@ fn app() -> Element {
                                                     button { class: "env-proc-kill", title: "Unpin", onclick: move |_| {
                                                             pinned_msgs.write().retain(|p| p.0 != mi);
                                                             thread_json_save(&ui.workspace.peek().clone(), "pins", &thread_stem(&tabs, &active_tab), &*pinned_msgs.read());
-                                                        }, "✕" }
+                                                        }, Icon { name: "x" } }
                                                 }
                                             }
                                         }
@@ -6444,7 +6582,7 @@ fn app() -> Element {
                                                             if ki < mv.len() { mv.remove(ki); }
                                                             drop(mv);
                                                             thread_json_save(&ui.workspace.peek().clone(), "markers", &thread_stem(&tabs, &active_tab), &*markers.read());
-                                                        }, "✕" }
+                                                        }, Icon { name: "x" } }
                                                 }
                                             }
                                         }
@@ -6452,7 +6590,7 @@ fn app() -> Element {
                                     if !recap_text.read().is_empty() {
                                         div { class: "env-card-sep" }
                                         button { class: "env-card-row", onclick: move |_| { let v = *recap_open.read(); recap_open.set(!v); },
-                                            Icon { name: "brain" } span { "Recap" } span { class: "env-card-badge", if *recap_open.read() { "⌃" } else { "⌄" } }
+                                            Icon { name: "brain" } span { "Recap" } span { class: if *recap_open.read() { "env-card-badge open" } else { "env-card-badge" }, Icon { name: "chevron" } }
                                         }
                                         if *recap_open.read() {
                                             div { class: "env-note recap", "{recap_text}" }
@@ -6460,7 +6598,7 @@ fn app() -> Element {
                                     }
                                     div { class: "env-card-sep" }
                                     button { class: "env-card-row", onclick: move |_| { let v = *note_open.read(); note_open.set(!v); },
-                                        Icon { name: "file" } span { "Notepad" } span { class: "env-card-badge", if *note_open.read() { "⌃" } else { "⌄" } }
+                                        Icon { name: "file" } span { "Notepad" } span { class: "env-card-badge", Icon { name: "chevron" } }
                                     }
                                     if *note_open.read() {
                                         textarea { class: "env-note-input", placeholder: "Notes for this thread…", value: "{note_text}",
@@ -6496,7 +6634,7 @@ fn app() -> Element {
                                         Icon { name: ic } span { "{label}" }
                                     }
                                 }
-                                button { class: "env-x", title: "Close", onclick: move |_| show_env.set(false), "✕" }
+                                button { class: "env-x", title: "Close", onclick: move |_| show_env.set(false), Icon { name: "x" } }
                             }
                             div { class: "env-body",
                             if env_tab.read().as_str() == "changes" {
@@ -6530,7 +6668,7 @@ fn app() -> Element {
                                                         let _ = run_cmd(&ws, "gh", &["pr", "create", "--fill"]).await;
                                                     });
                                                 }, "Create PR" }
-                                                button { class: "term-x", onclick: move |_| show_env.set(false), "✕" }
+                                                button { class: "term-x", onclick: move |_| show_env.set(false), Icon { name: "x" } }
                                             }
                                             div { class: "changes-list",
                                                 if files.is_empty() { div { class: "insp-empty", "Working tree clean." } }
@@ -6559,7 +6697,9 @@ fn app() -> Element {
                                                 if !u.is_empty() && !u.contains("://") { u = format!("http://{u}"); preview_url.set(u); }
                                             }
                                         }
-                                        button { class: "preview-btn", title: "Rescan localhost ports", onclick: move |_| { spawn(async move { preview_ports.set(scan_ports().await); }); }, "⟳ Scan" }
+                                        button { class: "preview-btn", title: "Rescan localhost ports", onclick: move |_| { spawn(async move { preview_ports.set(scan_ports().await); }); },
+                                            Icon { name: "refresh" } "Scan"
+                                        }
                                         button { class: "preview-btn pick", title: "Select an element to send to the composer", onclick: move |_| {
                                             spawn(async move { let _ = document::eval("document.querySelector('.preview-frame')?.contentWindow?.postMessage('oxide-pick-on','*')").await; });
                                         }, "Pick" }
@@ -6572,12 +6712,14 @@ fn app() -> Element {
                                             spawn(async move { let _ = document::eval(&js).await; });
                                         }, "Design" }
                                         button { class: "preview-btn", title: "Reload", onclick: move |_| { let u = preview_url.read().clone(); preview_url.set(String::new()); preview_url.set(u); }, "Reload" }
-                                        button { class: "preview-btn", title: "Open in system browser", onclick: move |_| { let u = preview_url.read().clone(); if !u.is_empty() { let _ = std::process::Command::new("open").arg(u).spawn(); } }, "↗" }
-                                        button { class: "term-x", onclick: move |_| show_env.set(false), "✕" }
+                                        button { class: "preview-btn", title: "Open in system browser", onclick: move |_| { let u = preview_url.read().clone(); if !u.is_empty() { let _ = std::process::Command::new("open").arg(u).spawn(); } },
+                                            Icon { name: "external-link" }
+                                        }
+                                        button { class: "term-x", onclick: move |_| show_env.set(false), Icon { name: "x" } }
                                     }
                                     div { class: "preview-ports",
                                         if preview_ports.read().is_empty() {
-                                            span { class: "preview-hint", "No localhost servers detected. Start a dev server, then ⟳ Scan." }
+                                            span { class: "preview-hint", "No localhost servers detected. Start a dev server, then scan again." }
                                         }
                                         for (port, cmd) in preview_ports.read().iter().cloned() {
                                             button { class: "port-chip", title: "{cmd}", onclick: move |_| {
@@ -6655,7 +6797,11 @@ fn app() -> Element {
                                                                 for (prop, old, newv) in pending.iter().cloned() {
                                                                     div { class: "design-pending-row",
                                                                         span { class: "design-pending-prop", "{prop}" }
-                                                                        span { class: "design-pending-val", "{old} → {newv}" }
+                                                                        span { class: "design-pending-val",
+                                                                            span { "{old}" }
+                                                                            Icon { name: "arrow-right" }
+                                                                            span { "{newv}" }
+                                                                        }
                                                                     }
                                                                 }
                                                             }
@@ -6681,7 +6827,7 @@ fn app() -> Element {
                                                                 design_edits.set(Vec::new());
                                                                 design_note.set(String::new());
                                                                 spawn(async move { let _ = document::eval("document.querySelector('.preview-frame')?.contentWindow?.postMessage('oxide-design-reset','*')").await; });
-                                                            }, "Apply → code" }
+                                                        }, Icon { name: "edit" } "Apply to code" }
                                                             button { class: "preview-btn", onclick: move |_| {
                                                                 design_edits.set(Vec::new());
                                                                 design_note.set(String::new());
@@ -6692,7 +6838,7 @@ fn app() -> Element {
                                                 }
                                             }
                                         } else {
-                                            div { class: "design-hint", "🎨 Design Mode aktif — klik elemen di preview untuk mengedit." }
+                                            div { class: "design-hint", Icon { name: "edit" } span { "Design Mode aktif — klik elemen di preview untuk mengedit." } }
                                         }
                                     }
                                     if preview_url.read().is_empty() {
@@ -6732,7 +6878,7 @@ fn app() -> Element {
                                         }
                                     }
                                 }
-                                button { class: "term-x", onclick: move |_| show_env.set(false), "✕" }
+                                button { class: "term-x", onclick: move |_| show_env.set(false), Icon { name: "x" } }
                             }
                             div { class: "insp-body",
                                 match inspector_tab.read().as_str() {
@@ -6933,14 +7079,15 @@ fn app() -> Element {
                                                                 } else {
                                                                     "agents-worker fail"
                                                                 };
-                                                                let worker_status = if card.ok { "✓" } else { "!" };
                                                                 rsx! {
                                                                     div { class: "{worker_class}",
                                                                         span { class: "agents-worker-status",
                                                                             if card.running {
                                                                                 span { class: "syn-spinner" }
+                                                                            } else if card.ok {
+                                                                                Icon { name: "check" }
                                                                             } else {
-                                                                                span { "{worker_status}" }
+                                                                                Icon { name: "alert" }
                                                                             }
                                                                         }
                                                                         div { class: "agents-worker-copy",
@@ -7026,9 +7173,9 @@ fn app() -> Element {
                                                             }
                                                             div { class: "review-actions",
                                                                 if is_reverted {
-                                                                    span { class: "diff-reverted slot-status", SlotText { text: "✓ Reverted".to_string(), reverse: true } }
+                                                                    span { class: "diff-reverted slot-status icon-slot", Icon { name: "check" } SlotText { text: "Reverted".to_string(), reverse: true } }
                                                                 } else if is_accepted {
-                                                                    span { class: "diff-kept slot-status", SlotText { text: "✓ Kept".to_string() } }
+                                                                    span { class: "diff-kept slot-status icon-slot", Icon { name: "check" } SlotText { text: "Kept".to_string() } }
                                                                 } else {
                                                                     button { class: "review-accept", title: "Keep this change", onclick: move |_| {
                                                                         if cp != 0 { accepted.write().insert(cp); }
@@ -7257,7 +7404,7 @@ fn app() -> Element {
                                                             git_diff.set(format!("$ git push\n{out}"));
                                                         });
                                                     }
-                                                }, "Push ↑" }
+                                                }, Icon { name: "arrow-up" } "Push" }
                                                 button { class: "git-act", title: "Create a pull request (gh)", onclick: {
                                                     let ws = ws_pr.clone();
                                                     move |_| {
@@ -7305,7 +7452,7 @@ fn app() -> Element {
                                                 div { class: "insp-empty", "No skills yet. The agent saves reusable procedures via save_skill." }
                                             }
                                             for s in skills {
-                                                div { class: "tl-item", div { class: "tl-title", "🛠 {s}" } }
+                                                div { class: "tl-item", div { class: "tl-title", span { class: "tl-icon", Icon { name: "tool" } } "{s}" } }
                                             }
                                         }
                                     },
@@ -7395,7 +7542,7 @@ fn app() -> Element {
                                                                     e.stop_propagation();
                                                                     let n = { let mut tv = terms.write(); if ti < tv.len() { tv.remove(ti); } tv.len() };
                                                                     if *term_sel.read() >= n { term_sel.set(n.saturating_sub(1)); }
-                                                                }, "✕" }
+                                                                }, Icon { name: "x" } }
                                                             }
                                                         }
                                                     }
@@ -7405,8 +7552,8 @@ fn app() -> Element {
                                                 let id = *term_seq.read() + 1; term_seq.set(id);
                                                 terms.write().push((id, format!("zsh {id}"), Vec::new()));
                                                 let n = terms.read().len(); term_sel.set(n - 1);
-                                            }, "+" }
-                                            button { class: "term-tab add", title: "Clear output", onclick: move |_| { let sel = *term_sel.read(); if let Some(t) = terms.write().get_mut(sel) { t.2.clear(); } }, "⌫" }
+                                            }, Icon { name: "plus" } }
+                                            button { class: "term-tab add", title: "Clear output", onclick: move |_| { let sel = *term_sel.read(); if let Some(t) = terms.write().get_mut(sel) { t.2.clear(); } }, Icon { name: "backspace" } }
                                         }
                                         div { class: "term-body",
                                             {
@@ -7416,7 +7563,7 @@ fn app() -> Element {
                                             }
                                         }
                                         div { class: "term-input-row",
-                                            span { class: "term-prompt", "❯" }
+                                            span { class: "term-prompt", Icon { name: "chevron" } }
                                             input { class: "term-input", placeholder: "command…", value: "{term_input}",
                                                 oninput: move |e| term_input.set(e.value()),
                                                 onkeydown: move |e| if e.key() == Key::Enter { run_term(); },
@@ -7457,11 +7604,13 @@ fn app() -> Element {
                                             }
                                         }
                                     }
-                                    button { class: "board-btn", onclick: move |_| { let _ = workspace_of(&cfg.read()); run_board(board, cfg, workspace_of(&cfg.read())); }, "▶ Run To-Do" }
+                                    button { class: "board-btn", onclick: move |_| { let _ = workspace_of(&cfg.read()); run_board(board, cfg, workspace_of(&cfg.read())); }, Icon { name: "play" } "Run To-Do" }
                                     button { class: "board-btn ghost", onclick: move |_| {
                                             let root = workspace_of(&cfg.read());
                                             sync_board_issues(board, root, board_sync_status, board_syncing);
-                                        }, if *board_syncing.read() { "Syncing…" } else { "↻ Sync issues" } }
+                                        },
+                                        if *board_syncing.read() { "Syncing…" } else { span { Icon { name: "refresh" } "Sync issues" } }
+                                    }
                                 }
                             }
                             div { class: "board-sync-status", "{board_sync_status}" }
@@ -7514,12 +7663,12 @@ fn app() -> Element {
                                                                     };
                                                                     snap.save(&root);
                                                                 });
-                                                            }, "✓ Merge" }
+                                                            }, Icon { name: "check" } "Merge" }
                                                         }
                                                         button { class: "board-card-x", onclick: move |_| {
                                                             board.write().cards.retain(|c| c.id != cid);
                                                             let snap = board.read().clone(); snap.save(&workspace_of(&cfg.read()));
-                                                        }, "✕" }
+                                                        }, Icon { name: "x" } }
                                                     }
                                                 }
                                             }
@@ -7583,7 +7732,7 @@ fn app() -> Element {
                             div { class: "jump-anchor",
                                 button { class: "jump-bottom", title: "Scroll to bottom",
                                     onclick: move |_| { spawn(async move { let _ = dioxus::document::eval("const s=document.querySelector('.scroll'); if(s) s.scrollTo({top:s.scrollHeight, behavior:'smooth'});").await; }); },
-                                    "↓"
+                                    Icon { name: "arrow-down" }
                                 }
                             }
                             div {
@@ -7615,7 +7764,7 @@ fn app() -> Element {
                                                         let m = &messages.read()[i];
                                                         if let Author::Activity { running, ok, .. } = m.author { (m.text.clone(), running, ok) } else { (m.text.clone(), false, true) }
                                                     }).collect();
-                                                    let label = activity_group_label(&rows);
+                                                    let (icon, label) = activity_group_display(&rows);
                                                     // Default COLLAPSED, even while live — an open group with dozens
                                                     // of (animating) rows lags hard. The header shows live progress;
                                                     // the user expands for detail. And cap rendered rows to the most
@@ -7633,6 +7782,7 @@ fn app() -> Element {
                                                                     act_open.write().insert(group_key, !cur);
                                                                 },
                                                                 span { class: "diff-caret", Icon { name: "chevron" } }
+                                                                span { class: "act-group-icon", Icon { name: icon } }
                                                                 "{label}"
                                                             }
                                                             if hidden > 0 { div { class: "act-more", "… {hidden} earlier" } }
@@ -7711,7 +7861,7 @@ fn app() -> Element {
                                                                             }
                                                                         }
                                                                         div { class: "msg-actions",
-                                                                            button { class: "msg-act", title: "Copy message", onclick: move |_| { let c = copy.clone(); spawn(async move { let _ = document::eval(&format!("navigator.clipboard.writeText({c})")).await; }); push_toast(toasts, toast_seq, "ok", "Copied"); }, "⧉" }
+                                                                            button { class: "msg-act", title: "Copy message", onclick: move |_| { let c = copy.clone(); spawn(async move { let _ = document::eval(&format!("navigator.clipboard.writeText({c})")).await; }); push_toast(toasts, toast_seq, "ok", "Copied"); }, Icon { name: "copy" } }
                                                                             if *confirm_restore.read() == Some(idx) {
                                                                                 button { class: "msg-act danger", title: "Click again to confirm — reverts files and brings this message back to the composer to edit & resend", onclick: move |_| {
                                                                                     confirm_restore.set(None);
@@ -7739,7 +7889,7 @@ fn app() -> Element {
                                                                                     });
                                                                                 }, "Edit & restore?" }
                                                                             } else {
-                                                                                button { class: "msg-act", title: "Restore — revert files and edit this message", onclick: move |_| confirm_restore.set(Some(idx)), "↩" }
+                                                                                button { class: "msg-act", title: "Restore — revert files and edit this message", onclick: move |_| confirm_restore.set(Some(idx)), Icon { name: "undo" } }
                                                                             }
                                                                         }
                                                                     }
@@ -7869,28 +8019,7 @@ fn app() -> Element {
                                     // momentarily emptied between events, restarting the spinner's
                                     // CSS animation each time (it looked frozen/stuck). A stable
                                     // key + always-mounted pill lets the spin run continuously.
-                                    div { class: "status-pill",
-                                        span { key: "status-spin", class: "status-spinner" }
-                                        {
-                                            let s = status.read();
-                                            let label = if s.is_empty() { "Working…".to_string() } else { s.clone() };
-                                            rsx! { span { class: "status-shimmer", "{label}" } }
-                                        }
-                                        if *elapsed_s.read() >= 3 {
-                                            {
-                                                // Long turns read as "6m 10s" / "1h 5m", not "370s".
-                                                let el = *elapsed_s.read();
-                                                let txt = if el >= 3600 {
-                                                    format!("{}h {}m", el / 3600, (el % 3600) / 60)
-                                                } else if el >= 60 {
-                                                    format!("{}m {}s", el / 60, el % 60)
-                                                } else {
-                                                    format!("{el}s")
-                                                };
-                                                rsx! { span { class: "status-elapsed", "· {txt}" } }
-                                            }
-                                        }
-                                    }
+                                    StatusPill { text: status.read().clone(), elapsed_s: *elapsed_s.read() }
                                 }
                                 if !bg_jobs.read().is_empty() {
                                     div { class: "bg-bar",
@@ -7900,14 +8029,14 @@ fn app() -> Element {
                                             span { class: "bg-chip", title: "Running in background — result won't auto-return",
                                                 span { class: "bg-dot" }
                                                 span { class: "bg-chip-text", "{job}" }
-                                                button { class: "bg-x", title: "Dismiss", onclick: move |_| { let mut v = bg_jobs.write(); if bi < v.len() { v.remove(bi); } }, "✕" }
+                                                button { class: "bg-x", title: "Dismiss", onclick: move |_| { let mut v = bg_jobs.write(); if bi < v.len() { v.remove(bi); } }, Icon { name: "x" } }
                                             }
                                         }
                                     }
                                 }
                                 if !queue.read().is_empty() {
                                     div { class: "queue-bar",
-                                        span { class: "queue-label", "⧖ Queued ({queue.read().len()})" }
+                                        span { class: "queue-label", Icon { name: "clock" } "Queued ({queue.read().len()})" }
                                         for (qi, q) in queue.read().iter().enumerate() {
                                             {
                                                 let preview = queue_preview(q);
@@ -7938,8 +8067,8 @@ fn app() -> Element {
                                                                     let display = strip_scaffold(&t);
                                                                     engine.send(EngineCmd::Submit { engine: t, display });
                                                                 }
-                                                            }, "↪" }
-                                                        button { class: "queue-x", onclick: move |e: dioxus::prelude::MouseEvent| { e.stop_propagation(); let mut qv = queue.write(); if qi < qv.len() { qv.remove(qi); } }, "✕" }
+                                                            }, Icon { name: "corner-up-right" } }
+                                                        button { class: "queue-x", onclick: move |e: dioxus::prelude::MouseEvent| { e.stop_propagation(); let mut qv = queue.write(); if qi < qv.len() { qv.remove(qi); } }, Icon { name: "x" } }
                                                     }
                                                 }
                                             }
@@ -7951,7 +8080,7 @@ fn app() -> Element {
                                 }
                                 for (qid, question, options) in questions.read().iter().cloned() {
                                     div { class: "question-card",
-                                        div { class: "question-q", "❓ {question}" }
+                                        div { class: "question-q", Icon { name: "help" } span { "{question}" } }
                                         div { class: "question-opts",
                                             for (oi, opt) in options.iter().enumerate() {
                                                 {
@@ -8007,18 +8136,18 @@ fn app() -> Element {
                                                         span { class: "edits-counts", span { class: "diff-adds countup plus", style: "--n:{total_add}" } " " span { class: "diff-dels countup minus", style: "--n:{total_del}" } }
                                                     }
                                                     if *edits_undone.read() {
-                                                        span { class: "edits-undone slot-status", SlotText { text: "✓ Undone".to_string(), reverse: true } }
+                                                        span { class: "edits-undone slot-status icon-slot", Icon { name: "check" } SlotText { text: "Undone".to_string(), reverse: true } }
                                                     } else {
                                                         div { class: "edits-actions",
                                                             button { class: "edits-keepall", title: "Keep every change in this turn", onclick: move |_| {
                                                                 let cps: Vec<u64> = turn_edits.read().iter().map(|e| e.3).filter(|cp| *cp != 0).collect();
                                                                 let mut a = accepted.write();
                                                                 for cp in cps { a.insert(cp); }
-                                                            }, SlotText { text: "Keep all ✓".to_string() } }
+                                                            }, Icon { name: "check" } SlotText { text: "Keep all".to_string() } }
                                                             button { class: "edits-undo", onclick: move |_| {
                                                                 for (_, _, _, cp, _) in turn_edits.read().iter() { engine.send(EngineCmd::Rewind { id: *cp }); reverted.write().insert(*cp); }
                                                                 edits_undone.set(true);
-                                                            }, SlotText { text: "Undo ↺".to_string(), reverse: true } }
+                                                            }, Icon { name: "undo" } SlotText { text: "Undo".to_string(), reverse: true } }
                                                         }
                                                     }
                                                 }
@@ -8044,9 +8173,9 @@ fn app() -> Element {
                                                                         span { class: "edits-path", "{path}" }
                                                                         span { class: "edits-rowcounts", span { class: "diff-adds", "+{a}" } " " span { class: "diff-dels", "−{d}" } }
                                                                         if is_reverted {
-                                                                            span { class: "diff-reverted slot-status", SlotText { text: "✓ Reverted".to_string(), reverse: true } }
+                                                                            span { class: "diff-reverted slot-status icon-slot", Icon { name: "check" } SlotText { text: "Reverted".to_string(), reverse: true } }
                                                                         } else if accepted.read().contains(&cp) {
-                                                                            span { class: "diff-kept slot-status", SlotText { text: "✓ Kept".to_string() } }
+                                                                            span { class: "diff-kept slot-status icon-slot", Icon { name: "check" } SlotText { text: "Kept".to_string() } }
                                                                         } else if cp != 0 {
                                                                             button { class: "edits-row-keep",
                                                                                 onclick: move |e: dioxus::prelude::MouseEvent| { e.prevent_default(); e.stop_propagation(); accepted.write().insert(cp); },
@@ -8092,8 +8221,8 @@ fn app() -> Element {
                                                     div { class: "{row_cls}",
                                                         span { class: "subagent-status",
                                                             if card.running { span { class: "syn-spinner" } }
-                                                            else if card.ok { "✓" }
-                                                            else { "!" }
+                                                            else if card.ok { Icon { name: "check" } }
+                                                            else { Icon { name: "alert" } }
                                                         }
                                                         div { class: "subagent-copy",
                                                             div { class: "subagent-title", "{card.profile} · {card.task}" }
@@ -8111,8 +8240,8 @@ fn app() -> Element {
                                                                                         summary { class: "subagent-log-head",
                                                                                             span { class: "subagent-log-status",
                                                                                                 if log.running { span { class: "syn-spinner" } }
-                                                                                                else if log.ok { "✓" }
-                                                                                                else { "!" }
+                                                                                                else if log.ok { Icon { name: "check" } }
+                                                                                                else { Icon { name: "alert" } }
                                                                                             }
                                                                                             span { class: "subagent-log-command", "{log.command}" }
                                                                                             if lines > 0 {
@@ -8148,7 +8277,7 @@ fn app() -> Element {
                                         for (content, st) in items {
                                             div { class: "todo-row {st}",
                                                 span { class: "todo-box",
-                                                    if st == "completed" { "✓" } else if st == "in_progress" { span { class: "syn-spinner" } } else { "" }
+                                                    if st == "completed" { Icon { name: "check" } } else if st == "in_progress" { span { class: "syn-spinner" } } else { "" }
                                                 }
                                                 span { class: "todo-text", "{content}" }
                                             }
@@ -8205,7 +8334,7 @@ fn app() -> Element {
                                                         let row_cls = if row_pending { "live-change-file pending" } else { "live-change-file" };
                                                         rsx! {
                                                             div { class: "{row_cls}",
-                                                                if row_pending { span { class: "syn-spinner" } } else { span { class: "live-change-ready", "✓" } }
+                                                                if row_pending { span { class: "syn-spinner" } } else { span { class: "live-change-ready", Icon { name: "check" } } }
                                                                 span { class: "live-change-path", "{path}" }
                                                                 if row_pending {
                                                                     span { class: "live-change-state shimmer slot-status", SlotText { text: "editing…".to_string() } }
@@ -8235,7 +8364,7 @@ fn app() -> Element {
                                             Icon { name: "spark" } span { "{f}" }
                                         }
                                     }
-                                    button { class: "followups-x", title: "Dismiss", onclick: move |_| followups.write().clear(), "✕" }
+                                    button { class: "followups-x", title: "Dismiss", onclick: move |_| followups.write().clear(), Icon { name: "x" } }
                                 }
                             }
                             Composer { streaming, engine, cfg, model_label, bypass,
@@ -8343,25 +8472,25 @@ fn app() -> Element {
             // Lightbox for images attached to sent messages.
             if let Some(src) = chat_img.read().clone() {
                 div { class: "img-lightbox", onclick: move |_| chat_img.set(None),
-                    button { class: "img-lightbox-x", onclick: move |_| chat_img.set(None), "✕" }
+                    button { class: "img-lightbox-x", onclick: move |_| chat_img.set(None), Icon { name: "x" } }
                     img { class: "img-lightbox-img", src: "{src}", onclick: move |e| e.stop_propagation() }
                 }
             }
             if *show_shortcuts.read() {
                 div { class: "modal-overlay", onclick: move |_| show_shortcuts.set(false),
                     div { class: "modal shortcuts-modal", onclick: move |e| e.stop_propagation(),
-                        div { class: "modal-head", h2 { "Keyboard shortcuts" } button { class: "term-x", onclick: move |_| show_shortcuts.set(false), "✕" } }
+                        div { class: "modal-head", h2 { "Keyboard shortcuts" } button { class: "term-x", onclick: move |_| show_shortcuts.set(false), Icon { name: "x" } } }
                         div { class: "modal-body shortcuts-body",
                             for (k, d) in [
-                                ("⌘K", "Command palette + chat search"),
-                                ("⌘/", "This shortcuts sheet"),
-                                ("⌘B", "Toggle Files inspector"),
-                                ("⌘1–9", "Jump to agent tab N"),
-                                ("⌘⇧]", "Next tab"),
-                                ("⌘⇧[", "Previous tab"),
-                                ("⌘↵", "Send message"),
-                                ("⇧↵", "New line in composer"),
-                                ("⇧⇥", "Toggle plan mode (in composer)"),
+                                ("Cmd-K", "Command palette + chat search"),
+                                ("Cmd-/", "This shortcuts sheet"),
+                                ("Cmd-B", "Toggle Files inspector"),
+                                ("Cmd-1-9", "Jump to agent tab N"),
+                                ("Cmd-Shift-]", "Next tab"),
+                                ("Cmd-Shift-[", "Previous tab"),
+                                ("Cmd-Enter", "Send message"),
+                                ("Shift-Enter", "New line in composer"),
+                                ("Shift-Tab", "Toggle plan mode (in composer)"),
                                 ("@", "Mention MCP / skill / file"),
                                 ("Esc", "Close menus / overlays"),
                                 ("Double-click tab", "Rename"),
@@ -8552,7 +8681,7 @@ fn McpModal(
             div { class: "modal skills-modal", onclick: move |e| e.stop_propagation(),
                 div { class: "modal-head",
                     h2 { "MCP servers" }
-                    button { class: "term-x", onclick: move |_| on_close.call(()), "✕" }
+                    button { class: "term-x", onclick: move |_| on_close.call(()), Icon { name: "x" } }
                 }
                 div { class: "modal-body skills-body",
                     if servers.is_empty() {
@@ -8668,7 +8797,7 @@ fn SkillsModal(workspace: PathBuf, on_close: EventHandler<()>) -> Element {
             div { class: "modal skills-modal", onclick: move |e| e.stop_propagation(),
                 div { class: "modal-head",
                     h2 { "Skills · {total}" }
-                    button { class: "term-x", onclick: move |_| on_close.call(()), "✕" }
+                    button { class: "term-x", onclick: move |_| on_close.call(()), Icon { name: "x" } }
                 }
                 div { class: "menu-search", style: "margin: 0 18px",
                     Icon { name: "search" }
@@ -8986,11 +9115,11 @@ fn set_accent(mut cfg: Signal<Config>, accent: &str) {
     }
 }
 
-/// Native folder picker → switch workspace.
+/// Native folder picker to switch workspace.
 fn open_folder(cfg: Signal<Config>, ui: Ui, engine: Coroutine<EngineCmd>) {
     // MUST use the async dialog: the blocking `FileDialog::pick_folder()` runs
     // an NSOpenPanel modal loop on the main thread, which deadlocks the webview
-    // when invoked from inside a synchronous JS→native event dispatch.
+    // when invoked from inside a synchronous JS to native event dispatch.
     spawn(async move {
         if let Some(h) = rfd::AsyncFileDialog::new().pick_folder().await {
             apply_workspace(cfg, ui, engine, h.path().to_path_buf());
@@ -9533,7 +9662,7 @@ fn SettingsModal(
             div { class: "modal settings-modal", onclick: move |e| e.stop_propagation(),
                 div { class: "modal-head",
                     h2 { "Settings" }
-                    button { class: "term-x", onclick: move |_| on_close.call(()), "✕" }
+                    button { class: "term-x", onclick: move |_| on_close.call(()), Icon { name: "x" } }
                 }
                 div { class: "settings-tabs",
                     for (key, label) in [("model", "Model"), ("access", "Access"), ("agents", "Agents"), ("hermes", "Hermes"), ("automations", "Automations"), ("sessions", "Sessions"), ("updates", "Updates")] {
@@ -9682,7 +9811,7 @@ fn SettingsModal(
                         label { class: "toggle-field",
                             input { r#type: "checkbox", checked: *orchestrate.read(),
                                 onchange: move |e| orchestrate.set(e.checked()) }
-                            span { class: "field-label", "Orchestrate (front planner → backend implementer)" }
+                            span { class: "field-label", "Orchestrate (front planner to backend implementer)" }
                         }
                         if *orchestrate.read() {
                             div { class: "orch-row",
@@ -10191,7 +10320,7 @@ fn Composer(
     // Full-screen image preview (lightbox) when a thumbnail is clicked.
     let mut preview_img = use_signal(|| None::<String>);
     let ws_paste = workspace.clone();
-    // Intercept image paste into the composer → attachment card (not inline).
+    // Intercept image paste into the composer as an attachment card (not inline).
     use_future(move || {
         let ws_paste = ws_paste.clone();
         async move {
@@ -10220,7 +10349,7 @@ fn Composer(
                   ev.preventDefault();
                   const lines = text.split('\n').length;
                   if (text.length > 800 || lines > 12) {
-                    // Long paste → text attachment (full text kept on disk).
+                    // Long paste becomes a text attachment (full text kept on disk).
                     dioxus.send('PASTE:' + text);
                   } else {
                     document.execCommand('insertText', false, text);
@@ -10422,7 +10551,7 @@ fn Composer(
                         if e.key() == dioxus::prelude::Key::Escape { preview_img.set(None); }
                     },
                     onmounted: move |el| { spawn(async move { let _ = el.set_focus(true).await; }); },
-                    button { class: "img-lightbox-x", onclick: move |_| preview_img.set(None), "✕" }
+                    button { class: "img-lightbox-x", onclick: move |_| preview_img.set(None), Icon { name: "x" } }
                     img { class: "img-lightbox-img", src: "{src}", onclick: move |e| e.stop_propagation() }
                 }
             }
@@ -10431,7 +10560,7 @@ fn Composer(
                     for (i, src) in attachments.read().iter().cloned().enumerate() {
                         div { class: "attach-card",
                             img { src: "{src}", onclick: { let s = src.clone(); move |_| preview_img.set(Some(s.clone())) } }
-                            button { class: "attach-x", onclick: move |_| { let mut v = attachments.write(); if i < v.len() { v.remove(i); } }, "✕" }
+                            button { class: "attach-x", onclick: move |_| { let mut v = attachments.write(); if i < v.len() { v.remove(i); } }, Icon { name: "x" } }
                         }
                     }
                     for (i, att) in text_attachments.read().iter().cloned().enumerate() {
@@ -10450,7 +10579,7 @@ fn Composer(
                                             let removed = v.remove(i);
                                             let _ = std::fs::remove_file(ws_remove.join(&removed.rel_path));
                                         }
-                                    }, "✕" }
+                                    }, Icon { name: "x" } }
                                 }
                             }
                         }
@@ -10462,10 +10591,10 @@ fn Composer(
                     let label = p.lines().find_map(|l| l.strip_prefix("- selector: ")).unwrap_or("element").to_string();
                     rsx! {
                         div { class: "elem-chip", title: "{p}",
-                            span { class: "elem-pin", "📍" }
+                            span { class: "elem-pin", Icon { name: "pin" } }
                             span { class: "elem-sel", "{label}" }
-                            span { class: "elem-note", "→ will be sent to change" }
-                            button { class: "elem-x", onclick: move |_| picked_element.set(None), "✕" }
+                            span { class: "elem-note", "will be sent to change" }
+                            button { class: "elem-x", onclick: move |_| picked_element.set(None), Icon { name: "x" } }
                         }
                     }
                 }
@@ -10637,7 +10766,7 @@ fn Composer(
                                         engine.send(EngineCmd::Reconfigure(c));
                                     },
                                     Icon { name: "spark" }
-                                    span { class: "plus-name", title: "Two-stage: a planner delegates to an implementer, then reviews (plan→do→review)", "Orchestrate" }
+                                    span { class: "plus-name", title: "Two-stage: a planner delegates to an implementer, then reviews (plan to do to review)", "Orchestrate" }
                                     span { class: if cfg.read().orchestrate { "switch on" } else { "switch" }, span { class: "knob" } }
                                 }
                             }
@@ -10660,17 +10789,17 @@ fn Composer(
                                         button { class: "menu-item", onclick: move |_| set_access_mode(cfg, engine, show_access, ApprovalPolicy::Always, SandboxPolicy::WorkspaceWrite),
                                             Icon { name: "shield" }
                                             span { class: "menu-copy", span { class: "menu-name", "Ask for approval" } span { class: "menu-meta", "Always ask before edits and network" } }
-                                            if matches!(ap, ApprovalPolicy::Always) { span { class: "menu-check", "✓" } }
+                                            if matches!(ap, ApprovalPolicy::Always) { span { class: "menu-check", Icon { name: "check" } } }
                                         }
                                         button { class: "menu-item", onclick: move |_| set_access_mode(cfg, engine, show_access, ApprovalPolicy::OnRequest, SandboxPolicy::WorkspaceWrite),
                                             Icon { name: "terminal" }
                                             span { class: "menu-copy", span { class: "menu-name", "Approve for me" } span { class: "menu-meta", "Auto-run safe; ask for risky actions" } }
-                                            if matches!(ap, ApprovalPolicy::OnRequest) { span { class: "menu-check", "✓" } }
+                                            if matches!(ap, ApprovalPolicy::OnRequest) { span { class: "menu-check", Icon { name: "check" } } }
                                         }
                                         button { class: "menu-item", onclick: move |_| set_access_mode(cfg, engine, show_access, ApprovalPolicy::Never, SandboxPolicy::DangerFullAccess),
                                             Icon { name: "zap" }
                                             span { class: "menu-copy", span { class: "menu-name", "Full access" } span { class: "menu-meta", "Unrestricted files + network (yolo)" } }
-                                            if matches!(ap, ApprovalPolicy::Never) { span { class: "menu-check", "✓" } }
+                                            if matches!(ap, ApprovalPolicy::Never) { span { class: "menu-check", Icon { name: "check" } } }
                                         }
                                         div { class: "plus-divider" }
                                         button { class: "menu-item", onclick: move |_| { show_access.set(false); on_settings.call(()); },
@@ -10775,7 +10904,7 @@ fn Composer(
                                                     span { class: "menu-meta", "{preset.model} · {preset.summary}" }
                                                 }
                                                 span { class: if preset.fast { "menu-badge fast" } else { "menu-badge" }, "{preset.badge}" }
-                                                if selected { span { class: "menu-check", "✓" } }
+                                                if selected { span { class: "menu-check", Icon { name: "check" } } }
                                             }
                                         }
                                             }
@@ -10821,7 +10950,7 @@ fn Composer(
                                                     span { class: "menu-name", "{preset.label}" }
                                                     span { class: "menu-meta", "{preset.summary}" }
                                                 }
-                                                if selected { span { class: "menu-check", "✓" } }
+                                                if selected { span { class: "menu-check", Icon { name: "check" } } }
                                             }
                                         }
                                     }
@@ -10835,10 +10964,10 @@ fn Composer(
                         }
                     }
                     if *streaming.read() {
-                        button { class: "send steer", title: "Steer (inject into the running turn)", onclick: move |_| { let ws = ws_steer.clone(); spawn(async move { submit_ce(streaming, engine, plan_mode, pursue_goal, goal_text, queue, attachments, text_attachments, picked_element, true, ws).await; }); }, "↪" }
-                        button { class: "send stop", title: "Stop", onclick: move |_| { engine.send(EngineCmd::Interrupt); }, "■" }
+                        button { class: "send steer", title: "Steer (inject into the running turn)", onclick: move |_| { let ws = ws_steer.clone(); spawn(async move { submit_ce(streaming, engine, plan_mode, pursue_goal, goal_text, queue, attachments, text_attachments, picked_element, true, ws).await; }); }, Icon { name: "corner-up-right" } }
+                        button { class: "send stop", title: "Stop", onclick: move |_| { engine.send(EngineCmd::Interrupt); }, Icon { name: "stop" } }
                     } else {
-                        button { class: "send", onclick: move |_| { let ws = ws_btn.clone(); spawn(async move { submit_ce(streaming, engine, plan_mode, pursue_goal, goal_text, queue, attachments, text_attachments, picked_element, false, ws).await; }); }, "↑" }
+                        button { class: "send", onclick: move |_| { let ws = ws_btn.clone(); spawn(async move { submit_ce(streaming, engine, plan_mode, pursue_goal, goal_text, queue, attachments, text_attachments, picked_element, false, ws).await; }); }, Icon { name: "arrow-up" } }
                     }
                 }
             }
@@ -10934,6 +11063,73 @@ fn Composer(
 }
 
 #[component]
+fn DoneNote(text: String) -> Element {
+    let (label, meta) = done_note_display_parts(&text);
+    rsx! {
+        div { class: "row note done-row",
+            div { class: "note-text done-note",
+                span { class: "done-icon", Icon { name: "check" } }
+                span { class: "done-label", "{label}" }
+                for item in meta {
+                    span { class: "done-sep", "·" }
+                    span { class: "done-meta", "{item}" }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn ToolNote(text: String) -> Element {
+    let Some((icon, label)) = prefixed_icon_text(&text) else {
+        return rsx! { div { class: "row note", div { class: "note-text", "{text}" } } };
+    };
+    rsx! {
+        div { class: "row tool",
+            div { class: "tool-card tool-note",
+                span { class: "tool-note-icon", Icon { name: icon } }
+                pre { class: "tool-note-text", "{label}" }
+            }
+        }
+    }
+}
+
+#[component]
+fn StatusPill(text: String, #[props(default)] elapsed_s: u64) -> Element {
+    let label = if text.is_empty() {
+        "Working…".to_string()
+    } else {
+        text
+    };
+    let icon_parts = icon_text(&label);
+    let shown = icon_parts
+        .as_ref()
+        .map(|(_, label)| label.as_str())
+        .unwrap_or(label.as_str());
+    rsx! {
+        div { class: "status-pill",
+            span { key: "status-spin", class: "status-spinner" }
+            if let Some((icon, _)) = icon_parts {
+                span { class: "status-icon", Icon { name: icon } }
+            }
+            span { class: "status-shimmer", "{shown}" }
+            if elapsed_s >= 3 {
+                {
+                    let txt = if elapsed_s >= 3600 {
+                        format!("{}h {}m", elapsed_s / 3600, (elapsed_s % 3600) / 60)
+                    } else if elapsed_s >= 60 {
+                        format!("{}m {}s", elapsed_s / 60, elapsed_s % 60)
+                    } else {
+                        format!("{elapsed_s}s")
+                    };
+                    rsx! { span { class: "status-elapsed", "· {txt}" } }
+                }
+            }
+        }
+    }
+}
+
+#[component]
 fn Message(author: Author, text: String, #[props(default)] live: bool) -> Element {
     match author {
         Author::User => {
@@ -10946,7 +11142,7 @@ fn Message(author: Author, text: String, #[props(default)] live: bool) -> Elemen
                             if is_m { span { class: "inline-chip", "{s}" } } else { "{s}" }
                         }
                     }
-                    button { class: "msg-copy", title: "Copy message", onclick: move |_| { let c = copy.clone(); spawn(async move { let _ = document::eval(&format!("navigator.clipboard.writeText({c})")).await; }); }, "⧉" }
+                    button { class: "msg-copy", title: "Copy message", onclick: move |_| { let c = copy.clone(); spawn(async move { let _ = document::eval(&format!("navigator.clipboard.writeText({c})")).await; }); }, Icon { name: "copy" } }
                 }
             }
         }
@@ -10974,7 +11170,7 @@ fn Message(author: Author, text: String, #[props(default)] live: bool) -> Elemen
                     img { class: "avatar", src: logo_uri() }
                     div { class: "{body_cls}", dangerous_inner_html: md_to_html(&text, live) }
                     if !live {
-                        button { class: "msg-copy", title: "Copy message", onclick: move |_| { let c = copy.clone(); spawn(async move { let _ = document::eval(&format!("navigator.clipboard.writeText({c})")).await; }); }, "⧉" }
+                        button { class: "msg-copy", title: "Copy message", onclick: move |_| { let c = copy.clone(); spawn(async move { let _ = document::eval(&format!("navigator.clipboard.writeText({c})")).await; }); }, Icon { name: "copy" } }
                     }
                 }
             }
@@ -10995,12 +11191,10 @@ fn Message(author: Author, text: String, #[props(default)] live: bool) -> Elemen
         },
         Author::Diff(..) => rsx! {},
         Author::Note => {
-            let is_cmd = text.starts_with('⌘')
-                || text.starts_with('✎')
-                || text.starts_with('🔎')
-                || text.starts_with('⚙');
-            if is_cmd {
-                rsx! { div { class: "row tool", pre { class: "tool-card", "{text}" } } }
+            if text.starts_with(DONE_NOTE_MARK) {
+                rsx! { DoneNote { text } }
+            } else if prefixed_icon_text(&text).is_some() {
+                rsx! { ToolNote { text } }
             } else {
                 rsx! { div { class: "row note", div { class: "note-text", "{text}" } } }
             }
@@ -11047,10 +11241,10 @@ fn TerminalView(id: u64, bin: String, ws: String) -> Element {
                     }}
                     if (k === 'a') {{ term.selectAll(); return false; }}
                     if (k === 'k') {{ term.clear(); return false; }}
-                    // macOS line editing → send the readline control sequence.
-                    if (e.key === 'Backspace') {{ dioxus.send(JSON.stringify({{ inp: '\x15' }})); return false; }}  // ⌘⌫ delete to line start
-                    if (e.key === 'ArrowLeft') {{ dioxus.send(JSON.stringify({{ inp: '\x01' }})); return false; }}  // ⌘← line start
-                    if (e.key === 'ArrowRight') {{ dioxus.send(JSON.stringify({{ inp: '\x05' }})); return false; }} // ⌘→ line end
+                    // macOS line editing sends the readline control sequence.
+                    if (e.key === 'Backspace') {{ dioxus.send(JSON.stringify({{ inp: '\x15' }})); return false; }}  // command-backspace delete to line start
+                    if (e.key === 'ArrowLeft') {{ dioxus.send(JSON.stringify({{ inp: '\x01' }})); return false; }}  // command-left line start
+                    if (e.key === 'ArrowRight') {{ dioxus.send(JSON.stringify({{ inp: '\x05' }})); return false; }} // command-right line end
                     return false;  // swallow other Cmd combos so app shortcuts don't fire
                 }});
                 term.onData(d => dioxus.send(JSON.stringify({{ inp: d }})));
@@ -11453,8 +11647,8 @@ fn ActivityRow(text: String, running: bool, ok: bool) -> Element {
                 div { class: "{cls}",
                     span { class: "activity-tic", Icon { name: icon_static(&view.icon) } }
                     if running { span { class: "activity-spin" } }
-                    else if ok { span { class: "activity-ic ok", "✓" } }
-                    else { span { class: "activity-ic fail", "✕" } }
+                    else if ok { span { class: "activity-ic ok", Icon { name: "check" } } }
+                    else { span { class: "activity-ic fail", Icon { name: "x" } } }
                     span { class: "activity-verb", "{view.verb}" }
                     if !view.detail.is_empty() { span { class: "activity-text", "{view.detail}" } }
                 }
@@ -11462,7 +11656,7 @@ fn ActivityRow(text: String, running: bool, ok: bool) -> Element {
                 details { class: "{cls} has-out",
                     summary { class: "activity-sum",
                         span { class: "activity-tic", Icon { name: icon_static(&view.icon) } }
-                        if ok { span { class: "activity-ic ok", "✓" } } else { span { class: "activity-ic fail", "✕" } }
+                        if ok { span { class: "activity-ic ok", Icon { name: "check" } } } else { span { class: "activity-ic fail", Icon { name: "x" } } }
                         span { class: "activity-verb", "{view.verb}" }
                         if !view.detail.is_empty() { span { class: "activity-text", "{view.detail}" } }
                         span { class: "activity-out-n", "{lines} lines" }
@@ -11475,7 +11669,7 @@ fn ActivityRow(text: String, running: bool, ok: bool) -> Element {
                                     copy_text_to_clipboard(out.clone());
                                 }
                             },
-                            "⧉"
+                            Icon { name: "copy" }
                         }
                     }
                     pre { class: "activity-out", "{view.output}" }
@@ -11664,10 +11858,10 @@ fn SplitLeaf(
                     }
                 }
                 div { class: "pane-actions",
-                    button { class: "pane-btn", title: "Split right", onclick: move |_| on_split.call(true), "⊞" }
-                    button { class: "pane-btn", title: "Split down", onclick: move |_| on_split.call(false), "⊟" }
+                    button { class: "pane-btn", title: "Split right", onclick: move |_| on_split.call(true), Icon { name: "split-right" } }
+                    button { class: "pane-btn", title: "Split down", onclick: move |_| on_split.call(false), Icon { name: "split-down" } }
                     if closable {
-                        button { class: "pane-btn", title: "Close pane", onclick: move |_| on_close.call(()), "✕" }
+                        button { class: "pane-btn", title: "Close pane", onclick: move |_| on_close.call(()), Icon { name: "x" } }
                     }
                 }
             }
@@ -11873,10 +12067,10 @@ fn ChatPane(
                         Some(Event::UiSpec { spec, .. }) => { messages.write().push(ui_spec_message(*spec)); }
                         Some(Event::TurnStarted { .. }) => { thinking.set(String::new()); status.set("Working…".to_string()); }
                         Some(Event::TurnFinished { .. }) => { streaming.set(false); status.set(String::new()); pane_question.set(None); { let mut mm = messages.write(); for c in mm.iter_mut() { if let Author::Activity { running, .. } = &mut c.author { *running = false; } } } }
-                        Some(Event::Info { text }) => { if text.starts_with(['🧭','⚙','🔍','🤖','🧩','🔁','✓','⚠']) { status.set(text); } }
+                        Some(Event::Info { text }) => { if is_stage_status(&text) { status.set(text); } }
                         Some(Event::Error { message }) => { messages.write().push(ChatMsg { author: Author::Note, text: format!("error: {message}") }); streaming.set(false); }
                         Some(Event::QuestionAsked { question, options, .. }) => {
-                            messages.write().push(ChatMsg { author: Author::Note, text: format!("❓ {question}") });
+                            messages.write().push(ChatMsg { author: Author::Note, text: format!("{} {question}", '\u{2753}') });
                             pane_question.set(Some((question, options)));
                         }
                         Some(Event::AuditLog { .. })
@@ -11926,12 +12120,12 @@ fn ChatPane(
                     }
                 }
                 if *streaming.read() && !status.read().is_empty() {
-                    div { class: "status-pill", span { class: "status-spinner" } span { class: "status-shimmer", "{status}" } }
+                    StatusPill { text: status.read().clone() }
                 }
             }
             if let Some((q, opts)) = pane_question.read().clone() {
                 div { class: "question-card",
-                    div { class: "question-q", "❓ {q}" }
+                    div { class: "question-q", Icon { name: "help" } span { "{q}" } }
                     div { class: "question-opts",
                         for opt in opts {
                             {
@@ -11957,12 +12151,12 @@ fn ChatPane(
                     }
                 }
                 if *streaming.read() {
-                    button { class: "send stop", onclick: move |_| pane.send(PaneCmd::Interrupt), "■" }
+                    button { class: "send stop", onclick: move |_| pane.send(PaneCmd::Interrupt), Icon { name: "stop" } }
                 } else {
                     button { class: "send", onclick: move |_| {
                         let t = input.read().trim().to_string();
                         if !t.is_empty() { input.set(String::new()); pane_question.set(None); pane.send(PaneCmd::Submit(t)); }
-                    }, "↑" }
+                    }, Icon { name: "arrow-up" } }
                 }
             }
         }
@@ -12090,7 +12284,7 @@ fn HunkedDiff(ws: PathBuf, path: String, diff: String) -> Element {
                             div { class: "hunk-head",
                                 span { class: "hunk-hdr", "{header}" }
                                 if done {
-                                    span { class: "hunk-done", "reverted ↩" }
+                                    span { class: "hunk-done icon-slot", Icon { name: "undo" } "reverted" }
                                 } else {
                                     button { class: "hunk-revert", title: "Undo just this hunk in the file",
                                         onclick: move |_| { if revert_hunk(&ws2, &path2, &lines2) { reverted.write().insert(hi); } }, "Revert hunk" }
@@ -12188,6 +12382,106 @@ fn Icon(name: &'static str) -> Element {
         "clock" => {
             rsx! { circle { cx: "12", cy: "12", r: "9" } polyline { points: "12 7 12 12 15 14" } }
         }
+        "check" => rsx! { polyline { points: "20 6 9 17 4 12" } },
+        "x" => rsx! {
+            line { x1: "18", y1: "6", x2: "6", y2: "18" }
+            line { x1: "6", y1: "6", x2: "18", y2: "18" }
+        },
+        "archive" => rsx! {
+            rect { x: "3", y: "4", width: "18", height: "4", rx: "1" }
+            path { d: "M5 8v11a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8" }
+            path { d: "M10 12h4" }
+        },
+        "arrow-up" => rsx! {
+            line { x1: "12", y1: "19", x2: "12", y2: "5" }
+            polyline { points: "5 12 12 5 19 12" }
+        },
+        "arrow-down" => rsx! {
+            line { x1: "12", y1: "5", x2: "12", y2: "19" }
+            polyline { points: "19 12 12 19 5 12" }
+        },
+        "arrow-right" => rsx! {
+            line { x1: "5", y1: "12", x2: "19", y2: "12" }
+            polyline { points: "12 5 19 12 12 19" }
+        },
+        "corner-up-right" => rsx! {
+            polyline { points: "15 14 20 9 15 4" }
+            path { d: "M4 20v-7a4 4 0 0 1 4-4h12" }
+        },
+        "stop" => rsx! { rect { x: "7", y: "7", width: "10", height: "10", rx: "2" } },
+        "undo" => rsx! {
+            path { d: "M9 14 4 9l5-5" }
+            path { d: "M4 9h10a6 6 0 1 1-4.2 10.2" }
+        },
+        "external-link" => rsx! {
+            path { d: "M14 3h7v7" }
+            path { d: "M21 3l-9 9" }
+            path { d: "M17 14v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2h5" }
+        },
+        "backspace" => rsx! {
+            path { d: "M21 5H8l-5 7 5 7h13z" }
+            line { x1: "18", y1: "9", x2: "12", y2: "15" }
+            line { x1: "12", y1: "9", x2: "18", y2: "15" }
+        },
+        "play" => rsx! { polygon { points: "8 5 19 12 8 19 8 5" } },
+        "refresh" => rsx! {
+            path { d: "M21 12a9 9 0 0 1-15.5 6.2" }
+            polyline { points: "3 18 5.5 18.2 5.7 15.6" }
+            path { d: "M3 12A9 9 0 0 1 18.5 5.8" }
+            polyline { points: "21 6 18.5 5.8 18.3 8.4" }
+        },
+        "help" => rsx! {
+            circle { cx: "12", cy: "12", r: "9" }
+            path { d: "M9.5 9a2.7 2.7 0 0 1 5.1 1.3c0 1.8-2.6 2.2-2.6 4" }
+            circle { cx: "12", cy: "18", r: ".35" }
+        },
+        "alert" => rsx! {
+            path { d: "M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" }
+            line { x1: "12", y1: "9", x2: "12", y2: "13" }
+            circle { cx: "12", cy: "17", r: ".35" }
+        },
+        "split-right" => rsx! {
+            rect { x: "3", y: "4", width: "18", height: "16", rx: "2" }
+            line { x1: "12", y1: "4", x2: "12", y2: "20" }
+        },
+        "split-down" => rsx! {
+            rect { x: "3", y: "4", width: "18", height: "16", rx: "2" }
+            line { x1: "3", y1: "12", x2: "21", y2: "12" }
+        },
+        "flask" => rsx! {
+            path { d: "M9 3h6" }
+            path { d: "M10 3v5l-5 9a3 3 0 0 0 2.6 4.5h8.8A3 3 0 0 0 19 17l-5-9V3" }
+            path { d: "M8 15h8" }
+        },
+        "hook" => rsx! {
+            path { d: "M9 4v8a4 4 0 1 0 8 0V7" }
+            path { d: "M13 4H9" }
+            path { d: "M17 7h4" }
+        },
+        "camera" => rsx! {
+            path { d: "M4 7h3l2-3h6l2 3h3a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2z" }
+            circle { cx: "12", cy: "13", r: "4" }
+        },
+        "tool" => {
+            rsx! { path { d: "M14.7 6.3a4 4 0 0 0-5 5L3 18l3 3 6.7-6.7a4 4 0 0 0 5-5l-2.4 2.4-2.8-2.8z" } }
+        }
+        "browser" => rsx! {
+            rect { x: "3", y: "4", width: "18", height: "16", rx: "2" }
+            line { x1: "3", y1: "9", x2: "21", y2: "9" }
+            circle { cx: "7", cy: "6.5", r: ".45" }
+            circle { cx: "10", cy: "6.5", r: ".45" }
+        },
+        "git" => rsx! {
+            circle { cx: "6", cy: "6", r: "2" }
+            circle { cx: "18", cy: "18", r: "2" }
+            circle { cx: "6", cy: "18", r: "2" }
+            path { d: "M8 7.5 16.5 16" }
+            path { d: "M6 8v8" }
+        },
+        "copy" => rsx! {
+            rect { x: "9", y: "9", width: "13", height: "13", rx: "2" }
+            path { d: "M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" }
+        },
         "pin" => rsx! { path { d: "M9 3h6l-1 6 3 3v2h-5v5l-1 2-1-2v-5H4v-2l3-3-1-6z" } },
         "brain" => rsx! {
             line { x1: "5", y1: "19", x2: "5", y2: "14" }

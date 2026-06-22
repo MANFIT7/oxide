@@ -7,11 +7,11 @@
 //! a desktop app, and lets behavior be swapped via harnesses at runtime.
 //!
 //! ```text
-//!   frontend ──Op──▶  [ Engine task ]  ──Event──▶ frontend
-//!                          │
+//!   frontend --Op-->  [ Engine task ]  --Event--> frontend
+//!                          |
 //!                  Harness (prompt+tools)
-//!                          │
-//!                  Provider (streaming)        ToolRouter ─▶ sandbox (Fase 2)
+//!                          |
+//!                  Provider (streaming)        ToolRouter --> sandbox (Fase 2)
 //! ```
 
 pub mod automation;
@@ -1365,7 +1365,7 @@ struct Engine {
     /// typecheck errors.
     turn_edit_paths: Vec<String>,
     /// Files already read THIS turn — re-reading the same file is intercepted to
-    /// break the "read README → re-plan → read README again" loop.
+    /// break the "read README, re-plan, read README again" loop.
     turn_reads: std::collections::HashSet<String>,
     /// Doom-loop guard: last tool call signature + consecutive repeat count.
     last_tool_sig: String,
@@ -2716,7 +2716,7 @@ Rules:
 
     /// Run one provider stream to completion, emitting its output (as the answer
     /// or as reasoning) and returning the accumulated text. Used by the
-    /// orchestration pipeline (front planner → backend implementer).
+    /// orchestration pipeline (front planner to backend implementer).
     #[allow(clippy::too_many_arguments)]
     async fn stream_collect(
         &self,
@@ -3067,7 +3067,7 @@ Rules:
                             Some(Op::Shutdown) => { interrupted = true; break; }
                             Some(Op::UserTurn { text }) => {
                                 self.session.push(Message::new(Role::User, text.clone()));
-                                self.emit(Event::Info { text: format!("↪ steering worker: {text}") }).await;
+                                self.emit(Event::Info { text: format!("Steering worker: {text}") }).await;
                                 steered = true;
                             }
                             Some(Op::Rewind { checkpoint_id }) => {
@@ -3104,7 +3104,7 @@ Rules:
                     overflow_retries += 1;
                     self.force_compact(turn).await;
                     self.emit(Event::Info {
-                        text: "⚠ worker context full — compacted, retrying".into(),
+                        text: "worker context full — compacted, retrying".into(),
                     })
                     .await;
                     continue;
@@ -3508,7 +3508,7 @@ Treat the following as the only current, top-priority instruction:]\n\n{user_tex
         // default to English without this; the user's prompt language should win.
         sys.push_str(
             "\n\n# Language\nAlways reply in the SAME language the user writes in \
-             (e.g. user writes Indonesian → reply in Indonesian). Match the user's \
+             (e.g. user writes Indonesian, reply in Indonesian). Match the user's \
              language for every response; do not switch to English on your own.",
         );
         // Tell the agent exactly where it is working so it never wanders to $HOME.
@@ -3577,13 +3577,13 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
         let mut assistant = String::new();
         let mut interrupted = false;
 
-        // ── Orchestration pipeline (front planner → backend implementer) ──
+        // ── Orchestration pipeline (front planner to backend implementer) ──
         if self.config.orchestrate {
             let front = self.config.front_provider.clone();
             let backend = self.config.backend_provider.clone();
             let effort = self.config.reasoning_effort.clone();
             self.emit(Event::Info {
-                text: format!("🧭 Planning · front: {front}"),
+                text: format!("Planning · front: {front}"),
             })
             .await;
             let plan = self
@@ -3641,7 +3641,7 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                 } else {
                     self.emit(Event::Info {
                         text: format!(
-                            "🤖 Running {} tool-capable sub-agents · backend: {backend}",
+                            "Running {} tool-capable sub-agents · backend: {backend}",
                             subtasks.len()
                         ),
                     })
@@ -3672,7 +3672,7 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                     for result in &results {
                         self.emit(Event::Info {
                             text: format!(
-                                "✓ sub-agent {}: {}",
+                                "Sub-agent {}: {}",
                                 result.index,
                                 result.task.chars().take(60).collect::<String>()
                             ),
@@ -3694,7 +3694,7 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                     } else {
                         // Synthesize sub-agent outputs into the final answer.
                         self.emit(Event::Info {
-                            text: format!("🧩 Synthesizing · front: {front}"),
+                            text: format!("Synthesizing · front: {front}"),
                         })
                         .await;
                         let ssys = format!(
@@ -3707,7 +3707,7 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                 }
             } else {
                 self.emit(Event::Info {
-                    text: format!("⚙ Implementing · backend: {backend}"),
+                    text: format!("Implementing · backend: {backend}"),
                 })
                 .await;
                 let isys = format!(
@@ -3757,11 +3757,11 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                     self.turn_edited = false;
                     self.emit(Event::Info {
                         text: format!(
-                            "🧪 Auto-verify failed · fixing {verify_iter}/2 · backend: {backend}"
+                            "Auto-verify failed · fixing {verify_iter}/2 · backend: {backend}"
                         ),
                     })
                     .await;
-                    let header = format!("\n\n— 🧪 Auto-verify fix {verify_iter} —\n");
+                    let header = format!("\n\n— Auto-verify fix {verify_iter} —\n");
                     self.emit(Event::AgentMessageDelta {
                         turn,
                         text: header.clone(),
@@ -3810,12 +3810,12 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                 return;
             }
 
-            // ── Review + auto-fix loop (review → if gaps, re-implement) ──
+            // ── Review + auto-fix loop (review, then re-implement if gaps) ──
             let max_iters: u32 = 3;
             let mut iter: u32 = 0;
             loop {
                 self.emit(Event::Info {
-                    text: format!("🔍 Reviewing · front: {front}"),
+                    text: format!("Reviewing · front: {front}"),
                 })
                 .await;
                 let vsys = format!(
@@ -3828,7 +3828,7 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                 let has_gaps = !review_passes_gate(&review);
                 if !has_gaps {
                     self.emit(Event::Info {
-                        text: "✓ Review passed".to_string(),
+                        text: "Review passed".to_string(),
                     })
                     .await;
                     break;
@@ -3836,10 +3836,10 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                 iter += 1;
                 if iter >= max_iters {
                     self.emit(Event::Info {
-                        text: format!("⚠ Gaps remain after {max_iters} fixes"),
+                        text: format!("Gaps remain after {max_iters} fixes"),
                     })
                     .await;
-                    let note = format!("\n\n— ⚠ Remaining gaps —\n{}", review.trim());
+                    let note = format!("\n\n— Remaining gaps —\n{}", review.trim());
                     self.emit(Event::AgentMessageDelta {
                         turn,
                         text: note.clone(),
@@ -3849,10 +3849,10 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                     break;
                 }
                 self.emit(Event::Info {
-                    text: format!("🔁 Fixing gaps · iteration {iter} · backend: {backend}"),
+                    text: format!("Fixing gaps · iteration {iter} · backend: {backend}"),
                 })
                 .await;
-                let header = format!("\n\n— 🔁 Revision {iter} —\n");
+                let header = format!("\n\n— Revision {iter} —\n");
                 self.emit(Event::AgentMessageDelta {
                     turn,
                     text: header.clone(),
@@ -3899,7 +3899,7 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
             return;
         }
 
-        // ── Agentic loop: stream → run tool calls → re-request with results,
+        // ── Agentic loop: stream, run tool calls, re-request with results,
         //    until the model answers with no tool calls (or step budget runs out). ──
         let _ = &mut assistant; // (assistant is used by the orchestrate path above)
         let model = policy
@@ -3980,7 +3980,7 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                     item = stream_rx.recv() => {
                         // No engine-side idle cap: each provider manages its own
                         // timeout. HTTP/SSE clients have a read_timeout (a real
-                        // stall closes the connection → stream ends); CLI drivers
+                        // stall closes the connection and the stream ends); CLI drivers
                         // (claude/codex) run their own tool timeouts and end the
                         // stream when the child exits. The user can always Interrupt.
                         match item {
@@ -4099,7 +4099,7 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                                     let _ = store.append("user", &text);
                                 }
                                 self.session.push(Message::new(Role::User, text.clone()));
-                                self.emit(Event::Info { text: format!("↪ steering: {text}") }).await;
+                                self.emit(Event::Info { text: format!("Steering: {text}") }).await;
                                 steered = true;
                             }
                             // Rewind works mid-turn too — restoring a checkpoint
@@ -4141,7 +4141,7 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                     overflow_retries += 1;
                     self.force_compact(turn).await;
                     self.emit(Event::Info {
-                        text: "⚠ context full — compacted, retrying".into(),
+                        text: "context full — compacted, retrying".into(),
                     })
                     .await;
                     continue;
@@ -4496,7 +4496,7 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
             .output();
         let out = match tokio::time::timeout(std::time::Duration::from_secs(180), fut).await {
             Ok(Ok(o)) => o,
-            _ => return None, // spawn error / timeout → don't block
+            _ => return None, // spawn error / timeout; don't block
         };
         if out.status.success() {
             return None;
