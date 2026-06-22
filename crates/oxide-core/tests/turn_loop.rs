@@ -53,10 +53,12 @@ async fn mock_provider_tool_call_writes_file_in_sandbox() {
     let tmp = std::env::temp_dir().join(format!("oxide-engine-{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
 
-    let mut config = Config::default();
-    config.provider = "mock".into();
-    config.approval_policy = oxide_protocol::ApprovalPolicy::Never; // auto-run tools
-    config.workspace = Some(tmp.clone());
+    let config = Config {
+        provider: "mock".into(),
+        approval_policy: oxide_protocol::ApprovalPolicy::Never,
+        workspace: Some(tmp.clone()),
+        ..Default::default()
+    };
 
     let (handle, mut events) = oxide_core::spawn(config).expect("spawn");
     let _ = events.recv().await; // Ready
@@ -94,19 +96,69 @@ async fn mock_provider_tool_call_writes_file_in_sandbox() {
 }
 
 #[tokio::test]
+async fn mock_provider_renders_ui_spec_artifact() {
+    let tmp = std::env::temp_dir().join(format!("oxide-engine-ui-spec-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    let config = Config {
+        provider: "mock".into(),
+        approval_policy: oxide_protocol::ApprovalPolicy::Never,
+        persist: false,
+        workspace: Some(tmp.clone()),
+        ..Default::default()
+    };
+
+    let (handle, mut events) = oxide_core::spawn(config).expect("spawn");
+    let _ = events.recv().await; // Ready
+
+    handle
+        .submit(Op::UserTurn {
+            text: "render ui spec artifact".into(),
+        })
+        .await
+        .unwrap();
+
+    let mut began = false;
+    let mut rendered = false;
+    let mut ended_ok = false;
+    while let Some(ev) = events.recv().await {
+        match ev {
+            Event::ToolCallBegin { tool, .. } => began |= tool == "render_ui_spec",
+            Event::UiSpec { spec, .. } => {
+                assert_eq!(spec.title.as_deref(), Some("Mock UI"));
+                spec.validate().expect("mock UI spec should validate");
+                rendered = true;
+            }
+            Event::ToolCallEnd { ok, .. } => ended_ok |= ok,
+            Event::TurnFinished { .. } => break,
+            _ => {}
+        }
+    }
+
+    assert!(began, "render_ui_spec tool call should begin");
+    assert!(rendered, "engine should emit a UiSpec event");
+    assert!(ended_ok, "render_ui_spec should finish ok");
+
+    handle.submit(Op::Shutdown).await.unwrap();
+    std::fs::remove_dir_all(&tmp).ok();
+}
+
+#[tokio::test]
 async fn orchestrated_subagents_run_backend_tool_calls() {
     let tmp = std::env::temp_dir().join(format!("oxide-subagents-{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
 
-    let mut config = Config::default();
-    config.provider = "echo".into();
-    config.orchestrate = true;
-    config.subagents = true;
-    config.front_provider = "mock_plan".into();
-    config.backend_provider = "mock".into();
-    config.approval_policy = oxide_protocol::ApprovalPolicy::Never;
-    config.persist = false;
-    config.workspace = Some(tmp.clone());
+    let config = Config {
+        provider: "echo".into(),
+        orchestrate: true,
+        subagents: true,
+        front_provider: "mock_plan".into(),
+        backend_provider: "mock".into(),
+        approval_policy: oxide_protocol::ApprovalPolicy::Never,
+        persist: false,
+        workspace: Some(tmp.clone()),
+        ..Default::default()
+    };
 
     let (handle, mut events) = oxide_core::spawn(config).expect("spawn");
     let _ = events.recv().await; // Ready
@@ -121,8 +173,19 @@ async fn orchestrated_subagents_run_backend_tool_calls() {
     let mut began = false;
     let mut patched = false;
     let mut ended_ok = false;
+    let mut active_subagents = std::collections::HashSet::new();
+    let mut started_subagents = 0usize;
+    let mut max_parallel_subagents = 0usize;
     while let Some(ev) = events.recv().await {
         match ev {
+            Event::SubagentStarted { worker_id, .. } if worker_id.starts_with("subagent-") => {
+                started_subagents += 1;
+                active_subagents.insert(worker_id);
+                max_parallel_subagents = max_parallel_subagents.max(active_subagents.len());
+            }
+            Event::SubagentFinished { worker_id, .. } if worker_id.starts_with("subagent-") => {
+                active_subagents.remove(&worker_id);
+            }
             Event::ToolCallBegin { tool, .. } => began |= tool == "write_file",
             Event::PatchApplied { path, .. } => patched |= path == "oxide_mock.txt",
             Event::ToolCallEnd { ok, .. } => ended_ok |= ok,
@@ -132,6 +195,14 @@ async fn orchestrated_subagents_run_backend_tool_calls() {
     }
 
     assert!(began, "sub-agent backend should begin a tool call");
+    assert!(
+        started_subagents >= 2,
+        "mock plan should fan out to at least two sub-agents"
+    );
+    assert!(
+        max_parallel_subagents >= 2,
+        "sub-agents should overlap instead of running sequentially"
+    );
     assert!(patched, "sub-agent backend write should emit PatchApplied");
     assert!(ended_ok, "sub-agent backend tool should finish ok");
     assert!(
@@ -148,11 +219,13 @@ async fn checkpoint_then_rewind_undoes_write() {
     let tmp = std::env::temp_dir().join(format!("oxide-rewind-{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
 
-    let mut config = Config::default();
-    config.provider = "mock".into();
-    config.approval_policy = oxide_protocol::ApprovalPolicy::Never;
-    config.persist = false; // keep the test workspace clean
-    config.workspace = Some(tmp.clone());
+    let config = Config {
+        provider: "mock".into(),
+        approval_policy: oxide_protocol::ApprovalPolicy::Never,
+        persist: false,
+        workspace: Some(tmp.clone()),
+        ..Default::default()
+    };
 
     let (handle, mut events) = oxide_core::spawn(config).expect("spawn");
     let _ = events.recv().await; // Ready

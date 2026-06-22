@@ -279,6 +279,9 @@ fn apply_event(event: Event, state: &mut State) {
         }
         Event::AgentMessageDelta { text, .. } => state.streaming.push_str(&text),
         Event::ReasoningDelta { .. } => {}
+        Event::ToolCallDelta { tool, .. } => {
+            state.status = format!("preparing {tool} input…");
+        }
         Event::ToolCallBegin { tool, .. } => {
             state.flush_streaming();
             state.push(Line::from(Span::styled(
@@ -404,6 +407,27 @@ fn apply_event(event: Event, state: &mut State) {
             format!("browser snapshot requested: {url} · {note}"),
             Style::default().fg(Color::Blue),
         ))),
+        Event::DesignSnapshotRequested { url, note, .. } => state.push(Line::from(Span::styled(
+            format!("design snapshot requested: {url} · {note}"),
+            Style::default().fg(Color::Cyan),
+        ))),
+        Event::DesignPatchProposed { proposal, .. } => state.push(Line::from(Span::styled(
+            format!(
+                "design patch proposal: {} ({} edit(s))",
+                proposal.selection.selector,
+                proposal.edits.len()
+            ),
+            Style::default().fg(Color::Cyan),
+        ))),
+        Event::DesignReviewCompleted { review, .. } => state.push(Line::from(Span::styled(
+            format!(
+                "design review: ok={} score={} finding(s)={}",
+                review.ok,
+                review.score,
+                review.findings.len()
+            ),
+            Style::default().fg(Color::Cyan),
+        ))),
         Event::TurnFinished { .. } => {
             state.flush_streaming();
             state.status = "ready".into();
@@ -420,6 +444,17 @@ fn apply_event(event: Event, state: &mut State) {
             format!("± diff {path}"),
             Style::default().fg(Color::Magenta),
         ))),
+        Event::UiSpec { spec, .. } => {
+            let title = spec
+                .title
+                .as_deref()
+                .or(spec.root.props.title.as_deref())
+                .unwrap_or("Untitled UI");
+            state.push(Line::from(Span::styled(
+                format!("▣ UI artifact: {title}"),
+                Style::default().fg(Color::Blue),
+            )));
+        }
         Event::HookFired {
             hook,
             command,
@@ -442,6 +477,15 @@ fn apply_event(event: Event, state: &mut State) {
         ))),
         Event::SubagentStarted { profile, task, .. } => state.push(Line::from(Span::styled(
             format!("subagent {profile}: {task}"),
+            Style::default().fg(Color::Blue),
+        ))),
+        Event::SubagentStatus {
+            profile,
+            status,
+            detail,
+            ..
+        } => state.push(Line::from(Span::styled(
+            format!("subagent {profile} {status}: {detail}"),
             Style::default().fg(Color::Blue),
         ))),
         Event::SubagentFinished {

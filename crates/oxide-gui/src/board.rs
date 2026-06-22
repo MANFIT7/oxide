@@ -201,7 +201,22 @@ pub async fn run_card(
 ) -> (String, String) {
     let branch = format!("oxide/card-{id}");
     let wt = root.join(format!(".oxide/worktrees/card-{id}"));
-    let _ = tokio::process::Command::new("git")
+    if let Some(parent) = wt.parent() {
+        if let Err(err) = tokio::fs::create_dir_all(parent).await {
+            return (
+                card_worktree_unavailable(
+                    &branch,
+                    &wt,
+                    &format!(
+                        "Could not create worktree parent directory `{}`: {err}",
+                        parent.display()
+                    ),
+                ),
+                branch,
+            );
+        }
+    }
+    let add = tokio::process::Command::new("git")
         .args([
             "worktree",
             "add",
@@ -213,14 +228,48 @@ pub async fn run_card(
         .current_dir(&root)
         .output()
         .await;
-    let workspace = if wt.exists() {
-        wt.clone()
-    } else {
-        root.clone()
+
+    let add = match add {
+        Ok(output) => output,
+        Err(err) => {
+            return (
+                card_worktree_unavailable(
+                    &branch,
+                    &wt,
+                    &format!(
+                        "Could not run `git worktree add` in `{}`: {err}",
+                        root.display()
+                    ),
+                ),
+                branch,
+            );
+        }
+    };
+    if !add.status.success() {
+        let status = add
+            .status
+            .code()
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| add.status.to_string());
+        let stdout = String::from_utf8_lossy(&add.stdout);
+        let stderr = String::from_utf8_lossy(&add.stderr);
+        let detail =
+            worktree_add_failure_detail(&root, &wt, &branch, &status, stdout.trim(), stderr.trim());
+        return (card_worktree_unavailable(&branch, &wt, &detail), branch);
+    }
+    if !wt.is_dir() {
+        return (
+            card_worktree_unavailable(
+                &branch,
+                &wt,
+                "Git reported success, but the expected worktree directory is missing.",
+            ),
+            branch,
+        );
     };
 
     let mut cfg = base;
-    cfg.workspace = Some(workspace.clone());
+    cfg.workspace = Some(wt.clone());
     cfg.harness = "coding".to_string();
     cfg.approval_policy = ApprovalPolicy::Never;
     cfg.persist = false;
@@ -243,6 +292,14 @@ pub async fn run_card(
     while let Some(ev) = events.recv().await {
         match ev {
             Event::AgentMessageDelta { text, .. } => out.push_str(&text),
+            Event::UiSpec { spec, .. } => {
+                let title = spec
+                    .title
+                    .as_deref()
+                    .or(spec.root.props.title.as_deref())
+                    .unwrap_or("Untitled UI");
+                out.push_str(&format!("\n[ui] {title}\n"));
+            }
             Event::Error { message } => out.push_str(&format!("\n[error] {message}")),
             Event::TurnFinished { .. } => break,
             Event::Shutdown => break,
@@ -254,7 +311,7 @@ pub async fn run_card(
     // Summarize file changes in the worktree.
     let stat = tokio::process::Command::new("git")
         .args(["status", "--short"])
-        .current_dir(&workspace)
+        .current_dir(&wt)
         .output()
         .await
         .ok()
@@ -266,6 +323,41 @@ pub async fn run_card(
         out.trim()
     );
     (summary, branch)
+}
+
+fn card_worktree_unavailable(branch: &str, wt: &Path, detail: &str) -> String {
+    format!(
+        "Worktree unavailable for board card `{branch}` at `{}`.\n\
+         Card was not run because falling back to the repository root would break isolation.\n\
+         {detail}\n\
+         Fix the git worktree state, then run the card again.",
+        wt.display()
+    )
+}
+
+fn worktree_add_failure_detail(
+    root: &Path,
+    wt: &Path,
+    branch: &str,
+    status: &str,
+    stdout: &str,
+    stderr: &str,
+) -> String {
+    let mut parts = vec![
+        format!(
+            "Command failed: git worktree add -B {branch} {} HEAD",
+            wt.display()
+        ),
+        format!("Root: {}", root.display()),
+        format!("Exit status: {status}"),
+    ];
+    if !stderr.is_empty() {
+        parts.push(format!("stderr: {stderr}"));
+    }
+    if !stdout.is_empty() {
+        parts.push(format!("stdout: {stdout}"));
+    }
+    parts.join("\n")
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -558,11 +650,8 @@ fn linear_issue_from_value(issue: &serde_json::Value) -> Option<IssueCard> {
         desc.push_str(&format!("Priority: {priority}\n"));
     }
     if !team.is_empty() || !project.is_empty() {
-        desc.push_str(
-            &format!("Team/project: {team} {project}\n")
-                .trim_end()
-                .to_string(),
-        );
+        let team_project = format!("Team/project: {team} {project}\n");
+        desc.push_str(team_project.trim_end());
         desc.push('\n');
     }
     if !labels.is_empty() {
@@ -687,5 +776,18 @@ mod tests {
         });
 
         assert!(linear_issue_from_value(&raw).is_none());
+    }
+
+    #[test]
+    fn card_worktree_unavailable_explains_no_root_fallback() {
+        let msg = card_worktree_unavailable(
+            "oxide/card-42",
+            Path::new("/repo/.oxide/worktrees/card-42"),
+            "git worktree add failed",
+        );
+
+        assert!(msg.contains("oxide/card-42"));
+        assert!(msg.contains("Card was not run"));
+        assert!(msg.contains("repository root would break isolation"));
     }
 }

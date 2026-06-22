@@ -42,6 +42,8 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -55,6 +57,21 @@ jobs:
             echo "Tag/version mismatch: tag=$actual Cargo.toml=$version" >&2
             exit 1
           fi
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run GUI visual QA contracts
+        run: python3 scripts/gui-visual-qa.py
+
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Check workspace
+        run: cargo check --workspace --all-targets
+
+      - name: Run tests
+        run: cargo test --workspace
 
       - name: Resolve previous release tag
         id: previous_tag

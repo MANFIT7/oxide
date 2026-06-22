@@ -33,15 +33,23 @@ struct ProcessGroupGuard {
 }
 
 #[cfg(unix)]
-impl Drop for ProcessGroupGuard {
-    fn drop(&mut self) {
+impl ProcessGroupGuard {
+    fn kill_now(&mut self) {
         if self.armed && self.pgid > 1 {
             // SAFETY: killpg with a valid pgid is sound; a dead group yields
             // ESRCH which we ignore.
             unsafe {
                 libc::killpg(self.pgid, libc::SIGKILL);
             }
+            self.armed = false;
         }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        self.kill_now();
     }
 }
 
@@ -52,7 +60,8 @@ static CLAUDE_INTERACTIVE_SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 const CLAUDE_INTERACTIVE_POLL: Duration = Duration::from_millis(250);
 const CLAUDE_INTERACTIVE_SETTLE: Duration = Duration::from_millis(1600);
-const CLAUDE_INTERACTIVE_TURN_TIMEOUT: Duration = Duration::from_secs(45 * 60);
+const DEFAULT_CLI_TURN_TIMEOUT: Duration = Duration::from_secs(45 * 60);
+const DEFAULT_CLAUDE_INTERACTIVE_TURN_TIMEOUT: Duration = Duration::from_secs(45 * 60);
 const CLAUDE_INTERACTIVE_READY_TIMEOUT: Duration = Duration::from_secs(8);
 const CLAUDE_INTERACTIVE_PROMPT_ACCEPT_TIMEOUT: Duration = Duration::from_secs(12);
 
@@ -105,6 +114,64 @@ fn resolve_bin(name: &str, env_override: &str) -> String {
         }
     }
     name.to_string() // fall back to PATH lookup
+}
+
+fn duration_from_env(keys: &[&str], default: Duration) -> anyhow::Result<Duration> {
+    for key in keys {
+        let Ok(raw) = std::env::var(key) else {
+            continue;
+        };
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let secs = trimmed.parse::<u64>().map_err(|e| {
+            anyhow::anyhow!("{key} must be a positive integer number of seconds: {e}")
+        })?;
+        if secs == 0 {
+            anyhow::bail!("{key} must be greater than 0 seconds");
+        }
+        return Ok(Duration::from_secs(secs));
+    }
+    Ok(default)
+}
+
+fn codex_cli_timeout() -> anyhow::Result<Duration> {
+    duration_from_env(
+        &["OXIDE_CODEX_CLI_TIMEOUT_SEC", "OXIDE_CLI_TIMEOUT_SEC"],
+        DEFAULT_CLI_TURN_TIMEOUT,
+    )
+}
+
+fn claude_cli_timeout() -> anyhow::Result<Duration> {
+    duration_from_env(
+        &["OXIDE_CLAUDE_CLI_TIMEOUT_SEC", "OXIDE_CLI_TIMEOUT_SEC"],
+        DEFAULT_CLI_TURN_TIMEOUT,
+    )
+}
+
+fn claude_interactive_timeout() -> anyhow::Result<Duration> {
+    duration_from_env(
+        &[
+            "OXIDE_CLAUDE_INTERACTIVE_TIMEOUT_SEC",
+            "OXIDE_CLAUDE_CLI_TIMEOUT_SEC",
+            "OXIDE_CLI_TIMEOUT_SEC",
+        ],
+        DEFAULT_CLAUDE_INTERACTIVE_TURN_TIMEOUT,
+    )
+}
+
+fn format_timeout(timeout: Duration) -> String {
+    let secs = timeout.as_secs();
+    if secs == 0 {
+        format!("{} ms", timeout.as_millis())
+    } else if secs.is_multiple_of(3600) {
+        format!("{} hours", secs / 3600)
+    } else if secs.is_multiple_of(60) {
+        format!("{} minutes", secs / 60)
+    } else {
+        format!("{secs} seconds")
+    }
 }
 
 /// Pull the latest user message — these CLIs take a single prompt, not a list.
@@ -205,6 +272,7 @@ async fn run_jsonl<F>(
     args: &[String],
     cwd: &str,
     stdin_text: Option<String>,
+    timeout: Duration,
     sink: &mpsc::Sender<StreamItem>,
     mut on_line: F,
 ) -> anyhow::Result<()>
@@ -263,7 +331,7 @@ where
         .ok_or_else(|| anyhow::anyhow!("no stdout"))?;
     // Collect stderr in the background so failures aren't silent.
     let stderr = child.stderr.take();
-    let err_task = tokio::spawn(async move {
+    let mut err_task = tokio::spawn(async move {
         let mut tail = String::new();
         if let Some(e) = stderr {
             let mut lines = BufReader::new(e).lines();
@@ -279,7 +347,15 @@ where
     });
     let mut lines = BufReader::new(stdout).lines();
     let mut emitted = false;
-    while let Some(line) = lines.next_line().await? {
+    let mut timed_out = false;
+    let deadline = tokio::time::Instant::now() + timeout;
+    while let Some(line) = match tokio::time::timeout_at(deadline, lines.next_line()).await {
+        Ok(line) => line?,
+        Err(_) => {
+            timed_out = true;
+            None
+        }
+    } {
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -292,14 +368,72 @@ where
             }
         }
     }
-    let status = child.wait().await;
+    let status = if timed_out {
+        None
+    } else {
+        match tokio::time::timeout_at(deadline, child.wait()).await {
+            Ok(status) => Some(status),
+            Err(_) => {
+                timed_out = true;
+                None
+            }
+        }
+    };
+    if timed_out {
+        #[cfg(unix)]
+        if let Some(g) = group_guard.as_mut() {
+            g.kill_now();
+        }
+        let _ = child.start_kill();
+        let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+        if let Some(task) = &stdin_task {
+            task.abort();
+        }
+        let tail = match tokio::time::timeout(Duration::from_secs(1), &mut err_task).await {
+            Ok(Ok(tail)) => tail,
+            _ => {
+                err_task.abort();
+                String::new()
+            }
+        };
+        let tail = tail.trim();
+        let message = format!(
+            "{program} timed out after {}{}{}",
+            format_timeout(timeout),
+            if tail.is_empty() { "" } else { " — " },
+            tail.chars().take(600).collect::<String>()
+        );
+        let _ = sink
+            .send(StreamItem::Notice(format!("error: {message}")))
+            .await;
+        let _ = sink.send(StreamItem::Done).await;
+        anyhow::bail!(message);
+    }
+    let status = status.unwrap_or_else(|| {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "CLI process timeout elapsed",
+        ))
+    });
     let stdin_error = match stdin_task {
-        Some(task) => task.await.ok().and_then(Result::err),
+        Some(mut task) => match tokio::time::timeout(Duration::from_secs(1), &mut task).await {
+            Ok(joined) => joined.ok().and_then(Result::err),
+            Err(_) => {
+                task.abort();
+                None
+            }
+        },
         None => None,
     };
     let failed = status.map(|st| !st.success()).unwrap_or(true);
     if failed {
-        let tail = err_task.await.unwrap_or_default();
+        let tail = match tokio::time::timeout(Duration::from_secs(1), &mut err_task).await {
+            Ok(Ok(tail)) => tail,
+            _ => {
+                err_task.abort();
+                String::new()
+            }
+        };
         let tail = tail.trim();
         if !emitted || !tail.is_empty() {
             let _ = sink
@@ -407,11 +541,13 @@ impl Provider for CodexCliProvider {
         args.push("-".to_string());
 
         let skey_cb = skey.clone();
+        let timeout = codex_cli_timeout()?;
         run_jsonl(
             &self.bin,
             &args,
             &req.cwd,
             Some(prompt),
+            timeout,
             &sink,
             move |v, sink| {
                 match v["type"].as_str() {
@@ -626,147 +762,158 @@ impl Provider for ClaudeCliProvider {
         }
 
         let skey_cb = skey.clone();
+        let timeout = claude_cli_timeout()?;
         // With partial messages on, text arrives via stream_event deltas; the
         // final `assistant` message would duplicate it, so skip its text blocks.
         let mut saw_partial = false;
-        run_jsonl(&self.bin, &args, &req.cwd, None, &sink, move |v, sink| {
-            match v["type"].as_str() {
-                Some("system") => {
-                    if let Some(id) = v["session_id"].as_str() {
-                        session_set(&skey_cb, id);
-                        send(sink, StreamItem::CliSession(id.to_string()));
-                    }
-                }
-                Some("stream_event") => {
-                    let ev = &v["event"];
-                    // Each new assistant message resets the dedupe latch, so a
-                    // later message's final text isn't dropped because an earlier
-                    // one streamed deltas.
-                    if ev["type"].as_str() == Some("message_start") {
-                        saw_partial = false;
-                    }
-                    if ev["type"].as_str() == Some("content_block_delta") {
-                        match ev["delta"]["type"].as_str() {
-                            Some("text_delta") => {
-                                if let Some(t) = ev["delta"]["text"].as_str() {
-                                    saw_partial = true;
-                                    send(sink, StreamItem::TextDelta(t.to_string()));
-                                }
-                            }
-                            Some("thinking_delta") => {
-                                if let Some(t) = ev["delta"]["thinking"].as_str() {
-                                    send(sink, StreamItem::ReasoningDelta(t.to_string()));
-                                }
-                            }
-                            _ => {}
+        run_jsonl(
+            &self.bin,
+            &args,
+            &req.cwd,
+            None,
+            timeout,
+            &sink,
+            move |v, sink| {
+                match v["type"].as_str() {
+                    Some("system") => {
+                        if let Some(id) = v["session_id"].as_str() {
+                            session_set(&skey_cb, id);
+                            send(sink, StreamItem::CliSession(id.to_string()));
                         }
                     }
-                }
-                Some("assistant") => {
-                    if let Some(content) = v["message"]["content"].as_array() {
-                        for block in content {
-                            match block["type"].as_str() {
-                                Some("text") => {
-                                    if !saw_partial {
-                                        if let Some(t) = block["text"].as_str() {
-                                            send(sink, StreamItem::TextDelta(t.to_string()));
-                                        }
+                    Some("stream_event") => {
+                        let ev = &v["event"];
+                        // Each new assistant message resets the dedupe latch, so a
+                        // later message's final text isn't dropped because an earlier
+                        // one streamed deltas.
+                        if ev["type"].as_str() == Some("message_start") {
+                            saw_partial = false;
+                        }
+                        if ev["type"].as_str() == Some("content_block_delta") {
+                            match ev["delta"]["type"].as_str() {
+                                Some("text_delta") => {
+                                    if let Some(t) = ev["delta"]["text"].as_str() {
+                                        saw_partial = true;
+                                        send(sink, StreamItem::TextDelta(t.to_string()));
                                     }
                                 }
-                                Some("tool_use") => {
-                                    let name = block["name"].as_str().unwrap_or("tool");
-                                    // Pull the human-relevant arg so the live status reads
-                                    // "⚙ Read src/lib.rs", not a bare tool name.
-                                    let input = &block["input"];
-                                    let detail = [
-                                        "file_path",
-                                        "path",
-                                        "command",
-                                        "pattern",
-                                        "query",
-                                        "url",
-                                        "description",
-                                    ]
-                                    .iter()
-                                    .find_map(|k| input[k].as_str())
-                                    .unwrap_or("");
-                                    let detail: String = detail.chars().take(80).collect();
-                                    // A backgrounded command ("I'll let you know when done")
-                                    // won't stream its result back — surface WHAT it's doing
-                                    // with a distinct ⏳ marker so the UI can show it persistently.
-                                    let bg = input["run_in_background"].as_bool() == Some(true);
-                                    let is_command = matches!(name, "Bash" | "Shell")
-                                        || input["command"].as_str().is_some();
-                                    if is_command {
-                                        // A command is fully shown by its command row (started →
-                                        // output → finished); emitting a "⚙ Bash …" notice on top
-                                        // would leave a second, redundant activity row lingering.
-                                        let command = input["command"]
-                                            .as_str()
-                                            .unwrap_or(detail.as_str())
-                                            .to_string();
-                                        let id = block["id"]
-                                            .as_str()
-                                            .map(str::to_string)
-                                            .unwrap_or_else(|| format!("claude-command-{command}"));
-                                        send(
-                                            sink,
-                                            StreamItem::CommandStarted {
-                                                id,
-                                                command,
-                                                cwd: String::new(),
-                                                background: bg,
-                                            },
-                                        );
-                                    } else {
-                                        let label = if detail.is_empty() {
-                                            format!("⚙ {name}")
-                                        } else {
-                                            format!("⚙ {name} {detail}")
-                                        };
-                                        send(sink, StreamItem::Notice(label));
-                                    }
-                                    if matches!(
-                                        name,
-                                        "Edit" | "Write" | "MultiEdit" | "NotebookEdit"
-                                    ) {
-                                        if let Some(p) = input["file_path"].as_str() {
-                                            send(sink, StreamItem::FileChanged(p.to_string()));
-                                        }
+                                Some("thinking_delta") => {
+                                    if let Some(t) = ev["delta"]["thinking"].as_str() {
+                                        send(sink, StreamItem::ReasoningDelta(t.to_string()));
                                     }
                                 }
                                 _ => {}
                             }
                         }
                     }
-                }
-                Some("result") => {
-                    if let Some(id) = v["session_id"].as_str() {
-                        session_set(&skey_cb, id);
-                        send(sink, StreamItem::CliSession(id.to_string()));
+                    Some("assistant") => {
+                        if let Some(content) = v["message"]["content"].as_array() {
+                            for block in content {
+                                match block["type"].as_str() {
+                                    Some("text") => {
+                                        if !saw_partial {
+                                            if let Some(t) = block["text"].as_str() {
+                                                send(sink, StreamItem::TextDelta(t.to_string()));
+                                            }
+                                        }
+                                    }
+                                    Some("tool_use") => {
+                                        let name = block["name"].as_str().unwrap_or("tool");
+                                        // Pull the human-relevant arg so the live status reads
+                                        // "⚙ Read src/lib.rs", not a bare tool name.
+                                        let input = &block["input"];
+                                        let detail = [
+                                            "file_path",
+                                            "path",
+                                            "command",
+                                            "pattern",
+                                            "query",
+                                            "url",
+                                            "description",
+                                        ]
+                                        .iter()
+                                        .find_map(|k| input[k].as_str())
+                                        .unwrap_or("");
+                                        let detail: String = detail.chars().take(80).collect();
+                                        // A backgrounded command ("I'll let you know when done")
+                                        // won't stream its result back — surface WHAT it's doing
+                                        // with a distinct ⏳ marker so the UI can show it persistently.
+                                        let bg = input["run_in_background"].as_bool() == Some(true);
+                                        let is_command = matches!(name, "Bash" | "Shell")
+                                            || input["command"].as_str().is_some();
+                                        if is_command {
+                                            // A command is fully shown by its command row (started →
+                                            // output → finished); emitting a "⚙ Bash …" notice on top
+                                            // would leave a second, redundant activity row lingering.
+                                            let command = input["command"]
+                                                .as_str()
+                                                .unwrap_or(detail.as_str())
+                                                .to_string();
+                                            let id = block["id"]
+                                                .as_str()
+                                                .map(str::to_string)
+                                                .unwrap_or_else(|| {
+                                                    format!("claude-command-{command}")
+                                                });
+                                            send(
+                                                sink,
+                                                StreamItem::CommandStarted {
+                                                    id,
+                                                    command,
+                                                    cwd: String::new(),
+                                                    background: bg,
+                                                },
+                                            );
+                                        } else {
+                                            let label = if detail.is_empty() {
+                                                format!("⚙ {name}")
+                                            } else {
+                                                format!("⚙ {name} {detail}")
+                                            };
+                                            send(sink, StreamItem::Notice(label));
+                                        }
+                                        if matches!(
+                                            name,
+                                            "Edit" | "Write" | "MultiEdit" | "NotebookEdit"
+                                        ) {
+                                            if let Some(p) = input["file_path"].as_str() {
+                                                send(sink, StreamItem::FileChanged(p.to_string()));
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
                     }
-                    if v["is_error"].as_bool() == Some(true) {
-                        let msg = v["result"].as_str().unwrap_or("Claude CLI error");
-                        send(sink, StreamItem::Notice(format!("error: {msg}")));
+                    Some("result") => {
+                        if let Some(id) = v["session_id"].as_str() {
+                            session_set(&skey_cb, id);
+                            send(sink, StreamItem::CliSession(id.to_string()));
+                        }
+                        if v["is_error"].as_bool() == Some(true) {
+                            let msg = v["result"].as_str().unwrap_or("Claude CLI error");
+                            send(sink, StreamItem::Notice(format!("error: {msg}")));
+                        }
+                        let u = &v["usage"];
+                        let window = v["modelUsage"]
+                            .as_object()
+                            .and_then(|m| m.values().next())
+                            .and_then(|mu| mu["contextWindow"].as_u64());
+                        send(
+                            sink,
+                            StreamItem::Usage {
+                                input: u["input_tokens"].as_u64().unwrap_or(0),
+                                output: u["output_tokens"].as_u64().unwrap_or(0),
+                                context_window: window,
+                            },
+                        );
                     }
-                    let u = &v["usage"];
-                    let window = v["modelUsage"]
-                        .as_object()
-                        .and_then(|m| m.values().next())
-                        .and_then(|mu| mu["contextWindow"].as_u64());
-                    send(
-                        sink,
-                        StreamItem::Usage {
-                            input: u["input_tokens"].as_u64().unwrap_or(0),
-                            output: u["output_tokens"].as_u64().unwrap_or(0),
-                            context_window: window,
-                        },
-                    );
+                    _ => {}
                 }
-                _ => {}
-            }
-            true
-        })
+                true
+            },
+        )
         .await
     }
 }
@@ -824,16 +971,18 @@ impl Provider for ClaudeInteractiveProvider {
 
         let transcript = claude_transcript_path(&req.cwd, &session_id)?;
         let baseline_lines = count_file_lines(&transcript);
-        let result = run_claude_interactive_turn(
-            &self.bin,
-            &req,
-            &prompt,
-            &session_id,
-            resume.as_deref(),
-            &transcript,
+        let timeout = claude_interactive_timeout()?;
+        let result = run_claude_interactive_turn(ClaudeInteractiveTurn {
+            bin: &self.bin,
+            req: &req,
+            prompt: &prompt,
+            session_id: &session_id,
+            resume: resume.as_deref(),
+            transcript: &transcript,
             baseline_lines,
-            &sink,
-        )
+            timeout,
+            sink: &sink,
+        })
         .await;
 
         let _ = sink.send(StreamItem::Done).await;
@@ -888,19 +1037,14 @@ struct ClaudeToolResult {
     is_error: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum ClaudeTranscriptTail {
+    #[default]
     None,
     User,
     AssistantText,
     AssistantToolUse,
     Other,
-}
-
-impl Default for ClaudeTranscriptTail {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 #[derive(Debug, Default)]
@@ -915,16 +1059,30 @@ struct ClaudeTranscriptSnapshot {
     usage: Option<(u64, u64, Option<u64>)>,
 }
 
-async fn run_claude_interactive_turn(
-    bin: &str,
-    req: &TurnRequest,
-    prompt: &str,
-    session_id: &str,
-    resume: Option<&str>,
-    transcript: &Path,
+struct ClaudeInteractiveTurn<'a> {
+    bin: &'a str,
+    req: &'a TurnRequest,
+    prompt: &'a str,
+    session_id: &'a str,
+    resume: Option<&'a str>,
+    transcript: &'a Path,
     baseline_lines: usize,
-    sink: &mpsc::Sender<StreamItem>,
-) -> anyhow::Result<()> {
+    timeout: Duration,
+    sink: &'a mpsc::Sender<StreamItem>,
+}
+
+async fn run_claude_interactive_turn(turn: ClaudeInteractiveTurn<'_>) -> anyhow::Result<()> {
+    let ClaudeInteractiveTurn {
+        bin,
+        req,
+        prompt,
+        session_id,
+        resume,
+        transcript,
+        baseline_lines,
+        timeout,
+        sink,
+    } = turn;
     let pty = portable_pty::native_pty_system();
     let pair = pty
         .openpty(portable_pty::PtySize {
@@ -1027,10 +1185,11 @@ async fn run_claude_interactive_turn(
             push_tail(&mut terminal_tail, &bytes);
         }
 
-        if started.elapsed() > CLAUDE_INTERACTIVE_TURN_TIMEOUT {
+        if started.elapsed() > timeout {
+            let _ = child.kill();
             return Err(anyhow::anyhow!(
-                "Claude interactive turn timed out after {} minutes",
-                CLAUDE_INTERACTIVE_TURN_TIMEOUT.as_secs() / 60
+                "Claude interactive turn timed out after {}",
+                format_timeout(timeout)
             ));
         }
 
@@ -1469,11 +1628,7 @@ fn claude_transcript_path(cwd: &str, session_id: &str) -> anyhow::Result<PathBuf
     } else {
         PathBuf::from(cwd)
     };
-    let slug = workspace
-        .display()
-        .to_string()
-        .replace('/', "-")
-        .replace('.', "-");
+    let slug = workspace.display().to_string().replace(['/', '.'], "-");
     Ok(home
         .join(".claude/projects")
         .join(slug)
@@ -1587,6 +1742,30 @@ fn tail_context(tail: &str) -> String {
     }
 }
 
+fn codex_effort(effort: &str) -> &str {
+    effort
+}
+
+fn claude_effort(effort: &str) -> &str {
+    // claude --effort accepts low|medium|high|xhigh|max directly.
+    effort
+}
+
+fn claude_model_arg(model: &str) -> Option<&str> {
+    let model = model.trim();
+    if model.is_empty() {
+        return None;
+    }
+    let lower = model.to_ascii_lowercase();
+    if lower.starts_with("claude-")
+        || matches!(lower.as_str(), "fable" | "opus" | "sonnet" | "haiku")
+    {
+        Some(model)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod claude_interactive_tests {
     use super::*;
@@ -1676,6 +1855,7 @@ mod claude_interactive_tests {
             &args,
             "",
             Some("hello-stdin".to_string()),
+            Duration::from_secs(5),
             &tx,
             |v, _sink| {
                 seen = v["text"].as_str().unwrap_or("").to_string();
@@ -1686,6 +1866,32 @@ mod claude_interactive_tests {
         .unwrap();
 
         assert_eq!(seen, "hello-stdin");
+    }
+
+    #[tokio::test]
+    async fn run_jsonl_times_out_silent_child() {
+        let args = vec!["-c".to_string(), "sleep 5".to_string()];
+        let (tx, mut rx) = mpsc::channel(8);
+
+        let err = run_jsonl(
+            "/bin/sh",
+            &args,
+            "",
+            None,
+            Duration::from_millis(100),
+            &tx,
+            |_v, _sink| true,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("timed out after 100 ms"));
+        let Some(StreamItem::Notice(notice)) = rx.recv().await else {
+            panic!("expected timeout notice");
+        };
+        assert!(notice.contains("timed out after 100 ms"));
+        assert!(matches!(rx.recv().await, Some(StreamItem::Done)));
     }
 
     #[test]
@@ -1733,29 +1939,5 @@ mod claude_interactive_tests {
 
         assert_eq!(prompt, "Cek struktur tim di schema");
         assert_eq!(images.len(), 1);
-    }
-}
-
-fn codex_effort(effort: &str) -> &str {
-    effort
-}
-
-fn claude_effort(effort: &str) -> &str {
-    // claude --effort accepts low|medium|high|xhigh|max directly.
-    effort
-}
-
-fn claude_model_arg(model: &str) -> Option<&str> {
-    let model = model.trim();
-    if model.is_empty() {
-        return None;
-    }
-    let lower = model.to_ascii_lowercase();
-    if lower.starts_with("claude-")
-        || matches!(lower.as_str(), "fable" | "opus" | "sonnet" | "haiku")
-    {
-        Some(model)
-    } else {
-        None
     }
 }

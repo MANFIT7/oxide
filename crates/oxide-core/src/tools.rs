@@ -442,7 +442,7 @@ impl ToolRouter {
         let status = loop {
             tokio::select! {
                 result = &mut wait_task => {
-                    break result.unwrap_or_else(|err| Err(std::io::Error::new(std::io::ErrorKind::Other, err)));
+                    break result.unwrap_or_else(|err| Err(std::io::Error::other(err)));
                 }
                 line = line_rx.recv(), if rx_open => {
                     match line {

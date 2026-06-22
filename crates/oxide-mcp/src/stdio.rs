@@ -4,6 +4,7 @@
 //! framing trivial.
 
 use crate::Transport;
+use anyhow::Context;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -124,8 +125,14 @@ impl Transport for StdioTransport {
 
     async fn notify(&self, method: &str, params: Value) -> anyhow::Result<()> {
         let msg = json!({ "jsonrpc": "2.0", "method": method, "params": params });
-        let mut io = self.inner.lock().await;
-        StdioTransport::send(&mut io, &msg).await
+        let write = async {
+            let mut io = self.inner.lock().await;
+            StdioTransport::send(&mut io, &msg).await
+        };
+        match tokio::time::timeout(self.request_timeout, write).await {
+            Ok(result) => result.with_context(|| format!("mcp notification {method} failed")),
+            Err(_) => anyhow::bail!("mcp notification {method} timed out"),
+        }
     }
 }
 

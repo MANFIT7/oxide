@@ -9,6 +9,7 @@
 //! The [`Transport`] trait keeps the protocol logic testable without spawning a
 //! real process: production uses [`StdioTransport`]; tests use an in-memory one.
 
+use anyhow::Context;
 use async_trait::async_trait;
 use oxide_protocol::ToolSpec;
 use serde_json::{json, Value};
@@ -113,10 +114,12 @@ impl McpClient {
             )
             .await?;
         // Per spec, follow up with the initialized notification.
-        let _ = self
-            .transport
+        self.transport
             .notify("notifications/initialized", json!({}))
-            .await;
+            .await
+            .with_context(|| {
+                format!("mcp server {} initialized notification failed", self.server)
+            })?;
         let _ = self.next_id.fetch_add(1, Ordering::Relaxed);
         Ok(result
             .get("instructions")
@@ -218,6 +221,8 @@ mod tests {
         last_call: Mutex<Option<(String, Value)>>,
     }
 
+    struct InitNotifyFailsTransport;
+
     #[async_trait]
     impl Transport for MockTransport {
         async fn call(&self, method: &str, params: Value) -> anyhow::Result<Value> {
@@ -239,6 +244,20 @@ mod tests {
         }
         async fn notify(&self, _method: &str, _params: Value) -> anyhow::Result<()> {
             Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl Transport for InitNotifyFailsTransport {
+        async fn call(&self, method: &str, _params: Value) -> anyhow::Result<Value> {
+            Ok(match method {
+                "initialize" => json!({ "protocolVersion": PROTOCOL_VERSION, "capabilities": {} }),
+                _ => json!({}),
+            })
+        }
+
+        async fn notify(&self, _method: &str, _params: Value) -> anyhow::Result<()> {
+            anyhow::bail!("write failed")
         }
     }
 
@@ -269,5 +288,16 @@ mod tests {
         assert!(ok);
         // The server should have received the bare tool name, not the namespaced one.
         assert!(out.contains("echo"));
+    }
+
+    #[tokio::test]
+    async fn connect_surfaces_initialized_notification_failure() {
+        let err = match McpClient::connect("fs", Box::new(InitNotifyFailsTransport)).await {
+            Ok(_) => panic!("connect should fail when initialized notification fails"),
+            Err(err) => err,
+        };
+        let message = format!("{err:#}");
+        assert!(message.contains("mcp server fs initialized notification failed"));
+        assert!(message.contains("write failed"));
     }
 }

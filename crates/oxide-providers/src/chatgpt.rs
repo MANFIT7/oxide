@@ -60,6 +60,18 @@ fn retry_after(resp: &reqwest::Response) -> Option<u64> {
         .map(|s| s.saturating_mul(1000))
 }
 
+fn retry_delay_ms(resp: Option<&reqwest::Response>, attempt: u32) -> u64 {
+    if let Some(delay) = resp.and_then(retry_after) {
+        return delay.min(10_000);
+    }
+    let base = (500u64 << attempt.min(4)).min(10_000);
+    let jitter = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| u64::from(d.subsec_millis()) % (base / 5 + 1))
+        .unwrap_or(0);
+    base.saturating_add(jitter).min(10_000)
+}
+
 fn value_f64(v: &Value) -> Option<f64> {
     v.as_f64()
         .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
@@ -125,20 +137,136 @@ fn parse_usage_headers(resp: &reqwest::Response) -> Option<(String, u8, u8, u64,
             .and_then(|s| s.parse::<f64>().ok())
             .map(|n| n.round().clamp(0.0, 100.0) as u8)
     };
-    let p = pct("x-codex-primary-used-percent")?;
-    let s = pct("x-codex-secondary-used-percent")?;
+    let pct_from_limit = |limit_key: &str, remaining_key: &str| {
+        let limit = hv(limit_key).and_then(|s| s.parse::<f64>().ok())?;
+        let remaining = hv(remaining_key).and_then(|s| s.parse::<f64>().ok())?;
+        if limit <= 0.0 {
+            return None;
+        }
+        Some(
+            (((limit - remaining).max(0.0) / limit) * 100.0)
+                .round()
+                .clamp(0.0, 100.0) as u8,
+        )
+    };
+    let reset = |codex_key: &str, ratelimit_key: &str| {
+        hv(codex_key)
+            .or_else(|| hv(ratelimit_key))
+            .and_then(parse_reset_header)
+            .unwrap_or(0)
+    };
+    let p = pct("x-codex-primary-used-percent").or_else(|| {
+        pct_from_limit(
+            "x-ratelimit-limit-requests",
+            "x-ratelimit-remaining-requests",
+        )
+    })?;
+    let s = pct("x-codex-secondary-used-percent")
+        .or_else(|| pct_from_limit("x-ratelimit-limit-tokens", "x-ratelimit-remaining-tokens"))?;
     let plan = hv("x-codex-plan-type")
         .or_else(|| hv("x-codex-active-limit"))
         .unwrap_or("")
         .to_string();
-    let resets = |k: &str| hv(k).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
     Some((
         plan,
         p,
         s,
-        resets("x-codex-primary-reset-after-seconds"),
-        resets("x-codex-secondary-reset-after-seconds"),
+        reset(
+            "x-codex-primary-reset-after-seconds",
+            "x-ratelimit-reset-requests",
+        ),
+        reset(
+            "x-codex-secondary-reset-after-seconds",
+            "x-ratelimit-reset-tokens",
+        ),
     ))
+}
+
+fn parse_reset_header(raw: &str) -> Option<u64> {
+    let mut n = raw.parse::<u64>().ok()?;
+    if n > 10_000_000_000 {
+        n /= 1000;
+    }
+    if n > 1_000_000_000 {
+        Some(n.saturating_sub(unix_now_s()))
+    } else {
+        Some(n)
+    }
+}
+
+fn base64url_decode(input: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(input.len() * 3 / 4);
+    let mut buffer = 0u32;
+    let mut bits = 0u8;
+    for b in input.bytes() {
+        if b == b'=' {
+            break;
+        }
+        let val = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a' + 26,
+            b'0'..=b'9' => b - b'0' + 52,
+            b'-' => 62,
+            b'_' => 63,
+            _ => return None,
+        };
+        buffer = (buffer << 6) | u32::from(val);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((buffer >> bits) & 0xff) as u8);
+        }
+    }
+    Some(out)
+}
+
+fn account_id_from_claims(claims: &Value) -> Option<String> {
+    for key in [
+        "chatgpt_account_id",
+        "https://api.openai.com/auth.chatgpt_account_id",
+    ] {
+        if let Some(id) = claims[key].as_str().filter(|s| !s.trim().is_empty()) {
+            return Some(id.to_string());
+        }
+    }
+    claims["organizations"].as_array()?.iter().find_map(|org| {
+        org.as_str()
+            .or_else(|| org["id"].as_str())
+            .or_else(|| org["organization_id"].as_str())
+            .filter(|s| !s.trim().is_empty())
+            .map(ToString::to_string)
+    })
+}
+
+fn account_id_from_access_token(access: &str) -> Option<String> {
+    let payload = access.split('.').nth(1)?;
+    let decoded = base64url_decode(payload)?;
+    let claims: Value = serde_json::from_slice(&decoded).ok()?;
+    account_id_from_claims(&claims)
+}
+
+fn refresh_form(refresh: &str) -> [(&'static str, &str); 3] {
+    [
+        ("client_id", OAUTH_CLIENT_ID),
+        ("grant_type", "refresh_token"),
+        ("refresh_token", refresh),
+    ]
+}
+
+fn error_summary(error: &Value, fallback: &str) -> String {
+    let msg = error["message"].as_str().unwrap_or(fallback);
+    let mut details = Vec::new();
+    if let Some(code) = error["code"].as_str().filter(|s| !s.trim().is_empty()) {
+        details.push(format!("code={code}"));
+    }
+    if let Some(kind) = error["type"].as_str().filter(|s| !s.trim().is_empty()) {
+        details.push(format!("type={kind}"));
+    }
+    if details.is_empty() {
+        msg.to_string()
+    } else {
+        format!("{msg} ({})", details.join(", "))
+    }
 }
 
 async fn send_rate_limit(
@@ -219,32 +347,35 @@ impl ChatGptProvider {
             )
         })?;
         let v: Value = serde_json::from_str(&text)?;
-        let at = v["tokens"]["access_token"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("ChatGPT subscription auth is missing access_token — run `codex login` to refresh it."))?
-            .to_string();
-        let acc = v["tokens"]["account_id"].as_str().unwrap_or("").to_string();
         let refresh = v["tokens"]["refresh_token"]
             .as_str()
             .unwrap_or("")
             .to_string();
+        let at = v["tokens"]["access_token"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        if at.trim().is_empty() && refresh.trim().is_empty() {
+            anyhow::bail!(
+                "ChatGPT subscription auth is missing access_token and refresh_token — run `codex login` to refresh it."
+            );
+        }
+        let acc = v["tokens"]["account_id"]
+            .as_str()
+            .filter(|s| !s.trim().is_empty())
+            .map(ToString::to_string)
+            .or_else(|| account_id_from_access_token(&at))
+            .unwrap_or_default();
         Ok((at, acc, refresh))
     }
 
     /// Exchange a refresh token for a fresh `(access_token, refresh_token)` at the
     /// OAuth endpoint (same flow the codex CLI uses). The refresh token may rotate.
     async fn refresh_access(&self, refresh: &str) -> anyhow::Result<(String, String)> {
-        let body = json!({
-            "client_id": OAUTH_CLIENT_ID,
-            "grant_type": "refresh_token",
-            "refresh_token": refresh,
-            "scope": "openid profile email",
-        });
         let resp = self
             .client
             .post(OAUTH_TOKEN_URL)
-            .header("Content-Type", "application/json")
-            .json(&body)
+            .form(&refresh_form(refresh))
             .send()
             .await?;
         if !resp.status().is_success() {
@@ -284,7 +415,6 @@ impl ChatGptProvider {
             let _ = std::fs::write(&self.auth_path, serialized);
         }
     }
-
 }
 
 impl Default for ChatGptProvider {
@@ -475,6 +605,7 @@ fn build_body(req: &TurnRequest) -> Value {
         "input": input,
         "stream": true,
         "store": false,
+        "temperature": req.temperature,
         "include": ["reasoning.encrypted_content"],
         // `summary: auto` streams reasoning summaries (shown live as thinking).
         "reasoning": { "effort": effort, "summary": "auto" }
@@ -543,7 +674,11 @@ fn response_tool_call(
                 .as_str()
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
-                .or_else(|| pending_item.map(|(_, _, cid)| cid).filter(|s| !s.is_empty()))
+                .or_else(|| {
+                    pending_item
+                        .map(|(_, _, cid)| cid)
+                        .filter(|s| !s.is_empty())
+                })
                 .unwrap_or_default();
             Some((vec![call_id, item_id], name, parse_tool_args(&raw)))
         }
@@ -602,6 +737,21 @@ async fn send_tool_call(
     .is_ok()
 }
 
+async fn send_response_usage(
+    sink: &mpsc::Sender<StreamItem>,
+    response: &Value,
+    model: &str,
+) -> bool {
+    let usage = &response["usage"];
+    sink.send(StreamItem::Usage {
+        input: usage["input_tokens"].as_u64().unwrap_or(0),
+        output: usage["output_tokens"].as_u64().unwrap_or(0),
+        context_window: Some(model_context_window(model)),
+    })
+    .await
+    .is_ok()
+}
+
 #[async_trait]
 impl Provider for ChatGptProvider {
     fn name(&self) -> &str {
@@ -609,43 +759,71 @@ impl Provider for ChatGptProvider {
     }
 
     async fn stream(&self, req: TurnRequest, sink: mpsc::Sender<StreamItem>) -> anyhow::Result<()> {
-        let (mut access, account, refresh) = self.credentials()?;
+        let (mut access, mut account, mut refresh) = self.credentials()?;
+        let mut refreshed = false;
+        if access.trim().is_empty() && !refresh.trim().is_empty() {
+            let (new_access, new_refresh) = self.refresh_access(&refresh).await?;
+            self.persist_refreshed(&new_access, &new_refresh);
+            account = account
+                .trim()
+                .is_empty()
+                .then(|| account_id_from_access_token(&new_access))
+                .flatten()
+                .unwrap_or(account);
+            access = new_access;
+            refresh = new_refresh;
+            refreshed = true;
+        }
         let chatgpt_session_id = session_id_for(&req.conversation_id);
         let body = build_body(&req);
+        let active_model = if req.model.is_empty() {
+            DEFAULT_MODEL.to_string()
+        } else {
+            req.model.clone()
+        };
         // POST with: a one-shot in-place token refresh on 401, and bounded
         // backoff retries on transient 429/5xx/connection errors.
         let mut attempt = 0u32;
-        let mut refreshed = false;
         let resp = loop {
-            let send_result = self
+            let mut builder = self
                 .client
                 .post(ENDPOINT)
                 .bearer_auth(&access)
-                .header("chatgpt-account-id", &account)
                 .header("Content-Type", "application/json")
                 .header("Accept", "text/event-stream")
                 .header("OpenAI-Beta", "responses=experimental")
                 .header("originator", "codex_cli_rs")
                 .header("session_id", &chatgpt_session_id)
-                .json(&body)
-                .send()
-                .await;
+                .json(&body);
+            if !account.trim().is_empty() {
+                builder = builder.header("chatgpt-account-id", &account);
+            }
+            let send_result = builder.send().await;
             match send_result {
                 Ok(resp) if resp.status().is_success() => break resp,
                 Ok(resp) => {
                     let status = resp.status();
+                    if status.as_u16() == 429 {
+                        if let Some((plan, p, s, p_reset, s_reset)) = parse_usage_headers(&resp) {
+                            let _ = send_rate_limit(&sink, plan, p, s, p_reset, s_reset).await;
+                        }
+                    }
                     // Expired access token → refresh once in place, then retry.
                     if status.as_u16() == 401 && !refresh.is_empty() && !refreshed {
                         refreshed = true;
                         let (new_access, new_refresh) = self.refresh_access(&refresh).await?;
                         self.persist_refreshed(&new_access, &new_refresh);
+                        if account.trim().is_empty() {
+                            account = account_id_from_access_token(&new_access).unwrap_or_default();
+                        }
                         access = new_access;
+                        refresh = new_refresh;
                         continue;
                     }
                     // Transient → wait (honor retry-after) and retry.
                     if (status.as_u16() == 429 || status.is_server_error()) && attempt < MAX_RETRIES
                     {
-                        let wait = retry_after(&resp).unwrap_or(500u64 << attempt);
+                        let wait = retry_delay_ms(Some(&resp), attempt);
                         attempt += 1;
                         tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
                         continue;
@@ -666,7 +844,7 @@ impl Provider for ChatGptProvider {
                     anyhow::bail!("chatgpt {status}: {text}");
                 }
                 Err(_e) if attempt < MAX_RETRIES => {
-                    let wait = 500u64 << attempt;
+                    let wait = retry_delay_ms(None, attempt);
                     attempt += 1;
                     tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
                     continue;
@@ -747,9 +925,25 @@ impl Provider for ChatGptProvider {
                             let name = item["name"].as_str().unwrap_or("").to_string();
                             let args = item["arguments"].as_str().unwrap_or("").to_string();
                             let call_id = item["call_id"].as_str().unwrap_or("").to_string();
-                            pending_function_args
-                                .entry(item_id.to_string())
-                                .or_insert((name, args, call_id));
+                            pending_function_args.entry(item_id.to_string()).or_insert((
+                                name.clone(),
+                                args.clone(),
+                                call_id.clone(),
+                            ));
+                            if !args.is_empty() {
+                                let _ = sink
+                                    .send(StreamItem::ToolInputDelta {
+                                        id: if call_id.is_empty() {
+                                            item_id.to_string()
+                                        } else {
+                                            call_id.clone()
+                                        },
+                                        name,
+                                        delta: args.clone(),
+                                        accumulated: args,
+                                    })
+                                    .await;
+                            }
                         }
                     }
                 }
@@ -775,6 +969,19 @@ impl Provider for ChatGptProvider {
                                 .entry(item_id.to_string())
                                 .or_insert((String::new(), String::new(), String::new()));
                             entry.1.push_str(delta);
+                            let id = if entry.2.is_empty() {
+                                item_id.to_string()
+                            } else {
+                                entry.2.clone()
+                            };
+                            let _ = sink
+                                .send(StreamItem::ToolInputDelta {
+                                    id,
+                                    name: entry.0.clone(),
+                                    delta: delta.to_string(),
+                                    accumulated: entry.1.clone(),
+                                })
+                                .await;
                         }
                     }
                 }
@@ -783,9 +990,11 @@ impl Provider for ChatGptProvider {
                     if item_id.is_empty() {
                         continue;
                     }
-                    let entry = pending_function_args
-                        .entry(item_id)
-                        .or_insert((String::new(), String::new(), String::new()));
+                    let entry = pending_function_args.entry(item_id.clone()).or_insert((
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                    ));
                     if let Some(name) = v["name"].as_str().filter(|s| !s.is_empty()) {
                         entry.0 = name.to_string();
                     }
@@ -793,36 +1002,37 @@ impl Provider for ChatGptProvider {
                     // deltas accumulated.
                     if let Some(args) = v["arguments"].as_str().filter(|s| !s.is_empty()) {
                         entry.1 = args.to_string();
+                        let id = if entry.2.is_empty() {
+                            item_id.clone()
+                        } else {
+                            entry.2.clone()
+                        };
+                        let _ = sink
+                            .send(StreamItem::ToolInputDelta {
+                                id,
+                                name: entry.0.clone(),
+                                delta: String::new(),
+                                accumulated: entry.1.clone(),
+                            })
+                            .await;
                     }
                 }
                 Some("response.completed") => {
-                    let u = &v["response"]["usage"];
-                    let _ = sink
-                        .send(StreamItem::Usage {
-                            input: u["input_tokens"].as_u64().unwrap_or(0),
-                            output: u["output_tokens"].as_u64().unwrap_or(0),
-                            context_window: Some(model_context_window(if req.model.is_empty() {
-                                DEFAULT_MODEL
-                            } else {
-                                &req.model
-                            })),
-                        })
-                        .await;
+                    let _ = send_response_usage(&sink, &v["response"], &active_model).await;
                     // Terminal event — stop reading. Don't keep the SSE loop alive
                     // waiting for the connection to close (that can hang the turn).
                     stream_completed = true;
                     break;
                 }
                 Some("response.failed") => {
-                    let msg = v["response"]["error"]["message"]
-                        .as_str()
-                        .unwrap_or("response failed");
-                    anyhow::bail!("ChatGPT response failed: {msg}");
+                    let detail = error_summary(&v["response"]["error"], "response failed");
+                    anyhow::bail!("ChatGPT response failed: {detail}");
                 }
                 Some("response.incomplete") => {
                     // A soft stop (length / content filter / etc.) — NOT an error.
                     // Surface a note and end the turn gracefully with whatever was
                     // produced, so a truncated response doesn't blow up the turn.
+                    let _ = send_response_usage(&sink, &v["response"], &active_model).await;
                     let reason = v["response"]["incomplete_details"]["reason"]
                         .as_str()
                         .unwrap_or("unknown");
@@ -836,11 +1046,12 @@ impl Provider for ChatGptProvider {
                 }
                 // Top-level error frame (not wrapped in a response object).
                 Some("error") => {
-                    let msg = v["message"]
-                        .as_str()
-                        .or_else(|| v["error"]["message"].as_str())
-                        .unwrap_or("stream error");
-                    anyhow::bail!("ChatGPT stream error: {msg}");
+                    let detail = if v["error"].is_object() {
+                        error_summary(&v["error"], "stream error")
+                    } else {
+                        error_summary(&v, "stream error")
+                    };
+                    anyhow::bail!("ChatGPT stream error: {detail}");
                 }
                 _ => {}
             }
@@ -869,8 +1080,14 @@ impl Provider for ChatGptProvider {
             } else {
                 vec![call_id, item_id]
             };
-            if !send_tool_call(&sink, &mut sent_tools, ids, name, parse_tool_args(&raw_args))
-                .await
+            if !send_tool_call(
+                &sink,
+                &mut sent_tools,
+                ids,
+                name,
+                parse_tool_args(&raw_args),
+            )
+            .await
             {
                 return Ok(());
             }
@@ -923,7 +1140,76 @@ mod tests {
         assert_eq!(body["prompt_cache_key"], "session");
         assert_eq!(body["reasoning"]["summary"], "auto");
         assert_eq!(body["reasoning"]["effort"], "medium");
+        assert!((body["temperature"].as_f64().unwrap() - 0.2).abs() < 0.0001);
         assert_eq!(body["store"], false);
+    }
+
+    fn jwt_with_payload(payload: Value) -> String {
+        let encoded = base64_encode(payload.to_string().as_bytes())
+            .trim_end_matches('=')
+            .replace('+', "-")
+            .replace('/', "_");
+        format!("header.{encoded}.signature")
+    }
+
+    #[test]
+    fn account_id_falls_back_to_jwt_claims() {
+        let token = jwt_with_payload(json!({
+            "chatgpt_account_id": "acct_primary",
+            "organizations": ["acct_other"]
+        }));
+
+        assert_eq!(
+            account_id_from_access_token(&token),
+            Some("acct_primary".to_string())
+        );
+    }
+
+    #[test]
+    fn account_id_uses_namespaced_claim_or_organization() {
+        let namespaced = jwt_with_payload(json!({
+            "https://api.openai.com/auth.chatgpt_account_id": "acct_namespaced"
+        }));
+        let org = jwt_with_payload(json!({
+            "organizations": [{ "id": "org_123" }]
+        }));
+
+        assert_eq!(
+            account_id_from_access_token(&namespaced),
+            Some("acct_namespaced".to_string())
+        );
+        assert_eq!(
+            account_id_from_access_token(&org),
+            Some("org_123".to_string())
+        );
+    }
+
+    #[test]
+    fn refresh_form_matches_oauth_contract() {
+        assert_eq!(
+            refresh_form("refresh_token_value"),
+            [
+                ("client_id", OAUTH_CLIENT_ID),
+                ("grant_type", "refresh_token"),
+                ("refresh_token", "refresh_token_value"),
+            ]
+        );
+    }
+
+    #[test]
+    fn error_summary_includes_code_and_type() {
+        let detail = error_summary(
+            &json!({
+                "message": "too large",
+                "code": "context_length_exceeded",
+                "type": "invalid_request_error"
+            }),
+            "response failed",
+        );
+
+        assert!(detail.contains("too large"));
+        assert!(detail.contains("context_length_exceeded"));
+        assert!(detail.contains("invalid_request_error"));
     }
 
     #[test]

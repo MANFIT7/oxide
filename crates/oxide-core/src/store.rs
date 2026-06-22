@@ -23,7 +23,15 @@ pub struct StoredMessage {
 pub struct SessionStore {
     pub id: String,
     workspace: PathBuf,
-    provider: std::sync::Mutex<String>,
+    config: std::sync::Mutex<SessionRuntimeConfig>,
+}
+
+#[derive(Clone, Default)]
+struct SessionRuntimeConfig {
+    provider: String,
+    model: String,
+    harness: String,
+    reasoning_effort: String,
 }
 
 impl SessionStore {
@@ -32,7 +40,7 @@ impl SessionStore {
         Ok(Self {
             id: crate::db::new_id(),
             workspace: workspace.to_path_buf(),
-            provider: std::sync::Mutex::new(String::new()),
+            config: std::sync::Mutex::new(SessionRuntimeConfig::default()),
         })
     }
 
@@ -47,7 +55,7 @@ impl SessionStore {
         Ok(Self {
             id: id.to_string(),
             workspace: workspace.to_path_buf(),
-            provider: std::sync::Mutex::new(String::new()),
+            config: std::sync::Mutex::new(SessionRuntimeConfig::default()),
         })
     }
 
@@ -56,31 +64,63 @@ impl SessionStore {
         self.id.clone()
     }
 
-    /// Provider stamp (sidebar logos). Applied immediately if the session
-    /// already exists, and to every future append.
-    pub fn set_meta(&self, content: &str) {
-        let p = content
-            .strip_prefix("provider=")
-            .unwrap_or(content)
-            .to_string();
+    pub fn set_runtime_config(
+        &self,
+        provider: &str,
+        model: &str,
+        harness: &str,
+        reasoning_effort: &str,
+    ) {
+        let current = {
+            let mut config = self.config.lock().unwrap();
+            config.provider = provider.to_string();
+            config.model = model.to_string();
+            config.harness = harness.to_string();
+            config.reasoning_effort = reasoning_effort.to_string();
+            config.clone()
+        };
+        self.persist_config(&current);
+    }
+
+    fn persist_config(&self, config: &SessionRuntimeConfig) {
         if crate::db::exists(&self.id) {
-            crate::db::set_provider(&self.id, &p);
-        }
-        if let Ok(mut g) = self.provider.lock() {
-            *g = p;
+            crate::db::set_session_config(
+                &self.id,
+                &config.provider,
+                &config.model,
+                &config.harness,
+                &config.reasoning_effort,
+            );
         }
     }
 
     pub fn append(&self, role: &str, content: &str) -> std::io::Result<()> {
-        let prov = self.provider.lock().map(|g| g.clone()).unwrap_or_default();
-        crate::db::append(&self.id, &self.workspace, &prov, role, content);
+        let config = self.config.lock().map(|g| g.clone()).unwrap_or_default();
+        crate::db::append_with_config(
+            &self.id,
+            &self.workspace,
+            &config.provider,
+            &config.model,
+            &config.harness,
+            &config.reasoning_effort,
+            role,
+            content,
+        );
         Ok(())
     }
 
     /// Replace the whole conversation (restore-to-message).
     pub fn rewrite(&self, msgs: &[(String, String)]) -> std::io::Result<()> {
-        let prov = self.provider.lock().map(|g| g.clone()).unwrap_or_default();
-        crate::db::rewrite(&self.id, &self.workspace, &prov, msgs);
+        let config = self.config.lock().map(|g| g.clone()).unwrap_or_default();
+        crate::db::rewrite_with_config(
+            &self.id,
+            &self.workspace,
+            &config.provider,
+            &config.model,
+            &config.harness,
+            &config.reasoning_effort,
+            msgs,
+        );
         Ok(())
     }
 

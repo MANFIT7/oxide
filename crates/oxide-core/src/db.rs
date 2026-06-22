@@ -61,6 +61,9 @@ impl LocalDb {
                id TEXT PRIMARY KEY,
                workspace TEXT NOT NULL,
                provider TEXT NOT NULL DEFAULT '',
+               model TEXT NOT NULL DEFAULT '',
+               harness TEXT NOT NULL DEFAULT '',
+               reasoning_effort TEXT NOT NULL DEFAULT '',
                title TEXT NOT NULL DEFAULT '',
                pinned INTEGER NOT NULL DEFAULT 0,
                archived_at INTEGER,
@@ -87,6 +90,13 @@ impl LocalDb {
             self.conn
                 .execute("ALTER TABLE sessions ADD COLUMN cli_session_id TEXT", ()),
         );
+        for sql in [
+            "ALTER TABLE sessions ADD COLUMN model TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE sessions ADD COLUMN harness TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE sessions ADD COLUMN reasoning_effort TEXT NOT NULL DEFAULT ''",
+        ] {
+            let _ = self.rt.block_on(self.conn.execute(sql, ()));
+        }
         // Backfill: legacy imports stamped rows with the import moment, which
         // flattened ordering/relative times. The id leads with the original
         // epoch-ms — restore created/updated from it when they disagree wildly.
@@ -232,6 +242,9 @@ pub struct SessionMeta {
     pub id: String,
     pub workspace: String,
     pub provider: String,
+    pub model: String,
+    pub harness: String,
+    pub reasoning_effort: String,
     pub title: String,
     pub pinned: bool,
     pub updated_ms: i64,
@@ -277,11 +290,15 @@ fn title_from_user_content(content: &str) -> String {
     first.chars().take(60).collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_in_db(
     db: &mut LocalDb,
     id: &str,
     workspace: &str,
     provider: &str,
+    model: &str,
+    harness: &str,
+    reasoning_effort: &str,
     role: &str,
     content: &str,
     ts_ms: i64,
@@ -293,10 +310,23 @@ fn append_in_db(
     );
     db.execute(
         "upsert session",
-        "INSERT INTO sessions (id, workspace, provider, title, created_ms, updated_ms)
-         VALUES (?1, ?2, ?3, '', ?4, ?4)
-         ON CONFLICT(id) DO UPDATE SET updated_ms=?4",
-        turso::params![id, workspace, provider, ts_ms],
+        "INSERT INTO sessions (id, workspace, provider, model, harness, reasoning_effort, title, created_ms, updated_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, '', ?7, ?7)
+         ON CONFLICT(id) DO UPDATE SET
+           updated_ms=?7,
+           provider=?3,
+           model=?4,
+           harness=?5,
+           reasoning_effort=?6",
+        turso::params![
+            id,
+            workspace,
+            provider,
+            model,
+            harness,
+            reasoning_effort,
+            ts_ms
+        ],
     );
     db.execute(
         "append session message",
@@ -317,6 +347,20 @@ fn append_in_db(
 /// Append one message; creates the session row on first use (lazy, so an
 /// empty chat never leaves anything behind).
 pub fn append(id: &str, workspace: &Path, provider: &str, role: &str, content: &str) {
+    append_with_config(id, workspace, provider, "", "", "", role, content);
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn append_with_config(
+    id: &str,
+    workspace: &Path,
+    provider: &str,
+    model: &str,
+    harness: &str,
+    reasoning_effort: &str,
+    role: &str,
+    content: &str,
+) {
     // Never record throwaway workspaces (test temp dirs) in the global db.
     let wss = workspace.to_string_lossy();
     let throwaway =
@@ -327,10 +371,26 @@ pub fn append(id: &str, workspace: &Path, provider: &str, role: &str, content: &
     let id = id.to_string();
     let ws = workspace.display().to_string();
     let provider = provider.to_string();
+    let model = model.to_string();
+    let harness = harness.to_string();
+    let reasoning_effort = reasoning_effort.to_string();
     let role = role.to_string();
     let content = content.to_string();
     let t = now_ms();
-    with_db(move |db| append_in_db(db, &id, &ws, &provider, &role, &content, t));
+    with_db(move |db| {
+        append_in_db(
+            db,
+            &id,
+            &ws,
+            &provider,
+            &model,
+            &harness,
+            &reasoning_effort,
+            &role,
+            &content,
+            t,
+        )
+    });
 }
 
 /// Update the provider stamp (model/provider switch on a live session).
@@ -356,13 +416,26 @@ pub fn title_of(id: &str) -> String {
 }
 
 pub fn set_provider(id: &str, provider: &str) {
+    set_session_config(id, provider, "", "", "");
+}
+
+pub fn set_session_config(
+    id: &str,
+    provider: &str,
+    model: &str,
+    harness: &str,
+    reasoning_effort: &str,
+) {
     let id = id.to_string();
     let provider = provider.to_string();
+    let model = model.to_string();
+    let harness = harness.to_string();
+    let reasoning_effort = reasoning_effort.to_string();
     with_db(move |db| {
         db.execute(
-            "set session provider",
-            "UPDATE sessions SET provider=?2 WHERE id=?1",
-            turso::params![id, provider],
+            "set session runtime config",
+            "UPDATE sessions SET provider=?2, model=?3, harness=?4, reasoning_effort=?5 WHERE id=?1",
+            turso::params![id, provider, model, harness, reasoning_effort],
         );
     });
 }
@@ -398,9 +471,24 @@ pub fn message_count(id: &str) -> usize {
 
 /// Replace the whole conversation (restore-to-message).
 pub fn rewrite(id: &str, workspace: &Path, provider: &str, msgs: &[(String, String)]) {
+    rewrite_with_config(id, workspace, provider, "", "", "", msgs);
+}
+
+pub fn rewrite_with_config(
+    id: &str,
+    workspace: &Path,
+    provider: &str,
+    model: &str,
+    harness: &str,
+    reasoning_effort: &str,
+    msgs: &[(String, String)],
+) {
     let id = id.to_string();
     let ws = workspace.display().to_string();
     let provider = provider.to_string();
+    let model = model.to_string();
+    let harness = harness.to_string();
+    let reasoning_effort = reasoning_effort.to_string();
     let msgs = msgs.to_vec();
     with_db(move |db| {
         db.execute(
@@ -415,7 +503,18 @@ pub fn rewrite(id: &str, workspace: &Path, provider: &str, msgs: &[(String, Stri
         );
         let base_ts = now_ms();
         for (idx, (role, content)) in msgs.iter().enumerate() {
-            append_in_db(db, &id, &ws, &provider, role, content, base_ts + idx as i64);
+            append_in_db(
+                db,
+                &id,
+                &ws,
+                &provider,
+                &model,
+                &harness,
+                &reasoning_effort,
+                role,
+                content,
+                base_ts + idx as i64,
+            );
         }
         if msgs.is_empty() {
             // Nothing left — drop the row so it doesn't linger as an empty chat.
@@ -482,7 +581,7 @@ where
 {
     let cond = cond.to_string();
     let sql = format!(
-        "SELECT id, workspace, provider, title, pinned, updated_ms FROM sessions
+        "SELECT id, workspace, provider, model, harness, reasoning_effort, title, pinned, updated_ms FROM sessions
          WHERE {cond} ORDER BY pinned DESC, updated_ms DESC LIMIT {limit}"
     );
     with_db(move |db| {
@@ -491,9 +590,12 @@ where
                 id: r.get(0)?,
                 workspace: r.get(1)?,
                 provider: r.get(2)?,
-                title: r.get(3)?,
-                pinned: r.get::<i64>(4)? != 0,
-                updated_ms: r.get(5)?,
+                model: r.get(3)?,
+                harness: r.get(4)?,
+                reasoning_effort: r.get(5)?,
+                title: r.get(6)?,
+                pinned: r.get::<i64>(7)? != 0,
+                updated_ms: r.get(8)?,
             })
         })
     })
@@ -781,11 +883,7 @@ pub fn import_claude_sessions(workspace: &Path) {
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
         return;
     };
-    let slug = workspace
-        .display()
-        .to_string()
-        .replace('/', "-")
-        .replace('.', "-");
+    let slug = workspace.display().to_string().replace(['/', '.'], "-");
     let dir = home.join(".claude/projects").join(&slug);
     let Ok(rd) = std::fs::read_dir(&dir) else {
         return;
@@ -1013,5 +1111,37 @@ mod tests {
         assert!(list(Path::new("/Volumes/Data/oxide-test-import"), 10).is_empty());
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn session_meta_preserves_runtime_config() {
+        let id = format!("session-meta-runtime-{}-{}", std::process::id(), now_ms());
+        let workspace = Path::new("/Volumes/Data/oxide-session-meta-test");
+
+        append_with_config(
+            &id,
+            workspace,
+            "chatgpt",
+            "gpt-5.5",
+            "coding",
+            "high",
+            "user",
+            "Test runtime config metadata",
+        );
+
+        let row = meta(&id).unwrap();
+        assert_eq!(row.provider, "chatgpt");
+        assert_eq!(row.model, "gpt-5.5");
+        assert_eq!(row.harness, "coding");
+        assert_eq!(row.reasoning_effort, "high");
+
+        set_session_config(&id, "claude", "claude-fable-5", "debug", "max");
+        let row = meta(&id).unwrap();
+        assert_eq!(row.provider, "claude");
+        assert_eq!(row.model, "claude-fable-5");
+        assert_eq!(row.harness, "debug");
+        assert_eq!(row.reasoning_effort, "max");
+
+        delete(&id);
     }
 }

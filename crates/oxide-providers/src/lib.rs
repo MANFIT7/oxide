@@ -6,9 +6,16 @@
 //! and is used for offline/dev runs and tests.
 
 mod anthropic;
+mod catalog;
 mod chatgpt;
 mod cli;
 mod openai;
+pub use catalog::{
+    default_model_for_provider, diagnose_provider, diagnose_providers, fast_model_for_provider,
+    list_provider_capabilities, list_provider_models, list_providers, provider_info,
+    DiagnosticStatus, ProviderAuth, ProviderCapability, ProviderDiagnostic, ProviderInfo,
+    ProviderKind, ProviderModel, ProviderStability,
+};
 pub use cli::{ClaudeCliProvider, ClaudeInteractiveProvider, CodexCliProvider};
 
 use async_trait::async_trait;
@@ -119,6 +126,15 @@ pub enum StreamItem {
         id: String,
         name: String,
         arguments: serde_json::Value,
+    },
+    /// Partial provider-native tool arguments while the model is still
+    /// streaming them. This is UI-only preview data; the engine waits for the
+    /// final `ToolCall` before executing anything.
+    ToolInputDelta {
+        id: String,
+        name: String,
+        delta: String,
+        accumulated: String,
     },
     /// A provider-native CLI command started.
     CommandStarted {
@@ -246,9 +262,9 @@ impl Provider for MockPlanProvider {
     }
 }
 
-/// Scripted provider for tests/demos: emits one `write_file` tool call then a
-/// short reply. Drives the full tool-routing/approval/sandbox path without a
-/// network or API key.
+/// Scripted provider for tests/demos: emits one tool call then a short reply.
+/// Drives the full tool-routing/approval/sandbox path without a network or API
+/// key.
 pub struct MockToolProvider;
 
 #[async_trait]
@@ -261,6 +277,45 @@ impl Provider for MockToolProvider {
         // Terminate the agentic loop once the tool has run.
         if req.messages.iter().any(|m| matches!(m.role, Role::Tool)) {
             let _ = sink.send(StreamItem::TextDelta("done.".to_string())).await;
+            let _ = sink.send(StreamItem::Done).await;
+            return Ok(());
+        }
+        let wants_ui = req.messages.iter().any(|m| {
+            if !matches!(m.role, Role::User) {
+                return false;
+            }
+            let content = m.content.to_ascii_lowercase();
+            content.contains("ui spec") || content.contains("ui artifact")
+        });
+        if wants_ui {
+            let _ = sink
+                .send(StreamItem::ToolCall {
+                    id: "m1".into(),
+                    name: "render_ui_spec".to_string(),
+                    arguments: serde_json::json!({
+                        "spec": {
+                            "title": "Mock UI",
+                            "root": {
+                                "type": "card",
+                                "props": {
+                                    "title": "Mock UI",
+                                    "caption": "Rust-native structured artifact"
+                                },
+                                "children": [
+                                    {
+                                        "type": "metric",
+                                        "props": {
+                                            "label": "Status",
+                                            "value": "Rendered",
+                                            "tone": "success"
+                                        }
+                                    }
+                                ]
+                            }
+                        }
+                    }),
+                })
+                .await;
             let _ = sink.send(StreamItem::Done).await;
             return Ok(());
         }
@@ -362,6 +417,9 @@ pub fn http_client() -> reqwest::Client {
 }
 
 pub fn build(provider: &str) -> Box<dyn Provider> {
+    let provider = provider_info(provider)
+        .map(|info| info.id)
+        .unwrap_or("echo");
     match provider {
         "openai" => Box::new(openai::OpenAiProvider::from_env()),
         "gemini" => Box::new(openai::OpenAiProvider::from_env_compatible(
@@ -414,5 +472,17 @@ mod tests {
         assert_eq!(build("deepseek").name(), "deepseek");
         assert_eq!(build("mistral").name(), "mistral");
         assert_eq!(build("claude_interactive").name(), "claude_interactive");
+    }
+
+    #[test]
+    fn catalog_entries_resolve_to_matching_runtime_provider() {
+        for info in list_providers() {
+            assert_eq!(build(info.id).name(), info.id);
+        }
+    }
+
+    #[test]
+    fn unknown_provider_still_falls_back_to_echo() {
+        assert_eq!(build("unknown").name(), "echo");
     }
 }

@@ -7,6 +7,7 @@
 //! workspace and live-reconfigures the engine (persisted to `oxide.toml`).
 
 mod board;
+mod hermes;
 mod preview_proxy;
 mod update;
 
@@ -15,7 +16,10 @@ use dioxus::prelude::*;
 use futures::StreamExt;
 use oxide_config::Config;
 use oxide_core::{automation, EngineHandle};
-use oxide_protocol::{ApprovalDecision, ApprovalPolicy, Event, Op, SandboxPolicy};
+use oxide_protocol::{
+    ApprovalDecision, ApprovalPolicy, DesignEdit, DesignPatchProposal, DesignSelection, Event, Op,
+    SandboxPolicy, SubagentControlAction, UiNode, UiNodeKind, UiSpec, UiTone,
+};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -265,7 +269,7 @@ fn workspace_of(config: &Config) -> PathBuf {
     // No folder chosen yet (welcome state). Avoid root "/" — fall back to HOME
     // so the file tree isn't the whole filesystem.
     match std::env::current_dir().ok() {
-        Some(p) if p != PathBuf::from("/") => p,
+        Some(p) if p.as_path() != Path::new("/") => p,
         _ => std::env::var_os("HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(".")),
@@ -325,6 +329,8 @@ enum Author {
     User,
     Agent,
     Note,
+    /// Rust-native structured UI artifact (json-render pattern without a JS runtime).
+    UiSpec,
     /// A reviewable file diff: (path, checkpoint id to rewind).
     Diff(String, u64),
     /// A tool activity row (terminal/edit/read/…). `key` is the stable
@@ -595,6 +601,11 @@ fn activity_label(tool: &str, args: &serde_json::Value) -> String {
         "browser_eval" => ("globe", "Evaluate", short(s("script"))),
         "browser_click" => ("globe", "Click", s("selector").to_string()),
         "browser_type" => ("globe", "Type", s("selector").to_string()),
+        "design_read_system" => ("palette", "Read design", s("path").to_string()),
+        "design_extract_tokens" => ("palette", "Extract tokens", s("source").to_string()),
+        "design_snapshot" => ("palette", "Design snapshot", s("url").to_string()),
+        "design_review" => ("palette", "Review design", String::new()),
+        "design_propose_patch" => ("palette", "Propose design patch", String::new()),
         "todo_write" => {
             let n = args
                 .get("todos")
@@ -623,6 +634,153 @@ fn activity_label(tool: &str, args: &serde_json::Value) -> String {
         other => ("spark", "Tool", other.to_string()),
     };
     format!("{icon}\t{verb}\t{detail}")
+}
+
+fn design_string(value: &serde_json::Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+fn design_selection_from_value(value: &serde_json::Value) -> DesignSelection {
+    let mut styles = std::collections::BTreeMap::new();
+    if let Some(obj) = value.get("styles").and_then(|v| v.as_object()) {
+        for (key, val) in obj {
+            if let Some(s) = val.as_str() {
+                styles.insert(key.clone(), s.to_string());
+            }
+        }
+    }
+    DesignSelection {
+        selector: design_string(value, "selector"),
+        component: design_string(value, "component"),
+        source: design_string(value, "source"),
+        text: design_string(value, "text"),
+        html: design_string(value, "html"),
+        styles,
+    }
+}
+
+fn upsert_design_edit(
+    edits: &mut Vec<(String, String, String)>,
+    property: String,
+    old_value: String,
+    new_value: String,
+) {
+    if let Some(existing) = edits.iter_mut().find(|(prop, _, _)| *prop == property) {
+        existing.2 = new_value;
+    } else {
+        edits.push((property, old_value, new_value));
+    }
+}
+
+fn design_edit_values(edits: &[(String, String, String)]) -> Vec<DesignEdit> {
+    edits
+        .iter()
+        .map(|(property, old_value, new_value)| DesignEdit {
+            property: property.clone(),
+            old_value: old_value.clone(),
+            new_value: new_value.clone(),
+        })
+        .collect()
+}
+
+fn build_design_apply_prompt(
+    selection: &DesignSelection,
+    edits: &[DesignEdit],
+    note: &str,
+) -> String {
+    let proposal = DesignPatchProposal {
+        selection: selection.clone(),
+        edits: edits.to_vec(),
+        instruction: note.trim().to_string(),
+    };
+    let mut spec = String::from("Apply these Design Workbench edits to the SOURCE CODE.\n");
+    spec.push_str("- Find the element in the codebase; prefer existing design tokens/classes over raw values.\n");
+    spec.push_str("- Keep motion purposeful and add reduced-motion coverage for transform/scale/position animation.\n");
+    spec.push_str("- After editing, verify the rendered UI or run the relevant build/check.\n\n");
+    spec.push_str(&format!("- selector: {}\n", proposal.selection.selector));
+    if !proposal.selection.component.is_empty() {
+        spec.push_str(&format!(
+            "- component: <{}>\n",
+            proposal.selection.component
+        ));
+    }
+    if !proposal.selection.source.is_empty() {
+        spec.push_str(&format!("- source: {}\n", proposal.selection.source));
+    }
+    if !proposal.selection.text.is_empty() {
+        spec.push_str(&format!("- text: {:?}\n", proposal.selection.text));
+    }
+    if !proposal.selection.html.is_empty() {
+        spec.push_str(&format!("- html: {}\n", proposal.selection.html));
+    }
+    spec.push_str("- edits:\n");
+    for edit in &proposal.edits {
+        if edit.property == "text" {
+            spec.push_str(&format!("  - text -> {:?}\n", edit.new_value));
+        } else {
+            spec.push_str(&format!(
+                "  - {}: {} -> {}\n",
+                edit.property, edit.old_value, edit.new_value
+            ));
+        }
+    }
+    if !proposal.instruction.is_empty() {
+        spec.push_str("\nReview note:\n");
+        spec.push_str(&proposal.instruction);
+        spec.push('\n');
+    }
+    spec
+}
+
+fn tool_input_preview_label(tool: &str, accumulated: &str) -> String {
+    let short = accumulated
+        .trim()
+        .replace(['\n', '\r', '\t'], " ")
+        .chars()
+        .take(140)
+        .collect::<String>();
+    let detail = if short.is_empty() {
+        tool.to_string()
+    } else {
+        format!("{tool} · {short}")
+    };
+    format!("spark\tPreparing\t{detail}")
+}
+
+fn upsert_tool_input_preview(
+    messages: &mut Vec<ChatMsg>,
+    call_id: String,
+    tool: String,
+    accumulated: String,
+) {
+    if call_id.is_empty() {
+        return;
+    }
+    let text = tool_input_preview_label(&tool, &accumulated);
+    if let Some(idx) = activity_idx(messages, &call_id) {
+        messages[idx].text = text;
+        if let Author::Activity { running, ok, .. } = &mut messages[idx].author {
+            *running = true;
+            *ok = true;
+        }
+    } else {
+        buf_push_activity(
+            messages,
+            ChatMsg {
+                author: Author::Activity {
+                    running: true,
+                    ok: true,
+                    key: Some(call_id),
+                },
+                text,
+            },
+        );
+    }
 }
 
 fn command_activity_label(command: &str, background: bool) -> String {
@@ -668,6 +826,37 @@ struct ChatMsg {
     text: String,
 }
 
+fn ui_spec_message(spec: UiSpec) -> ChatMsg {
+    ChatMsg {
+        author: Author::UiSpec,
+        text: serde_json::to_string(&spec).unwrap_or_else(|_| "{}".to_string()),
+    }
+}
+
+fn parse_ui_spec_message(text: &str) -> Result<UiSpec, String> {
+    let spec: UiSpec =
+        serde_json::from_str(text).map_err(|e| format!("ui spec parse error: {e}"))?;
+    spec.validate()?;
+    Ok(spec)
+}
+
+#[component]
+fn SlotText(text: String, #[props(default)] reverse: bool) -> Element {
+    let dir = if reverse { "down" } else { "up" };
+    rsx! {
+        span { class: "slot-text {dir}", aria_label: "{text}",
+            for (i, ch) in text.chars().enumerate() {
+                span {
+                    class: "slot-char",
+                    style: "--i:{i}",
+                    aria_hidden: "true",
+                    if ch == ' ' { "\u{00a0}" } else { "{ch}" }
+                }
+            }
+        }
+    }
+}
+
 /// Commands sent into the engine coroutine.
 enum EngineCmd {
     /// `engine` is the full prompt (with mention/skill/MCP context); `display`
@@ -698,6 +887,10 @@ enum EngineCmd {
         id: u64,
     },
     SetHistory(Vec<(String, String)>),
+    SubagentControl {
+        worker_id: String,
+        action: SubagentControlAction,
+    },
     Interrupt,
 }
 
@@ -708,6 +901,8 @@ struct AgentTab {
     title: String,
     provider: String,
     model: String,
+    harness: String,
+    reasoning_effort: String,
     messages: Vec<ChatMsg>,
     /// "gui" = chat, "tui" = embedded terminal running a CLI.
     mode: String,
@@ -800,6 +995,213 @@ struct CommandLog {
     ok: bool,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VisualFixtureMode {
+    Streaming,
+}
+
+impl VisualFixtureMode {
+    fn from_env() -> Option<Self> {
+        match std::env::var("OXIDE_GUI_VISUAL_FIXTURE").ok().as_deref() {
+            Some("streaming") => Some(Self::Streaming),
+            _ => None,
+        }
+    }
+}
+
+fn visual_fixture_messages(mode: Option<VisualFixtureMode>) -> Vec<ChatMsg> {
+    if !matches!(mode, Some(VisualFixtureMode::Streaming)) {
+        return Vec::new();
+    }
+    vec![
+        ChatMsg {
+            author: Author::User,
+            text: "Audit the Oxide GUI motion states and harden the harness parity pass."
+                .to_string(),
+        },
+        ChatMsg {
+            author: Author::Activity {
+                running: true,
+                ok: true,
+                key: Some("visual-tool".to_string()),
+            },
+            text: tool_input_preview_label(
+                "browser_search",
+                "{\"query\":\"oxide gui visual qa cursor parity\"}",
+            ),
+        },
+        ChatMsg {
+            author: Author::Activity {
+                running: true,
+                ok: true,
+                key: Some("visual-command".to_string()),
+            },
+            text: command_activity_label(
+                "cargo test -p oxide-core gui_visual_fixture_screenshot",
+                false,
+            ),
+        },
+        ui_spec_message(visual_fixture_ui_spec()),
+        ChatMsg {
+            author: Author::Agent,
+            text: String::new(),
+        },
+    ]
+}
+
+fn visual_fixture_ui_spec() -> UiSpec {
+    UiSpec {
+        title: Some("Cursor-grade Visual QA".to_string()),
+        root: UiNode {
+            id: Some("visual-qa-root".to_string()),
+            kind: UiNodeKind::Card,
+            props: oxide_protocol::UiProps {
+                title: Some("Rust-native UI Spec".to_string()),
+                caption: Some("Rendered by Dioxus from a typed Oxide protocol spec.".to_string()),
+                ..Default::default()
+            },
+            children: vec![
+                UiNode {
+                    id: Some("metrics".to_string()),
+                    kind: UiNodeKind::Row,
+                    props: Default::default(),
+                    children: vec![
+                        UiNode {
+                            id: Some("state".to_string()),
+                            kind: UiNodeKind::Metric,
+                            props: oxide_protocol::UiProps {
+                                label: Some("Native state".to_string()),
+                                value: Some("streaming".to_string()),
+                                tone: Some(UiTone::Info),
+                                ..Default::default()
+                            },
+                            children: Vec::new(),
+                        },
+                        UiNode {
+                            id: Some("qa".to_string()),
+                            kind: UiNodeKind::Metric,
+                            props: oxide_protocol::UiProps {
+                                label: Some("Visual QA".to_string()),
+                                value: Some("seeded".to_string()),
+                                tone: Some(UiTone::Success),
+                                ..Default::default()
+                            },
+                            children: Vec::new(),
+                        },
+                    ],
+                },
+                UiNode {
+                    id: Some("table".to_string()),
+                    kind: UiNodeKind::Table,
+                    props: oxide_protocol::UiProps {
+                        columns: vec![
+                            oxide_protocol::UiTableColumn {
+                                key: "layer".to_string(),
+                                label: "Layer".to_string(),
+                            },
+                            oxide_protocol::UiTableColumn {
+                                key: "status".to_string(),
+                                label: "Status".to_string(),
+                            },
+                        ],
+                        rows: vec![
+                            std::collections::BTreeMap::from([
+                                ("layer".to_string(), serde_json::json!("Protocol")),
+                                ("status".to_string(), serde_json::json!("typed")),
+                            ]),
+                            std::collections::BTreeMap::from([
+                                ("layer".to_string(), serde_json::json!("GUI")),
+                                ("status".to_string(), serde_json::json!("Dioxus")),
+                            ]),
+                        ],
+                        ..Default::default()
+                    },
+                    children: Vec::new(),
+                },
+            ],
+        },
+    }
+}
+
+fn visual_fixture_thinking(mode: Option<VisualFixtureMode>) -> String {
+    if matches!(mode, Some(VisualFixtureMode::Streaming)) {
+        "Checking streamed tool arguments, reasoning placement, edit shimmer, and native window capture."
+            .to_string()
+    } else {
+        String::new()
+    }
+}
+
+fn visual_fixture_status(mode: Option<VisualFixtureMode>) -> String {
+    if matches!(mode, Some(VisualFixtureMode::Streaming)) {
+        "Running native GUI visual fixture".to_string()
+    } else {
+        String::new()
+    }
+}
+
+fn visual_fixture_subagents(mode: Option<VisualFixtureMode>) -> Vec<SubagentCard> {
+    if !matches!(mode, Some(VisualFixtureMode::Streaming)) {
+        return Vec::new();
+    }
+    vec![SubagentCard {
+        worker_id: "visual-motion-auditor".to_string(),
+        profile: "reviewer".to_string(),
+        task: "GUI motion parity".to_string(),
+        summary: "Auditing waiting, reasoning, activity, and edit-review states.".to_string(),
+        running: true,
+        ok: true,
+        logs: vec![CommandLog {
+            command_id: "visual-check".to_string(),
+            command: "python3 scripts/gui-visual-qa.py --runtime".to_string(),
+            output: "Checking fixture selectors and PNG pixel sanity...".to_string(),
+            running: true,
+            ok: true,
+        }],
+    }]
+}
+
+fn visual_fixture_turn_edits(
+    mode: Option<VisualFixtureMode>,
+) -> Vec<(String, u32, u32, u64, String)> {
+    if !matches!(mode, Some(VisualFixtureMode::Streaming)) {
+        return Vec::new();
+    }
+    vec![
+        (
+            "crates/oxide-gui/src/lib.rs".to_string(),
+            0,
+            0,
+            0,
+            String::new(),
+        ),
+        (
+            "scripts/gui-native-visual-smoke.py".to_string(),
+            64,
+            3,
+            42,
+            "@@ visual smoke @@\n+ capture native window region\n+ validate PNG pixels\n"
+                .to_string(),
+        ),
+    ]
+}
+
+fn visual_fixture_todos(mode: Option<VisualFixtureMode>) -> Vec<(String, String)> {
+    if !matches!(mode, Some(VisualFixtureMode::Streaming)) {
+        return Vec::new();
+    }
+    vec![
+        (
+            "Verify native Dioxus screenshot artifact".to_string(),
+            "in_progress".to_string(),
+        ),
+        (
+            "Record remaining golden-diff follow-up".to_string(),
+            "pending".to_string(),
+        ),
+    ]
+}
+
 #[derive(Clone, PartialEq)]
 struct ReplayRow {
     role: String,
@@ -883,9 +1285,6 @@ fn chatgpt_status() -> Option<String> {
     Some(format!("Connected · {mode}"))
 }
 
-/// Build the prompt (mode prefixes + mention/skill context) and submit it.
-#[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 /// JS: report the in-progress `@query` at the caret + whether the editor is empty.
 const CE_QUERY_JS: &str = r#"
 const el=document.getElementById('ce-input');
@@ -974,6 +1373,44 @@ return true;
     )
 }
 
+fn clipboard_write_js(text: &str) -> String {
+    let text = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".into());
+    format!(
+        r#"
+const text = {text};
+if (navigator.clipboard && navigator.clipboard.writeText) {{
+  navigator.clipboard.writeText(text).catch(() => fallbackCopy(text));
+  return true;
+}}
+return fallbackCopy(text);
+
+function fallbackCopy(value) {{
+const ta = document.createElement('textarea');
+ta.value = value;
+ta.setAttribute('readonly', '');
+ta.style.position = 'fixed';
+ta.style.top = '-9999px';
+ta.style.left = '-9999px';
+document.body.appendChild(ta);
+ta.select();
+try {{
+  return document.execCommand('copy');
+}} finally {{
+  document.body.removeChild(ta);
+}}
+}}
+"#,
+        text = text
+    )
+}
+
+fn copy_text_to_clipboard(text: String) {
+    spawn(async move {
+        let js = clipboard_write_js(&text);
+        let _ = dioxus::document::eval(&js).join::<bool>().await;
+    });
+}
+
 /// Split user text into `(is_mention, text)` segments — `@word` at a word
 /// boundary becomes a mention pill.
 /// Strip the prompt scaffolding the composer injects (context files, MCP/skill
@@ -1004,7 +1441,7 @@ fn save_attachments(ws: &Path, atts: &[String]) -> Vec<String> {
             "png"
         };
         let Ok(bytes) =
-            base64::engine::general_purpose::STANDARD.decode(src[comma + 1..].as_bytes())
+            base64::engine::general_purpose::STANDARD.decode(&src.as_bytes()[comma + 1..])
         else {
             continue;
         };
@@ -1052,7 +1489,7 @@ fn text_attachment_name(rel_path: &str) -> String {
 /// Human token count: 272_000 → "272k", 1_000_000 → "1M".
 fn fmt_tokens(n: u64) -> String {
     if n >= 1_000_000 {
-        if n % 1_000_000 == 0 {
+        if n.is_multiple_of(1_000_000) {
             format!("{}M", n / 1_000_000)
         } else {
             format!("{:.1}M", n as f64 / 1_000_000.0)
@@ -1186,8 +1623,6 @@ fn mention_label(token: &str) -> String {
         .to_string()
 }
 
-#[allow(clippy::too_many_arguments)]
-
 /// Serialize the contenteditable composer, build the prompt, and submit it.
 #[allow(clippy::too_many_arguments)]
 async fn submit_ce(
@@ -1245,7 +1680,7 @@ why it's wrong, and the concrete fix. If the diff is clean, say so plainly.{}\n\
         if *streaming.read() {
             queue.write().push(prompt);
         } else {
-            let _ = engine.send(EngineCmd::Submit {
+            engine.send(EngineCmd::Submit {
                 engine: prompt,
                 display: "/review (Bugbot)".into(),
             });
@@ -1411,7 +1846,7 @@ why it's wrong, and the concrete fix. If the diff is clean, say so plainly.{}\n\
     if !steer && *streaming.read() {
         queue.write().push(text);
     } else {
-        let _ = engine.send(EngineCmd::Submit {
+        engine.send(EngineCmd::Submit {
             engine: text,
             display,
         });
@@ -1596,6 +2031,7 @@ fn sync_board_issues(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_automation_turn(
     workspace: PathBuf,
     spec: automation::AutomationSpec,
@@ -1618,7 +2054,7 @@ fn run_automation_turn(
                 queue.write().push(prompt);
                 status.set(format!("Queued automation: {}", spec.name));
             } else {
-                let _ = engine.send(EngineCmd::Submit {
+                engine.send(EngineCmd::Submit {
                     engine: prompt,
                     display: label,
                 });
@@ -1655,32 +2091,18 @@ fn set_access_mode(
     c.approval_policy = approval;
     c.sandbox = sandbox;
     cfg.set(c.clone());
-    let _ = engine.send(EngineCmd::Reconfigure(c));
+    engine.send(EngineCmd::Reconfigure(c));
     show_access.set(false);
 }
 
-/// Available harness ids: builtins + manifests scanned from `dir`.
-fn list_harnesses(dir: &Path) -> Vec<String> {
-    let mut out = vec!["default".to_string(), "hermes".to_string()];
-    if let Ok(rd) = std::fs::read_dir(dir) {
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.extension().and_then(|x| x.to_str()) == Some("toml") {
-                if let Ok(text) = std::fs::read_to_string(&p) {
-                    if let Some(id) = text
-                        .lines()
-                        .find_map(|l| l.trim().strip_prefix("id ="))
-                        .map(|v| v.trim().trim_matches('"').to_string())
-                    {
-                        if !out.contains(&id) {
-                            out.push(id);
-                        }
-                    }
-                }
-            }
-        }
+/// Available harness ids from the same registry path used by the engine.
+fn list_harnesses(config: &Config) -> Vec<String> {
+    let mut registry = oxide_harness::Registry::with_builtins();
+    let workspace = Some(workspace_of(config));
+    for dir in oxide_harness::manifest_dirs(config.harness_dir.as_deref(), workspace.as_deref()) {
+        let _ = registry.load_dir(&dir);
     }
-    out
+    registry.ids()
 }
 
 /// Available slash commands `(name, description)` matching `query`.
@@ -2314,6 +2736,25 @@ fn open_session_tab(
     title: String,
 ) {
     let loaded = load_session(&path);
+    let session_runtime = |meta: Option<&oxide_core::db::SessionMeta>, base: &Config| {
+        let provider = meta
+            .map(|m| m.provider.clone())
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| base.provider.clone());
+        let model = meta
+            .map(|m| m.model.clone())
+            .filter(|m| !m.is_empty())
+            .unwrap_or_else(|| base.model.clone());
+        let harness = meta
+            .map(|m| m.harness.clone())
+            .filter(|h| !h.is_empty())
+            .unwrap_or_else(|| base.harness.clone());
+        let effort = meta
+            .map(|m| m.reasoning_effort.clone())
+            .filter(|e| !e.is_empty())
+            .unwrap_or_else(|| base.reasoning_effort.clone());
+        (provider, model, harness, effort)
+    };
     // If the current tab is mid-turn, NEVER replace it (that would kill its
     // engine and abort the running task). Open the session in a NEW tab instead
     // so folder A keeps working while you go look at folder B — synara-style.
@@ -2330,18 +2771,17 @@ fn open_session_tab(
                 t.messages = messages.peek().clone();
             }
             let meta = oxide_core::db::meta(&sid(&path));
-            let prov = meta
-                .as_ref()
-                .map(|m| m.provider.clone())
-                .filter(|p| !p.is_empty())
-                .unwrap_or_else(|| cfg.peek().provider.clone());
+            let base_cfg = cfg.peek().clone();
+            let (prov, model, harness, effort) = session_runtime(meta.as_ref(), &base_cfg);
             let id = *next_id.peek();
             next_id.set(id + 1);
             tabs.write().push(AgentTab {
                 id,
                 title: title.clone(),
                 provider: prov.clone(),
-                model: String::new(),
+                model: model.clone(),
+                harness: harness.clone(),
+                reasoning_effort: effort.clone(),
                 messages: loaded.clone(),
                 mode: "gui".into(),
                 bin: String::new(),
@@ -2349,9 +2789,11 @@ fn open_session_tab(
             });
             let idx = tabs.peek().len() - 1;
             active_tab.set(idx);
-            let mut c = cfg.peek().clone();
+            let mut c = base_cfg;
             c.provider = prov;
-            c.model = String::new();
+            c.model = model;
+            c.harness = harness;
+            c.reasoning_effort = effort;
             if let Some(ws) = oxide_core::db::meta(&sid(&path))
                 .map(|m| PathBuf::from(m.workspace))
                 .filter(|w| !w.as_os_str().is_empty())
@@ -2364,7 +2806,7 @@ fn open_session_tab(
             }
             c.resume_path = Some(path);
             cfg.set(c.clone());
-            let _ = engine.send(EngineCmd::SwitchTab {
+            engine.send(EngineCmd::SwitchTab {
                 id,
                 conf: c,
                 msgs: loaded,
@@ -2384,19 +2826,18 @@ fn open_session_tab(
         .map(|m| PathBuf::from(&m.workspace))
         .filter(|w| !w.as_os_str().is_empty());
     let mut c = cfg.read().clone();
-    // Adopt the session's own provider (a Claude TUI session stays Claude, not
-    // whatever the composer was last set to).
-    let sess_provider = meta
-        .as_ref()
-        .map(|m| m.provider.clone())
-        .unwrap_or_default();
-    if !sess_provider.is_empty() && sess_provider != c.provider {
-        c.provider = sess_provider.clone();
-        c.model = String::new();
-        if let Some(t) = tabs.write().get_mut(cur) {
-            t.provider = sess_provider;
-            t.model = String::new();
-        }
+    // Adopt the session's own runtime mode (provider/model/harness/effort), not
+    // whatever the composer was last set to.
+    let (sess_provider, sess_model, sess_harness, sess_effort) = session_runtime(meta.as_ref(), &c);
+    c.provider = sess_provider.clone();
+    c.model = sess_model.clone();
+    c.harness = sess_harness.clone();
+    c.reasoning_effort = sess_effort.clone();
+    if let Some(t) = tabs.write().get_mut(cur) {
+        t.provider = sess_provider;
+        t.model = sess_model;
+        t.harness = sess_harness;
+        t.reasoning_effort = sess_effort;
     }
     if let Some(ws) = session_ws {
         if c.workspace.as_deref() != Some(ws.as_path()) {
@@ -2421,8 +2862,8 @@ fn open_session_tab(
     cfg.set(c.clone());
     // The tab's CONTENT changed (different session) — its old engine, if any,
     // holds the old history. Drop it; a fresh one resumes this session lazily.
-    let _ = engine.send(EngineCmd::CloseTab(tab_id));
-    let _ = engine.send(EngineCmd::SwitchTab {
+    engine.send(EngineCmd::CloseTab(tab_id));
+    engine.send(EngineCmd::SwitchTab {
         id: tab_id,
         conf: c,
         msgs: loaded,
@@ -2444,12 +2885,13 @@ fn load_session(path: &Path) -> Vec<ChatMsg> {
     let mut out: Vec<ChatMsg> = rows
         .into_iter()
         .filter_map(|(role, content)| {
-            if !matches!(role.as_str(), "user" | "assistant" | "summary") {
+            if !matches!(role.as_str(), "user" | "assistant" | "summary" | "ui_spec") {
                 return None;
             }
             let author = match role.as_str() {
                 "user" => Author::User,
                 "assistant" => Author::Agent,
+                "ui_spec" => Author::UiSpec,
                 _ => Author::Note,
             };
             Some(ChatMsg {
@@ -2471,6 +2913,7 @@ fn replay_role_label(role: &str) -> &'static str {
         "assistant" => "Assistant",
         "summary" => "Summary",
         "event" => "Audit",
+        "ui_spec" => "UI",
         "meta" => "Meta",
         "tool" => "Tool",
         "system" => "System",
@@ -2494,6 +2937,20 @@ fn parse_replay_row(role: String, content: String) -> ReplayRow {
                 role,
                 title,
                 detail: detail.chars().take(600).collect(),
+            };
+        }
+    }
+    if role == "ui_spec" {
+        if let Ok(spec) = parse_ui_spec_message(&content) {
+            let title = spec
+                .title
+                .as_deref()
+                .or(spec.root.props.title.as_deref())
+                .unwrap_or("Untitled UI");
+            return ReplayRow {
+                role,
+                title: format!("UI · {title}"),
+                detail: "Rust-native structured artifact".to_string(),
             };
         }
     }
@@ -2811,17 +3268,62 @@ fn open_file(mut ui: Ui, path: PathBuf) {
     }
 }
 
+async fn hermes_diff_context(ws: &Path) -> String {
+    let status = run_cmd(ws, "git", &["status", "--short", "--branch"]).await;
+    let diff = run_cmd(ws, "git", &["diff"]).await;
+    let rules = std::fs::read_to_string(ws.join("AGENTS.md"))
+        .or_else(|_| std::fs::read_to_string(ws.join("agents.md")))
+        .unwrap_or_default();
+    let diff: String = diff.chars().take(16_000).collect();
+    let rules: String = rules.chars().take(6_000).collect();
+    format!(
+        "## Git status\n```text\n{}\n```\n\n## Working git diff\n```diff\n{}\n```\n\n## Project rules\n{}",
+        status.trim(),
+        diff.trim(),
+        if rules.trim().is_empty() {
+            "(no AGENTS.md found)"
+        } else {
+            rules.trim()
+        }
+    )
+}
+
+fn submit_hermes_prompt(
+    mut cfg: Signal<Config>,
+    engine: Coroutine<EngineCmd>,
+    streaming: Signal<bool>,
+    mut status: Signal<String>,
+    prompt: String,
+    display: String,
+) {
+    if *streaming.read() {
+        status.set("Finish or stop the current turn before starting Hermes".to_string());
+        return;
+    }
+    let mut next = cfg.read().clone();
+    next.harness = "hermes".to_string();
+    cfg.set(next.clone());
+    engine.send(EngineCmd::Reconfigure(next));
+    engine.send(EngineCmd::Submit {
+        engine: prompt,
+        display,
+    });
+    status.set("Hermes evolve started".to_string());
+}
+
 fn app() -> Element {
     let initial = use_context::<Config>();
+    let visual_fixture = VisualFixtureMode::from_env();
 
     // Live, editable configuration.
     let cfg = use_signal(|| initial.clone());
     let ws0 = workspace_of(&initial);
 
     // Chat state.
-    let mut messages = use_signal(Vec::<ChatMsg>::new);
+    let mut messages = use_signal(move || visual_fixture_messages(visual_fixture));
     let mut context_limit = use_signal(|| None::<u64>);
-    let mut streaming = use_signal(|| false);
+    let mut streaming =
+        use_signal(move || matches!(visual_fixture, Some(VisualFixtureMode::Streaming)));
 
     // Panels.
     // Environment pane (right): one tabbed home for Files/Terminals/Preview/Diffs.
@@ -2888,6 +3390,7 @@ fn app() -> Element {
     let mut design_mode = use_signal(|| false);
     let mut design_sel = use_signal(|| Option::<serde_json::Value>::None);
     let mut design_edits = use_signal(Vec::<(String, String, String)>::new);
+    let mut design_note = use_signal(String::new);
     let split_panes = use_signal(|| {
         vec![(
             0u64,
@@ -2912,6 +3415,18 @@ fn app() -> Element {
     let automation_prompt = use_signal(|| automation::DEFAULT_PROMPT.to_string());
     let automation_status = use_signal(|| "Automations idle".to_string());
     let automation_confirm_delete = use_signal(|| None::<String>);
+    let hermes_ws = ws0.clone();
+    let hermes_profiles = use_signal(move || hermes::read_profiles(&hermes_ws).unwrap_or_default());
+    let hermes_profile_name = use_signal(|| "Hermes lane".to_string());
+    let hermes_goal =
+        use_signal(|| "Improve Oxide with local-first Hermes-grade agent workflows".to_string());
+    let hermes_validation =
+        use_signal(|| "cargo check -p oxide-gui && cargo test -p oxide-core".to_string());
+    let hermes_review_prompt = use_signal(|| {
+        "DONE only if the change is complete, scoped, validated, and local-first; otherwise list GAPS with exact fixes.".to_string()
+    });
+    let hermes_status = use_signal(|| "Hermes idle".to_string());
+    let hermes_confirm_delete = use_signal(|| None::<String>);
     let mut projects_list = use_signal(Vec::<ProjectGroup>::new);
     let mut session_menu = use_signal(|| None::<PathBuf>);
     // Per-project visible session count. Default is 5; Show more reveals
@@ -2958,13 +3473,17 @@ fn app() -> Element {
     // Agent tabs (multiple agent sessions in one workspace).
     let initial_provider = cfg.read().provider.clone();
     let initial_model = cfg.read().model.clone();
+    let initial_harness = cfg.read().harness.clone();
+    let initial_effort = cfg.read().reasoning_effort.clone();
     let mut tabs = use_signal(|| {
         vec![AgentTab {
             id: 0,
             title: provider_title(&initial_provider).to_string(),
             provider: initial_provider,
             model: initial_model,
-            messages: Vec::new(),
+            harness: initial_harness,
+            reasoning_effort: initial_effort,
+            messages: visual_fixture_messages(visual_fixture),
             mode: "gui".to_string(),
             bin: String::new(),
             session: None,
@@ -2983,7 +3502,7 @@ fn app() -> Element {
     // Inspector (right panel) state — ported from the desktop command center.
     let mut inspector_tab = use_signal(|| "files".to_string());
     let mut timeline = use_signal(Vec::<TimelineItem>::new);
-    let mut subagent_cards = use_signal(Vec::<SubagentCard>::new);
+    let mut subagent_cards = use_signal(move || visual_fixture_subagents(visual_fixture));
     let mut session_replay = use_signal(|| None::<SessionReplay>);
     let mut approvals = use_signal(Vec::<(u64, String, String)>::new);
     let mut checkpoints = use_signal(Vec::<(u64, String)>::new);
@@ -2998,7 +3517,7 @@ fn app() -> Element {
     let mut browser_log = use_signal(Vec::<String>::new);
     let goal_text = use_signal(String::new);
     let mut memory_text = use_signal(String::new);
-    let mut thinking = use_signal(String::new);
+    let mut thinking = use_signal(move || visual_fixture_thinking(visual_fixture));
     // Background tasks the CLI agent started ("running in background") — their
     // result won't stream back, so we surface what they are as persistent chips.
     let mut bg_jobs = use_signal(Vec::<String>::new);
@@ -3013,8 +3532,8 @@ fn app() -> Element {
     // review affordance on that row so reviewed edits read as resolved.
     let mut accepted = use_signal(HashSet::<u64>::new);
     // Edits made this turn: (path, adds, dels, checkpoint).
-    let mut turn_edits = use_signal(Vec::<(String, u32, u32, u64, String)>::new);
-    let mut todos = use_signal(Vec::<(String, String)>::new);
+    let mut turn_edits = use_signal(move || visual_fixture_turn_edits(visual_fixture));
+    let mut todos = use_signal(move || visual_fixture_todos(visual_fixture));
     let mut edits_expanded = use_signal(|| false);
     let mut edits_undone = use_signal(|| false);
     // Two-click confirm for the destructive restore-checkpoint hover button.
@@ -3033,8 +3552,14 @@ fn app() -> Element {
     // Tool/command activity rows are paired to their streamed updates by a stable
     // key stored ON the row (see `activity_idx`), not by a side index map — so a
     // row inserted above the "Done" note can't shift another row's pairing.
-    let mut status = use_signal(String::new);
-    let mut turn_start = use_signal(|| None::<std::time::Instant>);
+    let mut status = use_signal(move || visual_fixture_status(visual_fixture));
+    let mut turn_start = use_signal(move || {
+        if matches!(visual_fixture, Some(VisualFixtureMode::Streaming)) {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        }
+    });
     // Seconds since the turn started (ticks while streaming, shown in the pill).
     let mut elapsed_s = use_signal(|| 0u64);
     use_future(move || async move {
@@ -3375,8 +3900,7 @@ fn app() -> Element {
             .map(|p| {
                 oxide_core::db::load(&sid(&p))
                     .into_iter()
-                    .filter(|(role, _)| role == "summary")
-                    .last()
+                    .rfind(|(role, _)| role == "summary")
                     .map(|(_, content)| content)
                     .unwrap_or_default()
             })
@@ -3807,7 +4331,6 @@ fn app() -> Element {
                             // own session file (bound via Event::SessionPath), so a
                             // model/effort change doesn't mint a new file or attach to
                             // another tab's transcript.
-                            let mut conf = conf;
                             if same_ws {
                                 let cur = *active_tab.peek();
                                 conf.resume_path = tabs.peek().get(cur).and_then(|t| t.session.clone());
@@ -3827,6 +4350,8 @@ fn app() -> Element {
                                 let cur = *active_tab.peek();
                                 let mut tw = tabs.write();
                                 if let Some(t) = tw.get_mut(cur) {
+                                    t.harness = conf.harness.clone();
+                                    t.reasoning_effort = conf.reasoning_effort.clone();
                                     if t.mode == "gui" && t.provider != conf.provider {
                                         let was_default = t.title == provider_title(&t.provider);
                                         t.provider = conf.provider.clone();
@@ -3966,6 +4491,13 @@ fn app() -> Element {
                                 let _ = h.submit(Op::Rewind { checkpoint_id: id }).await;
                             }
                         }
+                        Some(EngineCmd::SubagentControl { worker_id, action }) => {
+                            if let Some(h) = active_id!().and_then(|t| handles.get(&t)) {
+                                let _ = h
+                                    .submit(Op::SubagentControl { worker_id, action })
+                                    .await;
+                            }
+                        }
                         Some(EngineCmd::SetHistory(msgs)) => {
                             if let Some(h) = active_id!().and_then(|t| handles.get(&t)) {
                                 let _ = h.submit(Op::SetHistory { msgs }).await;
@@ -4058,12 +4590,27 @@ fn app() -> Element {
                                 Event::FileDiff { path, diff, checkpoint, .. } => {
                                     buf.push(ChatMsg { author: Author::Diff(path, checkpoint), text: diff });
                                 }
+                                Event::UiSpec { spec, .. } => {
+                                    buf.push(ui_spec_message(*spec));
+                                }
+                                    Event::ToolCallDelta { call_id, tool, accumulated, .. } => {
+                                        upsert_tool_input_preview(buf, call_id, tool, accumulated);
+                                    }
                                     Event::ToolCallBegin { call_id, tool, args, .. } => {
                                         if tool != "ask_user" && tool != "shell" {
-                                            buf_push_activity(buf, ChatMsg {
-                                            author: Author::Activity { running: true, ok: true, key: Some(call_id) },
-                                            text: activity_label(&tool, &args),
-                                        });
+                                            let text = activity_label(&tool, &args);
+                                            if let Some(idx) = activity_idx(buf, &call_id) {
+                                                buf[idx].text = text;
+                                                if let Author::Activity { running, ok, .. } = &mut buf[idx].author {
+                                                    *running = true;
+                                                    *ok = true;
+                                                }
+                                            } else {
+                                                buf_push_activity(buf, ChatMsg {
+                                                    author: Author::Activity { running: true, ok: true, key: Some(call_id) },
+                                                    text,
+                                                });
+                                            }
                                     }
                                 }
                                     Event::ToolCallEnd { call_id, output, ok, .. } => {
@@ -4071,7 +4618,7 @@ fn app() -> Element {
                                         if out.chars().count() > 4000 {
                                             out = out.chars().take(4000).collect::<String>() + "\n… (truncated)";
                                         }
-                                    if let Some(idx) = activity_idx(&buf, &call_id) {
+                                    if let Some(idx) = activity_idx(buf, &call_id) {
                                         if let Author::Activity { running, ok: o, .. } = &mut buf[idx].author {
                                             *running = false;
                                             *o = ok;
@@ -4089,7 +4636,7 @@ fn app() -> Element {
                                         });
                                     }
                                     Event::CommandOutput { command_id, chunk, .. } => {
-                                        if let Some(idx) = activity_idx(&buf, &command_id) {
+                                        if let Some(idx) = activity_idx(buf, &command_id) {
                                             append_activity_output(&mut buf[idx].text, &chunk);
                                         } else {
                                             let mut text = command_activity_label(&command_id, false);
@@ -4098,7 +4645,7 @@ fn app() -> Element {
                                         }
                                     }
                                     Event::CommandFinished { command_id, ok, exit_code, .. } => {
-                                        if let Some(idx) = activity_idx(&buf, &command_id) {
+                                        if let Some(idx) = activity_idx(buf, &command_id) {
                                             {
                                                 let row = &mut buf[idx];
                                                 if let Author::Activity { running, ok: o, .. } = &mut row.author {
@@ -4141,11 +4688,9 @@ fn app() -> Element {
                                     // Background tab done — you're looking elsewhere, always chime.
                                     play_notification_sound(cfg, true);
                                 }
-                                Event::Error { message } => {
-                                    if !message.starts_with("mcp '") {
-                                        buf.push(ChatMsg { author: Author::Note, text: format!("error: {message}") });
-                                        push_toast(toasts, toast_seq, "err", &message.chars().take(120).collect::<String>());
-                                    }
+                                Event::Error { message } if !message.starts_with("mcp '") => {
+                                    buf.push(ChatMsg { author: Author::Note, text: format!("error: {message}") });
+                                    push_toast(toasts, toast_seq, "err", &message.chars().take(120).collect::<String>());
                                 }
                                 _ => {}
                             }
@@ -4183,7 +4728,7 @@ fn app() -> Element {
                                     // persistent chip + activity row so the user sees what's
                                     // running (its result won't stream back this turn).
                                     let label = text.trim_start_matches('⏳').trim().to_string();
-                                    if !label.is_empty() && !bg_jobs.read().iter().any(|j| *j == label) {
+                                    if !label.is_empty() && !bg_jobs.read().contains(&label) {
                                         bg_jobs.write().push(label.clone());
                                     }
                                     status.set(format!("Background · {label}"));
@@ -4197,7 +4742,8 @@ fn app() -> Element {
                                     }
                                     // Route through push_activity! so it lands above a trailing
                                     // "Done" note like every other activity row (never below it).
-                                    push_activity!(ChatMsg { author: Author::Activity { running: false, ok: true, key: None }, text: row });
+                                    let running = verb.eq_ignore_ascii_case("running");
+                                    push_activity!(ChatMsg { author: Author::Activity { running, ok: true, key: None }, text: row });
                                     } else if text.starts_with('⚙') {
                                         // CLI-driver tool activity: live shimmer + an activity
                                         // trail row in the chat (synara-style).
@@ -4269,6 +4815,15 @@ fn app() -> Element {
                                     status.set(String::new());
                                     todos.write().clear();
                                     subagent_cards.write().clear();
+                                    turn_edits.write().clear();
+                                    {
+                                        let mut m = messages.write();
+                                        for c in m.iter_mut() {
+                                            if let Author::Activity { running, .. } = &mut c.author {
+                                                *running = false;
+                                            }
+                                        }
+                                    }
                                 }
                             }
                             Event::ContextWindow { limit } => context_limit.set(Some(limit)),
@@ -4327,6 +4882,10 @@ fn app() -> Element {
                                     sub,
                                 });
                             }
+                            Event::UiSpec { spec, .. } => {
+                                messages.write().push(ui_spec_message(*spec));
+                                scroll_chat_bottom_if_sticky();
+                            }
                             Event::SubagentStarted { worker_id, profile, task, .. } => {
                                 subagent_cards.write().push(SubagentCard {
                                     worker_id,
@@ -4340,6 +4899,29 @@ fn app() -> Element {
                                 timeline.write().push(TimelineItem {
                                     title: format!("Subagent · {profile}"),
                                     sub: task,
+                                });
+                                scroll_chat_bottom_if_sticky();
+                            }
+                            Event::SubagentStatus { worker_id, profile, status, detail, .. } => {
+                                {
+                                    let mut cards = subagent_cards.write();
+                                    if let Some(card) = cards.iter_mut().find(|c| c.worker_id == worker_id) {
+                                        card.summary = format!("{status}: {detail}");
+                                    } else {
+                                        cards.push(SubagentCard {
+                                            worker_id,
+                                            profile: profile.clone(),
+                                            task: status.clone(),
+                                            summary: detail.clone(),
+                                            running: true,
+                                            ok: true,
+                                            logs: Vec::new(),
+                                        });
+                                    }
+                                }
+                                timeline.write().push(TimelineItem {
+                                    title: format!("Subagent {status} · {profile}"),
+                                    sub: detail,
                                 });
                                 scroll_chat_bottom_if_sticky();
                             }
@@ -4372,13 +4954,32 @@ fn app() -> Element {
                                 approvals.write().push((request_id, tool.clone(), summary.clone()));
                                 timeline.write().push(TimelineItem { title: format!("Approval needed · {tool}"), sub: summary });
                             }
+                            Event::ToolCallDelta { call_id, tool, accumulated, .. } => {
+                                status.set(format!("Preparing {tool} input…"));
+                                let mut m = messages.write();
+                                upsert_tool_input_preview(&mut m, call_id, tool, accumulated);
+                                scroll_chat_bottom_if_sticky();
+                            }
                             Event::ToolCallBegin { call_id, tool, args, .. } => {
                                 timeline.write().push(TimelineItem { title: format!("⚙ {tool}"), sub: "running…".into() });
                                 // Live shimmer shows WHAT it's doing ("Reading src/lib.rs…"),
                                 // not just a generic verb.
                                 status.set(activity_label(&tool, &args));
                                     if tool != "ask_user" && tool != "shell" {
-                                        push_activity!(ChatMsg { author: Author::Activity { running: true, ok: true, key: Some(call_id) }, text: activity_label(&tool, &args) });
+                                        let text = activity_label(&tool, &args);
+                                        let idx = activity_idx(&messages.read(), &call_id);
+                                        if let Some(idx) = idx {
+                                            let mut m = messages.write();
+                                            if let Some(c) = m.get_mut(idx) {
+                                                c.text = text;
+                                                if let Author::Activity { running, ok, .. } = &mut c.author {
+                                                    *running = true;
+                                                    *ok = true;
+                                                }
+                                            }
+                                        } else {
+                                            push_activity!(ChatMsg { author: Author::Activity { running: true, ok: true, key: Some(call_id) }, text });
+                                        }
                                     }
                             }
                                 Event::ToolCallEnd { call_id, tool, output, ok, .. } => {
@@ -4396,7 +4997,7 @@ fn app() -> Element {
                                         let mut m = messages.write();
                                         if let Some(c) = m.get_mut(idx) {
                                             if let Author::Activity { running, ok: o, .. } = &mut c.author { *running = false; *o = ok; }
-                                            if !out.is_empty() && !(tool == "shell" && activity_has_output(&c.text)) {
+                                            if !(out.is_empty() || tool == "shell" && activity_has_output(&c.text)) {
                                                 c.text.push('\t');
                                                 c.text.push_str(&out);
                                             }
@@ -4525,6 +5126,28 @@ fn app() -> Element {
                             }
                             Event::BrowserSnapshotRequested { url, note, .. } => {
                                 timeline.write().push(TimelineItem { title: format!("📸 snapshot {url}"), sub: note });
+                            }
+                            Event::DesignSnapshotRequested { url, note, .. } => {
+                                if !url.trim().is_empty() {
+                                    preview_url.set(url.clone());
+                                    show_env.set(true);
+                                    env_tab.set("preview".to_string());
+                                    design_mode.set(true);
+                                    spawn(async move { let _ = document::eval("document.querySelector('.preview-frame')?.contentWindow?.postMessage('oxide-design-on','*')").await; });
+                                }
+                                timeline.write().push(TimelineItem { title: format!("Design snapshot {url}"), sub: note });
+                            }
+                            Event::DesignPatchProposed { proposal, .. } => {
+                                timeline.write().push(TimelineItem {
+                                    title: format!("Design patch · {}", proposal.selection.selector),
+                                    sub: format!("{} pending edit(s)", proposal.edits.len()),
+                                });
+                            }
+                            Event::DesignReviewCompleted { review, .. } => {
+                                timeline.write().push(TimelineItem {
+                                    title: format!("Design review · score {}", review.score),
+                                    sub: format!("ok={} · {} finding(s)", review.ok, review.findings.len()),
+                                });
                             }
                             Event::QuestionAsked { request_id, question, options } => {
                                 questions.write().push((request_id, question, options));
@@ -4771,6 +5394,7 @@ fn app() -> Element {
             if *design_mode.read() {
                 design_sel.set(Some(v));
                 design_edits.set(Vec::new());
+                design_note.set(String::new());
                 continue;
             }
             let sel = v["selector"].as_str().unwrap_or("");
@@ -5029,7 +5653,7 @@ fn app() -> Element {
                             status.set(String::new());
                             let cur = *active_tab.read();
                             if let Some(t) = tabs.write().get_mut(cur) { t.messages.clear(); t.title = provider_title(&t.provider).to_string(); }
-                            let _ = engine.send(EngineCmd::Reconfigure(cfg.read().clone()));
+                            engine.send(EngineCmd::Reconfigure(cfg.read().clone()));
                         },
                         Icon { name: "edit" } span { "New chat" }
                     }
@@ -5182,7 +5806,6 @@ fn app() -> Element {
                                     if is_current && !collapsed {
                                         for (i, t) in tabs.read().iter().enumerate() {
                                             {
-                                                let i = i;
                                                 let id = t.id;
                                                 let ttl = if t.title.is_empty() { "New chat".to_string() } else { t.title.clone() };
                                                 let is_active = i == *active_tab.read();
@@ -5431,7 +6054,6 @@ fn app() -> Element {
                         div { class: "agent-tabs-scroll",
                         for (i, t) in tabs.read().iter().enumerate() {
                             {
-                                let i = i;
                                 let id = t.id;
                                 let title = t.title.clone();
                                 let logo = provider_logo(&t.provider);
@@ -5527,7 +6149,13 @@ fn app() -> Element {
                             button { class: "top-btn", onclick: move |_| open_folder(cfg, ui, engine),
                                 Icon { name: "folder" } "Open folder"
                             }
-                            button { class: if *show_env.read() && env_tab.read().as_str() == "files" { "top-btn on" } else { "top-btn" },
+                            button { class: if *show_env.read() && env_tab.read().as_str() == "files" && inspector_tab.read().as_str() == "agents" { "top-btn on" } else { "top-btn" },
+                                onclick: move |_| {
+                                    inspector_tab.set("agents".to_string());
+                                    select_env_tab(env_tab, show_env, env_tab_by_tab, tabs, active_tab, "files", false);
+                                }, Icon { name: "spark" } "Agents"
+                            }
+                            button { class: if *show_env.read() && env_tab.read().as_str() == "files" && inspector_tab.read().as_str() != "agents" { "top-btn on" } else { "top-btn" },
                                 onclick: move |_| {
                                     select_env_tab(env_tab, show_env, env_tab_by_tab, tabs, active_tab, "files", true);
                                 }, Icon { name: "plugins" } "Files"
@@ -5730,6 +6358,13 @@ fn app() -> Element {
                                     }
                                     div { class: "env-card-sep" }
                                     div { class: "env-card-label", "Sources" }
+                                    button { class: "env-card-row", onclick: move |_| {
+                                            inspector_tab.set("agents".to_string());
+                                            select_env_tab(env_tab, show_env, env_tab_by_tab, tabs, active_tab, "files", false);
+                                        },
+                                        Icon { name: "spark" } span { "Agents" }
+                                        span { class: "env-card-badge", "{busy_tabs.read().len()} running" }
+                                    }
                                     div { class: "env-card-anchor",
                                         button { class: "env-card-row", onclick: move |_| {
                                                 let v = *procs_menu.read();
@@ -5931,7 +6566,7 @@ fn app() -> Element {
                                         button { class: if *design_mode.read() { "preview-btn pick on" } else { "preview-btn" }, title: "Design Mode — click an element, edit it live, Apply writes the code", onclick: move |_| {
                                             let v = *design_mode.read();
                                             design_mode.set(!v);
-                                            if v { design_sel.set(None); design_edits.set(Vec::new()); }
+                                            if v { design_sel.set(None); design_edits.set(Vec::new()); design_note.set(String::new()); }
                                             let msg = if v { "'oxide-design-off'" } else { "'oxide-design-on'" };
                                             let js = format!("document.querySelector('.preview-frame')?.contentWindow?.postMessage({msg},'*')");
                                             spawn(async move { let _ = document::eval(&js).await; });
@@ -5960,25 +6595,38 @@ fn app() -> Element {
                                     if *design_mode.read() {
                                         if let Some(sel) = design_sel.read().clone() {
                                             {
-                                                let selector = sel["selector"].as_str().unwrap_or("").to_string();
-                                                let source = sel["source"].as_str().unwrap_or("").to_string();
-                                                let component = sel["component"].as_str().unwrap_or("").to_string();
-                                                let html = sel["html"].as_str().unwrap_or("").to_string();
-                                                let cur_text = sel["text"].as_str().unwrap_or("").to_string();
+                                                let selection = design_selection_from_value(&sel);
+                                                let selector = selection.selector.clone();
+                                                let source = selection.source.clone();
+                                                let component = selection.component.clone();
+                                                let tag = sel["tag"].as_str().unwrap_or("").to_string();
+                                                let cur_text = selection.text.clone();
                                                 let styles = sel["styles"].clone();
+                                                let pending = design_edits.read().clone();
+                                                let pending_count = pending.len();
+                                                let note_value = design_note.read().clone();
+                                                let selection_review = selection.clone();
+                                                let selection_apply = selection.clone();
+                                                let selector_review = selector.clone();
+                                                let selector_apply = selector.clone();
                                                 let props = ["color", "background", "fontSize", "fontWeight", "padding", "margin", "borderRadius"];
                                                 rsx! {
                                                     div { class: "design-panel",
                                                         div { class: "design-head",
                                                             span { class: "design-selector", "{selector}" }
                                                             if !component.is_empty() { span { class: "design-comp", "<{component}>" } }
+                                                            if !tag.is_empty() { span { class: "design-comp", "{tag}" } }
+                                                        }
+                                                        div { class: "design-summary",
+                                                            if !source.is_empty() { span { "source: {source}" } }
+                                                            if !cur_text.is_empty() { span { "text: {cur_text}" } }
                                                         }
                                                         div { class: "design-row",
                                                             span { class: "design-lbl", "text" }
                                                             input { class: "design-input", value: "{cur_text}",
                                                                 onchange: move |e| {
                                                                     let t = e.value();
-                                                                    design_edits.write().push(("text".into(), String::new(), t.clone()));
+                                                                    upsert_design_edit(&mut design_edits.write(), "text".into(), cur_text.clone(), t.clone());
                                                                     let js = format!("document.querySelector('.preview-frame')?.contentWindow?.postMessage({{type:'oxide-text-set',text:{}}},'*')", serde_json::to_string(&t).unwrap_or_default());
                                                                     spawn(async move { let _ = document::eval(&js).await; });
                                                                 } }
@@ -5993,7 +6641,7 @@ fn app() -> Element {
                                                                         input { class: "design-input", value: "{cur}",
                                                                             onchange: move |e| {
                                                                                 let val = e.value();
-                                                                                design_edits.write().push((cssname.to_string(), cur.clone(), val.clone()));
+                                                                                upsert_design_edit(&mut design_edits.write(), cssname.to_string(), cur.clone(), val.clone());
                                                                                 let js = format!("document.querySelector('.preview-frame')?.contentWindow?.postMessage({{type:'oxide-style-set',prop:'{cssname}',value:{}}},'*')", serde_json::to_string(&val).unwrap_or_default());
                                                                                 spawn(async move { let _ = document::eval(&js).await; });
                                                                             } }
@@ -6001,26 +6649,42 @@ fn app() -> Element {
                                                                 }
                                                             }
                                                         }
-                                                        div { class: "design-actions",
-                                                            button { class: "git-act", onclick: move |_| {
-                                                                let edits = design_edits.read().clone();
-                                                                if edits.is_empty() { return; }
-                                                                let mut spec = String::new();
-                                                                spec.push_str(&format!("- selector: {selector}\n"));
-                                                                if !component.is_empty() { spec.push_str(&format!("- component: <{component}>\n")); }
-                                                                if !source.is_empty() { spec.push_str(&format!("- source: {source}\n")); }
-                                                                spec.push_str(&format!("- html: {html}\n- edits:\n"));
-                                                                for (p2, old, newv) in &edits {
-                                                                    if p2 == "text" { spec.push_str(&format!("  - text -> {newv:?}\n")); }
-                                                                    else { spec.push_str(&format!("  - {p2}: {old} -> {newv}\n")); }
+                                                        if pending_count > 0 {
+                                                            div { class: "design-pending",
+                                                                span { class: "design-pending-title", "{pending_count} pending edit(s)" }
+                                                                for (prop, old, newv) in pending.iter().cloned() {
+                                                                    div { class: "design-pending-row",
+                                                                        span { class: "design-pending-prop", "{prop}" }
+                                                                        span { class: "design-pending-val", "{old} → {newv}" }
+                                                                    }
                                                                 }
-                                                                let prompt = format!("Apply these visual edits from Design Mode to the SOURCE CODE (find the element in the codebase; prefer existing design tokens/classes over raw values):\n{spec}");
-                                                                let _ = engine.send(EngineCmd::Submit { engine: prompt, display: format!("🎨 Apply design edits to {selector}") });
+                                                            }
+                                                        }
+                                                        textarea { class: "design-note", placeholder: "Visual review note…", value: "{note_value}",
+                                                            oninput: move |e| design_note.set(e.value())
+                                                        }
+                                                        div { class: "design-actions",
+                                                            button { class: "preview-btn", onclick: move |_| {
+                                                                let edits = design_edit_values(&design_edits.read());
+                                                                let note = design_note.read().clone();
+                                                                let prompt = format!(
+                                                                    "Review this selected UI element before code changes. Use Design Workbench standards: token fit, contrast/accessibility, layout overflow, motion discipline, and source-code implementation risk. Do not edit files unless you find a concrete fix is needed.\n\n{}",
+                                                                    build_design_apply_prompt(&selection_review, &edits, &note)
+                                                                );
+                                                                engine.send(EngineCmd::Submit { engine: prompt, display: format!("Review design edits · {selector_review}") });
+                                                            }, "Review" }
+                                                            button { class: "git-act", onclick: move |_| {
+                                                                let edits = design_edit_values(&design_edits.read());
+                                                                if edits.is_empty() { return; }
+                                                                let prompt = build_design_apply_prompt(&selection_apply, &edits, &design_note.read());
+                                                                engine.send(EngineCmd::Submit { engine: prompt, display: format!("Apply design edits · {selector_apply}") });
                                                                 design_edits.set(Vec::new());
+                                                                design_note.set(String::new());
                                                                 spawn(async move { let _ = document::eval("document.querySelector('.preview-frame')?.contentWindow?.postMessage('oxide-design-reset','*')").await; });
                                                             }, "Apply → code" }
                                                             button { class: "preview-btn", onclick: move |_| {
                                                                 design_edits.set(Vec::new());
+                                                                design_note.set(String::new());
                                                                 spawn(async move { let _ = document::eval("document.querySelector('.preview-frame')?.contentWindow?.postMessage('oxide-design-reset','*')").await; });
                                                             }, "Reset" }
                                                         }
@@ -6047,10 +6711,11 @@ fn app() -> Element {
                         }
                         aside { class: "files-panel",
                             div { class: "insp-tabs",
-                                for (key, label) in [("review","Review"),("files","Files"),("timeline","Timeline"),("sessions","Sessions"),("git","Git"),("memory","Memory"),("goal","Goal"),("browser","Browser"),("approvals","Approvals"),("checkpoints","Checkpoints"),("usage","Usage")] {
+                                for (key, label) in [("agents","Agents"),("review","Review"),("files","Files"),("timeline","Timeline"),("sessions","Sessions"),("git","Git"),("memory","Memory"),("goal","Goal"),("browser","Browser"),("approvals","Approvals"),("checkpoints","Checkpoints"),("usage","Usage")] {
                                     {
                                         let active = *inspector_tab.read() == key;
                                         let badge = match key {
+                                            "agents" => busy_tabs.read().len() + subagent_cards.read().iter().filter(|c| c.running).count(),
                                             "approvals" => approvals.read().len(),
                                             "checkpoints" => checkpoints.read().len(),
                                             "review" => turn_edits.read().len(),
@@ -6071,6 +6736,260 @@ fn app() -> Element {
                             }
                             div { class: "insp-body",
                                 match inspector_tab.read().as_str() {
+                                    "agents" => rsx! {
+                                        {
+                                            let tab_rows = tabs.read().clone();
+                                            let active_idx = *active_tab.read();
+                                            let running_tabs = busy_tabs.read().len();
+                                            let running_subagents = subagent_cards.read().iter().filter(|c| c.running).count();
+                                            let review_count = turn_edits.read().len();
+                                            let artifact_count = messages.read().iter().filter(|m| m.author == Author::UiSpec).count();
+                                            let bg_count = bg_jobs.read().len();
+                                            let split_label = if *show_split.read() { "Split on" } else { "Split" };
+                                            let changes_workspace = workspace.clone();
+                                            let review_workspace = workspace.clone();
+                                            let hermes_workspace = workspace.clone();
+                                            rsx! {
+                                                div { class: "agents-window",
+                                                    div { class: "agents-hero",
+                                                        div {
+                                                            div { class: "agents-kicker", "Local workspace" }
+                                                            div { class: "agents-title", "Agents" }
+                                                            div { class: "agents-sub", "Local agent sessions, sub-agents, review queue, browser context, and artifacts in one control surface." }
+                                                        }
+                                                        div { class: "agents-hero-actions",
+                                                            button { class: "agent-action primary", onclick: move |_| {
+                                                                new_agent_tab(tabs, active_tab, messages, cfg, engine, next_tab_id, "codex", "", "Codex");
+                                                            }, Icon { name: "plus" } span { "New Codex" } }
+                                                            button { class: if *show_split.read() { "agent-action on" } else { "agent-action" }, onclick: move |_| {
+                                                                let v = *show_split.read();
+                                                                show_split.set(!v);
+                                                            }, Icon { name: "plugins" } span { "{split_label}" } }
+                                                        }
+                                                    }
+                                                    div { class: "agents-metrics",
+                                                        div { class: "agents-metric", span { class: "agents-metric-num", "{tab_rows.len()}" } span { class: "agents-metric-label", "open agents" } }
+                                                        div { class: "agents-metric live", span { class: "agents-metric-num", "{running_tabs}" } span { class: "agents-metric-label", "running turns" } }
+                                                        div { class: "agents-metric", span { class: "agents-metric-num", "{running_subagents}" } span { class: "agents-metric-label", "sub-agents" } }
+                                                        div { class: "agents-metric", span { class: "agents-metric-num", "{review_count}" } span { class: "agents-metric-label", "review files" } }
+                                                    }
+                                                    div { class: "agents-section",
+                                                        div { class: "agents-section-head",
+                                                            span { "Agent sessions" }
+                                                            span { class: "agents-section-meta", "local" }
+                                                        }
+                                                        div { class: "agents-session-list",
+                                                            for (idx, tab) in tab_rows.iter().cloned().enumerate() {
+                                                                {
+                                                                    let is_active = idx == active_idx;
+                                                                    let is_running = busy_tabs.read().contains(&tab.id);
+                                                                    let status = tab_statuses.read().get(&tab.id).cloned();
+                                                                    let status_text = match status {
+                                                                        Some(TabStatus::WaitingApproval) => "approval",
+                                                                        Some(TabStatus::WaitingInput) => "input",
+                                                                        Some(TabStatus::Failed) => "failed",
+                                                                        Some(TabStatus::Running) => "running",
+                                                                        None if is_running => "running",
+                                                                        None => "idle",
+                                                                    };
+                                                                    let row_cls = if is_active {
+                                                                        "agents-session active"
+                                                                    } else if status_text == "failed" {
+                                                                        "agents-session failed"
+                                                                    } else if is_running {
+                                                                        "agents-session running"
+                                                                    } else {
+                                                                        "agents-session"
+                                                                    };
+                                                                    let message_count = if is_active { messages.read().len() } else { tab.messages.len() };
+                                                                    let artifact_count = if is_active {
+                                                                        messages.read().iter().filter(|m| m.author == Author::UiSpec).count()
+                                                                    } else {
+                                                                        tab.messages.iter().filter(|m| m.author == Author::UiSpec).count()
+                                                                    };
+                                                                    let status_class = format!("agents-status {status_text}");
+                                                                    rsx! {
+                                                                        button { class: "{row_cls}", onclick: move |_| {
+                                                                            switch_tab(tabs, active_tab, messages, cfg, engine, idx);
+                                                                        },
+                                                                            span { class: "agents-session-logo",
+                                                                                if let Some(l) = provider_logo(&tab.provider) {
+                                                                                    span { class: "prov-logo", dangerous_inner_html: l }
+                                                                                } else {
+                                                                                    Icon { name: "spark" }
+                                                                                }
+                                                                            }
+                                                                            span { class: "agents-session-copy",
+                                                                                span { class: "agents-session-title", "{tab.title}" }
+                                                                                span { class: "agents-session-sub", "{tab.provider} · {tab.harness} · {tab.reasoning_effort}" }
+                                                                            }
+                                                                            span { class: "agents-session-meta",
+                                                                                span { class: "{status_class}", "{status_text}" }
+                                                                                span { "{message_count} msgs" }
+                                                                                if artifact_count > 0 { span { "{artifact_count} UI" } }
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    div { class: "agents-section",
+                                                        div { class: "agents-section-head",
+                                                            span { "Local work" }
+                                                            span { class: "agents-section-meta", "no cloud" }
+                                                        }
+                                                        div { class: "agents-work-grid",
+                                                            button { class: "agents-work-card", onclick: move |_| {
+                                                                inspector_tab.set("review".to_string());
+                                                                select_env_tab(env_tab, show_env, env_tab_by_tab, tabs, active_tab, "files", false);
+                                                            },
+                                                                Icon { name: "branch" }
+                                                                span { class: "agents-work-title", "Review queue" }
+                                                                span { class: "agents-work-sub", "{review_count} file(s)" }
+                                                            }
+                                                            button { class: "agents-work-card", onclick: move |_| {
+                                                                select_env_tab(env_tab, show_env, env_tab_by_tab, tabs, active_tab, "changes", false);
+                                                                let ws = changes_workspace.clone();
+                                                                spawn(async move { changed_files.set(load_changed_files(&ws).await); });
+                                                            },
+                                                                Icon { name: "edit" }
+                                                                span { class: "agents-work-title", "Changes" }
+                                                                span { class: "agents-work-sub", "git diff + commit" }
+                                                            }
+                                                            button { class: "agents-work-card", onclick: move |_| {
+                                                                select_env_tab(env_tab, show_env, env_tab_by_tab, tabs, active_tab, "preview", false);
+                                                                spawn(async move { preview_ports.set(scan_ports().await); });
+                                                            },
+                                                                Icon { name: "browser" }
+                                                                span { class: "agents-work-title", "Preview" }
+                                                                span { class: "agents-work-sub", "browser + design mode" }
+                                                            }
+                                                            button { class: "agents-work-card", onclick: move |_| {
+                                                                let ws = review_workspace.clone();
+                                                                spawn(async move {
+                                                                    let diff = run_cmd(&ws, "git", &["diff"]).await;
+                                                                    let diff: String = diff.chars().take(12_000).collect();
+                                                                    let prompt = format!(
+                                                                        "Act as Bugbot. Review the current working changes for bugs, security issues, logic errors, and regressions. For each finding give: file:line, severity, why it is wrong, and the concrete fix. If the diff is clean, say so plainly.\n\n```diff\n{diff}\n```"
+                                                                    );
+                                                                    if *streaming.read() {
+                                                                        queue.write().push(prompt);
+                                                                    } else {
+                                                                        engine.send(EngineCmd::Submit {
+                                                                            engine: prompt,
+                                                                            display: "/review (Bugbot)".into(),
+                                                                        });
+                                                                    }
+                                                                });
+                                                            },
+                                                                Icon { name: "shield" }
+                                                                span { class: "agents-work-title", "Bugbot review" }
+                                                                span { class: "agents-work-sub", "local git diff" }
+                                                            }
+                                                            button { class: "agents-work-card", onclick: move |_| {
+                                                                let ws = hermes_workspace.clone();
+                                                                let goal = hermes_goal.read().clone();
+                                                                let validation = hermes_validation.read().clone();
+                                                                let status_sig = hermes_status;
+                                                                spawn(async move {
+                                                                    let context = hermes_diff_context(&ws).await;
+                                                                    let prompt = hermes::build_evolve_prompt(&goal, &validation, &context);
+                                                                    submit_hermes_prompt(cfg, engine, streaming, status_sig, prompt, "Hermes evolve".to_string());
+                                                                });
+                                                            },
+                                                                Icon { name: "spark" }
+                                                                span { class: "agents-work-title", "Hermes evolve" }
+                                                                span { class: "agents-work-sub", "{hermes_profiles.read().len()} profile(s)" }
+                                                            }
+                                                        }
+                                                        if bg_count > 0 || artifact_count > 0 {
+                                                            div { class: "agents-chip-row",
+                                                                if bg_count > 0 { span { class: "agents-chip", "{bg_count} background job(s)" } }
+                                                                if artifact_count > 0 { span { class: "agents-chip", "{artifact_count} UI artifact(s)" } }
+                                                            }
+                                                        }
+                                                    }
+                                                    div { class: "agents-section",
+                                                        div { class: "agents-section-head",
+                                                            span { "Sub-agents" }
+                                                            span { class: "agents-section-meta", "{subagent_cards.read().len()} total" }
+                                                        }
+                                                        if subagent_cards.read().is_empty() {
+                                                            div { class: "agents-empty", "No sub-agents running. Enable orchestrate/sub-agents for multi-lane local work." }
+                                                        }
+                                                        for card in subagent_cards.read().iter().cloned() {
+                                                            {
+                                                                let worker_summary = if card.summary.is_empty() {
+                                                                    card.worker_id.clone()
+                                                                } else {
+                                                                    card.summary.clone()
+                                                                };
+                                                                let stop_worker = card.worker_id.clone();
+                                                                let worker_class = if card.running {
+                                                                    "agents-worker running"
+                                                                } else if card.ok {
+                                                                    "agents-worker done"
+                                                                } else {
+                                                                    "agents-worker fail"
+                                                                };
+                                                                let worker_status = if card.ok { "✓" } else { "!" };
+                                                                rsx! {
+                                                                    div { class: "{worker_class}",
+                                                                        span { class: "agents-worker-status",
+                                                                            if card.running {
+                                                                                span { class: "syn-spinner" }
+                                                                            } else {
+                                                                                span { "{worker_status}" }
+                                                                            }
+                                                                        }
+                                                                        div { class: "agents-worker-copy",
+                                                                            div { class: "agents-worker-title", "{card.profile} · {card.task}" }
+                                                                            div { class: "agents-worker-sub", "{worker_summary}" }
+                                                                            if !card.logs.is_empty() {
+                                                                                div { class: "agents-worker-logs", "{card.logs.len()} tool log(s)" }
+                                                                            }
+                                                                            if card.running {
+                                                                                div { class: "agents-worker-actions",
+                                                                                    button { class: "agent-action", title: "Stop this sub-agent", onclick: move |_| {
+                                                                                        engine.send(EngineCmd::SubagentControl {
+                                                                                            worker_id: stop_worker.clone(),
+                                                                                            action: SubagentControlAction::Interrupt,
+                                                                                        });
+                                                                                    },
+                                                                                        Icon { name: "x" }
+                                                                                        span { "Stop" }
+                                                                                    }
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    div { class: "agents-section",
+                                                        div { class: "agents-section-head",
+                                                            span { "Recent activity" }
+                                                            span { class: "agents-section-meta", "timeline" }
+                                                        }
+                                                        if timeline.read().is_empty() {
+                                                            div { class: "agents-empty", "No activity yet." }
+                                                        }
+                                                        for item in timeline.read().iter().cloned().rev().take(6) {
+                                                            div { class: "agents-timeline-row",
+                                                                span { class: "agents-timeline-dot" }
+                                                                span { class: "agents-timeline-copy",
+                                                                    span { class: "agents-timeline-title", "{item.title}" }
+                                                                    if !item.sub.is_empty() { span { class: "agents-timeline-sub", "{item.sub}" } }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    },
                                     "review" => rsx! {
                                         if turn_edits.read().is_empty() {
                                             div { class: "insp-empty", "No changes to review. Edits the agent makes appear here — accept to keep, reject to revert." }
@@ -6079,30 +6998,48 @@ fn app() -> Element {
                                                 span { class: "review-count", "{turn_edits.read().len()} changed file(s)" }
                                                 button { class: "ed-close", onclick: move |_| {
                                                     let edits = turn_edits.read().clone();
-                                                    for (_, _, _, cp, _) in edits.iter().rev() { let _ = engine.send(EngineCmd::Rewind { id: *cp }); reverted.write().insert(*cp); }
+                                                    for (_, _, _, cp, _) in edits.iter().rev() { engine.send(EngineCmd::Rewind { id: *cp }); reverted.write().insert(*cp); }
                                                     turn_edits.write().clear();
                                                 }, "Reject all" }
                                             }
-                                            for (idx, (path, adds, dels, cp, diff)) in turn_edits.read().clone().into_iter().enumerate() {
-                                                div { class: "review-item",
-                                                    details { class: "review-diff-d",
-                                                        summary { class: "review-file",
-                                                            span { class: "edits-caret", Icon { name: "chevron" } }
-                                                            span { class: "review-path", "{path}" }
-                                                            span { class: "diff-adds", "+{adds}" }
-                                                            span { class: "diff-dels", "−{dels}" }
+                                            for (path, adds, dels, cp, diff) in turn_edits.read().clone() {
+                                                {
+                                                    let is_accepted = cp != 0 && accepted.read().contains(&cp);
+                                                    let is_reverted = cp != 0 && reverted.read().contains(&cp);
+                                                    let item_cls = if is_reverted {
+                                                        "review-item resolved reverted"
+                                                    } else if is_accepted {
+                                                        "review-item resolved kept"
+                                                    } else {
+                                                        "review-item"
+                                                    };
+                                                    rsx! {
+                                                        div { class: "{item_cls}",
+                                                            details { class: "review-diff-d",
+                                                                summary { class: "review-file",
+                                                                    span { class: "edits-caret", Icon { name: "chevron" } }
+                                                                    span { class: "review-path", "{path}" }
+                                                                    span { class: "diff-adds", "+{adds}" }
+                                                                    span { class: "diff-dels", "−{dels}" }
+                                                                }
+                                                                HunkedDiff { ws: workspace.clone(), path: path.clone(), diff }
+                                                            }
+                                                            div { class: "review-actions",
+                                                                if is_reverted {
+                                                                    span { class: "diff-reverted slot-status", SlotText { text: "✓ Reverted".to_string(), reverse: true } }
+                                                                } else if is_accepted {
+                                                                    span { class: "diff-kept slot-status", SlotText { text: "✓ Kept".to_string() } }
+                                                                } else {
+                                                                    button { class: "review-accept", title: "Keep this change", onclick: move |_| {
+                                                                        if cp != 0 { accepted.write().insert(cp); }
+                                                                    }, SlotText { text: "Accept".to_string() } }
+                                                                    button { class: "review-reject", title: "Revert this change", onclick: move |_| {
+                                                                        engine.send(EngineCmd::Rewind { id: cp });
+                                                                        if cp != 0 { reverted.write().insert(cp); }
+                                                                    }, SlotText { text: "Reject".to_string(), reverse: true } }
+                                                                }
+                                                            }
                                                         }
-                                                        HunkedDiff { ws: workspace.clone(), path: path.clone(), diff }
-                                                    }
-                                                    div { class: "review-actions",
-                                                        button { class: "review-accept", title: "Keep this change", onclick: move |_| {
-                                                            let mut v = turn_edits.write(); if idx < v.len() { v.remove(idx); }
-                                                        }, "Accept" }
-                                                        button { class: "review-reject", title: "Revert this change", onclick: move |_| {
-                                                            let _ = engine.send(EngineCmd::Rewind { id: cp });
-                                                            reverted.write().insert(cp);
-                                                            let mut v = turn_edits.write(); if idx < v.len() { v.remove(idx); }
-                                                        }, "Reject" }
                                                     }
                                                 }
                                             }
@@ -6122,9 +7059,9 @@ fn app() -> Element {
                                                 div { class: "insp-card-title", "{tool}" }
                                                 div { class: "insp-card-sub", "{summary}" }
                                                 div { class: "insp-card-actions",
-                                                    button { class: "ed-save", onclick: move |_| { let _ = engine.send(EngineCmd::Approve { id, decision: ApprovalDecision::Approve }); }, "Approve" }
-                                                    button { class: "ed-save", onclick: move |_| { let _ = engine.send(EngineCmd::Approve { id, decision: ApprovalDecision::ApproveForSession }); }, "Always" }
-                                                    button { class: "ed-close", onclick: move |_| { let _ = engine.send(EngineCmd::Approve { id, decision: ApprovalDecision::Reject }); }, "Reject" }
+                                                    button { class: "ed-save", onclick: move |_| { engine.send(EngineCmd::Approve { id, decision: ApprovalDecision::Approve }); }, "Approve" }
+                                                    button { class: "ed-save", onclick: move |_| { engine.send(EngineCmd::Approve { id, decision: ApprovalDecision::ApproveForSession }); }, "Always" }
+                                                    button { class: "ed-close", onclick: move |_| { engine.send(EngineCmd::Approve { id, decision: ApprovalDecision::Reject }); }, "Reject" }
                                                 }
                                             }
                                         }
@@ -6137,7 +7074,7 @@ fn app() -> Element {
                                             div { class: "insp-card",
                                                 div { class: "insp-card-title", "#{id} · {label}" }
                                                 div { class: "insp-card-actions",
-                                                    button { class: "ed-close", onclick: move |_| { let _ = engine.send(EngineCmd::Rewind { id }); }, "Rewind to here" }
+                                                    button { class: "ed-close", onclick: move |_| { engine.send(EngineCmd::Rewind { id }); }, "Rewind to here" }
                                                 }
                                             }
                                         }
@@ -6634,7 +7571,7 @@ fn app() -> Element {
                                     button { class: "suggestion",
                                         onclick: {
                                             let p = s.to_string();
-                                            move |_| { let _ = engine.send(EngineCmd::Submit { engine: p.clone(), display: p.clone() }); }
+                                            move |_| { engine.send(EngineCmd::Submit { engine: p.clone(), display: p.clone() }); }
                                         },
                                         Icon { name: "spark" } span { "{s}" }
                                     }
@@ -6782,7 +7719,7 @@ fn app() -> Element {
                                                                                     let floor = { let ms = messages.read(); ms.iter().skip(idx).find_map(|mm| if let Author::Diff(_, cp) = mm.author { Some(cp) } else { None }) };
                                                                                     if let Some(fl) = floor {
                                                                                         let ids: Vec<u64> = checkpoints.read().iter().map(|(id, _)| *id).filter(|id| *id >= fl).collect();
-                                                                                        for id in ids.into_iter().rev() { let _ = engine.send(EngineCmd::Rewind { id }); reverted.write().insert(id); }
+                                                                                        for id in ids.into_iter().rev() { engine.send(EngineCmd::Rewind { id }); reverted.write().insert(id); }
                                                                                     }
                                                                                     // Drop this turn and everything after it (UI)…
                                                                                     messages.write().truncate(idx);
@@ -6793,7 +7730,7 @@ fn app() -> Element {
                                                                                         Author::Agent if !mm.text.is_empty() => Some(("assistant".to_string(), mm.text.clone())),
                                                                                         _ => None,
                                                                                     }).collect();
-                                                                                    let _ = engine.send(EngineCmd::SetHistory(hist));
+                                                                                    engine.send(EngineCmd::SetHistory(hist));
                                                                                     // …and load the message back into the composer to edit & resend.
                                                                                     let t = edit_text.clone();
                                                                                     spawn(async move {
@@ -6828,6 +7765,28 @@ fn app() -> Element {
                                                                 let ws_mark = workspace.clone();
                                                                 let snip2 = pin_snip.clone();
                                                                 rsx! {
+                                                                    if is_live && !thinking.read().is_empty() {
+                                                                        details { class: "thinking-box", open: think_open.read().unwrap_or(true),
+                                                                            summary {
+                                                                                class: "thinking-sum live",
+                                                                                onclick: move |e: dioxus::prelude::MouseEvent| {
+                                                                                    e.prevent_default();
+                                                                                    let cur = think_open.read().unwrap_or(true);
+                                                                                    think_open.set(Some(!cur));
+                                                                                },
+                                                                                span { class: "thinking-glow", "Reasoning" }
+                                                                                {
+                                                                                    let el = *elapsed_s.read();
+                                                                                    if el >= 1 {
+                                                                                        rsx! { span { class: "thinking-secs", "{el}s" } }
+                                                                                    } else {
+                                                                                        rsx! {}
+                                                                                    }
+                                                                                }
+                                                                            }
+                                                                            div { class: "thinking-body", "{thinking}" }
+                                                                        }
+                                                                    }
                                                                     div { id: "msg-{i}", class: "pinwrap",
                                                                         Message { author: m.author.clone(), text: m.text.clone(), live: is_live }
                                                                         if is_agent && !is_live {
@@ -6871,7 +7830,7 @@ fn app() -> Element {
                                         }
                                     }
                                 }
-                                if !thinking.read().is_empty() {
+                                if !*streaming.read() && !thinking.read().is_empty() {
                                     {
                                         let live = *streaming.read();
                                         rsx! {
@@ -6951,7 +7910,6 @@ fn app() -> Element {
                                         span { class: "queue-label", "⧖ Queued ({queue.read().len()})" }
                                         for (qi, q) in queue.read().iter().enumerate() {
                                             {
-                                                let qi = qi;
                                                 let preview = queue_preview(q);
                                                 let full = q.clone();
                                                 rsx! {
@@ -6978,7 +7936,7 @@ fn app() -> Element {
                                                                 };
                                                                 if let Some(t) = text {
                                                                     let display = strip_scaffold(&t);
-                                                                    let _ = engine.send(EngineCmd::Submit { engine: t, display });
+                                                                    engine.send(EngineCmd::Submit { engine: t, display });
                                                                 }
                                                             }, "↪" }
                                                         button { class: "queue-x", onclick: move |e: dioxus::prelude::MouseEvent| { e.stop_propagation(); let mut qv = queue.write(); if qi < qv.len() { qv.remove(qi); } }, "✕" }
@@ -6997,10 +7955,9 @@ fn app() -> Element {
                                         div { class: "question-opts",
                                             for (oi, opt) in options.iter().enumerate() {
                                                 {
-                                                    let qid = qid;
                                                     let opt = opt.clone();
                                                     rsx! {
-                                                        button { class: "question-opt", onclick: move |_| { let _ = engine.send(EngineCmd::Answer { id: qid, text: opt.clone() }); q_answer.set(String::new()); },
+                                                        button { class: "question-opt", onclick: move |_| { engine.send(EngineCmd::Answer { id: qid, text: opt.clone() }); q_answer.set(String::new()); },
                                                             span { class: "question-num", "{oi + 1}" } "{opt}"
                                                         }
                                                     }
@@ -7013,7 +7970,7 @@ fn app() -> Element {
                                                 onkeydown: move |e| {
                                                     if e.key() == Key::Enter {
                                                         let a = q_answer.read().trim().to_string();
-                                                        if !a.is_empty() { let _ = engine.send(EngineCmd::Answer { id: qid, text: a }); q_answer.set(String::new()); }
+                                                        if !a.is_empty() { engine.send(EngineCmd::Answer { id: qid, text: a }); q_answer.set(String::new()); }
                                                     }
                                                 }
                                             }
@@ -7025,9 +7982,9 @@ fn app() -> Element {
                                         div { class: "approval-q", "Allow " span { class: "approval-tool", "{tool}" } "?" }
                                         if !summary.is_empty() { div { class: "approval-sum", "{summary}" } }
                                         div { class: "approval-actions",
-                                            button { class: "approval-yes", onclick: move |_| { let _ = engine.send(EngineCmd::Approve { id, decision: ApprovalDecision::Approve }); }, "Approve" }
-                                            button { class: "approval-always", onclick: move |_| { let _ = engine.send(EngineCmd::Approve { id, decision: ApprovalDecision::ApproveForSession }); }, "Always" }
-                                            button { class: "approval-no", onclick: move |_| { let _ = engine.send(EngineCmd::Approve { id, decision: ApprovalDecision::Reject }); }, "Reject" }
+                                            button { class: "approval-yes", onclick: move |_| { engine.send(EngineCmd::Approve { id, decision: ApprovalDecision::Approve }); }, "Approve" }
+                                            button { class: "approval-always", onclick: move |_| { engine.send(EngineCmd::Approve { id, decision: ApprovalDecision::ApproveForSession }); }, "Always" }
+                                            button { class: "approval-no", onclick: move |_| { engine.send(EngineCmd::Approve { id, decision: ApprovalDecision::Reject }); }, "Reject" }
                                         }
                                     }
                                 }
@@ -7050,18 +8007,18 @@ fn app() -> Element {
                                                         span { class: "edits-counts", span { class: "diff-adds countup plus", style: "--n:{total_add}" } " " span { class: "diff-dels countup minus", style: "--n:{total_del}" } }
                                                     }
                                                     if *edits_undone.read() {
-                                                        span { class: "edits-undone", "✓ Undone" }
+                                                        span { class: "edits-undone slot-status", SlotText { text: "✓ Undone".to_string(), reverse: true } }
                                                     } else {
                                                         div { class: "edits-actions",
                                                             button { class: "edits-keepall", title: "Keep every change in this turn", onclick: move |_| {
                                                                 let cps: Vec<u64> = turn_edits.read().iter().map(|e| e.3).filter(|cp| *cp != 0).collect();
                                                                 let mut a = accepted.write();
                                                                 for cp in cps { a.insert(cp); }
-                                                            }, "Keep all ✓" }
+                                                            }, SlotText { text: "Keep all ✓".to_string() } }
                                                             button { class: "edits-undo", onclick: move |_| {
-                                                                for (_, _, _, cp, _) in turn_edits.read().iter() { let _ = engine.send(EngineCmd::Rewind { id: *cp }); reverted.write().insert(*cp); }
+                                                                for (_, _, _, cp, _) in turn_edits.read().iter() { engine.send(EngineCmd::Rewind { id: *cp }); reverted.write().insert(*cp); }
                                                                 edits_undone.set(true);
-                                                            }, "Undo ↺" }
+                                                            }, SlotText { text: "Undo ↺".to_string(), reverse: true } }
                                                         }
                                                     }
                                                 }
@@ -7076,7 +8033,7 @@ fn app() -> Element {
                                                                 div { class: "edits-row pending",
                                                                     span { class: "syn-spinner" }
                                                                     span { class: "edits-path", "{path}" }
-                                                                    span { class: "edits-rowcounts shimmer", "editing…" }
+                                                                    span { class: "edits-rowcounts shimmer slot-status", SlotText { text: "editing…".to_string() } }
                                                                 }
                                                             }
                                                         } else {
@@ -7087,16 +8044,16 @@ fn app() -> Element {
                                                                         span { class: "edits-path", "{path}" }
                                                                         span { class: "edits-rowcounts", span { class: "diff-adds", "+{a}" } " " span { class: "diff-dels", "−{d}" } }
                                                                         if is_reverted {
-                                                                            span { class: "diff-reverted", "✓ Reverted" }
+                                                                            span { class: "diff-reverted slot-status", SlotText { text: "✓ Reverted".to_string(), reverse: true } }
                                                                         } else if accepted.read().contains(&cp) {
-                                                                            span { class: "diff-kept", "✓ Kept" }
+                                                                            span { class: "diff-kept slot-status", SlotText { text: "✓ Kept".to_string() } }
                                                                         } else if cp != 0 {
                                                                             button { class: "edits-row-keep",
                                                                                 onclick: move |e: dioxus::prelude::MouseEvent| { e.prevent_default(); e.stop_propagation(); accepted.write().insert(cp); },
-                                                                                "Keep" }
+                                                                                SlotText { text: "Keep".to_string() } }
                                                                             button { class: "edits-row-revert",
-                                                                                onclick: move |e: dioxus::prelude::MouseEvent| { e.prevent_default(); e.stop_propagation(); let _ = engine.send(EngineCmd::Rewind { id: cp }); reverted.write().insert(cp); },
-                                                                                "Revert" }
+                                                                                onclick: move |e: dioxus::prelude::MouseEvent| { e.prevent_default(); e.stop_propagation(); engine.send(EngineCmd::Rewind { id: cp }); reverted.write().insert(cp); },
+                                                                                SlotText { text: "Revert".to_string(), reverse: true } }
                                                                         }
                                                                     }
                                                                     HunkedDiff { ws: workspace.clone(), path: path.clone(), diff }
@@ -7251,7 +8208,7 @@ fn app() -> Element {
                                                                 if row_pending { span { class: "syn-spinner" } } else { span { class: "live-change-ready", "✓" } }
                                                                 span { class: "live-change-path", "{path}" }
                                                                 if row_pending {
-                                                                    span { class: "live-change-state shimmer", "editing…" }
+                                                                    span { class: "live-change-state shimmer slot-status", SlotText { text: "editing…".to_string() } }
                                                                 } else {
                                                                     span { class: "live-change-state", span { class: "diff-adds", "+{a}" } " " span { class: "diff-dels", "−{d}" } }
                                                                 }
@@ -7273,7 +8230,7 @@ fn app() -> Element {
                                         button { class: "suggestion followup",
                                             onclick: {
                                                 let p = f.clone();
-                                                move |_| { let _ = engine.send(EngineCmd::Submit { engine: p.clone(), display: p.clone() }); }
+                                                move |_| { engine.send(EngineCmd::Submit { engine: p.clone(), display: p.clone() }); }
                                             },
                                             Icon { name: "spark" } span { "{f}" }
                                         }
@@ -7316,6 +8273,13 @@ fn app() -> Element {
                     automation_prompt,
                     automation_status,
                     automation_confirm_delete,
+                    hermes_profiles,
+                    hermes_profile_name,
+                    hermes_goal,
+                    hermes_validation,
+                    hermes_review_prompt,
+                    hermes_status,
+                    hermes_confirm_delete,
                     streaming,
                     queue,
                     on_close: move |_| show_settings.set(false)
@@ -7596,7 +8560,6 @@ fn McpModal(
                     }
                     for (i, s) in servers.iter().enumerate() {
                         {
-                            let i = i;
                             let st = status.read().get(&s.name).cloned();
                             let connected = st.as_deref().map(|x| x.starts_with("connected")).unwrap_or(false);
                             let cmdline = if s.url.is_empty() { format!("{} {}", s.command, s.args.join(" ")) } else { s.url.clone() };
@@ -7610,7 +8573,7 @@ fn McpModal(
                                         button { class: "mcp-remove", onclick: move |_| {
                                             let mut list = servers2.clone(); list.remove(i);
                                             let mut c = cfg.read().clone(); c.mcp_servers = list; cfg.set(c.clone());
-                                            let _ = engine.send(EngineCmd::Reconfigure(c));
+                                            engine.send(EngineCmd::Reconfigure(c));
                                         }, "Remove" }
                                     }
                                     div { class: "mcp-cmd", "{cmdline}" }
@@ -7644,7 +8607,7 @@ fn McpModal(
                                                     list.sort_by(|a, b| a.name.cmp(&b.name));
                                                 }
                                                 let mut c = cfg.read().clone(); c.mcp_servers = list; cfg.set(c.clone());
-                                                let _ = engine.send(EngineCmd::Reconfigure(c));
+                                                engine.send(EngineCmd::Reconfigure(c));
                                             }, "Trust" }
                                         }
                                         div { class: "mcp-src", "{source}" }
@@ -7673,7 +8636,7 @@ fn McpModal(
                                 ..oxide_config::McpServerConfig::default()
                             });
                             let mut c = cfg.read().clone(); c.mcp_servers = list; cfg.set(c.clone());
-                            let _ = engine.send(EngineCmd::Reconfigure(c));
+                            engine.send(EngineCmd::Reconfigure(c));
                             name.set(String::new()); command.set(String::new()); args.set(String::new());
                         }, "+ Add server" }
                     }
@@ -7755,7 +8718,7 @@ fn apply_workspace(
     c.recent_workspaces.truncate(8);
     c.workspace = Some(dir);
     cfg.set(c.clone());
-    let _ = engine.send(EngineCmd::Reconfigure(c));
+    engine.send(EngineCmd::Reconfigure(c));
 }
 
 /// Switch the active agent tab: save the current transcript, load the target's.
@@ -7781,9 +8744,11 @@ fn switch_tab(
     let mut c = cfg.read().clone();
     c.provider = t.provider.clone();
     c.model = t.model.clone();
+    c.harness = t.harness.clone();
+    c.reasoning_effort = t.reasoning_effort.clone();
     c.resume_path = t.session.clone();
     cfg.set(c.clone());
-    let _ = engine.send(EngineCmd::SwitchTab {
+    engine.send(EngineCmd::SwitchTab {
         id: t.id,
         conf: c,
         msgs: t.messages.clone(),
@@ -7792,6 +8757,7 @@ fn switch_tab(
 }
 
 /// Open a fresh agent tab for `provider` and make it active.
+#[allow(clippy::too_many_arguments)]
 fn new_agent_tab(
     mut tabs: Signal<Vec<AgentTab>>,
     mut active_tab: Signal<usize>,
@@ -7814,6 +8780,8 @@ fn new_agent_tab(
         title: title.to_string(),
         provider: provider.to_string(),
         model: model.to_string(),
+        harness: cfg.read().harness.clone(),
+        reasoning_effort: cfg.read().reasoning_effort.clone(),
         messages: Vec::new(),
         mode: "gui".to_string(),
         bin: String::new(),
@@ -7828,7 +8796,7 @@ fn new_agent_tab(
     c.resume_path = None;
     c.resume = false;
     cfg.set(c.clone());
-    let _ = engine.send(EngineCmd::SwitchTab {
+    engine.send(EngineCmd::SwitchTab {
         id,
         conf: c,
         msgs: Vec::new(),
@@ -7855,6 +8823,8 @@ fn new_tui_tab(
         title: format!("{title} (TUI)"),
         provider: bin.to_string(),
         model: String::new(),
+        harness: "default".to_string(),
+        reasoning_effort: "medium".to_string(),
         messages: Vec::new(),
         mode: "tui".to_string(),
         bin: bin.to_string(),
@@ -7887,7 +8857,7 @@ fn close_tab(
     }
     // Stop the closed tab's own engine (engines are per-tab now).
     let closed_id = tabs_w.read().get(idx).map(|t| t.id).unwrap_or(0);
-    let _ = engine.send(EngineCmd::CloseTab(closed_id));
+    engine.send(EngineCmd::CloseTab(closed_id));
     tabs_w.write().remove(idx);
     let len_after = tabs_w.read().len();
     if idx != cur {
@@ -8183,7 +9153,7 @@ fn md_live_html(src: &str) -> String {
     } else {
         thread_local! {
             static LIVE_CACHE: std::cell::RefCell<(u64, String)> =
-                std::cell::RefCell::new((0, String::new()));
+                const { std::cell::RefCell::new((0, String::new())) };
         }
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -8273,11 +9243,8 @@ fn md_to_html_uncached(src: &str, live: bool) -> String {
     }
     pulldown_cmark::html::push_html(&mut html, seg.drain(..));
     // Point local image sources at the workspace asset handler so they load.
-    let html = html
-        .replace("<img src=\"./", "<img loading=\"lazy\" src=\"/wsimg/")
-        .replace("<img src=\"/", "<img loading=\"lazy\" src=\"/wsimg/");
-
-    html
+    html.replace("<img src=\"./", "<img loading=\"lazy\" src=\"/wsimg/")
+        .replace("<img src=\"/", "<img loading=\"lazy\" src=\"/wsimg/")
 }
 
 /// Bundled VSCode Material Icon Theme SVGs (MIT — material-extensions).
@@ -8468,25 +9435,21 @@ fn SettingsModal(
     mut automation_prompt: Signal<String>,
     mut automation_status: Signal<String>,
     mut automation_confirm_delete: Signal<Option<String>>,
+    mut hermes_profiles: Signal<Vec<hermes::HermesProfile>>,
+    mut hermes_profile_name: Signal<String>,
+    mut hermes_goal: Signal<String>,
+    mut hermes_validation: Signal<String>,
+    mut hermes_review_prompt: Signal<String>,
+    mut hermes_status: Signal<String>,
+    mut hermes_confirm_delete: Signal<Option<String>>,
     streaming: Signal<bool>,
-    queue: Signal<Vec<String>>,
+    mut queue: Signal<Vec<String>>,
     on_close: EventHandler<()>,
 ) -> Element {
     let base = cfg.read().clone();
     let mut provider = use_signal(|| base.provider.clone());
     let mut harness = use_signal(|| base.harness.clone());
-    let harness_opts = {
-        let dir = base
-            .harness_dir
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("harnesses"));
-        let dir = if dir.is_absolute() {
-            dir
-        } else {
-            workspace_of(&base).join(dir)
-        };
-        list_harnesses(&dir)
-    };
+    let harness_opts = list_harnesses(&base);
     let mut model = use_signal(|| base.model.clone());
     let mut effort = use_signal(|| base.reasoning_effort.clone());
     let mut fast = use_signal(|| base.fast_mode);
@@ -8525,7 +9488,7 @@ fn SettingsModal(
         "mock",
     ];
 
-    let mut save = move |_| {
+    let save = move |_| {
         let mut c = cfg.read().clone();
         c.provider = provider.read().clone();
         c.harness = harness.read().clone();
@@ -8560,7 +9523,7 @@ fn SettingsModal(
         let mut uiw = ui;
         uiw.workspace.set(chosen_ws);
         uiw.open_path.set(None);
-        let _ = engine.send(EngineCmd::Reconfigure(c));
+        engine.send(EngineCmd::Reconfigure(c));
         on_close.call(());
     };
 
@@ -8573,7 +9536,7 @@ fn SettingsModal(
                     button { class: "term-x", onclick: move |_| on_close.call(()), "✕" }
                 }
                 div { class: "settings-tabs",
-                    for (key, label) in [("model", "Model"), ("access", "Access"), ("agents", "Agents"), ("automations", "Automations"), ("sessions", "Sessions"), ("updates", "Updates")] {
+                    for (key, label) in [("model", "Model"), ("access", "Access"), ("agents", "Agents"), ("hermes", "Hermes"), ("automations", "Automations"), ("sessions", "Sessions"), ("updates", "Updates")] {
                         button { class: if settings_tab.read().as_str() == key { "settings-tab active" } else { "settings-tab" },
                             onclick: move |_| settings_tab.set(key.to_string()), "{label}" }
                     }
@@ -8780,6 +9743,156 @@ fn SettingsModal(
                         select { class: "field-input", onchange: move |e| tab_mode.set(e.value()),
                             option { value: "gui", selected: tab_mode.read().as_str() == "gui", "GUI (chat)" }
                             option { value: "tui", selected: tab_mode.read().as_str() == "tui", "TUI (terminal)" }
+                        }
+                    }
+                  }
+                  if settings_tab.read().as_str() == "hermes" {
+                    div { class: "field cgpt-field",
+                        span { class: "field-label", "Hermes evolve profile" }
+                        span { class: "settings-hint", "Local-first Hermes lanes save under `.oxide/hermes-profiles` and run with the `hermes` harness." }
+                        label { class: "field",
+                            span { class: "field-label", "Profile name" }
+                            input {
+                                class: "field-input",
+                                value: "{hermes_profile_name}",
+                                oninput: move |e| hermes_profile_name.set(e.value())
+                            }
+                        }
+                        label { class: "field",
+                            span { class: "field-label", "Goal" }
+                            textarea {
+                                class: "field-input",
+                                rows: "4",
+                                value: "{hermes_goal}",
+                                oninput: move |e| hermes_goal.set(e.value())
+                            }
+                        }
+                        label { class: "field",
+                            span { class: "field-label", "Validation command(s)" }
+                            textarea {
+                                class: "field-input",
+                                rows: "3",
+                                value: "{hermes_validation}",
+                                oninput: move |e| hermes_validation.set(e.value())
+                            }
+                        }
+                        label { class: "field",
+                            span { class: "field-label", "Review gate" }
+                            textarea {
+                                class: "field-input",
+                                rows: "3",
+                                value: "{hermes_review_prompt}",
+                                oninput: move |e| hermes_review_prompt.set(e.value())
+                            }
+                        }
+                        div { class: "field-folder",
+                            span { class: "folder-path", "{hermes_status}" }
+                            button { class: "ed-save", onclick: move |_| {
+                                let root = workspace_of(&cfg.read());
+                                match hermes::profile_from_fields(
+                                    hermes_profile_name.read().as_str(),
+                                    hermes_goal.read().as_str(),
+                                    hermes_validation.read().as_str(),
+                                    hermes_review_prompt.read().as_str(),
+                                    automation::now_ms(),
+                                ) {
+                                    Ok(profile) => match hermes::write_profile(&root, &profile) {
+                                        Ok(()) => {
+                                            hermes_profiles.set(hermes::read_profiles(&root).unwrap_or_default());
+                                            hermes_confirm_delete.set(None);
+                                            hermes_status.set(format!("Saved Hermes profile: {}", profile.name));
+                                        }
+                                        Err(err) => hermes_status.set(format!("Hermes profile save failed: {err}")),
+                                    },
+                                    Err(err) => hermes_status.set(err.to_string()),
+                                }
+                            }, "Save profile" }
+                            button { class: "ed-close", onclick: move |_| {
+                                let root = workspace_of(&cfg.read());
+                                let goal = hermes_goal.read().clone();
+                                let validation = hermes_validation.read().clone();
+                                let status_sig = hermes_status;
+                                spawn(async move {
+                                    let context = hermes_diff_context(&root).await;
+                                    let prompt = hermes::build_evolve_prompt(&goal, &validation, &context);
+                                    submit_hermes_prompt(cfg, engine, streaming, status_sig, prompt, "Hermes evolve".to_string());
+                                });
+                            }, "Run evolve" }
+                            button { class: "ed-close", onclick: move |_| {
+                                let goal = hermes_goal.read().clone();
+                                let validation = hermes_validation.read().clone();
+                                let review = hermes_review_prompt.read().clone();
+                                let prompt = hermes::build_review_prompt(&goal, &validation, &review);
+                                submit_hermes_prompt(cfg, engine, streaming, hermes_status, prompt, "Hermes review".to_string());
+                            }, "Run review" }
+                        }
+                    }
+                    div { class: "field",
+                        span { class: "field-label", "Saved Hermes profiles" }
+                        if hermes_profiles.read().is_empty() {
+                            div { class: "archived-empty", "No Hermes profiles saved yet." }
+                        } else {
+                            div { class: "archived-list",
+                                for profile in hermes_profiles.read().iter().cloned() {
+                                    {
+                                        let apply_profile = profile.clone();
+                                        let run_profile = profile.clone();
+                                        let review_profile = profile.clone();
+                                        let delete_profile = profile.clone();
+                                        let confirm = hermes_confirm_delete.read().as_deref() == Some(profile.id.as_str());
+                                        rsx! {
+                                            div { class: "archived-folder",
+                                                div { class: "archived-folder-head", title: "{profile.goal}",
+                                                    Icon { name: "spark" }
+                                                    span { class: "archived-folder-name", "{profile.name}" }
+                                                    span { class: "archived-count", "hermes" }
+                                                }
+                                                div { class: "archived-row",
+                                                    span { class: "archived-title", title: "{profile.validation}", "{profile.validation}" }
+                                                    button { class: "archived-restore", onclick: move |_| {
+                                                        hermes_profile_name.set(apply_profile.name.clone());
+                                                        hermes_goal.set(apply_profile.goal.clone());
+                                                        hermes_validation.set(apply_profile.validation.clone());
+                                                        hermes_review_prompt.set(apply_profile.review_prompt.clone());
+                                                        hermes_status.set(format!("Applied Hermes profile: {}", apply_profile.name));
+                                                    }, "Apply" }
+                                                    button { class: "archived-restore", onclick: move |_| {
+                                                        let root = workspace_of(&cfg.read());
+                                                        let goal = run_profile.goal.clone();
+                                                        let validation = run_profile.validation.clone();
+                                                        let display = format!("Hermes evolve · {}", run_profile.name);
+                                                        let status_sig = hermes_status;
+                                                        spawn(async move {
+                                                            let context = hermes_diff_context(&root).await;
+                                                            let prompt = hermes::build_evolve_prompt(&goal, &validation, &context);
+                                                            submit_hermes_prompt(cfg, engine, streaming, status_sig, prompt, display);
+                                                        });
+                                                    }, "Run" }
+                                                    button { class: "archived-restore", onclick: move |_| {
+                                                        let prompt = hermes::build_review_prompt(&review_profile.goal, &review_profile.validation, &review_profile.review_prompt);
+                                                        submit_hermes_prompt(cfg, engine, streaming, hermes_status, prompt, format!("Hermes review · {}", review_profile.name));
+                                                    }, "Review" }
+                                                    button { class: if confirm { "archived-del danger" } else { "archived-del" }, onclick: move |_| {
+                                                        let root = workspace_of(&cfg.read());
+                                                        if !confirm {
+                                                            hermes_confirm_delete.set(Some(delete_profile.id.clone()));
+                                                            return;
+                                                        }
+                                                        match hermes::delete_profile(&root, &delete_profile.id) {
+                                                            Ok(()) => {
+                                                                hermes_profiles.set(hermes::read_profiles(&root).unwrap_or_default());
+                                                                hermes_confirm_delete.set(None);
+                                                                hermes_status.set(format!("Deleted Hermes profile: {}", delete_profile.name));
+                                                            }
+                                                            Err(err) => hermes_status.set(format!("Hermes profile delete failed: {err}")),
+                                                        }
+                                                    }, if confirm { "Sure?" } else { "Delete" } }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                   }
@@ -9023,7 +10136,7 @@ fn SettingsModal(
                 }
                 div { class: "modal-foot",
                     button { class: "ed-close", onclick: move |_| on_close.call(()), "Cancel" }
-                    button { class: "ed-save", onclick: move |e| save(e), "Save" }
+                    button { class: "ed-save", onclick: save, "Save" }
                 }
             }
         }
@@ -9124,33 +10237,26 @@ fn Composer(
             }
             "#,
             );
-            loop {
-                match eval.recv::<String>().await {
-                    Ok(msg) => {
-                        if let Some(text) = msg.strip_prefix("PASTE:") {
-                            let id = *paste_seq.peek() + 1;
-                            paste_seq.set(id);
-                            match save_pasted_text_attachment(&ws_paste, id, text) {
-                                Ok(att) => {
-                                    text_attachments.write().push(att);
-                                    ce_empty.set(false);
-                                }
-                                Err(_) => {
-                                    let fallback = text.to_string();
-                                    spawn(async move {
-                                        let _ = dioxus::document::eval(&ce_insert_plain_text_js(
-                                            &fallback,
-                                        ))
-                                        .join::<bool>()
-                                        .await;
-                                    });
-                                }
-                            }
-                        } else {
-                            attachments.write().push(msg);
+            while let Ok(msg) = eval.recv::<String>().await {
+                if let Some(text) = msg.strip_prefix("PASTE:") {
+                    let id = *paste_seq.peek() + 1;
+                    paste_seq.set(id);
+                    match save_pasted_text_attachment(&ws_paste, id, text) {
+                        Ok(att) => {
+                            text_attachments.write().push(att);
+                        }
+                        Err(_) => {
+                            let fallback = text.to_string();
+                            spawn(async move {
+                                let _ = dioxus::document::eval(&ce_insert_plain_text_js(&fallback))
+                                    .join::<bool>()
+                                    .await;
+                            });
                         }
                     }
-                    Err(_) => break,
+                    ce_empty.set(false);
+                } else {
+                    attachments.write().push(msg);
                 }
             }
         }
@@ -9528,7 +10634,7 @@ fn Composer(
                                         let mut c = cfg.read().clone();
                                         c.orchestrate = !c.orchestrate;
                                         cfg.set(c.clone());
-                                        let _ = engine.send(EngineCmd::Reconfigure(c));
+                                        engine.send(EngineCmd::Reconfigure(c));
                                     },
                                     Icon { name: "spark" }
                                     span { class: "plus-name", title: "Two-stage: a planner delegates to an implementer, then reviews (plan→do→review)", "Orchestrate" }
@@ -9589,7 +10695,7 @@ fn Composer(
                                 }
                             }
                             cfg.set(c.clone());
-                            let _ = engine.send(EngineCmd::Reconfigure(c));
+                            engine.send(EngineCmd::Reconfigure(c));
                         },
                         Icon { name: "zap" } "Fast"
                     }
@@ -9656,7 +10762,7 @@ fn Composer(
                                                     c.provider = prov.clone();
                                                     c.model = model.clone();
                                                     cfg.set(c.clone());
-                                                    let _ = engine.send(EngineCmd::Reconfigure(c));
+                                                    engine.send(EngineCmd::Reconfigure(c));
                                                     show_models.set(false);
                                                 },
                                                 if let Some(svg) = logo {
@@ -9707,7 +10813,7 @@ fn Composer(
                                                     let mut c = cfg.read().clone();
                                                     c.reasoning_effort = value.clone();
                                                     cfg.set(c.clone());
-                                                    let _ = engine.send(EngineCmd::Reconfigure(c));
+                                                    engine.send(EngineCmd::Reconfigure(c));
                                                     show_effort.set(false);
                                                 },
                                                 Icon { name: "brain" }
@@ -9730,7 +10836,7 @@ fn Composer(
                     }
                     if *streaming.read() {
                         button { class: "send steer", title: "Steer (inject into the running turn)", onclick: move |_| { let ws = ws_steer.clone(); spawn(async move { submit_ce(streaming, engine, plan_mode, pursue_goal, goal_text, queue, attachments, text_attachments, picked_element, true, ws).await; }); }, "↪" }
-                        button { class: "send stop", title: "Stop", onclick: move |_| { let _ = engine.send(EngineCmd::Interrupt); }, "■" }
+                        button { class: "send stop", title: "Stop", onclick: move |_| { engine.send(EngineCmd::Interrupt); }, "■" }
                     } else {
                         button { class: "send", onclick: move |_| { let ws = ws_btn.clone(); spawn(async move { submit_ce(streaming, engine, plan_mode, pursue_goal, goal_text, queue, attachments, text_attachments, picked_element, false, ws).await; }); }, "↑" }
                     }
@@ -9845,10 +10951,16 @@ fn Message(author: Author, text: String, #[props(default)] live: bool) -> Elemen
             }
         }
         Author::Agent => {
-            // An empty agent bubble (placeholder before the first token, or a
-            // stray one left after a turn) renders nothing — no lone avatar row.
-            // Progress is shown by the status pill instead.
             if text.is_empty() {
+                if live {
+                    return rsx! {
+                        div { class: "row agent agent-waiting",
+                            img { class: "avatar", src: logo_uri() }
+                            div { class: "typing", span {}, span {}, span {} }
+                        }
+                    };
+                }
+                // A stray placeholder left after a turn renders nothing.
                 return rsx! {};
             }
             let copy = serde_json::to_string(&text).unwrap_or_default();
@@ -9868,6 +10980,19 @@ fn Message(author: Author, text: String, #[props(default)] live: bool) -> Elemen
             }
         }
         Author::Activity { running, ok, .. } => rsx! { ActivityRow { text, running, ok } },
+        Author::UiSpec => match parse_ui_spec_message(&text) {
+            Ok(spec) => rsx! {
+                div { class: "row agent ui-spec-row",
+                    img { class: "avatar", src: logo_uri() }
+                    UiSpecView { spec }
+                }
+            },
+            Err(e) => rsx! {
+                div { class: "row note",
+                    div { class: "note-text", "Invalid UI spec: {e}" }
+                }
+            },
+        },
         Author::Diff(..) => rsx! {},
         Author::Note => {
             let is_cmd = text.starts_with('⌘')
@@ -10134,6 +11259,179 @@ fn tile_leaves(node: &Tile, out: &mut Vec<u64>) {
 }
 
 #[component]
+fn UiSpecView(spec: UiSpec) -> Element {
+    rsx! {
+        div { class: "ui-spec",
+            if let Some(title) = spec.title.clone() {
+                div { class: "ui-spec-title", "{title}" }
+            }
+            UiNodeView { node: spec.root }
+        }
+    }
+}
+
+#[component]
+fn UiNodeView(node: UiNode) -> Element {
+    let props = node.props.clone();
+    match node.kind {
+        UiNodeKind::Stack => rsx! {
+            div { class: "ui-node ui-stack",
+                for child in node.children { UiNodeView { node: child } }
+            }
+        },
+        UiNodeKind::Row => rsx! {
+            div { class: "ui-node ui-row-spec",
+                for child in node.children { UiNodeView { node: child } }
+            }
+        },
+        UiNodeKind::Card => {
+            let tone = ui_tone_class(props.tone);
+            rsx! {
+                div { class: "ui-node ui-card-spec {tone}",
+                    if let Some(title) = props.title {
+                        div { class: "ui-card-title", "{title}" }
+                    }
+                    if let Some(caption) = props.caption {
+                        div { class: "ui-card-caption", "{caption}" }
+                    }
+                    if let Some(text) = props.text {
+                        div { class: "ui-text", "{text}" }
+                    }
+                    for child in node.children { UiNodeView { node: child } }
+                }
+            }
+        }
+        UiNodeKind::Text => {
+            let tone = ui_tone_class(props.tone);
+            let text = props.text.or(props.value).unwrap_or_default();
+            rsx! {
+                div { class: "ui-node ui-text {tone}",
+                    "{text}"
+                }
+            }
+        }
+        UiNodeKind::Metric => {
+            let tone = ui_tone_class(props.tone);
+            let label = props.label.unwrap_or_default();
+            let value = props.value.unwrap_or_default();
+            rsx! {
+                div { class: "ui-node ui-metric {tone}",
+                    if !label.is_empty() {
+                        div { class: "ui-metric-label", "{label}" }
+                    }
+                    div { class: "ui-metric-value", "{value}" }
+                    if let Some(caption) = props.caption {
+                        div { class: "ui-metric-caption", "{caption}" }
+                    }
+                }
+            }
+        }
+        UiNodeKind::Table => {
+            let columns = props.columns;
+            let rows = props.rows;
+            rsx! {
+                div { class: "ui-node ui-table-wrap",
+                    table { class: "ui-table",
+                        thead {
+                            tr {
+                                for column in columns.iter() {
+                                    th { "{column.label}" }
+                                }
+                            }
+                        }
+                        tbody {
+                            for row in rows {
+                                tr {
+                                    for column in columns.iter() {
+                                        td { "{ui_value_display(row.get(&column.key))}" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        UiNodeKind::Code => {
+            let language = props.language.unwrap_or_else(|| "text".to_string());
+            let text = props.text.unwrap_or_default();
+            rsx! {
+                div { class: "ui-node ui-code-block",
+                    div { class: "ui-code-lang", "{language}" }
+                    pre { "{text}" }
+                }
+            }
+        }
+        UiNodeKind::Alert => {
+            let tone = ui_tone_class(props.tone);
+            let title = props.title.unwrap_or_else(|| "Notice".to_string());
+            let text = props.text.unwrap_or_default();
+            rsx! {
+                div { class: "ui-node ui-alert {tone}",
+                    div { class: "ui-alert-title", "{title}" }
+                    if !text.is_empty() {
+                        div { class: "ui-alert-text", "{text}" }
+                    }
+                }
+            }
+        }
+        UiNodeKind::Divider => rsx! {
+            div { class: "ui-node ui-divider" }
+        },
+        UiNodeKind::Action => {
+            if let Some(action) = props.action {
+                let label = action.label.clone();
+                let payload = serde_json::to_string(&serde_json::json!({
+                    "name": action.name,
+                    "payload": action.payload,
+                }))
+                .unwrap_or_default();
+                let clipboard = serde_json::to_string(&payload).unwrap_or_default();
+                rsx! {
+                    button {
+                        class: "ui-node ui-action",
+                        title: "Copy action payload",
+                        onclick: move |_| {
+                            let c = clipboard.clone();
+                            spawn(async move {
+                                let _ = document::eval(&format!("navigator.clipboard.writeText({c})")).await;
+                            });
+                        },
+                        "{label}"
+                    }
+                }
+            } else {
+                let label = props
+                    .label
+                    .or(props.text)
+                    .unwrap_or_else(|| "Action".to_string());
+                rsx! { div { class: "ui-node ui-action ghost", "{label}" } }
+            }
+        }
+    }
+}
+
+fn ui_tone_class(tone: Option<UiTone>) -> &'static str {
+    match tone.unwrap_or(UiTone::Neutral) {
+        UiTone::Neutral => "neutral",
+        UiTone::Info => "info",
+        UiTone::Success => "success",
+        UiTone::Warning => "warning",
+        UiTone::Danger => "danger",
+    }
+}
+
+fn ui_value_display(value: Option<&serde_json::Value>) -> String {
+    match value {
+        None | Some(serde_json::Value::Null) => String::new(),
+        Some(serde_json::Value::Bool(v)) => v.to_string(),
+        Some(serde_json::Value::Number(v)) => v.to_string(),
+        Some(serde_json::Value::String(v)) => v.clone(),
+        Some(other) => other.to_string(),
+    }
+}
+
+#[component]
 fn ActivityRow(text: String, running: bool, ok: bool) -> Element {
     let view = activity_view(&text);
     let state = if running {
@@ -10172,9 +11470,9 @@ fn ActivityRow(text: String, running: bool, ok: bool) -> Element {
                             onclick: {
                                 let out = view.output.clone();
                                 move |e: dioxus::prelude::MouseEvent| {
+                                    e.prevent_default();
                                     e.stop_propagation();
-                                    let js = format!("navigator.clipboard.writeText({});", serde_json::to_string(&out).unwrap_or_default());
-                                    let _ = dioxus::document::eval(&js);
+                                    copy_text_to_clipboard(out.clone());
                                 }
                             },
                             "⧉"
@@ -10542,9 +11840,22 @@ fn ChatPane(
                             }
                         }
                         Some(Event::ReasoningDelta { text, .. }) => { thinking.write().push_str(&text); }
+                        Some(Event::ToolCallDelta { call_id, tool, accumulated, .. }) => {
+                            let mut m = messages.write();
+                            upsert_tool_input_preview(&mut m, call_id, tool, accumulated);
+                        }
                         Some(Event::ToolCallBegin { call_id, tool, args, .. }) => {
                             if tool != "ask_user" {
-                                messages.write().push(ChatMsg { author: Author::Activity { running: true, ok: true, key: Some(call_id) }, text: activity_label(&tool, &args) });
+                                let text = activity_label(&tool, &args);
+                                let idx = { let g = messages.read(); activity_idx(&g, &call_id) };
+                                if let Some(idx) = idx {
+                                    if let Some(c) = messages.write().get_mut(idx) {
+                                        c.text = text;
+                                        if let Author::Activity { running, ok, .. } = &mut c.author { *running = true; *ok = true; }
+                                    }
+                                } else {
+                                    messages.write().push(ChatMsg { author: Author::Activity { running: true, ok: true, key: Some(call_id) }, text });
+                                }
                             }
                         }
                         Some(Event::ToolCallEnd { call_id, output, ok, .. }) => {
@@ -10559,6 +11870,7 @@ fn ChatPane(
                             }
                         }
                         Some(Event::FileDiff { path, diff, checkpoint, .. }) => { messages.write().push(ChatMsg { author: Author::Diff(path, checkpoint), text: diff }); }
+                        Some(Event::UiSpec { spec, .. }) => { messages.write().push(ui_spec_message(*spec)); }
                         Some(Event::TurnStarted { .. }) => { thinking.set(String::new()); status.set("Working…".to_string()); }
                         Some(Event::TurnFinished { .. }) => { streaming.set(false); status.set(String::new()); pane_question.set(None); { let mut mm = messages.write(); for c in mm.iter_mut() { if let Author::Activity { running, .. } = &mut c.author { *running = false; } } } }
                         Some(Event::Info { text }) => { if text.starts_with(['🧭','⚙','🔍','🤖','🧩','🔁','✓','⚠']) { status.set(text); } }
@@ -10569,6 +11881,7 @@ fn ChatPane(
                         }
                         Some(Event::AuditLog { .. })
                         | Some(Event::SubagentStarted { .. })
+                        | Some(Event::SubagentStatus { .. })
                         | Some(Event::SubagentFinished { .. }) => {}
                         Some(Event::Shutdown) | None => break,
                         _ => {}

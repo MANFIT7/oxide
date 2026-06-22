@@ -8,6 +8,7 @@ description = "Desktop GUI for Oxide (Dioxus) — a Cursor-style single-agent ch
 [dependencies]
 oxide-core = { workspace = true }
 oxide-config = { workspace = true }
+oxide-harness = { workspace = true }
 oxide-protocol = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }

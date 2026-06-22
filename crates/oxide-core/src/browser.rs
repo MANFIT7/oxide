@@ -6,6 +6,7 @@
 
 use anyhow::{anyhow, Result};
 use chromiumoxide::browser::{Browser, BrowserConfig};
+use chromiumoxide::handler::viewport::Viewport;
 use chromiumoxide::page::ScreenshotParams;
 use chromiumoxide::Page;
 use futures::StreamExt;
@@ -65,9 +66,27 @@ pub struct BrowserSession {
 impl BrowserSession {
     /// Launch a browser session. `headless` hides the window for background use.
     pub async fn launch(headless: bool) -> Result<Self> {
+        Self::launch_with_viewport(headless, None).await
+    }
+
+    pub async fn launch_with_viewport(
+        headless: bool,
+        viewport: Option<(u32, u32)>,
+    ) -> Result<Self> {
         let mut builder = BrowserConfig::builder();
         if !headless {
             builder = builder.with_head();
+        }
+        builder = builder.user_data_dir(unique_browser_profile_dir());
+        if let Some((width, height)) = viewport {
+            builder = builder.viewport(Viewport {
+                width,
+                height,
+                device_scale_factor: Some(1.0),
+                emulating_mobile: false,
+                is_landscape: width >= height,
+                has_touch: false,
+            });
         }
         if let Some(bin) = detect_browser() {
             builder = builder.chrome_executable(bin);
@@ -132,10 +151,7 @@ impl BrowserSession {
 
     pub async fn screenshot(&self, dir: &std::path::Path) -> Result<String> {
         std::fs::create_dir_all(dir).ok();
-        let data = self
-            .page
-            .screenshot(ScreenshotParams::builder().build())
-            .await?;
+        let data = self.screenshot_png().await?;
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis())
@@ -145,6 +161,13 @@ impl BrowserSession {
         Ok(format!("screenshot saved → {}", path.display()))
     }
 
+    pub async fn screenshot_png(&self) -> Result<Vec<u8>> {
+        Ok(self
+            .page
+            .screenshot(ScreenshotParams::builder().build())
+            .await?)
+    }
+
     pub async fn eval(&self, script: &str) -> Result<String> {
         let v = self.page.evaluate(script).await?;
         match v.value() {
@@ -152,6 +175,23 @@ impl BrowserSession {
             None => Ok("undefined".to_string()),
         }
     }
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() > max {
+        let t: String = s.chars().take(max).collect();
+        format!("{t}\n…(truncated)")
+    } else {
+        s.to_string()
+    }
+}
+
+fn unique_browser_profile_dir() -> PathBuf {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!("oxide-browser-{}-{ts}", std::process::id()))
 }
 
 #[cfg(test)]
@@ -166,13 +206,112 @@ mod tests {
         let js = s.eval("1+2").await.expect("eval");
         assert_eq!(js, "3");
     }
-}
 
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() > max {
-        let t: String = s.chars().take(max).collect();
-        format!("{t}\n…(truncated)")
-    } else {
-        s.to_string()
+    #[tokio::test]
+    #[ignore] // needs python3 scripts/gui-visual-qa.py and an installed Chromium browser
+    async fn gui_visual_fixture_screenshot() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("workspace root")
+            .to_path_buf();
+        let fixture = root.join("target/gui-visual-qa/fixture.html");
+        assert!(
+            fixture.exists(),
+            "missing {}; run `python3 scripts/gui-visual-qa.py` first",
+            fixture.display()
+        );
+
+        let s = BrowserSession::launch_with_viewport(true, Some((1280, 820)))
+            .await
+            .expect("launch browser");
+        let url = format!("file://{}", fixture.display());
+        s.navigate(&url).await.expect("navigate visual fixture");
+
+        let report = s
+            .page
+            .evaluate(
+                r#"
+(() => {
+  const required = [
+    '.agent-waiting .typing',
+    '.thinking-box[open] .thinking-body',
+    '.activity-card.running',
+    '.review-actions .diff-kept',
+    '.edits-row.pending .edits-rowcounts.shimmer',
+    '.composer-live-changes .live-change-state.shimmer',
+    '.status-pill .status-shimmer'
+  ];
+  const missing = required.filter((selector) => !document.querySelector(selector));
+  const thinking = document.querySelector('.thinking-box')?.getBoundingClientRect();
+  const answer = document.querySelector('.row.agent:not(.agent-waiting)')?.getBoundingClientRect();
+  return JSON.stringify({
+    missing,
+    thinkingAboveAnswer: Boolean(thinking && answer && thinking.bottom <= answer.top),
+    viewport: [window.innerWidth, window.innerHeight],
+    text: document.body.innerText
+  });
+})()
+"#,
+            )
+            .await
+            .expect("eval fixture selectors")
+            .into_value::<String>()
+            .expect("selector report string");
+        let report: serde_json::Value =
+            serde_json::from_str(&report).expect("selector report json");
+        assert_eq!(
+            report["missing"].as_array().map(Vec::len),
+            Some(0),
+            "missing visual selectors: {report}"
+        );
+        assert_eq!(
+            report["thinkingAboveAnswer"].as_bool(),
+            Some(true),
+            "reasoning block should stay above the live answer: {report}"
+        );
+        let text = report["text"].as_str().unwrap_or_default();
+        assert!(
+            text.contains("Reasoning")
+                && text.contains("Preparing browser_search")
+                && text.contains("Kept"),
+            "fixture text did not render expected labels: {text}"
+        );
+
+        let png = s.screenshot_png().await.expect("screenshot");
+        let out = root.join("target/gui-visual-qa/fixture-cdp.png");
+        let _ = std::fs::write(&out, &png);
+        let image = image::load_from_memory(&png)
+            .expect("decode screenshot")
+            .to_rgba8();
+        assert!(
+            image.width() >= 1000 && image.height() >= 700,
+            "unexpected screenshot size {}x{}",
+            image.width(),
+            image.height()
+        );
+
+        let mut min_luma = u8::MAX;
+        let mut max_luma = u8::MIN;
+        let mut bright = 0usize;
+        let mut sampled = 0usize;
+        for (_, _, px) in image.enumerate_pixels().step_by(257) {
+            let [r, g, b, _] = px.0;
+            let luma = ((299u32 * r as u32 + 587u32 * g as u32 + 114u32 * b as u32) / 1000) as u8;
+            min_luma = min_luma.min(luma);
+            max_luma = max_luma.max(luma);
+            if luma > 96 {
+                bright += 1;
+            }
+            sampled += 1;
+        }
+        assert!(
+            max_luma.saturating_sub(min_luma) >= 40 && bright >= 20 && sampled > 1000,
+            "screenshot looks blank: contrast={}, bright={}, sampled={}, saved={}",
+            max_luma.saturating_sub(min_luma),
+            bright,
+            sampled,
+            out.display()
+        );
     }
 }

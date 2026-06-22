@@ -348,7 +348,7 @@ mod tests {
 
         assert!(!is_due(&spec, &[], 120_000));
         assert!(is_due(&spec, &[], 310_000));
-        assert!(!is_due(&spec, &[recent_run.clone()], 250_000));
+        assert!(!is_due(&spec, std::slice::from_ref(&recent_run), 250_000));
         assert!(is_due(&spec, &[recent_run], 311_000));
     }
 

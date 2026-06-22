@@ -6,6 +6,7 @@ license.workspace = true
 description = "The Oxide engine: a frontend-agnostic async submit/event agent loop. Reusable library that TUI, GUI, headless and RPC frontends all drive."
 
 [dependencies]
+oxide-design = { workspace = true }
 oxide-protocol = { workspace = true }
 oxide-config = { workspace = true }
 oxide-harness = { workspace = true }
@@ -26,3 +27,6 @@ model2vec-rs = "0.2.1"
 libc = "0.2.186"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 turso = { version = "0.7.0-pre.10", default-features = false }
+
+[dev-dependencies]
+image = { workspace = true }

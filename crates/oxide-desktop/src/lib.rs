@@ -624,7 +624,7 @@ enum TimelineState {
 
 enum RuntimeCmd {
     Op(Op),
-    Reconfigure(Config),
+    Reconfigure(Box<Config>),
 }
 
 pub fn run(config: Config) -> anyhow::Result<()> {
@@ -999,6 +999,18 @@ impl OxideDesktop {
                     });
                 }
             }
+            Event::ToolCallDelta {
+                tool, accumulated, ..
+            } => {
+                if self.detail_level == DetailLevel::Coding {
+                    self.timeline.push(TimelineItem {
+                        title: format!("Preparing tool: {tool}"),
+                        detail: truncate_title(&accumulated),
+                        state: TimelineState::Running,
+                        request_id: None,
+                    });
+                }
+            }
             Event::ApprovalRequested {
                 request_id,
                 tool,
@@ -1204,6 +1216,45 @@ impl OxideDesktop {
                     request_id: None,
                 });
             }
+            Event::DesignSnapshotRequested { url, note, .. } => {
+                self.browser_target_url = url.clone();
+                self.inspector = InspectorTab::Browser;
+                self.timeline.push(TimelineItem {
+                    title: "Design snapshot requested".to_string(),
+                    detail: format!("{} · {}", url, empty_label(&note)),
+                    state: TimelineState::Waiting,
+                    request_id: None,
+                });
+            }
+            Event::DesignPatchProposed { proposal, .. } => {
+                self.timeline.push(TimelineItem {
+                    title: "Design patch proposal".to_string(),
+                    detail: format!(
+                        "{} · {} edit(s)",
+                        proposal.selection.selector,
+                        proposal.edits.len()
+                    ),
+                    state: TimelineState::Waiting,
+                    request_id: None,
+                });
+            }
+            Event::DesignReviewCompleted { review, .. } => {
+                self.timeline.push(TimelineItem {
+                    title: "Design review".to_string(),
+                    detail: format!(
+                        "ok={} · score={} · {} finding(s)",
+                        review.ok,
+                        review.score,
+                        review.findings.len()
+                    ),
+                    state: if review.ok {
+                        TimelineState::Done
+                    } else {
+                        TimelineState::Error
+                    },
+                    request_id: None,
+                });
+            }
             Event::Info { text } => {
                 if !text.starts_with("session") {
                     self.chat.push(ChatMsg {
@@ -1236,10 +1287,36 @@ impl OxideDesktop {
                     request_id: None,
                 });
             }
+            Event::UiSpec { spec, .. } => {
+                let title = spec
+                    .title
+                    .as_deref()
+                    .or(spec.root.props.title.as_deref())
+                    .unwrap_or("Untitled UI");
+                self.timeline.push(TimelineItem {
+                    title: "UI artifact".to_string(),
+                    detail: title.to_string(),
+                    state: TimelineState::Done,
+                    request_id: None,
+                });
+            }
             Event::SubagentStarted { profile, task, .. } => {
                 self.timeline.push(TimelineItem {
                     title: format!("Subagent: {profile}"),
                     detail: task,
+                    state: TimelineState::Running,
+                    request_id: None,
+                });
+            }
+            Event::SubagentStatus {
+                profile,
+                status,
+                detail,
+                ..
+            } => {
+                self.timeline.push(TimelineItem {
+                    title: format!("Subagent {status}: {profile}"),
+                    detail,
                     state: TimelineState::Running,
                     request_id: None,
                 });
@@ -1452,7 +1529,7 @@ impl OxideDesktop {
         self.refresh_workspace_views();
         let _ = self
             .engine_tx
-            .send(RuntimeCmd::Reconfigure(self.cfg.clone()));
+            .send(RuntimeCmd::Reconfigure(Box::new(self.cfg.clone())));
         self.timeline.push(TimelineItem {
             title: "Configuration applied".to_string(),
             detail: format!(
@@ -4092,8 +4169,10 @@ impl OxideDesktop {
                     }
                     if ui.button("Insert latest").clicked() {
                         if let Some(appshot) = self.appshots.first() {
-                            self.prompt =
-                                build_prompt_with_appshots(&self.prompt, &[appshot.clone()]);
+                            self.prompt = build_prompt_with_appshots(
+                                &self.prompt,
+                                std::slice::from_ref(appshot),
+                            );
                             self.nav = NavSurface::Chat;
                         }
                     }
@@ -4186,8 +4265,10 @@ impl OxideDesktop {
                             self.add_appshot_annotation(&appshot);
                         }
                         if ui.button("Insert in prompt").clicked() {
-                            self.prompt =
-                                build_prompt_with_appshots(&self.prompt, &[appshot.clone()]);
+                            self.prompt = build_prompt_with_appshots(
+                                &self.prompt,
+                                std::slice::from_ref(&appshot),
+                            );
                             self.nav = NavSurface::Chat;
                         }
                         if ui.button("Reveal").clicked() {
@@ -5790,7 +5871,7 @@ fn spawn_engine(
                         if let Some(h) = handle.take() {
                             let _ = h.submit(Op::Shutdown).await;
                         }
-                        current = next;
+                        current = *next;
                     }
                     None => break,
                 }
@@ -6140,7 +6221,7 @@ fn send_button(disabled: bool) -> egui::Button<'static> {
     } else {
         ACCENT
     })
-    .stroke(Stroke::new(1.0, if disabled { ACCENT } else { ACCENT }))
+    .stroke(Stroke::new(1.0, ACCENT))
 }
 
 fn inspector_tab(ui: &mut Ui, tab: &mut InspectorTab, value: InspectorTab, label: &str) {
@@ -7237,8 +7318,8 @@ fn context_file_suggestions(
     repo_index
         .iter()
         .filter(|entry| !entry.is_dir && repo_index_entry_matches_query(entry, query))
-        .cloned()
         .take(limit)
+        .cloned()
         .collect()
 }
 
@@ -7655,10 +7736,8 @@ fn github_compare_url(remote_url: &str, branch: &str, base: &str) -> Option<Stri
 fn github_repo_path(remote_url: &str) -> Option<String> {
     let path = if let Some(path) = remote_url.strip_prefix("https://github.com/") {
         path
-    } else if let Some(path) = remote_url.strip_prefix("git@github.com:") {
-        path
     } else {
-        return None;
+        remote_url.strip_prefix("git@github.com:")?
     };
     let path = path.trim_end_matches(".git").trim_matches('/');
     let mut parts = path.split('/').filter(|part| !part.is_empty());
@@ -7688,7 +7767,7 @@ fn build_git_pr_draft(title: &str, body: &str, branch: &str, base: &str, summary
         draft.push('\n');
     }
     if !summary.is_empty() {
-        draft.push_str("\n");
+        draft.push('\n');
         draft.push_str(summary);
         draft.push('\n');
     }
@@ -9495,21 +9574,23 @@ mod tests {
 
     #[test]
     fn mcp_server_remove_deletes_matching_name_only() {
-        let mut cfg = Config::default();
-        cfg.mcp_servers = vec![
-            McpServerConfig {
-                name: "fs".to_string(),
-                command: "npx".to_string(),
-                args: Vec::new(),
-                ..McpServerConfig::default()
-            },
-            McpServerConfig {
-                name: "linear".to_string(),
-                command: "bunx".to_string(),
-                args: Vec::new(),
-                ..McpServerConfig::default()
-            },
-        ];
+        let mut cfg = Config {
+            mcp_servers: vec![
+                McpServerConfig {
+                    name: "fs".to_string(),
+                    command: "npx".to_string(),
+                    args: Vec::new(),
+                    ..McpServerConfig::default()
+                },
+                McpServerConfig {
+                    name: "linear".to_string(),
+                    command: "bunx".to_string(),
+                    args: Vec::new(),
+                    ..McpServerConfig::default()
+                },
+            ],
+            ..Default::default()
+        };
 
         remove_mcp_server(&mut cfg, "fs");
 
@@ -9595,11 +9676,13 @@ mod tests {
     fn save_project_config_writes_oxide_toml() {
         let tmp = unique_tmp("config");
         std::fs::create_dir_all(&tmp).unwrap();
-        let mut cfg = Config::default();
-        cfg.workspace = Some(tmp.clone());
-        cfg.provider = "codex".to_string();
-        cfg.model = "gpt-5.5".to_string();
-        cfg.reasoning_effort = "high".to_string();
+        let cfg = Config {
+            workspace: Some(tmp.clone()),
+            provider: "codex".to_string(),
+            model: "gpt-5.5".to_string(),
+            reasoning_effort: "high".to_string(),
+            ..Default::default()
+        };
 
         save_project_config(&cfg).unwrap();
 
@@ -9829,7 +9912,11 @@ mod tests {
 
         assert!(!automation_is_due(&spec, &[], 120_000));
         assert!(automation_is_due(&spec, &[], 310_000));
-        assert!(!automation_is_due(&spec, &[recent_run.clone()], 250_000));
+        assert!(!automation_is_due(
+            &spec,
+            std::slice::from_ref(&recent_run),
+            250_000
+        ));
         assert!(automation_is_due(&spec, &[recent_run], 311_000));
     }
 
@@ -10973,11 +11060,13 @@ mod tests {
 
     #[test]
     fn diagnostic_config_preview_contains_runtime_settings() {
-        let mut cfg = Config::default();
-        cfg.provider = "codex".to_string();
-        cfg.model = "gpt-5.5".to_string();
-        cfg.reasoning_effort = "high".to_string();
-        cfg.workspace = Some(PathBuf::from("/tmp/oxide"));
+        let cfg = Config {
+            provider: "codex".to_string(),
+            model: "gpt-5.5".to_string(),
+            reasoning_effort: "high".to_string(),
+            workspace: Some(PathBuf::from("/tmp/oxide")),
+            ..Default::default()
+        };
 
         let preview = diagnostic_config_preview(&cfg);
 

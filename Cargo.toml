@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/oxide-design",
     "crates/oxide-protocol",
     "crates/oxide-config",
     "crates/oxide-harness",
@@ -15,7 +16,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.93"
+version = "0.0.94"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Oxide contributors"]
@@ -25,6 +26,7 @@ rust-version = "1.85"
 [workspace.dependencies]
 # internal
 oxide-protocol = { path = "crates/oxide-protocol" }
+oxide-design = { path = "crates/oxide-design" }
 oxide-config = { path = "crates/oxide-config" }
 oxide-harness = { path = "crates/oxide-harness" }
 oxide-providers = { path = "crates/oxide-providers" }

@@ -5,6 +5,7 @@
 //! `Mcp-Session-Id` header returned on initialize is echoed on later requests.
 
 use crate::Transport;
+use anyhow::Context;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -82,6 +83,9 @@ impl HttpTransport {
             let t = resp.text().await.unwrap_or_default();
             anyhow::bail!("mcp http {s}: {t}");
         }
+        let Some(want_id) = want_id else {
+            return Ok(Value::Null);
+        };
         let ct = resp
             .headers()
             .get("Content-Type")
@@ -89,17 +93,11 @@ impl HttpTransport {
             .unwrap_or("")
             .to_string();
         let text = resp.text().await?;
-        let Some(want_id) = want_id else {
-            return Ok(Value::Null);
-        };
 
         // Collect candidate JSON-RPC messages: either a single JSON body, or the
         // `data:` payloads of an SSE stream.
         let msgs: Vec<Value> = if ct.contains("text/event-stream") {
-            text.lines()
-                .filter_map(|l| l.strip_prefix("data:").map(str::trim))
-                .filter_map(|d| serde_json::from_str::<Value>(d).ok())
-                .collect()
+            parse_sse_json_messages(&text)
         } else {
             serde_json::from_str::<Value>(&text).into_iter().collect()
         };
@@ -113,6 +111,44 @@ impl HttpTransport {
         }
         anyhow::bail!("mcp http: no response for id {want_id}");
     }
+}
+
+fn parse_sse_json_messages(text: &str) -> Vec<Value> {
+    let mut messages = Vec::new();
+    let mut data = String::new();
+
+    for line in text.lines() {
+        if line.is_empty() {
+            push_sse_data_message(&mut messages, &mut data);
+            continue;
+        }
+        if line.starts_with(':') {
+            continue;
+        }
+        let (field, value) = match line.split_once(':') {
+            Some((field, value)) => (field, value.strip_prefix(' ').unwrap_or(value)),
+            None => (line, ""),
+        };
+        if field == "data" {
+            data.push_str(value);
+            data.push('\n');
+        }
+    }
+    push_sse_data_message(&mut messages, &mut data);
+    messages
+}
+
+fn push_sse_data_message(messages: &mut Vec<Value>, data: &mut String) {
+    if data.is_empty() {
+        return;
+    }
+    if data.ends_with('\n') {
+        data.pop();
+    }
+    if let Ok(message) = serde_json::from_str::<Value>(data.trim()) {
+        messages.push(message);
+    }
+    data.clear();
 }
 
 pub struct HttpOptions {
@@ -145,7 +181,55 @@ impl Transport for HttpTransport {
 
     async fn notify(&self, method: &str, params: Value) -> anyhow::Result<()> {
         let body = json!({ "jsonrpc": "2.0", "method": method, "params": params });
-        let _ = self.post(&body, None).await;
-        Ok(())
+        let result = self.post(&body, None).await;
+        if let Err(error) = &result {
+            tracing::warn!(method, error = %error, "mcp http notification failed");
+        }
+        result
+            .map(|_| ())
+            .with_context(|| format!("mcp http notification {method} failed"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_multiline_sse_data_event() {
+        let messages = parse_sse_json_messages(
+            "event: message\n\
+             data: {\"jsonrpc\":\"2.0\",\n\
+             data: \"id\":1,\n\
+             data: \"result\":{\"ok\":true}}\n\
+             \n",
+        );
+
+        assert_eq!(
+            messages,
+            vec![json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": { "ok": true }
+            })]
+        );
+    }
+
+    #[test]
+    fn parses_multiple_sse_data_events() {
+        let messages = parse_sse_json_messages(
+            "data: {\"id\":1,\"result\":\"one\"}\n\
+             \n\
+             data: {\"id\":2,\"result\":\"two\"}\n\
+             \n",
+        );
+
+        assert_eq!(
+            messages,
+            vec![
+                json!({ "id": 1, "result": "one" }),
+                json!({ "id": 2, "result": "two" })
+            ]
+        );
     }
 }

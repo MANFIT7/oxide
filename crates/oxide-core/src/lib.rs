@@ -29,6 +29,10 @@ mod tools;
 pub use tools::{Routed, ToolRouter};
 
 use oxide_config::{Config, McpEnvVar, McpServerConfig};
+use oxide_design::{
+    build_design_token_contract, build_patch_instruction, extract_source_tokens,
+    parse_design_markdown, review_design_selection, DesignPatchProposal, DesignReviewInput,
+};
 
 /// A shallow file-tree of the workspace, injected into the system prompt so the
 /// agent sees the project's real structure from the first message (and doesn't
@@ -308,7 +312,11 @@ async fn fetch_url(url: &str) -> (String, bool) {
     };
     // Cap raw HTML before processing: large pages are expensive and the model
     // only needs the first ~200 KB to get the gist.
-    let html = if html.len() > 200_000 { &html[..200_000] } else { &html };
+    let html = if html.len() > 200_000 {
+        &html[..200_000]
+    } else {
+        &html
+    };
     // Drop <script>/<style> blocks with linear string scanning (not char-loop).
     let mut cleaned = String::with_capacity(html.len().min(200_000));
     let lower = html.to_ascii_lowercase();
@@ -319,7 +327,11 @@ async fn fetch_url(url: &str) -> (String, bool) {
             let abs = pos + rel;
             // Flush everything before this tag.
             cleaned.push_str(&html[pos..abs]);
-            let close = if lower[abs..].starts_with("<script") { "</script>" } else { "</style>" };
+            let close = if lower[abs..].starts_with("<script") {
+                "</script>"
+            } else {
+                "</style>"
+            };
             pos = match lower[abs..].find(close) {
                 Some(e) => abs + e + close.len(),
                 None => html.len(), // unclosed tag — skip rest
@@ -349,9 +361,7 @@ pub fn discover_external_mcp() -> Vec<McpServerConfig> {
 pub fn discover_external_mcp_for_workspace(workspace: &Path) -> Vec<McpServerConfig> {
     // Cache for 60s — engines respawn on every tab switch and ~/.claude.json
     // can be megabytes; no need to re-read + re-parse it each time.
-    static CACHE: std::sync::OnceLock<
-        std::sync::Mutex<HashMap<String, (std::time::Instant, Vec<McpServerConfig>)>>,
-    > = std::sync::OnceLock::new();
+    static CACHE: std::sync::OnceLock<ExternalMcpCache> = std::sync::OnceLock::new();
     let cache = CACHE.get_or_init(Default::default);
     let cache_key = workspace
         .canonicalize()
@@ -898,19 +908,28 @@ fn filter_mcp_tools(server: &McpServerConfig, tools: Vec<ToolSpec>) -> Vec<ToolS
         .collect()
 }
 
-use oxide_harness::{Harness, Registry};
+use futures::{stream::FuturesUnordered, StreamExt};
+use oxide_harness::{Harness, Registry, SkillRoute};
 use oxide_mcp::{is_mcp_tool, server_of, HttpOptions, McpClient, StdioSpawnOptions};
-use oxide_protocol::{ApprovalDecision, Event, Op, ToolSpec, TurnId};
+use oxide_protocol::{
+    ApprovalDecision, Event, Op, SubagentControlAction, ToolSpec, TurnId, UiSpec,
+};
 use oxide_providers::{Message, Provider, Role, StreamItem, TurnRequest};
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 use store::{CheckpointStore, SessionStore};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Barrier, Mutex};
 
 const OP_QUEUE: usize = 64;
 const EVENT_QUEUE: usize = 256;
 const STREAM_QUEUE: usize = 256;
+type ExternalMcpCache =
+    std::sync::Mutex<HashMap<String, (std::time::Instant, Vec<McpServerConfig>)>>;
 
 /// Cloneable handle a frontend uses to submit [`Op`]s into the engine.
 #[derive(Clone)]
@@ -928,16 +947,12 @@ impl EngineHandle {
     }
 }
 
-/// Start the engine task. Returns a handle to drive it and the event stream to
-/// subscribe to. The engine runs until [`Op::Shutdown`] or all handles drop.
-pub fn spawn(config: Config) -> anyhow::Result<(EngineHandle, mpsc::Receiver<Event>)> {
-    let (op_tx, op_rx) = mpsc::channel(OP_QUEUE);
-    let (event_tx, event_rx) = mpsc::channel(EVENT_QUEUE);
-
+fn registry_from_config(config: &Config) -> anyhow::Result<Registry> {
     let mut registry = Registry::with_builtins();
-    if let Some(dir) = &config.harness_dir {
-        if let Err(e) = registry.load_dir(dir) {
-            tracing::warn!(error = %e, "failed scanning harness dir");
+    let workspace = config.workspace.as_deref();
+    for dir in oxide_harness::manifest_dirs(config.harness_dir.as_deref(), workspace) {
+        if let Err(e) = registry.load_dir(&dir) {
+            tracing::warn!(dir = %dir.display(), error = %e, "failed scanning harness dir");
         }
     }
     if registry.get(&config.harness).is_none() {
@@ -947,6 +962,15 @@ pub fn spawn(config: Config) -> anyhow::Result<(EngineHandle, mpsc::Receiver<Eve
             registry.ids()
         );
     }
+    Ok(registry)
+}
+
+/// Start the engine task. Returns a handle to drive it and the event stream to
+/// subscribe to. The engine runs until [`Op::Shutdown`] or all handles drop.
+pub fn spawn(config: Config) -> anyhow::Result<(EngineHandle, mpsc::Receiver<Event>)> {
+    let (op_tx, op_rx) = mpsc::channel(OP_QUEUE);
+    let (event_tx, event_rx) = mpsc::channel(EVENT_QUEUE);
+    let registry = registry_from_config(&config)?;
 
     let workspace = config
         .workspace
@@ -990,9 +1014,14 @@ pub fn spawn(config: Config) -> anyhow::Result<(EngineHandle, mpsc::Receiver<Eve
             .unwrap_or_else(|| SessionStore::open(&workspace))
         {
             Ok(s) => {
-                // Stamp the provider (sidebar logos); applied now if the row
-                // exists, else carried to the first append.
-                s.set_meta(&format!("provider={}", config.provider));
+                // Stamp the runtime config (sidebar logo + exact replay mode);
+                // applied now if the row exists, else carried to first append.
+                s.set_runtime_config(
+                    &config.provider,
+                    &config.model,
+                    &config.harness,
+                    &config.reasoning_effort,
+                );
                 Some(s)
             }
             Err(e) => {
@@ -1010,11 +1039,11 @@ pub fn spawn(config: Config) -> anyhow::Result<(EngineHandle, mpsc::Receiver<Eve
         provider: oxide_providers::build("echo"),
         session: history,
         next_turn: 1,
-        next_approval: 1,
+        next_approval: Arc::new(AtomicU64::new(1)),
         session_approved: HashSet::new(),
         workspace,
         session_store,
-        checkpoints: CheckpointStore::default(),
+        checkpoints: Arc::new(Mutex::new(CheckpointStore::default())),
         mcp_clients: Vec::new(),
         mcp_tools: Vec::new(),
         mcp_instructions: Vec::new(),
@@ -1075,6 +1104,229 @@ fn compact_json(value: &serde_json::Value, limit: usize) -> String {
     compact_chars(&value.to_string(), limit)
 }
 
+fn ui_props_tool_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type":"object",
+        "additionalProperties":false,
+        "properties":{
+            "title":{"type":"string","maxLength":4000},
+            "text":{"type":"string","maxLength":4000},
+            "label":{"type":"string","maxLength":4000},
+            "value":{"type":"string","maxLength":4000},
+            "caption":{"type":"string","maxLength":4000},
+            "tone":{"type":"string","enum":["neutral","info","success","warning","danger"]},
+            "language":{"type":"string","maxLength":40},
+            "columns":{
+                "type":"array",
+                "maxItems":12,
+                "items":{
+                    "type":"object",
+                    "additionalProperties":false,
+                    "properties":{
+                        "key":{"type":"string","maxLength":120},
+                        "label":{"type":"string","maxLength":120}
+                    },
+                    "required":["key","label"]
+                }
+            },
+            "rows":{
+                "type":"array",
+                "maxItems":80,
+                "items":{"type":"object"}
+            },
+            "action":{
+                "type":"object",
+                "additionalProperties":false,
+                "properties":{
+                    "name":{"type":"string","maxLength":120},
+                    "label":{"type":"string","maxLength":120},
+                    "payload":{}
+                },
+                "required":["name","label"]
+            }
+        }
+    })
+}
+
+fn ui_node_tool_schema(depth: usize) -> serde_json::Value {
+    let children = if depth == 0 {
+        serde_json::json!({
+            "type":"array",
+            "maxItems":0,
+            "description":"Maximum schema nesting reached; use shallower UI trees."
+        })
+    } else {
+        serde_json::json!({
+            "type":"array",
+            "maxItems":24,
+            "items": ui_node_tool_schema(depth - 1)
+        })
+    };
+    serde_json::json!({
+        "type":"object",
+        "additionalProperties":false,
+        "properties":{
+            "id":{"type":"string","maxLength":120},
+            "type":{"type":"string","enum":["stack","row","card","text","metric","table","code","alert","divider","action"]},
+            "props": ui_props_tool_schema(),
+            "children": children
+        },
+        "required":["type"]
+    })
+}
+
+fn ui_spec_tool_params() -> serde_json::Value {
+    serde_json::json!({
+        "type":"object",
+        "additionalProperties":false,
+        "properties":{
+            "spec":{
+                "type":"object",
+                "additionalProperties":false,
+                "description":"Rust-native UiSpec. Use table only with columns/rows, action only with props.action, and never emit HTML or JavaScript.",
+                "properties":{
+                    "title":{"type":"string","maxLength":4000},
+                    "root": ui_node_tool_schema(4)
+                },
+                "required":["root"]
+            }
+        },
+        "required":["spec"]
+    })
+}
+
+fn design_selection_tool_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type":"object",
+        "additionalProperties":false,
+        "properties":{
+            "selector":{"type":"string","description":"Stable CSS selector or element handle from Design Workbench."},
+            "component":{"type":"string","description":"Component hint, if known."},
+            "source":{"type":"string","description":"Source file hint, if known."},
+            "text":{"type":"string"},
+            "html":{"type":"string"},
+            "styles":{"type":"object","additionalProperties":{"type":"string"}}
+        },
+        "required":["selector"]
+    })
+}
+
+fn design_edit_tool_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type":"object",
+        "additionalProperties":false,
+        "properties":{
+            "property":{"type":"string"},
+            "old_value":{"type":"string"},
+            "new_value":{"type":"string"}
+        },
+        "required":["property","new_value"]
+    })
+}
+
+fn design_review_tool_params() -> serde_json::Value {
+    serde_json::json!({
+        "type":"object",
+        "additionalProperties":false,
+        "properties":{
+            "selection": design_selection_tool_schema(),
+            "edits":{"type":"array","items": design_edit_tool_schema()}
+        },
+        "required":["selection"]
+    })
+}
+
+fn design_patch_tool_params() -> serde_json::Value {
+    serde_json::json!({
+        "type":"object",
+        "additionalProperties":false,
+        "properties":{
+            "selection": design_selection_tool_schema(),
+            "edits":{"type":"array","items": design_edit_tool_schema()},
+            "instruction":{"type":"string","description":"Optional extra implementation instruction."}
+        },
+        "required":["selection","edits"]
+    })
+}
+
+fn review_line_has_blocking_marker(line: &str) -> bool {
+    let trimmed = line
+        .trim_start_matches(|c: char| {
+            c == '-' || c == '*' || c == ':' || c == ')' || c == '.' || c.is_ascii_digit()
+        })
+        .trim_start();
+    let upper = trimmed.to_ascii_uppercase();
+    [
+        "GAP",
+        "GAPS",
+        "ISSUE",
+        "ISSUES",
+        "BUG",
+        "BUGS",
+        "REGRESSION",
+        "REGRESSIONS",
+        "FAIL",
+        "FAILING",
+        "MISSING",
+    ]
+    .iter()
+    .any(|marker| {
+        upper == *marker
+            || upper.starts_with(&format!("{marker}:"))
+            || upper.starts_with(&format!("{marker} -"))
+    })
+}
+
+fn review_passes_gate(review: &str) -> bool {
+    let mut lines = review.trim_start().lines();
+    let Some(first_line) = lines.next() else {
+        return false;
+    };
+    if !first_line.trim().eq_ignore_ascii_case("DONE") {
+        return false;
+    }
+    !lines.any(review_line_has_blocking_marker)
+}
+
+fn trigger_matches(user_text: &str, trigger: &str) -> bool {
+    let trigger = trigger.trim().to_ascii_lowercase();
+    if trigger.is_empty() {
+        return false;
+    }
+    let text = user_text.to_ascii_lowercase();
+    if trigger.contains(' ') {
+        return text.contains(&trigger);
+    }
+    text.split(|c: char| !c.is_alphanumeric())
+        .any(|token| token == trigger)
+}
+
+fn selected_skill_route(harness: &dyn Harness, user_text: &str) -> Option<SkillRoute> {
+    harness.skill_routes().into_iter().find(|route| {
+        route
+            .triggers
+            .iter()
+            .any(|trigger| trigger_matches(user_text, trigger))
+    })
+}
+
+fn render_skill_route(route: &SkillRoute) -> String {
+    let mut out = format!(
+        "\n\n# Harness workflow route: {}\n{}\n",
+        route.id,
+        route.instructions.trim()
+    );
+    if !route.template.is_empty() {
+        out.push_str("\nSuggested workflow checklist:\n");
+        for item in &route.template {
+            out.push_str("- ");
+            out.push_str(item.trim());
+            out.push('\n');
+        }
+    }
+    out
+}
+
 struct Engine {
     config: Config,
     registry: Registry,
@@ -1082,7 +1334,7 @@ struct Engine {
     /// Conversation history (system prompt is injected per-turn from the harness).
     session: Vec<Message>,
     next_turn: u64,
-    next_approval: u64,
+    next_approval: Arc<AtomicU64>,
     /// Tools approved for the whole session via ApproveForSession.
     session_approved: HashSet<String>,
     /// Root all tool filesystem/shell access is confined to.
@@ -1090,7 +1342,7 @@ struct Engine {
     /// Append-only session log (None if persistence is off/unavailable).
     session_store: Option<SessionStore>,
     /// Undo log for file-mutating tool calls.
-    checkpoints: CheckpointStore,
+    checkpoints: Arc<Mutex<CheckpointStore>>,
     /// Connected MCP servers (one per configured launcher).
     mcp_clients: Vec<std::sync::Arc<McpClient>>,
     /// Namespaced tool specs discovered from all MCP servers.
@@ -1132,8 +1384,97 @@ struct WorkerProfile {
     provider: String,
     effort: String,
     instructions: String,
-    allowed_tools: Vec<String>,
+    toolset: WorkerToolset,
     max_steps: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkerToolset {
+    Full,
+    ReviewReadOnly,
+    VerifyReadOnly,
+    ExploreReadOnly,
+}
+
+impl WorkerToolset {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::ReviewReadOnly => "review-read-only",
+            Self::VerifyReadOnly => "verify-read-only",
+            Self::ExploreReadOnly => "explore-read-only",
+        }
+    }
+
+    fn allowed_patterns(self) -> &'static [&'static str] {
+        match self {
+            Self::Full => &["*"],
+            Self::ReviewReadOnly => &[
+                "read_file",
+                "search",
+                "codebase_search",
+                "fetch_url",
+                "web_search",
+                "design_read_system",
+                "design_extract_tokens",
+                "design_review",
+                "design_propose_patch",
+            ],
+            Self::VerifyReadOnly => &[
+                "read_file",
+                "search",
+                "codebase_search",
+                "browser_read",
+                "fetch_url",
+                "design_read_system",
+                "design_extract_tokens",
+                "design_review",
+            ],
+            Self::ExploreReadOnly => &[
+                "read_file",
+                "search",
+                "codebase_search",
+                "browser_read",
+                "fetch_url",
+                "web_search",
+                "design_read_system",
+                "design_extract_tokens",
+                "design_review",
+                "design_propose_patch",
+            ],
+        }
+    }
+
+    fn allows(self, tool_name: &str) -> bool {
+        self.allowed_patterns().iter().any(|allowed| {
+            if *allowed == "*" {
+                true
+            } else if let Some(prefix) = allowed.strip_suffix('*') {
+                tool_name.starts_with(prefix)
+            } else {
+                tool_name == *allowed
+            }
+        })
+    }
+}
+
+struct SubagentAssignment {
+    index: usize,
+    task: String,
+    system: String,
+    worker_id: String,
+    profile: WorkerProfile,
+}
+
+struct SubagentRunResult {
+    index: usize,
+    task: String,
+    output: String,
+    interrupted: bool,
+    edited: bool,
+    edit_paths: Vec<String>,
+    read_files: HashSet<String>,
+    session_approved: HashSet<String>,
 }
 
 const DEFAULT_SUBAGENT_OPERATING_MODE: &str = "\
@@ -1169,15 +1510,16 @@ impl WorkerProfile {
             provider: provider.to_string(),
             effort: effort.to_string(),
             instructions: "You may inspect, edit, run commands, and verify. Keep changes scoped and finish the assigned implementation.".to_string(),
-            allowed_tools: Vec::new(),
+            toolset: WorkerToolset::Full,
             max_steps: 24,
         }
     }
 }
 
 fn worker_profile_system_block(profile: &WorkerProfile, exposed_tools: usize) -> String {
+    let tool_policy = profile.toolset.label();
     format!(
-        "# Sub-agent default operating mode\n{}\n\n# Sub-agent profile: {}\n{}\n\nAvailable tool policy: {} tool(s) exposed for this worker.",
+        "# Sub-agent default operating mode\n{}\n\n# Sub-agent profile: {}\n{}\n\nToolset: {tool_policy}. Available tool policy: {} tool(s) exposed for this worker.",
         DEFAULT_SUBAGENT_OPERATING_MODE,
         profile.id,
         profile.instructions,
@@ -1197,10 +1539,7 @@ fn subagent_profile_for(task: &str, provider: &str, effort: &str) -> WorkerProfi
             provider: provider.to_string(),
             effort: "low".to_string(),
             instructions: "You are the tester subagent. Run or inspect verification only. Do not edit files; report failures with exact commands and diagnostics.".to_string(),
-            allowed_tools: vec![
-                "read_file", "search", "codebase_search", "shell", "browser_navigate", "browser_read",
-                "browser_screenshot", "fetch_url",
-            ].into_iter().map(String::from).collect(),
+            toolset: WorkerToolset::VerifyReadOnly,
             max_steps: 12,
         }
     } else if lower.contains("review")
@@ -1213,10 +1552,7 @@ fn subagent_profile_for(task: &str, provider: &str, effort: &str) -> WorkerProfi
             provider: provider.to_string(),
             effort: "high".to_string(),
             instructions: "You are the reviewer subagent. Inspect for correctness, regressions, security, and test gaps. Do not edit files; return findings with file references.".to_string(),
-            allowed_tools: vec!["read_file", "search", "codebase_search", "shell", "fetch_url"]
-                .into_iter()
-                .map(String::from)
-                .collect(),
+            toolset: WorkerToolset::ReviewReadOnly,
             max_steps: 12,
         }
     } else if lower.contains("inspect")
@@ -1229,10 +1565,7 @@ fn subagent_profile_for(task: &str, provider: &str, effort: &str) -> WorkerProfi
             provider: provider.to_string(),
             effort: "low".to_string(),
             instructions: "You are the explorer subagent. Locate relevant code, docs, and facts. Do not edit files; return a concise map of what matters.".to_string(),
-            allowed_tools: vec!["read_file", "search", "codebase_search", "web_search", "fetch_url"]
-                .into_iter()
-                .map(String::from)
-                .collect(),
+            toolset: WorkerToolset::ExploreReadOnly,
             max_steps: 10,
         }
     } else {
@@ -1307,6 +1640,22 @@ impl Engine {
             ok,
         })
         .await;
+    }
+
+    fn next_request_id(&self) -> u64 {
+        self.next_approval.fetch_add(1, Ordering::Relaxed)
+    }
+
+    async fn rewind_checkpoint(&self, checkpoint_id: u64) -> u64 {
+        self.checkpoints.lock().await.rewind(checkpoint_id)
+    }
+
+    async fn snapshot_checkpoint(&self, path: &Path) -> u64 {
+        self.checkpoints.lock().await.snapshot(path)
+    }
+
+    async fn snapshot_checkpoint_with(&self, path: &Path, prior: Option<Vec<u8>>) -> u64 {
+        self.checkpoints.lock().await.snapshot_with(path, prior)
     }
 
     fn active_harness(&self) -> &dyn Harness {
@@ -1395,25 +1744,43 @@ impl Engine {
                 },"required":["content","status"]}}},
                 "required":["todos"]
             })));
+        tools.push(ToolSpec::new("render_ui_spec", "Render a constrained Rust-native UI artifact in the chat. Use for dashboards, metrics, tables, status panels, and summaries that are clearer as structured UI than markdown. The spec must use Oxide's fixed catalog: stack, row, card, text, metric, table, code, alert, divider, action.")
+            .params(ui_spec_tool_params()));
+        tools.push(ToolSpec::new("design_read_system", "Read and validate the workspace DESIGN.md contract. Returns parsed section completeness and a Rust-native token contract.")
+            .params(serde_json::json!({"type":"object","properties":{"path":{"type":"string","description":"Optional design system path. Defaults to DESIGN.md."}}})));
+        tools.push(ToolSpec::new("design_extract_tokens", "Extract a Rust-native design token contract from DESIGN.md/CSS text. Use before proposing visual changes so edits align with existing tokens.")
+            .params(serde_json::json!({
+                "type":"object",
+                "additionalProperties":false,
+                "properties":{
+                    "content":{"type":"string","description":"DESIGN.md or CSS text to inspect."},
+                    "source":{"type":"string","description":"Source label for token evidence."}
+                },
+                "required":["content"]
+            })));
+        tools.push(ToolSpec::new("design_snapshot", "Ask the frontend Design Workbench to capture or focus a visual target for element inspection.")
+            .mutating(true)
+            .params(serde_json::json!({
+                "type":"object",
+                "additionalProperties":false,
+                "properties":{"url":{"type":"string"},"note":{"type":"string"}},
+                "required":["url"]
+            })));
+        tools.push(ToolSpec::new("design_review", "Run deterministic checks on a selected Design Workbench element and pending edits. Emits a typed design review event.")
+            .params(design_review_tool_params()));
+        tools.push(ToolSpec::new("design_propose_patch", "Convert a selected Design Workbench element and edits into a typed patch proposal. This does not edit files; use it before source-code changes.")
+            .params(design_patch_tool_params()));
         tools
     }
 
     fn tools_for_worker_profile(&self, profile: &WorkerProfile) -> Vec<ToolSpec> {
         let tools = self.all_tools();
-        if profile.allowed_tools.is_empty() {
+        if profile.toolset == WorkerToolset::Full {
             return tools;
         }
         tools
             .into_iter()
-            .filter(|tool| {
-                profile.allowed_tools.iter().any(|allowed| {
-                    if let Some(prefix) = allowed.strip_suffix('*') {
-                        tool.name.starts_with(prefix)
-                    } else {
-                        tool.name == *allowed
-                    }
-                })
-            })
+            .filter(|tool| profile.toolset.allows(&tool.name))
             .collect()
     }
 
@@ -1474,7 +1841,10 @@ impl Engine {
         Some(match res {
             Ok(Ok(out)) => (out, true),
             Ok(Err(e)) => (format!("browser error: {e}"), false),
-            Err(_) => (format!("browser timeout after 45s — page may be slow or stalled"), false),
+            Err(_) => (
+                "browser timeout after 45s — page may be slow or stalled".to_string(),
+                false,
+            ),
         })
     }
 
@@ -2153,10 +2523,16 @@ Rules:
                     })
                     .await;
                 }
+                Op::SubagentControl { worker_id, .. } => {
+                    self.emit(Event::Info {
+                        text: format!("no live sub-agent worker '{worker_id}'"),
+                    })
+                    .await;
+                }
                 Op::ApprovalResponse { .. } => { /* handled inline during a turn */ }
                 Op::QuestionAnswer { .. } => { /* handled inline during a turn */ }
                 Op::Rewind { checkpoint_id } => {
-                    let restored = self.checkpoints.rewind(checkpoint_id);
+                    let restored = self.rewind_checkpoint(checkpoint_id).await;
                     self.emit(Event::RewindDone {
                         id: checkpoint_id,
                         restored,
@@ -2169,6 +2545,12 @@ Rules:
                         .map(|(r, c)| Message::new(role_from_str(r), c.clone()))
                         .collect();
                     if let Some(store) = &self.session_store {
+                        store.set_runtime_config(
+                            &self.config.provider,
+                            &self.config.model,
+                            &self.config.harness,
+                            &self.config.reasoning_effort,
+                        );
                         let meta = format!("provider={}", self.config.provider);
                         let mut full: Vec<(String, String)> = vec![("meta".into(), meta)];
                         full.extend(msgs.iter().cloned());
@@ -2194,6 +2576,14 @@ Rules:
             return;
         }
         self.config.harness = id.clone();
+        if let Some(store) = &self.session_store {
+            store.set_runtime_config(
+                &self.config.provider,
+                &self.config.model,
+                &self.config.harness,
+                &self.config.reasoning_effort,
+            );
+        }
         self.emit(Event::HarnessChanged { id }).await;
     }
 
@@ -2388,6 +2778,23 @@ Rules:
                         self.emit(Event::ReasoningDelta { turn, text: t }).await;
                     }
                 }
+                StreamItem::ToolInputDelta {
+                    id,
+                    name,
+                    delta,
+                    accumulated,
+                } => {
+                    if !silent {
+                        self.emit(Event::ToolCallDelta {
+                            turn,
+                            call_id: id,
+                            tool: name,
+                            delta,
+                            accumulated,
+                        })
+                        .await;
+                    }
+                }
                 StreamItem::Notice(text) => {
                     self.emit(Event::Info { text }).await;
                 }
@@ -2459,6 +2866,7 @@ Rules:
         worker_id: &str,
         profile: WorkerProfile,
         op_rx: &mut mpsc::Receiver<Op>,
+        start_barrier: Option<Arc<Barrier>>,
     ) -> (String, bool) {
         let saved_session = std::mem::replace(
             &mut self.session,
@@ -2495,6 +2903,9 @@ Rules:
             "running",
         )
         .await;
+        if let Some(barrier) = start_barrier {
+            barrier.wait().await;
+        }
 
         let policy = self.active_harness().loop_policy();
         let model = policy.model.clone().unwrap_or_else(|| {
@@ -2568,6 +2979,15 @@ Rules:
                             }
                             Some(StreamItem::ReasoningItem(v)) => {
                                 pending_reasoning = Some(v);
+                            }
+                            Some(StreamItem::ToolInputDelta { id, name, delta, accumulated }) => {
+                                self.emit(Event::ToolCallDelta {
+                                    turn,
+                                    call_id: id,
+                                    tool: name,
+                                    delta,
+                                    accumulated,
+                                }).await;
                             }
                             Some(StreamItem::ToolCall { id, name, arguments }) => {
                                 did_tool = true;
@@ -2651,7 +3071,7 @@ Rules:
                                 steered = true;
                             }
                             Some(Op::Rewind { checkpoint_id }) => {
-                                let restored = self.checkpoints.rewind(checkpoint_id);
+                                let restored = self.rewind_checkpoint(checkpoint_id).await;
                                 self.emit(Event::RewindDone { id: checkpoint_id, restored }).await;
                             }
                             Some(other) => {
@@ -2722,7 +3142,7 @@ Reply with text only: summarize what you changed, what you verified, and what re
             }
         }
 
-        let changed: Vec<String> = cli_changed.drain(..).collect();
+        let changed: Vec<String> = std::mem::take(&mut cli_changed);
         for path in changed {
             let (rel, diff) = cli_file_diff(&self.workspace, &path).await;
             if !diff.trim().is_empty() {
@@ -2742,7 +3162,7 @@ Reply with text only: summarize what you changed, what you verified, and what re
                         .filter(|o| o.status.success())
                         .map(|o| o.stdout);
                     let abs = self.workspace.join(&rel);
-                    checkpoint = self.checkpoints.snapshot_with(&abs, prior);
+                    checkpoint = self.snapshot_checkpoint_with(&abs, prior).await;
                     self.emit(Event::CheckpointCreated {
                         turn,
                         id: checkpoint,
@@ -2825,6 +3245,198 @@ Reply with text only: summarize what you changed, what you verified, and what re
         (out, interrupted)
     }
 
+    fn subagent_worker_engine(&self) -> anyhow::Result<Self> {
+        let mut config = self.config.clone();
+        config.persist = false;
+        let registry = registry_from_config(&config)?;
+        Ok(Self {
+            config,
+            registry,
+            provider: oxide_providers::build("echo"),
+            session: Vec::new(),
+            next_turn: self.next_turn,
+            next_approval: Arc::clone(&self.next_approval),
+            session_approved: self.session_approved.clone(),
+            workspace: self.workspace.clone(),
+            session_store: None,
+            checkpoints: Arc::clone(&self.checkpoints),
+            mcp_clients: self.mcp_clients.clone(),
+            mcp_tools: self.mcp_tools.clone(),
+            mcp_instructions: self.mcp_instructions.clone(),
+            required_mcp_unavailable: self.required_mcp_unavailable,
+            browser: None,
+            ctx_window: self.ctx_window,
+            read_files: self.read_files.clone(),
+            turn_edited: false,
+            turn_edit_paths: Vec::new(),
+            turn_reads: HashSet::new(),
+            last_tool_sig: String::new(),
+            last_tool_reps: 0,
+            user_interrupted: self.user_interrupted,
+            event_tx: self.event_tx.clone(),
+        })
+    }
+
+    async fn run_subagents_parallel(
+        &mut self,
+        assignments: Vec<SubagentAssignment>,
+        turn: TurnId,
+        op_rx: &mut mpsc::Receiver<Op>,
+    ) -> Vec<SubagentRunResult> {
+        let mut results = Vec::with_capacity(assignments.len());
+        let mut spawn_items = Vec::with_capacity(assignments.len());
+        for assignment in assignments {
+            match self.subagent_worker_engine() {
+                Ok(worker) => {
+                    let (op_tx, op_rx) = mpsc::channel(OP_QUEUE);
+                    spawn_items.push((assignment, worker, op_tx, op_rx));
+                }
+                Err(err) => {
+                    self.emit(Event::Error {
+                        message: format!("sub-agent worker init failed: {err}"),
+                    })
+                    .await;
+                    results.push(SubagentRunResult {
+                        index: assignment.index,
+                        task: assignment.task,
+                        output: String::new(),
+                        interrupted: true,
+                        edited: false,
+                        edit_paths: Vec::new(),
+                        read_files: HashSet::new(),
+                        session_approved: HashSet::new(),
+                    });
+                }
+            }
+        }
+
+        if spawn_items.is_empty() {
+            results.sort_by_key(|result| result.index);
+            return results;
+        }
+
+        let start_barrier = Arc::new(Barrier::new(spawn_items.len()));
+        let mut worker_ops = Vec::with_capacity(spawn_items.len());
+        let mut handles = FuturesUnordered::new();
+        for (assignment, mut worker, op_tx, mut worker_op_rx) in spawn_items {
+            let barrier = Arc::clone(&start_barrier);
+            let worker_id_for_control = assignment.worker_id.clone();
+            let profile_for_control = assignment.profile.id.clone();
+            worker_ops.push((worker_id_for_control, profile_for_control, op_tx));
+            handles.push(tokio::spawn(async move {
+                let SubagentAssignment {
+                    index,
+                    task,
+                    system,
+                    worker_id,
+                    profile,
+                } = assignment;
+                let (output, interrupted) = worker
+                    .stream_agentic_collect(
+                        &system,
+                        &task,
+                        turn,
+                        &worker_id,
+                        profile,
+                        &mut worker_op_rx,
+                        Some(barrier),
+                    )
+                    .await;
+                SubagentRunResult {
+                    index,
+                    task,
+                    output,
+                    interrupted,
+                    edited: worker.turn_edited,
+                    edit_paths: worker.turn_edit_paths,
+                    read_files: worker.read_files,
+                    session_approved: worker.session_approved,
+                }
+            }));
+        }
+
+        let mut parent_ops_open = true;
+        while !handles.is_empty() {
+            tokio::select! {
+                joined = handles.next() => {
+                    match joined {
+                        Some(Ok(result)) => results.push(result),
+                        Some(Err(err)) => {
+                            self.emit(Event::Error {
+                                message: format!("sub-agent worker task failed: {err}"),
+                            }).await;
+                        }
+                        None => break,
+                    }
+                }
+                op = op_rx.recv(), if parent_ops_open => {
+                    match op {
+                        Some(Op::SubagentControl { worker_id, action }) => {
+                            let mut delivered = false;
+                            for (live_worker_id, profile, worker_tx) in &worker_ops {
+                                if live_worker_id != &worker_id {
+                                    continue;
+                                }
+                                delivered = true;
+                                let (status, detail, routed) = match action.clone() {
+                                    SubagentControlAction::Interrupt => (
+                                        "interrupt_requested",
+                                        "operator interrupted this worker".to_string(),
+                                        Op::Interrupt,
+                                    ),
+                                    SubagentControlAction::Steer { text } => (
+                                        "steer_sent",
+                                        compact_chars(&text, 300),
+                                        Op::UserTurn { text },
+                                    ),
+                                };
+                                let _ = worker_tx.send(routed).await;
+                                self.emit(Event::SubagentStatus {
+                                    turn,
+                                    worker_id: live_worker_id.clone(),
+                                    profile: profile.clone(),
+                                    status: status.to_string(),
+                                    detail,
+                                })
+                                .await;
+                            }
+                            if !delivered {
+                                self.emit(Event::Error {
+                                    message: format!("no live sub-agent worker '{worker_id}'"),
+                                }).await;
+                            }
+                        }
+                        Some(op) => {
+                            for (_, _, worker_tx) in &worker_ops {
+                                let _ = worker_tx.send(op.clone()).await;
+                            }
+                        }
+                        None => {
+                            parent_ops_open = false;
+                            for (_, _, worker_tx) in &worker_ops {
+                                let _ = worker_tx.send(Op::Interrupt).await;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        results.sort_by_key(|result| result.index);
+        for result in &results {
+            self.turn_edited |= result.edited;
+            for path in &result.edit_paths {
+                if !self.turn_edit_paths.iter().any(|existing| existing == path) {
+                    self.turn_edit_paths.push(path.clone());
+                }
+            }
+            self.read_files.extend(result.read_files.iter().cloned());
+            self.session_approved
+                .extend(result.session_approved.iter().cloned());
+        }
+        results
+    }
+
     async fn run_turn(&mut self, user_text: String, op_rx: &mut mpsc::Receiver<Op>) {
         let turn = TurnId(self.next_turn);
         self.next_turn += 1;
@@ -2889,6 +3501,9 @@ Treat the following as the only current, top-priority instruction:]\n\n{user_tex
         let harness = self.active_harness();
         let policy = harness.loop_policy();
         let mut sys = harness.system_prompt();
+        if let Some(route) = selected_skill_route(harness, &user_text) {
+            sys.push_str(&render_skill_route(&route));
+        }
         // Mirror the user's language. The codex/chatgpt backend (and most models)
         // default to English without this; the user's prompt language should win.
         sys.push_str(
@@ -3018,6 +3633,7 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                             &worker_id,
                             WorkerProfile::implementer(&backend, &effort),
                             op_rx,
+                            None,
                         )
                         .await;
                     assistant = out;
@@ -3030,37 +3646,47 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                         ),
                     })
                     .await;
-                    let mut results: Vec<(usize, String, String)> =
-                        Vec::with_capacity(subtasks.len());
-                    for (i, st) in subtasks.iter().enumerate() {
-                        let profile = subagent_profile_for(st, &backend, &effort);
-                        let profile_id = profile.id.clone();
-                        let bsys = format!(
-                            "{sys}\n\n# Sub-agent assignment\nYou are sub-agent {} ({profile_id}). Do EXACTLY this subtask and report what you did. Overall plan for context:\n{plan}",
-                            i + 1
-                        );
-                        let worker_id = format!("subagent-{}-{}-{}", turn.0, i + 1, profile_id);
-                        let (out, was_interrupted) = self
-                            .stream_agentic_collect(&bsys, st, turn, &worker_id, profile, op_rx)
-                            .await;
-                        interrupted |= was_interrupted;
-                        results.push((i + 1, st.clone(), out));
-                        if interrupted {
-                            break;
-                        }
-                    }
-                    for (i, st, _) in &results {
+                    let assignments = subtasks
+                        .iter()
+                        .enumerate()
+                        .map(|(i, st)| {
+                            let profile = subagent_profile_for(st, &backend, &effort);
+                            let profile_id = profile.id.clone();
+                            let bsys = format!(
+                                "{sys}\n\n# Sub-agent assignment\nYou are sub-agent {} ({profile_id}). Do EXACTLY this subtask and report what you did. Overall plan for context:\n{plan}",
+                                i + 1
+                            );
+                            let worker_id =
+                                format!("subagent-{}-{}-{}", turn.0, i + 1, profile_id);
+                            SubagentAssignment {
+                                index: i + 1,
+                                task: st.clone(),
+                                system: bsys,
+                                worker_id,
+                                profile,
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    let results = self.run_subagents_parallel(assignments, turn, op_rx).await;
+                    interrupted |= results.iter().any(|result| result.interrupted);
+                    for result in &results {
                         self.emit(Event::Info {
                             text: format!(
-                                "✓ sub-agent {i}: {}",
-                                st.chars().take(60).collect::<String>()
+                                "✓ sub-agent {}: {}",
+                                result.index,
+                                result.task.chars().take(60).collect::<String>()
                             ),
                         })
                         .await;
                     }
                     let joined: String = results
                         .iter()
-                        .map(|(i, st, r)| format!("### Sub-agent {i} — {st}\n{r}"))
+                        .map(|result| {
+                            format!(
+                                "### Sub-agent {} — {}\n{}",
+                                result.index, result.task, result.output
+                            )
+                        })
                         .collect::<Vec<_>>()
                         .join("\n\n");
                     if interrupted {
@@ -3097,6 +3723,7 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                         &worker_id,
                         WorkerProfile::implementer(&backend, &effort),
                         op_rx,
+                        None,
                     )
                     .await;
                 assistant = out;
@@ -3153,6 +3780,7 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                             &worker_id,
                             WorkerProfile::implementer(&backend, &effort),
                             op_rx,
+                            None,
                         )
                         .await;
                     assistant.push_str(&fix);
@@ -3197,9 +3825,7 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                 let review = self
                     .stream_collect(&front, &vsys, &user_text, &effort, turn, true, false)
                     .await;
-                let up = review.trim_start().to_ascii_uppercase();
-                let has_gaps =
-                    up.starts_with("GAPS") || (up.contains("GAP") && !up.starts_with("DONE"));
+                let has_gaps = !review_passes_gate(&review);
                 if !has_gaps {
                     self.emit(Event::Info {
                         text: "✓ Review passed".to_string(),
@@ -3246,6 +3872,7 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                         &worker_id,
                         WorkerProfile::implementer(&backend, &effort),
                         op_rx,
+                        None,
                     )
                     .await;
                 assistant.push_str(&fix);
@@ -3367,6 +3994,15 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                             Some(StreamItem::ReasoningItem(v)) => {
                                 pending_reasoning = Some(v);
                             }
+                            Some(StreamItem::ToolInputDelta { id, name, delta, accumulated }) => {
+                                self.emit(Event::ToolCallDelta {
+                                    turn,
+                                    call_id: id,
+                                    tool: name,
+                                    delta,
+                                    accumulated,
+                                }).await;
+                            }
                             Some(StreamItem::ToolCall { id, name, arguments }) => {
                                 did_tool = true;
                                 turn_had_tool = true;
@@ -3469,7 +4105,7 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                             // Rewind works mid-turn too — restoring a checkpoint
                             // is independent of the stream in flight.
                             Some(Op::Rewind { checkpoint_id }) => {
-                                let restored = self.checkpoints.rewind(checkpoint_id);
+                                let restored = self.rewind_checkpoint(checkpoint_id).await;
                                 self.emit(Event::RewindDone { id: checkpoint_id, restored }).await;
                             }
                             Some(other) => {
@@ -3596,7 +4232,7 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
         }
         // CLI drivers edit inside their own process — reconstruct the diffs from
         // git at turn end so the UI gets the same per-file cards + summary.
-        let changed: Vec<String> = cli_changed.drain(..).collect();
+        let changed: Vec<String> = std::mem::take(&mut cli_changed);
         for path in changed {
             let (rel, diff) = cli_file_diff(&self.workspace, &path).await;
             if !diff.trim().is_empty() {
@@ -3618,7 +4254,7 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
                         .filter(|o| o.status.success())
                         .map(|o| o.stdout);
                     let abs = self.workspace.join(&rel);
-                    checkpoint = self.checkpoints.snapshot_with(&abs, prior);
+                    checkpoint = self.snapshot_checkpoint_with(&abs, prior).await;
                     self.emit(Event::CheckpointCreated {
                         turn,
                         id: checkpoint,
@@ -3964,8 +4600,7 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
 
         // ask_user: surface a question (with optional choices) and block for the answer.
         if name == "ask_user" {
-            let request_id = self.next_approval;
-            self.next_approval += 1;
+            let request_id = self.next_request_id();
             let question = arguments["question"].as_str().unwrap_or("").to_string();
             let options = arguments["options"]
                 .as_array()
@@ -4067,8 +4702,7 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
                 }
             }
             Routed::NeedsApproval => {
-                let request_id = self.next_approval;
-                self.next_approval += 1;
+                let request_id = self.next_request_id();
                 self.emit(Event::ApprovalRequested {
                     request_id,
                     tool: name.clone(),
@@ -4198,7 +4832,7 @@ Do NOT read it again. Proceed now: make the edits with the edit/write_file tools
             if let Some(path) = arguments["path"].as_str() {
                 let abs = self.workspace.join(path);
                 let prior = std::fs::read_to_string(&abs).unwrap_or_default();
-                let id = self.checkpoints.snapshot(&abs);
+                let id = self.snapshot_checkpoint(&abs).await;
                 self.emit(Event::CheckpointCreated {
                     turn,
                     id,
@@ -4249,10 +4883,117 @@ Do NOT read it again. Proceed now: make the edits with the edit/write_file tools
                 format!("todo list updated ({done}/{} done)", items.len()),
                 true,
             )
+        } else if name == "design_read_system" {
+            let path = arguments["path"].as_str().unwrap_or("DESIGN.md");
+            match sandbox::check_read(
+                self.config.sandbox,
+                &self.workspace,
+                std::path::Path::new(path),
+            ) {
+                sandbox::PathCheck::Denied(why) => (why, false),
+                sandbox::PathCheck::Ok(abs) => match std::fs::read_to_string(&abs) {
+                    Ok(content) => {
+                        let system = parse_design_markdown(&content);
+                        let tokens = extract_source_tokens(&content, path);
+                        let contract = build_design_token_contract(&tokens);
+                        match serde_json::to_string_pretty(&serde_json::json!({
+                            "system": system,
+                            "token_contract": contract
+                        })) {
+                            Ok(payload) => (payload, true),
+                            Err(e) => (
+                                format!("design_read_system serialization error: {e}"),
+                                false,
+                            ),
+                        }
+                    }
+                    Err(e) => (format!("design_read_system read error: {e}"), false),
+                },
+            }
+        } else if name == "design_extract_tokens" {
+            let content = arguments["content"].as_str().unwrap_or("");
+            let source = arguments["source"].as_str().unwrap_or("inline-design");
+            let tokens = extract_source_tokens(content, source);
+            let contract = build_design_token_contract(&tokens);
+            match serde_json::to_string_pretty(&contract) {
+                Ok(payload) => (payload, true),
+                Err(e) => (
+                    format!("design_extract_tokens serialization error: {e}"),
+                    false,
+                ),
+            }
+        } else if name == "design_review" {
+            match serde_json::from_value::<DesignReviewInput>(arguments.clone()) {
+                Ok(input) => {
+                    let review = review_design_selection(input);
+                    let ok = review.ok;
+                    self.emit(Event::DesignReviewCompleted {
+                        turn,
+                        review: Box::new(review.clone()),
+                    })
+                    .await;
+                    match serde_json::to_string_pretty(&review) {
+                        Ok(payload) => (payload, ok),
+                        Err(e) => (format!("design_review serialization error: {e}"), false),
+                    }
+                }
+                Err(e) => (format!("design_review parse error: {e}"), false),
+            }
+        } else if name == "design_propose_patch" {
+            match serde_json::from_value::<DesignPatchProposal>(arguments.clone()) {
+                Ok(mut proposal) => {
+                    proposal.instruction = build_patch_instruction(&proposal);
+                    self.emit(Event::DesignPatchProposed {
+                        turn,
+                        proposal: Box::new(proposal.clone()),
+                    })
+                    .await;
+                    (proposal.instruction, true)
+                }
+                Err(e) => (format!("design_propose_patch parse error: {e}"), false),
+            }
+        } else if name == "design_snapshot" {
+            let url = tool_arg_string(&arguments, "url");
+            let note = tool_arg_string(&arguments, "note");
+            self.emit(Event::DesignSnapshotRequested {
+                turn,
+                url: url.clone(),
+                note,
+            })
+            .await;
+            (format!("requested Design Workbench snapshot: {url}"), true)
+        } else if name == "render_ui_spec" {
+            match arguments.get("spec") {
+                Some(value) => match serde_json::from_value::<UiSpec>(value.clone()) {
+                    Ok(spec) => match spec.validate() {
+                        Ok(()) => {
+                            let title = spec
+                                .title
+                                .clone()
+                                .or_else(|| spec.root.props.title.clone())
+                                .unwrap_or_else(|| "Untitled UI".to_string());
+                            if let Some(store) = &self.session_store {
+                                if let Ok(payload) = serde_json::to_string(&spec) {
+                                    let _ = store.append("ui_spec", &payload);
+                                }
+                            }
+                            self.emit(Event::UiSpec {
+                                turn,
+                                spec: Box::new(spec),
+                            })
+                            .await;
+                            (format!("rendered UI spec: {title}"), true)
+                        }
+                        Err(e) => (format!("render_ui_spec validation error: {e}"), false),
+                    },
+                    Err(e) => (format!("render_ui_spec parse error: {e}"), false),
+                },
+                None => ("render_ui_spec: missing 'spec'".to_string(), false),
+            }
         } else if name == "shell" {
             let command = arguments["command"].as_str().unwrap_or("").to_string();
             let command_id = if call_id.trim().is_empty() {
-                format!("shell-{}-{}", turn.0, self.next_approval)
+                format!("shell-{}-{}", turn.0, self.next_request_id())
             } else {
                 format!("shell-{}-{call_id}", turn.0)
             };
@@ -4589,6 +5330,7 @@ async fn collect_provider_text_silent(
             | StreamItem::CommandFinished { .. }
             | StreamItem::ReasoningDelta(_)
             | StreamItem::ReasoningItem(_)
+            | StreamItem::ToolInputDelta { .. }
             | StreamItem::ToolCall { .. }
             | StreamItem::Notice(_)
             | StreamItem::CliSession(_)
@@ -4860,9 +5602,55 @@ attributes:
         let profile = super::subagent_profile_for("review the diff for risks", "codex", "medium");
 
         assert_eq!(profile.id, "reviewer");
-        assert!(profile.allowed_tools.contains(&"read_file".to_string()));
-        assert!(!profile.allowed_tools.contains(&"edit".to_string()));
+        assert_eq!(profile.toolset, super::WorkerToolset::ReviewReadOnly);
+        assert!(profile.toolset.allows("read_file"));
+        assert!(profile.toolset.allows("web_search"));
+        assert!(!profile.toolset.allows("shell"));
+        assert!(!profile.toolset.allows("edit"));
+        assert!(!profile.toolset.allows("write_file"));
         assert_eq!(profile.effort, "high");
+    }
+
+    #[test]
+    fn subagent_profile_limits_tester_to_read_only_tools() {
+        let profile = super::subagent_profile_for("run tests and verify", "codex", "medium");
+
+        assert_eq!(profile.id, "tester");
+        assert_eq!(profile.toolset, super::WorkerToolset::VerifyReadOnly);
+        assert!(profile.toolset.allows("read_file"));
+        assert!(profile.toolset.allows("browser_read"));
+        assert!(!profile.toolset.allows("shell"));
+        assert!(!profile.toolset.allows("browser_navigate"));
+        assert!(!profile.toolset.allows("browser_screenshot"));
+        assert!(!profile.toolset.allows("edit"));
+        assert!(!profile.toolset.allows("write_file"));
+    }
+
+    #[test]
+    fn subagent_profile_limits_explorer_to_read_only_research_tools() {
+        let profile = super::subagent_profile_for("explore provider catalog", "codex", "medium");
+
+        assert_eq!(profile.id, "explorer");
+        assert_eq!(profile.toolset, super::WorkerToolset::ExploreReadOnly);
+        assert!(profile.toolset.allows("read_file"));
+        assert!(profile.toolset.allows("codebase_search"));
+        assert!(profile.toolset.allows("web_search"));
+        assert!(!profile.toolset.allows("shell"));
+        assert!(!profile.toolset.allows("edit"));
+        assert!(!profile.toolset.allows("mcp__fs__write"));
+    }
+
+    #[test]
+    fn review_gate_rejects_done_with_gap_markers() {
+        assert!(super::review_passes_gate("DONE\nNo issues found."));
+        assert!(!super::review_passes_gate(
+            "DONE\nGAPS:\n- Missing regression test"
+        ));
+        assert!(!super::review_passes_gate(
+            "DONE\nIssue: reviewer still found a race"
+        ));
+        assert!(!super::review_passes_gate("DONE but there are gaps"));
+        assert!(!super::review_passes_gate("GAPS\n- incomplete"));
     }
 
     #[test]
@@ -4875,5 +5663,59 @@ attributes:
         assert!(block.contains("staying within safety, permission, sandbox, and tool policies"));
         assert!(block.contains("Sub-agent profile: implementer"));
         assert!(block.contains("8 tool(s) exposed"));
+    }
+
+    #[test]
+    fn registry_loads_workspace_harnesses_by_default() {
+        let root = std::env::temp_dir().join(format!(
+            "oxide-workspace-harness-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let harness_dir = root.join("harnesses");
+        std::fs::create_dir_all(&harness_dir).unwrap();
+        std::fs::write(
+            harness_dir.join("coding.toml"),
+            r#"
+id = "coding"
+name = "Focused Coding"
+system_prompt = "Test coding harness"
+
+[[tools]]
+name = "read_file"
+description = "Read a file"
+mutating = false
+"#,
+        )
+        .unwrap();
+
+        let config = oxide_config::Config {
+            workspace: Some(root.clone()),
+            harness: "coding".to_string(),
+            ..oxide_config::Config::default()
+        };
+
+        let registry = super::registry_from_config(&config).unwrap();
+        assert!(registry.get("coding").is_some());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn harness_skill_routes_match_user_intent_without_short_false_positives() {
+        let registry = oxide_harness::Registry::with_builtins();
+        let harness = registry.get("default").unwrap();
+
+        let frontend = super::selected_skill_route(harness, "audit animasi cursor di GUI").unwrap();
+        assert_eq!(frontend.id, "frontend");
+        assert!(super::render_skill_route(&frontend).contains("frontend workflow"));
+
+        let review = super::selected_skill_route(harness, "review bug dan risiko").unwrap();
+        assert_eq!(review.id, "review");
+
+        assert!(super::selected_skill_route(harness, "write a migration guide").is_none());
     }
 }

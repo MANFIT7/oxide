@@ -18,7 +18,7 @@ struct Cli {
     #[arg(long, global = true)]
     harness: Option<String>,
 
-    /// Override the provider backend (echo, mock, openai, anthropic).
+    /// Override the provider backend (see `oxide provider list`).
     #[arg(long, global = true)]
     provider: Option<String>,
 
@@ -65,6 +65,11 @@ enum Command {
         #[command(subcommand)]
         action: SessionAction,
     },
+    /// Inspect provider catalog and local provider readiness.
+    Provider {
+        #[command(subcommand)]
+        action: ProviderAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -85,6 +90,22 @@ enum SessionAction {
     Show {
         /// Session id from `oxide session list`.
         id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProviderAction {
+    /// List every provider in the local catalog.
+    List,
+    /// Show models, capabilities, and auth requirement for one provider.
+    Show {
+        /// Provider id from `oxide provider list`.
+        id: String,
+    },
+    /// Check local env/files/binaries required by providers.
+    Doctor {
+        /// Optional provider id. Omit to check every provider.
+        id: Option<String>,
     },
 }
 
@@ -147,6 +168,7 @@ fn main() -> Result<()> {
                         HarnessAction::List => list_harnesses(&config),
                     },
                     Command::Session { action } => run_session(action, &config),
+                    Command::Provider { action } => run_provider(action),
                     Command::Gui => unreachable!(),
                 }
             })
@@ -192,6 +214,7 @@ async fn run_exec(
                 }
             }
             Event::ReasoningDelta { .. } => {}
+            Event::ToolCallDelta { .. } => {}
             Event::ApprovalRequested {
                 request_id,
                 tool,
@@ -305,6 +328,16 @@ async fn run_exec(
                     println!("[diff] {path}");
                 }
             }
+            Event::UiSpec { spec, .. } => {
+                if !json_events {
+                    let title = spec
+                        .title
+                        .as_deref()
+                        .or(spec.root.props.title.as_deref())
+                        .unwrap_or("Untitled UI");
+                    println!("[ui] {title}");
+                }
+            }
             Event::HookFired {
                 hook,
                 command,
@@ -330,6 +363,16 @@ async fn run_exec(
             Event::SubagentStarted { profile, task, .. } => {
                 if !json_events {
                     println!("[subagent] {profile} started: {task}")
+                }
+            }
+            Event::SubagentStatus {
+                profile,
+                status,
+                detail,
+                ..
+            } => {
+                if !json_events {
+                    println!("[subagent] {profile} {status}: {detail}")
                 }
             }
             Event::SubagentFinished {
@@ -398,6 +441,30 @@ async fn run_exec(
             Event::BrowserSnapshotRequested { url, note, .. } => {
                 if !json_events {
                     println!("[browser] snapshot={url} note={note}")
+                }
+            }
+            Event::DesignSnapshotRequested { url, note, .. } => {
+                if !json_events {
+                    println!("[design] snapshot={url} note={note}")
+                }
+            }
+            Event::DesignPatchProposed { proposal, .. } => {
+                if !json_events {
+                    println!(
+                        "[design] patch proposal selector={} edits={}",
+                        proposal.selection.selector,
+                        proposal.edits.len()
+                    )
+                }
+            }
+            Event::DesignReviewCompleted { review, .. } => {
+                if !json_events {
+                    println!(
+                        "[design] review ok={} score={} findings={}",
+                        review.ok,
+                        review.score,
+                        review.findings.len()
+                    )
                 }
             }
             Event::Info { text } => {
@@ -469,6 +536,101 @@ fn run_session(action: SessionAction, config: &Config) -> Result<()> {
     Ok(())
 }
 
+fn run_provider(action: ProviderAction) -> Result<()> {
+    match action {
+        ProviderAction::List => {
+            println!("Providers:");
+            for provider in oxide_providers::list_providers() {
+                let default_model =
+                    oxide_providers::default_model_for_provider(provider.id).unwrap_or("-");
+                let fast_model = oxide_providers::fast_model_for_provider(provider.id)
+                    .map(|model| format!(" fast={model}"))
+                    .unwrap_or_default();
+                println!(
+                    "  {:<18} {:<24} kind={} stability={} default={}{}",
+                    provider.id,
+                    provider.display_name,
+                    provider.kind.as_str(),
+                    provider.stability.as_str(),
+                    default_model,
+                    fast_model
+                );
+            }
+        }
+        ProviderAction::Show { id } => {
+            let provider = oxide_providers::provider_info(&id)
+                .ok_or_else(|| anyhow::anyhow!("unknown provider `{id}`"))?;
+            print_provider_details(provider);
+        }
+        ProviderAction::Doctor { id } => {
+            if let Some(id) = id {
+                let diagnostic = oxide_providers::diagnose_provider(&id)
+                    .ok_or_else(|| anyhow::anyhow!("unknown provider `{id}`"))?;
+                print_provider_diagnostic(&diagnostic);
+            } else {
+                for diagnostic in oxide_providers::diagnose_providers() {
+                    print_provider_diagnostic(&diagnostic);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn print_provider_details(provider: &oxide_providers::ProviderInfo) {
+    println!("{} ({})", provider.display_name, provider.id);
+    println!("Kind: {}", provider.kind.as_str());
+    println!("Stability: {}", provider.stability.as_str());
+    println!("Auth: {}", provider.auth.summary());
+    println!("Capabilities: {}", join_capabilities(provider.capabilities));
+    println!("Models:");
+    for model in provider.models {
+        let mut flags = Vec::new();
+        if model.is_default {
+            flags.push("default");
+        }
+        if model.is_fast {
+            flags.push("fast");
+        }
+        let flags = if flags.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", flags.join(", "))
+        };
+        let context = model
+            .context_window
+            .map(|window| format!(" context={window}"))
+            .unwrap_or_default();
+        println!(
+            "  {:<24} {}{}{}",
+            model.id, model.display_name, flags, context
+        );
+    }
+    if !provider.notes.trim().is_empty() {
+        println!("Notes: {}", provider.notes);
+    }
+}
+
+fn print_provider_diagnostic(diagnostic: &oxide_providers::ProviderDiagnostic) {
+    println!(
+        "{:<18} {:<8} {}",
+        diagnostic.provider_id,
+        diagnostic.status.as_str(),
+        diagnostic.summary
+    );
+    if !diagnostic.detail.trim().is_empty() {
+        println!("  {}", diagnostic.detail);
+    }
+}
+
+fn join_capabilities(capabilities: &[oxide_providers::ProviderCapability]) -> String {
+    capabilities
+        .iter()
+        .map(|capability| capability.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 async fn run_tui(mut config: Config) -> Result<()> {
     // Open on the last conversation by default (resume context + render it).
     config.resume = true;
@@ -482,10 +644,26 @@ async fn run_tui(mut config: Config) -> Result<()> {
     tui.run(handle, events).await
 }
 
+#[cfg(test)]
+mod provider_cli_tests {
+    use super::*;
+
+    #[test]
+    fn join_capabilities_uses_catalog_labels() {
+        let joined = join_capabilities(&[
+            oxide_providers::ProviderCapability::Text,
+            oxide_providers::ProviderCapability::NativeCliTools,
+        ]);
+
+        assert_eq!(joined, "text, native-cli-tools");
+    }
+}
+
 fn list_harnesses(config: &Config) -> Result<()> {
     let mut registry = Registry::with_builtins();
-    if let Some(dir) = &config.harness_dir {
-        let _ = registry.load_dir(dir);
+    let workspace = config.workspace.as_deref();
+    for dir in oxide_harness::manifest_dirs(config.harness_dir.as_deref(), workspace) {
+        let _ = registry.load_dir(&dir);
     }
     println!("Available harnesses:");
     for id in registry.ids() {
