@@ -7582,7 +7582,10 @@ fn stage_git_file(workspace: &Path, file: &GitChangedFile) -> Result<String, Str
 
 fn unstage_git_file(workspace: &Path, file: &GitChangedFile) -> Result<String, String> {
     run_git(workspace, &["restore", "--staged", "--", &file.path]).or_else(|e| {
-        if e.contains("could not resolve HEAD") || e.contains("fatal: ambiguous argument") {
+        if e.contains("could not resolve HEAD")
+            || e.contains("could not resolve 'HEAD'")
+            || e.contains("fatal: ambiguous argument")
+        {
             run_git(workspace, &["rm", "--cached", "-q", "--", &file.path])
         } else {
             Err(e)
