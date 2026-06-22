@@ -644,21 +644,6 @@ async fn run_tui(mut config: Config) -> Result<()> {
     tui.run(handle, events).await
 }
 
-#[cfg(test)]
-mod provider_cli_tests {
-    use super::*;
-
-    #[test]
-    fn join_capabilities_uses_catalog_labels() {
-        let joined = join_capabilities(&[
-            oxide_providers::ProviderCapability::Text,
-            oxide_providers::ProviderCapability::NativeCliTools,
-        ]);
-
-        assert_eq!(joined, "text, native-cli-tools");
-    }
-}
-
 fn list_harnesses(config: &Config) -> Result<()> {
     let mut registry = Registry::with_builtins();
     let workspace = config.workspace.as_deref();
@@ -676,4 +661,19 @@ fn list_harnesses(config: &Config) -> Result<()> {
         println!("  {:<12} {}{}", id, h.display_name(), active);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod provider_cli_tests {
+    use super::*;
+
+    #[test]
+    fn join_capabilities_uses_catalog_labels() {
+        let joined = join_capabilities(&[
+            oxide_providers::ProviderCapability::Text,
+            oxide_providers::ProviderCapability::NativeCliTools,
+        ]);
+
+        assert_eq!(joined, "text, native-cli-tools");
+    }
 }
