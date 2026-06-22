@@ -2745,7 +2745,13 @@ details::details-content { overflow: clip; }
 .thought-body { margin-top: 6px; padding: 8px 12px; color: color-mix(in srgb, var(--text) 45%, transparent);
   font-size: 13px; line-height: 1.6; border-left: 2px solid color-mix(in srgb, var(--text) 20%, transparent);
   white-space: pre-wrap; max-height: 280px; overflow-y: auto; }
-@media (prefers-reduced-motion: reduce) { .typing { animation: none; } }
+@media (prefers-reduced-motion: reduce) {
+  .row.agent.agent-waiting {
+    display: none;
+    margin: 0;
+  }
+  .typing { animation: none; }
+}
 
 /* env card usage row: never wrap */
 .env-card-row { white-space: nowrap; }
@@ -3291,18 +3297,27 @@ details::details-content { overflow: clip; }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  /* NOTE: deliberately NOT a blanket `* { animation: none }`. That killed every
-     functional loading spinner (status pill, activity, sidebar) under macOS
-     Reduce Motion — a frozen spinner reads as a hung UI. Decorative motion is
-     disabled by the specific reduce-motion blocks throughout this file; here we
-     only drop transitions + smooth scroll globally. */
+  /* Reduce Motion keeps textual state visible, but removes decorative loading
+     sweep rows and turns spinner rings into static dots so they do not read as
+     a frozen animation. */
   .toast, .palette, .palette-list .palette-item, .env-panel, .env-body > *,
   .queue-chip, .tab-state, .palette-status, .thread-anchor.restored .thread,
   .tab-dot.busy, .diff-reverted, .diff-kept, .status-spinner, .activity-spin,
   .syn-spinner, .status-shimmer, .typing, .typing span, .slot-char {
     animation: none !important;
   }
-  .status-spinner, .activity-spin, .syn-spinner { will-change: auto; }
+  .status-pill {
+    margin-top: 2px;
+  }
+  .status-spinner, .activity-spin, .syn-spinner {
+    width: 8px;
+    height: 8px;
+    border: 0;
+    background: var(--syn-accent);
+    -webkit-mask: none;
+    mask: none;
+    will-change: auto;
+  }
   .status-shimmer {
     background: none;
     -webkit-text-fill-color: currentColor;

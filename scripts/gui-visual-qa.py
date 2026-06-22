@@ -260,18 +260,33 @@ def main() -> int:
         f"{rel(CSS)} defines glass-sweep typing skeleton",
     )
     require(
-        "reduced-motion freezes decorative motion",
+        "reduced-motion collapses decorative waiting row",
         contains_all(
             css,
             [
                 "@media (prefers-reduced-motion: reduce)",
+                ".row.agent.agent-waiting",
+                "display: none;",
+                ".status-pill",
+                "margin-top: 2px;",
+            ],
+        ),
+        f"{rel(CSS)} removes the empty pre-token skeleton and compacts the active status pill under Reduce Motion",
+    )
+    require(
+        "reduced-motion uses static progress dots",
+        contains_all(
+            css,
+            [
                 ".status-spinner, .activity-spin,",
                 ".syn-spinner, .status-shimmer, .typing, .typing span",
                 "animation: none !important;",
+                "background: var(--syn-accent);",
+                "-webkit-mask: none;",
                 "-webkit-text-fill-color: currentColor;",
             ],
         ),
-        f"{rel(CSS)} disables status/activity/syn/typing animation under Reduce Motion",
+        f"{rel(CSS)} converts spinner rings to static progress dots and disables shimmer text under Reduce Motion",
     )
     require(
         "reduced-motion freezes edit shimmer",

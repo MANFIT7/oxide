@@ -24,7 +24,8 @@ It focuses on states that compile tests cannot prove.
 ## Reduced Motion
 
 - Enable Reduce Motion and repeat a streaming prompt.
-- Confirm shimmer/spinner animations are static, not infinite.
+- Confirm the pre-token shimmer row collapses so it does not leave a blank bar between the user message and the working status.
+- Confirm shimmer/spinner animations become static progress dots/text, not infinite motion or frozen rings.
 - Confirm status text still communicates the active state.
 - Confirm tab switch and panel transitions are instant and do not overlap content.
 
