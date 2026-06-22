@@ -3297,9 +3297,9 @@ details::details-content { overflow: clip; }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  /* Reduce Motion keeps textual state visible, but removes decorative loading
-     sweep rows and turns spinner rings into static dots so they do not read as
-     a frozen animation. */
+  /* Reduce Motion keeps textual state visible, removes decorative loading
+     sweep rows, and freezes loader rings in a spinner shape instead of turning
+     them into solid dots. */
   .toast, .palette, .palette-list .palette-item, .env-panel, .env-body > *,
   .queue-chip, .tab-state, .palette-status, .thread-anchor.restored .thread,
   .tab-dot.busy, .diff-reverted, .diff-kept, .status-spinner, .activity-spin,
@@ -3310,10 +3310,12 @@ details::details-content { overflow: clip; }
     margin-top: 2px;
   }
   .status-spinner, .activity-spin, .syn-spinner {
-    width: 8px;
-    height: 8px;
-    border: 0;
-    background: var(--syn-accent);
+    width: 13px;
+    height: 13px;
+    box-sizing: border-box;
+    border: 2px solid color-mix(in srgb, var(--text) 18%, transparent);
+    border-top-color: var(--syn-accent);
+    background: transparent;
     -webkit-mask: none;
     mask: none;
     will-change: auto;

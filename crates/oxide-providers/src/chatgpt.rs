@@ -14,7 +14,7 @@ use eventsource_stream::Eventsource;
 use futures::StreamExt;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
 const ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
@@ -28,6 +28,12 @@ const OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 /// Network retries for transient failures (5xx / 429 / connection errors).
 const MAX_RETRIES: u32 = 2;
+/// Poll the SSE stream frequently enough to detect backend stalls even when the
+/// TCP connection remains open.
+const STREAM_POLL_TIMEOUT: Duration = Duration::from_secs(5);
+/// ChatGPT can keep the SSE socket alive without semantic events. Stop the turn
+/// instead of leaving the UI in a permanent Working state.
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(75);
 
 /// Best-known context window (tokens) for a ChatGPT-backend model, so
 /// compaction adapts automatically per model instead of a fixed number.
@@ -877,14 +883,36 @@ impl Provider for ChatGptProvider {
         // None / connection error, we surface a truncation notice so the user
         // doesn't mistake a cut-short reply for a complete one.
         let mut stream_completed = false;
-        while let Some(ev) = stream.next().await {
+        let mut stream_stalled = false;
+        let mut connection_lost = false;
+        let mut last_progress = tokio::time::Instant::now();
+        loop {
+            let Some(ev) = (match tokio::time::timeout(STREAM_POLL_TIMEOUT, stream.next()).await {
+                Ok(next) => next,
+                Err(_) => {
+                    if last_progress.elapsed() >= STREAM_IDLE_TIMEOUT {
+                        stream_stalled = true;
+                        break;
+                    }
+                    continue;
+                }
+            }) else {
+                break;
+            };
             let ev = match ev {
                 Ok(e) => e,
-                Err(_) => break, // connection error — fall through to truncation notice
+                Err(_) => {
+                    connection_lost = true;
+                    break;
+                }
             };
             // Skip empty events (SSE keep-alive blank lines) and the [DONE]
             // sentinel some endpoints append after response.completed.
             if ev.data.is_empty() {
+                if last_progress.elapsed() >= STREAM_IDLE_TIMEOUT {
+                    stream_stalled = true;
+                    break;
+                }
                 continue;
             }
             if ev.data.trim() == "[DONE]" {
@@ -897,7 +925,13 @@ impl Provider for ChatGptProvider {
                 Err(_) => continue, // non-JSON line (comment, malformed) — skip
             };
             match v["type"].as_str() {
+                Some("response.created")
+                | Some("response.in_progress")
+                | Some("response.output_item.in_progress") => {
+                    last_progress = tokio::time::Instant::now();
+                }
                 Some("response.output_text.delta") => {
+                    last_progress = tokio::time::Instant::now();
                     if let Some(t) = v["delta"].as_str() {
                         if sink
                             .send(StreamItem::TextDelta(t.to_string()))
@@ -910,11 +944,13 @@ impl Provider for ChatGptProvider {
                 }
                 Some("response.reasoning_summary_text.delta")
                 | Some("response.reasoning_text.delta") => {
+                    last_progress = tokio::time::Instant::now();
                     if let Some(t) = v["delta"].as_str() {
                         let _ = sink.send(StreamItem::ReasoningDelta(t.to_string())).await;
                     }
                 }
                 Some("response.output_item.added") => {
+                    last_progress = tokio::time::Instant::now();
                     // Seed a function_call's buffer at the START so later argument
                     // deltas have a name to attach to (and the call_id is preserved for
                     // the drain path even if output_item.done arrives without call_id).
@@ -947,6 +983,7 @@ impl Provider for ChatGptProvider {
                     }
                 }
                 Some("response.output_item.done") => {
+                    last_progress = tokio::time::Instant::now();
                     let item = &v["item"];
                     if item["type"].as_str() == Some("reasoning") {
                         let _ = sink.send(StreamItem::ReasoningItem(item.clone())).await;
@@ -960,6 +997,7 @@ impl Provider for ChatGptProvider {
                     }
                 }
                 Some("response.function_call_arguments.delta") => {
+                    last_progress = tokio::time::Instant::now();
                     // Accumulate streamed argument JSON so the call is complete even
                     // if the terminal done event omits the full arguments.
                     if let Some(item_id) = v["item_id"].as_str() {
@@ -985,6 +1023,7 @@ impl Provider for ChatGptProvider {
                     }
                 }
                 Some("response.function_call_arguments.done") => {
+                    last_progress = tokio::time::Instant::now();
                     let item_id = v["item_id"].as_str().unwrap_or("").to_string();
                     if item_id.is_empty() {
                         continue;
@@ -1054,17 +1093,26 @@ impl Provider for ChatGptProvider {
                 }
                 _ => {}
             }
+            if last_progress.elapsed() >= STREAM_IDLE_TIMEOUT {
+                stream_stalled = true;
+                break;
+            }
         }
-        // If the loop ended without a terminal event, the connection dropped
-        // mid-stream — the response is incomplete. Notify the user so they
-        // don't mistake a truncated reply for a full one.
+        if stream_stalled {
+            anyhow::bail!(
+                "ChatGPT subscription stream stalled for {}s without model output; stopped this turn so the UI does not stay stuck. Retry, compact the chat, or re-authenticate if it repeats.",
+                STREAM_IDLE_TIMEOUT.as_secs()
+            );
+        }
+        if connection_lost && !stream_completed {
+            anyhow::bail!(
+                "ChatGPT subscription connection lost mid-stream; response may be truncated. Retry if needed."
+            );
+        }
         if !stream_completed {
-            let _ = sink
-                .send(StreamItem::Notice(
-                    "⚠ connection lost mid-stream — response may be truncated. Retry if needed."
-                        .into(),
-                ))
-                .await;
+            anyhow::bail!(
+                "ChatGPT subscription stream ended before a completion event; response may be truncated. Retry if needed."
+            );
         }
         for (item_id, (name, raw_args, call_id)) in pending_function_args {
             // Skip buffers that never received a tool name (seeded by an
