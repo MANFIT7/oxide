@@ -467,12 +467,12 @@ mod tests {
     use super::Registry;
 
     #[test]
-    fn builtin_harnesses_expose_browser_contract_tools() {
+    fn builtin_harnesses_expose_core_tools() {
         let registry = Registry::with_builtins();
         let default = registry.get("default").unwrap();
         let tools = default.tools();
 
-        assert!(tools.iter().any(|tool| tool.name == "browser_open"));
-        assert!(tools.iter().any(|tool| tool.name == "browser_snapshot"));
+        assert!(tools.iter().any(|tool| tool.name == "read_file"));
+        assert!(tools.iter().any(|tool| tool.name == "search"));
     }
 }
