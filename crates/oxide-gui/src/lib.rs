@@ -2847,7 +2847,10 @@ fn scroll_chat_bottom() {
 fn scroll_chat_bottom_if_sticky() {
     spawn(async move {
         let _ = dioxus::document::eval(
-            "requestAnimationFrame(()=>{const s=document.querySelector('.scroll'); if(!s) return; const d=s.scrollHeight-s.scrollTop-s.clientHeight; if(window.__oxstick!==false || d < 180) s.scrollTo({top:s.scrollHeight, behavior:'auto'});});",
+            // Coalesce per-event follow-scrolls into one rAF (the __oxstickQ latch):
+            // a streaming turn calls this on every delta, and stacking a scroll per
+            // event on top of the MutationObserver snap is what makes the tail jitter.
+            "if(window.__oxstickQ)return;window.__oxstickQ=1;requestAnimationFrame(()=>{window.__oxstickQ=0;const s=document.querySelector('.scroll'); if(!s) return; const d=s.scrollHeight-s.scrollTop-s.clientHeight; if(window.__oxstick!==false || d < 180) s.scrollTop=s.scrollHeight;});",
         )
         .await;
     });
@@ -3758,6 +3761,20 @@ fn app() -> Element {
                 if ((e.metaKey || e.ctrlKey) && (e.key === 'k' || e.key === 'K')) { e.preventDefault(); dioxus.send('palette'); }
                 else if ((e.metaKey || e.ctrlKey) && e.key === '/') { e.preventDefault(); dioxus.send('shortcuts'); }
                 else if ((e.metaKey || e.ctrlKey) && (e.key === 'b' || e.key === 'B')) { e.preventDefault(); dioxus.send('files'); }
+                // Cmd-L toggles composer focus. Bind Cmd only (not Ctrl) so
+                // non-macOS Ctrl+L stays free for clearing the terminal.
+                else if (e.metaKey && (e.key === 'l' || e.key === 'L')) {
+                  e.preventDefault();
+                  const el = document.getElementById('ce-input');
+                  if (el) {
+                    if (document.activeElement === el) { el.blur(); }
+                    else {
+                      el.focus();
+                      const r = document.createRange(); r.selectNodeContents(el); r.collapse(false);
+                      const sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(r);
+                    }
+                  }
+                }
                 else if (e.key === 'Escape') { dioxus.send('esc'); }
               }, true);
             }
@@ -3984,17 +4001,28 @@ fn app() -> Element {
                   const b = s.querySelector('.jump-bottom');
                   if (b) b.classList.toggle('show', d > 300);
                 };
+                // Coalesce the snap into ONE rAF per frame. A streaming turn fires a
+                // characterData mutation per token; snapping + reading layout on each
+                // forces a reflow per token = visible tail jitter. Batching to one
+                // snap-per-frame keeps the tail glued smoothly (Synara's "snap in
+                // layout timing" lesson, adapted to the MutationObserver model).
+                let stickQueued = false;
                 const stick = () => {
-                  if (window.__oxstick !== false) s.scrollTop = s.scrollHeight;
-                  // Keep the LIVE reasoning panel pinned to its latest line as it
-                  // streams (Cursor-style), but only when already near the bottom
-                  // so a manual scroll-up to re-read isn't yanked back down.
-                  const tb = s.querySelector('.thinking-box[open] .thinking-body');
-                  if (tb) {
-                    const dd = tb.scrollHeight - tb.scrollTop - tb.clientHeight;
-                    if (dd < 60) tb.scrollTop = tb.scrollHeight;
-                  }
-                  upd();
+                  if (stickQueued) return;
+                  stickQueued = true;
+                  requestAnimationFrame(() => {
+                    stickQueued = false;
+                    if (window.__oxstick !== false) s.scrollTop = s.scrollHeight;
+                    // Keep the LIVE reasoning panel pinned to its latest line as it
+                    // streams (Cursor-style), but only when already near the bottom
+                    // so a manual scroll-up to re-read isn't yanked back down.
+                    const tb = s.querySelector('.thinking-box[open] .thinking-body');
+                    if (tb) {
+                      const dd = tb.scrollHeight - tb.scrollTop - tb.clientHeight;
+                      if (dd < 60) tb.scrollTop = tb.scrollHeight;
+                    }
+                    upd();
+                  });
                 };
                 s.addEventListener('scroll', upd, { passive: true });
                 inner = new MutationObserver(stick);
@@ -8485,6 +8513,7 @@ fn app() -> Element {
                                 ("Cmd-K", "Command palette + chat search"),
                                 ("Cmd-/", "This shortcuts sheet"),
                                 ("Cmd-B", "Toggle Files inspector"),
+                                ("Cmd-L", "Focus / blur composer"),
                                 ("Cmd-1-9", "Jump to agent tab N"),
                                 ("Cmd-Shift-]", "Next tab"),
                                 ("Cmd-Shift-[", "Previous tab"),

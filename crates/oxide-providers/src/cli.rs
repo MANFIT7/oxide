@@ -1042,6 +1042,19 @@ struct ClaudeToolUse {
     command: Option<String>,
     file_path: Option<String>,
     background: bool,
+    /// Transcript position (line, block) so this row emits in true order
+    /// relative to assistant text — a tool never streams above the text that
+    /// preceded it. Mirrors Synara's per-item sequence key.
+    pos: (usize, usize),
+}
+
+/// An assistant text segment carrying its transcript position, so it interleaves
+/// with `ClaudeToolUse` rows in the order the model actually emitted them
+/// (text-before-its-tools), instead of being dumped after every tool row.
+#[derive(Debug, Clone)]
+struct ClaudeTextBlock {
+    pos: (usize, usize),
+    text: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1064,7 +1077,12 @@ enum ClaudeTranscriptTail {
 #[derive(Debug, Default)]
 struct ClaudeTranscriptSnapshot {
     session_id: Option<String>,
+    /// Full assistant text, concatenated — kept for "has activity" / settle
+    /// checks. Ordered emission uses `assistant_blocks` instead.
     assistant_text: String,
+    /// Assistant text segments with transcript positions, interleaved at emit
+    /// time with `tool_uses` so order matches what the model produced.
+    assistant_blocks: Vec<ClaudeTextBlock>,
     tail: ClaudeTranscriptTail,
     tool_uses: Vec<ClaudeToolUse>,
     tool_results: Vec<ClaudeToolResult>,
@@ -1182,9 +1200,9 @@ async fn run_claude_interactive_turn(turn: ClaudeInteractiveTurn<'_>) -> anyhow:
     let mut last_change = Instant::now();
     let mut last_pty_output = Instant::now();
     let mut pending_text = String::new();
-    let mut text_emitted = false;
     let mut emitted_tools: HashSet<String> = HashSet::new();
     let mut command_tools: HashSet<String> = HashSet::new();
+    let mut emitted_text_pos: HashSet<(usize, usize)> = HashSet::new();
     let mut emitted_results: HashSet<String> = HashSet::new();
     let mut pending_usage: Option<(u64, u64, Option<u64>)> = None;
     let mut usage_emitted = false;
@@ -1219,17 +1237,21 @@ async fn run_claude_interactive_turn(turn: ClaudeInteractiveTurn<'_>) -> anyhow:
         if let Some(id) = snapshot.session_id.as_deref() {
             send(sink, StreamItem::CliSession(id.to_string()));
         }
-        for tool in snapshot.tool_uses {
-            if !emitted_tools.insert(tool.id.clone()) {
-                continue;
-            }
-            if tool.command.is_some() {
-                command_tools.insert(tool.id.clone());
-            }
-            emit_claude_tool_use(sink, &tool);
+        // Emit assistant text and tool rows in true transcript order — text
+        // that precedes a tool streams before it (fixes "command appears, then
+        // its text below it"). The trailing text block is held back so the
+        // final answer still waits out the settle window before it lands.
+        if emit_claude_ordered(
+            sink,
+            &snapshot,
+            &mut emitted_tools,
+            &mut command_tools,
+            &mut emitted_text_pos,
+            false,
+        ) {
             last_change = Instant::now();
         }
-        for result in snapshot.tool_results {
+        for result in &snapshot.tool_results {
             if !command_tools.contains(&result.id) || !emitted_results.insert(result.id.clone()) {
                 continue;
             }
@@ -1239,14 +1261,14 @@ async fn run_claude_interactive_turn(turn: ClaudeInteractiveTurn<'_>) -> anyhow:
                     StreamItem::CommandOutput {
                         id: result.id.clone(),
                         stream: if result.is_error { "stderr" } else { "stdout" }.to_string(),
-                        chunk: result.content,
+                        chunk: result.content.clone(),
                     },
                 );
             }
             send(
                 sink,
                 StreamItem::CommandFinished {
-                    id: result.id,
+                    id: result.id.clone(),
                     ok: !result.is_error,
                     exit_code: None,
                     duration_ms: 0,
@@ -1314,13 +1336,15 @@ async fn run_claude_interactive_turn(turn: ClaudeInteractiveTurn<'_>) -> anyhow:
                     tail_context(&terminal_tail)
                 ));
             }
-            emit_interactive_final(
+            emit_claude_ordered(
                 sink,
-                &pending_text,
-                pending_usage,
-                &mut text_emitted,
-                &mut usage_emitted,
+                &snapshot,
+                &mut emitted_tools,
+                &mut command_tools,
+                &mut emitted_text_pos,
+                true,
             );
+            emit_claude_usage(sink, pending_usage, &mut usage_emitted);
             break;
         }
 
@@ -1330,13 +1354,15 @@ async fn run_claude_interactive_turn(turn: ClaudeInteractiveTurn<'_>) -> anyhow:
                 || (snapshot.tail == ClaudeTranscriptTail::AssistantText
                     && last_pty_output.elapsed() >= CLAUDE_INTERACTIVE_SETTLE));
         if final_text_ready {
-            emit_interactive_final(
+            emit_claude_ordered(
                 sink,
-                &pending_text,
-                pending_usage,
-                &mut text_emitted,
-                &mut usage_emitted,
+                &snapshot,
+                &mut emitted_tools,
+                &mut command_tools,
+                &mut emitted_text_pos,
+                true,
             );
+            emit_claude_usage(sink, pending_usage, &mut usage_emitted);
             break;
         }
     }
@@ -1345,17 +1371,73 @@ async fn run_claude_interactive_turn(turn: ClaudeInteractiveTurn<'_>) -> anyhow:
     Ok(())
 }
 
-fn emit_interactive_final(
+/// Emit assistant text segments and tool rows in transcript order, so a tool
+/// never streams above the text that preceded it. Text and tools are merged by
+/// their `(line, block)` position — the order the model produced them.
+///
+/// `include_trailing` controls the LAST text block: while polling we pass
+/// `false` so the final answer isn't emitted until it settles; on the settle /
+/// turn-complete path we pass `true` to flush it. Already-emitted rows are
+/// skipped via `emitted_tools` / `emitted_text_pos`, so repeated polls don't
+/// duplicate. Returns whether anything new was emitted (to bump `last_change`).
+fn emit_claude_ordered(
     sink: &mpsc::Sender<StreamItem>,
-    text: &str,
+    snapshot: &ClaudeTranscriptSnapshot,
+    emitted_tools: &mut HashSet<String>,
+    command_tools: &mut HashSet<String>,
+    emitted_text_pos: &mut HashSet<(usize, usize)>,
+    include_trailing: bool,
+) -> bool {
+    enum Item<'a> {
+        Text(&'a ClaudeTextBlock),
+        Tool(&'a ClaudeToolUse),
+    }
+    let mut items: Vec<((usize, usize), Item)> = Vec::new();
+    for block in &snapshot.assistant_blocks {
+        items.push((block.pos, Item::Text(block)));
+    }
+    for tool in &snapshot.tool_uses {
+        items.push((tool.pos, Item::Tool(tool)));
+    }
+    items.sort_by_key(|(pos, _)| *pos);
+    let last_idx = items.len().saturating_sub(1);
+
+    let mut changed = false;
+    for (idx, (_pos, item)) in items.iter().enumerate() {
+        match item {
+            Item::Tool(tool) => {
+                if !emitted_tools.insert(tool.id.clone()) {
+                    continue;
+                }
+                if tool.command.is_some() {
+                    command_tools.insert(tool.id.clone());
+                }
+                emit_claude_tool_use(sink, tool);
+                changed = true;
+            }
+            Item::Text(block) => {
+                // Hold the trailing text (the in-progress final answer) until the
+                // settle path passes include_trailing — a tool appearing after it
+                // proves it's complete and lets it emit on the next poll.
+                if idx == last_idx && !include_trailing {
+                    continue;
+                }
+                if block.text.trim().is_empty() || !emitted_text_pos.insert(block.pos) {
+                    continue;
+                }
+                send(sink, StreamItem::TextDelta(block.text.clone()));
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+fn emit_claude_usage(
+    sink: &mpsc::Sender<StreamItem>,
     usage: Option<(u64, u64, Option<u64>)>,
-    text_emitted: &mut bool,
     usage_emitted: &mut bool,
 ) {
-    if !*text_emitted && !text.trim().is_empty() {
-        send(sink, StreamItem::TextDelta(text.to_string()));
-        *text_emitted = true;
-    }
     if !*usage_emitted {
         if let Some((input, output, context_window)) = usage {
             send(
@@ -1494,10 +1576,12 @@ fn parse_claude_assistant_line(
 ) {
     let content = &v["message"]["content"];
     let mut text_parts: Vec<String> = Vec::new();
+    let mut first_text_block: Option<usize> = None;
     let mut has_tool_use = false;
     match content {
         Value::String(s) => {
             if !s.trim().is_empty() {
+                first_text_block = Some(0);
                 text_parts.push(s.trim().to_string());
             }
         }
@@ -1507,6 +1591,7 @@ fn parse_claude_assistant_line(
                     Some("text") => {
                         if let Some(text) = block["text"].as_str() {
                             if !text.trim().is_empty() {
+                                first_text_block.get_or_insert(block_idx);
                                 text_parts.push(text.trim().to_string());
                             }
                         }
@@ -1524,7 +1609,14 @@ fn parse_claude_assistant_line(
         _ => {}
     }
     if !text_parts.is_empty() {
-        push_text_message(&mut snapshot.assistant_text, &text_parts.join("\n"));
+        let joined = text_parts.join("\n");
+        // Position the block at its first text block so it sorts before the
+        // tool_use blocks that follow it within the same assistant message.
+        snapshot.assistant_blocks.push(ClaudeTextBlock {
+            pos: (line_idx, first_text_block.unwrap_or(0)),
+            text: joined.clone(),
+        });
+        push_text_message(&mut snapshot.assistant_text, &joined);
     }
     snapshot.usage = transcript_usage(v).or(snapshot.usage);
     snapshot.tail = if has_tool_use {
@@ -1573,6 +1665,7 @@ fn parse_claude_tool_use(block: &Value, line_idx: usize, block_idx: usize) -> Cl
         command,
         file_path,
         background: input["run_in_background"].as_bool() == Some(true),
+        pos: (line_idx, block_idx),
     }
 }
 
@@ -1813,6 +1906,71 @@ mod claude_interactive_tests {
         assert_eq!(snapshot.tool_results[0].id, "tool-1");
         assert_eq!(snapshot.tool_results[0].content, "ok");
         assert_eq!(snapshot.usage, Some((11, 22, None)));
+        // Text and tool carry transcript positions so emission can interleave them.
+        assert_eq!(snapshot.assistant_blocks.len(), 2);
+        assert_eq!(snapshot.assistant_blocks[0].text, "I'll inspect.");
+        assert!(snapshot.assistant_blocks[0].pos < snapshot.tool_uses[0].pos);
+    }
+
+    #[test]
+    fn ordered_emit_streams_text_before_its_tool() {
+        let path = std::env::temp_dir().join(format!(
+            "oxide-claude-order-{}.jsonl",
+            new_claude_session_id()
+        ));
+        // Assistant says "Looking.", runs a command, then answers "Found it.".
+        let text = r#"{"type":"user","sessionId":"abc","message":{"content":"go"}}
+{"type":"assistant","sessionId":"abc","message":{"content":[{"type":"text","text":"Looking."},{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}}
+{"type":"user","sessionId":"abc","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"out"}]}}
+{"type":"assistant","sessionId":"abc","message":{"content":[{"type":"text","text":"Found it."}]}}
+"#;
+        std::fs::write(&path, text).unwrap();
+        let snapshot = parse_claude_transcript(&path, 0);
+        let _ = std::fs::remove_file(&path);
+
+        let (tx, mut rx) = mpsc::channel::<StreamItem>(64);
+        let mut emitted_tools = HashSet::new();
+        let mut command_tools = HashSet::new();
+        let mut emitted_text_pos = HashSet::new();
+
+        // Polling pass: trailing answer is held back, but "Looking." emits before `ls`.
+        emit_claude_ordered(
+            &tx,
+            &snapshot,
+            &mut emitted_tools,
+            &mut command_tools,
+            &mut emitted_text_pos,
+            false,
+        );
+        let mut order: Vec<String> = Vec::new();
+        while let Ok(item) = rx.try_recv() {
+            match item {
+                StreamItem::TextDelta(t) => order.push(format!("text:{t}")),
+                StreamItem::CommandStarted { command, .. } => order.push(format!("cmd:{command}")),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            order,
+            vec!["text:Looking.".to_string(), "cmd:ls".to_string()]
+        );
+
+        // Settle pass: the final answer lands, exactly once, with no re-emit of the rest.
+        emit_claude_ordered(
+            &tx,
+            &snapshot,
+            &mut emitted_tools,
+            &mut command_tools,
+            &mut emitted_text_pos,
+            true,
+        );
+        let mut tail: Vec<String> = Vec::new();
+        while let Ok(item) = rx.try_recv() {
+            if let StreamItem::TextDelta(t) = item {
+                tail.push(t);
+            }
+        }
+        assert_eq!(tail, vec!["Found it.".to_string()]);
     }
 
     #[test]
