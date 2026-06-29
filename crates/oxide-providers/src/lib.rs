@@ -416,6 +416,25 @@ pub fn http_client() -> reqwest::Client {
         .clone()
 }
 
+/// Bounded backoff retries for a transient INITIAL request failure (429 / 5xx /
+/// connection error) — safe to resend because no SSE bytes have been emitted yet.
+/// Mid-stream failures are never retried here (the caller bails so the engine can
+/// decide); a low cap keeps a hard outage from spinning.
+pub(crate) const MAX_HTTP_RETRIES: u32 = 2;
+
+/// Backoff (ms): honor a numeric `retry-after` (seconds) header when present,
+/// else exponential off the attempt index, both capped.
+pub(crate) fn http_retry_delay_ms(resp: Option<&reqwest::Response>, attempt: u32) -> u64 {
+    if let Some(secs) = resp
+        .and_then(|r| r.headers().get("retry-after"))
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+    {
+        return (secs * 1000).min(10_000);
+    }
+    (300u64 << attempt.min(5)).min(4_000)
+}
+
 pub fn build(provider: &str) -> Box<dyn Provider> {
     let provider = provider_info(provider)
         .map(|info| info.id)

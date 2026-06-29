@@ -129,18 +129,43 @@ impl Provider for OpenAiProvider {
         if self.api_key.trim().is_empty() {
             anyhow::bail!("{} key not set: {}", self.name, self.api_key_env);
         }
-        let resp = self
-            .client
-            .post(format!("{}/chat/completions", self.base_url))
-            .bearer_auth(&self.api_key)
-            .json(&body(&req))
-            .send()
-            .await?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("{} {status}: {text}", self.name);
-        }
+        // Initial POST with bounded backoff on transient 429 / 5xx / connection
+        // errors (covers OpenAI-compatible: gemini/xai/deepseek via from_env).
+        // Idempotent: no SSE bytes emitted until 2xx, so a resend can't duplicate.
+        let payload = body(&req);
+        let mut attempt = 0u32;
+        let resp = loop {
+            let send = self
+                .client
+                .post(format!("{}/chat/completions", self.base_url))
+                .bearer_auth(&self.api_key)
+                .json(&payload)
+                .send()
+                .await;
+            match send {
+                Ok(r) if r.status().is_success() => break r,
+                Ok(r) => {
+                    let status = r.status();
+                    if (status.as_u16() == 429 || status.is_server_error())
+                        && attempt < crate::MAX_HTTP_RETRIES
+                    {
+                        let wait = crate::http_retry_delay_ms(Some(&r), attempt);
+                        attempt += 1;
+                        tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
+                        continue;
+                    }
+                    let text = r.text().await.unwrap_or_default();
+                    anyhow::bail!("{} {status}: {text}", self.name);
+                }
+                Err(_e) if attempt < crate::MAX_HTTP_RETRIES => {
+                    let wait = crate::http_retry_delay_ms(None, attempt);
+                    attempt += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        };
 
         // Accumulate streamed tool calls by index until the stream ends.
         let mut tool_names: BTreeMap<u64, String> = BTreeMap::new();

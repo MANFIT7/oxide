@@ -1303,11 +1303,12 @@ svg { width: 17px; height: 17px; flex-shrink: 0; }
 @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
 .status-shimmer {
   font-size: 13px; font-weight: 500;
-  background: linear-gradient(90deg, var(--muted) 30%, #fff 50%, var(--muted) 70%);
-  background-size: 200% 100%;
   -webkit-background-clip: text; background-clip: text;
   -webkit-text-fill-color: transparent;
-  animation: shimmer 1.8s linear infinite;
+  /* The gradient/background-size/animation live in the consolidated rule below
+     (`.status-shimmer, .activity-card.running .activity-verb` → ox-shimmer 1.7s);
+     declaring them here too was dead (same-specificity later rule won) and gave
+     the file two shimmer speeds. Kept here: only the bits that rule omits. */
   /* One line, ellipsis on overflow (flex child needs min-width:0 to shrink). */
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0;
 }
@@ -1520,6 +1521,12 @@ svg { width: 17px; height: 17px; flex-shrink: 0; }
 .tab-actions { margin-left: auto; display: flex; align-items: center; gap: 8px; padding-bottom: 4px; }
 
 /* embedded terminal (xterm) */
+/* Persistent TUI hosts: the active one renders transparently (display:contents)
+   so its .xterm-host sizes against the content area exactly as before; background
+   tui tabs stay in the DOM (mounted, PTY alive) but hidden. Toggling these classes
+   on a tab switch never unmounts the terminal, so the CLI session survives. */
+.tui-host-live { display: contents; }
+.tui-host-off { display: none; }
 .xterm-host { width: 100%; height: 100%; min-height: 70vh; padding: 8px 10px; background: var(--composer); }
 .xterm-host .xterm { height: 100%; }
 .center:has(.xterm-host) { padding: 0; }
@@ -2073,6 +2080,10 @@ details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
   -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 1.5px), #000 calc(100% - 1.5px));
   mask: radial-gradient(farthest-side, transparent calc(100% - 1.5px), #000 calc(100% - 1.5px));
   animation: syn-spin 1.6s linear infinite;
+  /* Heaviest looping animation (conic-gradient + mask, many on screen in the
+     sidebar/edits) — promote to its own layer so the spin doesn't repaint
+     neighbours each frame. */
+  will-change: transform;
 }
 .syn-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
 
@@ -2249,15 +2260,14 @@ details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
   .model-menu, .effort-menu, .plus-menu, .sel-menu, .access-menu, .palette, .modal,
   .theme-menu, .mention-menu, .thread-menu, .newtab-menu,
   .question-card, .approval-card, .edits-card, .todo-card, .workflow-card, .subagents-card, .queue-bar, .status-pill,
-  .thinking-box, .attach-card, .elem-chip { animation: none; }
+  .thinking-box, .attach-card, .elem-chip, .diff-reverted { animation: none; }
 }
 
 /* ── Cursor-3.0-style touches ─────────────────────────────────── */
 /* composer focus: soft accent glow ring */
 .composer:focus-within { border-color: color-mix(in srgb, var(--syn-accent) 55%, var(--border)); box-shadow: 0 0 0 3px color-mix(in srgb, var(--syn-accent) 14%, transparent), 0 8px 28px -18px color-mix(in srgb, var(--syn-accent) 35%, transparent); transition: box-shadow .18s ease, border-color .18s ease; }
-/* blinking caret on the streaming assistant message */
-@keyframes ox-caret { 0%, 49% { opacity: 1; } 50%, 100% { opacity: 0; } }
-/* streaming caret removed — it rendered as a stray blue block under the text */
+/* streaming caret removed — it rendered as a stray blue block under the text
+   (its @keyframes ox-caret was dead and has been dropped). */
 /* springy send button */
 .send { transition: transform .16s cubic-bezier(.34,1.56,.64,1), background .12s ease; }
 .send:hover { transform: scale(1.07); }

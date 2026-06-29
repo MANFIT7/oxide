@@ -313,7 +313,14 @@ async fn fetch_url(url: &str) -> (String, bool) {
     // Cap raw HTML before processing: large pages are expensive and the model
     // only needs the first ~200 KB to get the gist.
     let html = if html.len() > 200_000 {
-        &html[..200_000]
+        // Slice on a char boundary — a raw byte cut at 200_000 panics if it
+        // lands inside a multi-byte UTF-8 sequence (non-ASCII page), which would
+        // unwind the whole turn (and, unsupervised, the engine task) silently.
+        let end = (0..=200_000)
+            .rev()
+            .find(|&i| html.is_char_boundary(i))
+            .unwrap_or(0);
+        &html[..end]
     } else {
         &html
     };
@@ -908,7 +915,7 @@ fn filter_mcp_tools(server: &McpServerConfig, tools: Vec<ToolSpec>) -> Vec<ToolS
         .collect()
 }
 
-use futures::{stream::FuturesUnordered, StreamExt};
+use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use oxide_harness::{Harness, Registry, SkillRoute};
 use oxide_mcp::{is_mcp_tool, server_of, HttpOptions, McpClient, StdioSpawnOptions};
 use oxide_protocol::{
@@ -2514,7 +2521,28 @@ Rules:
 
         while let Some(op) = op_rx.recv().await {
             match op {
-                Op::UserTurn { text } => self.run_turn(text, &mut op_rx).await,
+                Op::UserTurn { text } => {
+                    // Capture the id this turn will use (run_turn reads self.next_turn
+                    // then increments) so a panic anywhere in run_turn's deep call tree
+                    // still emits a matching TurnFinished. The engine task is spawned
+                    // bare with no JoinHandle awaited, so an unguarded unwind would kill
+                    // it silently: the spinner streams forever AND every later prompt on
+                    // this tab is dead (op_rx dropped). catch_unwind keeps run() alive;
+                    // the next turn self-heals via sanitize_tool_pairs.
+                    let turn = TurnId(self.next_turn);
+                    if std::panic::AssertUnwindSafe(self.run_turn(text, &mut op_rx))
+                        .catch_unwind()
+                        .await
+                        .is_err()
+                    {
+                        self.emit(Event::Error {
+                            message: "internal error during turn (session still alive — retry)"
+                                .into(),
+                        })
+                        .await;
+                        self.emit(Event::TurnFinished { turn }).await;
+                    }
+                }
                 Op::SetHarness { id } => self.set_harness(id).await,
                 Op::Interrupt => {
                     // No turn in flight here; nothing to interrupt.
@@ -3909,6 +3937,9 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
         let max_steps = (policy.max_steps as usize).clamp(1, 60);
         let mut step = 0usize;
         let mut overflow_retries = 0u8;
+        // Bounded re-requests for a round that died on a transient stream hiccup
+        // (connection reset / 5xx / truncation) before producing anything.
+        let mut transient_retries = 0u8;
         // CLI drivers (codex/claude) are self-agentic: they run their own tool
         // loop, so Oxide's nudge/wrap-up/auto-verify rounds would just respawn
         // the CLI with an out-of-context reminder as the whole prompt.
@@ -3975,6 +4006,10 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
             let mut pending_reasoning: Option<serde_json::Value> = None;
             let mut did_tool = false;
             let mut steered = false;
+            // True only on a clean terminal stream signal (StreamItem::Done). A bare
+            // channel close (None) leaves this false so a mid-stream cutoff can be
+            // told apart from a real completion when deciding whether to retry.
+            let mut saw_done = false;
             loop {
                 tokio::select! {
                     item = stream_rx.recv() => {
@@ -4085,7 +4120,14 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                                     db::set_cli_session(&store.id, &cli_id);
                                 }
                             }
-                            Some(StreamItem::Done) | None => break,
+                            // Clean terminal signal vs. a bare channel close (cut-off):
+                            // distinguished so the transient-retry path below only fires
+                            // for a real interruption, never a normal completion.
+                            Some(StreamItem::Done) => {
+                                saw_done = true;
+                                break;
+                            }
+                            None => break,
                         }
                     }
                     op = op_rx.recv() => {
@@ -4119,24 +4161,32 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                     }
                 }
             }
-            // Surface a provider error; on context-overflow, hard-compact + retry.
-            let stream_err = if interrupted {
+            // Surface a provider error; on context-overflow, hard-compact + retry;
+            // on a transient stream hiccup before any output, re-request the round.
+            // `crashed` flags a panic in the provider task (JoinError) — terminal:
+            // never compacted or retried (it would just panic again), only shown.
+            let (stream_err, crashed) = if interrupted {
                 stream_task.abort();
-                None
+                (None, false)
             } else {
-                stream_task
-                    .await
-                    .ok()
-                    .and_then(|r| r.err())
-                    .map(|e| e.to_string())
+                match stream_task.await {
+                    Ok(Ok(())) => (None, false),
+                    Ok(Err(e)) => (Some(e.to_string()), false),
+                    Err(join) if join.is_cancelled() => (None, false),
+                    // A bare `.ok()` here used to swallow the JoinError, leaving
+                    // stream_err=None — the turn then committed partial text and
+                    // ended like a clean finish, hiding the crash from the user.
+                    Err(join) => (Some(format!("provider stream task crashed: {join}")), true),
+                }
             };
             if let Some(err) = &stream_err {
                 let low = err.to_lowercase();
-                let overflow = low.contains("context")
-                    || low.contains("exceeds")
-                    || low.contains("too long")
-                    || low.contains("maximum")
-                    || (low.contains("token") && low.contains("limit"));
+                let overflow = !crashed
+                    && (low.contains("context")
+                        || low.contains("exceeds")
+                        || low.contains("too long")
+                        || low.contains("maximum")
+                        || (low.contains("token") && low.contains("limit")));
                 if overflow && round_text.is_empty() && overflow_retries < 3 {
                     overflow_retries += 1;
                     self.force_compact(turn).await;
@@ -4145,6 +4195,69 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                     })
                     .await;
                     continue;
+                }
+                // Transient cutoff (connection reset / 5xx / truncation / stall) on a
+                // round that produced NOTHING yet: re-request instead of ending the
+                // turn — this is the "turn berhenti tiba-tiba" case. Gated hard on
+                // `round_text.is_empty() && !did_tool && !saw_done` so a round that
+                // already streamed text or ran a tool is never re-run (no duplicate
+                // output / double tool calls). Allowlist transient classes only;
+                // exclude hard provider stops (auth/quota) that won't self-heal.
+                let transient = !overflow
+                    && !crashed
+                    && (low.contains("connection")
+                        || low.contains("reset")
+                        || low.contains("closed")
+                        || low.contains("truncat")
+                        || low.contains("before a completion")
+                        || low.contains("stalled")
+                        || low.contains("timed out")
+                        || low.contains("timeout")
+                        || low.contains("502")
+                        || low.contains("503")
+                        || low.contains("504")
+                        || low.contains("temporarily")
+                        || low.contains("overloaded"));
+                let hard = low.contains("token expired")
+                    || low.contains("rejected")
+                    || low.contains("sign in")
+                    || low.contains("log in")
+                    || low.contains("re-authenticate")
+                    || low.contains("wait for the plan reset")
+                    || low.contains("rate limit reached");
+                if transient
+                    && !hard
+                    && !saw_done
+                    && round_text.is_empty()
+                    && !did_tool
+                    && transient_retries < 3
+                {
+                    transient_retries += 1;
+                    let backoff =
+                        std::time::Duration::from_millis(400u64 << (transient_retries - 1));
+                    self.emit(Event::Info {
+                        text: format!("stream interrupted — retrying ({transient_retries}/3)"),
+                    })
+                    .await;
+                    // Interruptible backoff: Stop/Shutdown wins immediately; a message
+                    // sent during the wait is folded in as steering for the retry.
+                    tokio::select! {
+                        _ = tokio::time::sleep(backoff) => {}
+                        op = op_rx.recv() => match op {
+                            Some(Op::Interrupt) => { interrupted = true; self.user_interrupted = true; }
+                            Some(Op::Shutdown) | None => { interrupted = true; }
+                            Some(Op::UserTurn { text }) => {
+                                if let Some(store) = &self.session_store {
+                                    let _ = store.append("user", &text);
+                                }
+                                self.session.push(Message::new(Role::User, text));
+                            }
+                            Some(_) => {}
+                        }
+                    }
+                    if !interrupted {
+                        continue;
+                    }
                 }
                 self.emit(Event::Error {
                     message: err.clone(),

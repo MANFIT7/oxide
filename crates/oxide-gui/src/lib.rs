@@ -1023,6 +1023,9 @@ struct AgentTab {
     bin: String,
     /// Session file backing this tab's model context (resume on switch).
     session: Option<PathBuf>,
+    /// For a "tui" tab: the originating CLI session id to resume (so a TUI tab
+    /// opened from a codex/claude chat continues it instead of starting fresh).
+    resume: Option<String>,
 }
 
 const SESSION_RENDER_MESSAGE_LIMIT: usize = 20;
@@ -2921,6 +2924,7 @@ fn open_session_tab(
                 mode: "gui".into(),
                 bin: String::new(),
                 session: Some(path.clone()),
+                resume: None,
             });
             let idx = tabs.peek().len() - 1;
             active_tab.set(idx);
@@ -3627,6 +3631,7 @@ fn app() -> Element {
             mode: "gui".to_string(),
             bin: String::new(),
             session: None,
+            resume: None,
         }]
     });
     let active_tab = use_signal(|| 0usize);
@@ -4329,7 +4334,15 @@ fn app() -> Element {
             // One engine PER TAB. Events are tagged (tab id, generation) so a
             // single loop serves all engines without cross-tab bleed; a stale
             // generation (engine replaced) is simply dropped.
-            let (ev_tx, mut ev_rx) = tokio::sync::mpsc::channel::<(u64, u64, Event)>(256);
+            // UNBOUNDED on purpose: a bounded channel here back-propagates into
+            // core. If the Dioxus render thread falls behind (long answer =
+            // superlinear whole-message markdown re-render), a bounded forwarder
+            // would block on send, stop draining core's event_rx, fill core's
+            // EVENT_QUEUE, and park `emit().await` mid-turn — which also strands
+            // the op_rx arm so Stop goes dead. Unbounded keeps the forwarder
+            // always-draining so the engine never stalls and Interrupt stays live;
+            // queue memory is bounded by the answer length (tiny per-delta).
+            let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, u64, Event)>();
             let mut handles: std::collections::HashMap<u64, EngineHandle> =
                 std::collections::HashMap::new();
             let mut fwds: std::collections::HashMap<u64, tokio::task::JoinHandle<()>> =
@@ -4371,7 +4384,9 @@ fn app() -> Element {
                                 tid,
                                 tokio::spawn(async move {
                                     while let Some(e) = events.recv().await {
-                                        if tx.send((tid, g, e)).await.is_err() {
+                                        // Sync send (unbounded): never blocks, so this
+                                        // task always drains core's event_rx immediately.
+                                        if tx.send((tid, g, e)).is_err() {
                                             break;
                                         }
                                     }
@@ -4379,15 +4394,13 @@ fn app() -> Element {
                             );
                         }
                         Err(e) => {
-                            let _ = ev_tx
-                                .send((
-                                    tid,
-                                    g,
-                                    Event::Error {
-                                        message: format!("engine: {e}"),
-                                    },
-                                ))
-                                .await;
+                            let _ = ev_tx.send((
+                                tid,
+                                g,
+                                Event::Error {
+                                    message: format!("engine: {e}"),
+                                },
+                            ));
                         }
                     }
                 }};
@@ -4715,6 +4728,25 @@ fn app() -> Element {
                         }
                         None => break,
                       }
+                    },
+                    // Idle-flush: the delta handler only paints when >=33ms passed
+                    // since the last paint OR the buffer grew past 800B, so the final
+                    // sub-33ms tail of a burst sits in agent_buf until the NEXT event.
+                    // If the provider then pauses (bursty/slow stream, end-of-text gap
+                    // before TurnFinished), nothing wakes the loop and the buffered tail
+                    // stays invisible — chrome (spinner/shimmer/elapsed) keeps moving so
+                    // it reads as "frozen then jumps". This arm bounds tail latency to
+                    // ~50ms. The `if !agent_buf.is_empty()` guard is REQUIRED: select!
+                    // only builds the sleep future when the precondition is true, so an
+                    // empty buffer means no timer (no busy-spin); flush_agent! empties
+                    // the buffer via mem::take so the arm self-disables after one fire.
+                    // Anchored to last_paint (not loop-idle) so a chatty background tab
+                    // can't starve the foreground tail.
+                    _ = tokio::time::sleep(
+                        std::time::Duration::from_millis(50)
+                            .saturating_sub(last_paint.elapsed()),
+                    ), if !agent_buf.is_empty() => {
+                        flush_agent!();
                     },
                     Some((ev_tid, ev_gen, ev)) = ev_rx.recv() => {
                         // Drop events from a replaced engine (stale generation).
@@ -5616,11 +5648,11 @@ fn app() -> Element {
         }
     });
     // Active TUI tab (embedded terminal) info.
-    let (active_is_tui, active_bin, active_tab_id) = {
+    let (active_is_tui, active_tab_id) = {
         let t = tabs.read();
         match t.get(*active_tab.read()) {
-            Some(tab) if tab.mode == "tui" => (true, tab.bin.clone(), tab.id),
-            _ => (false, String::new(), 0),
+            Some(tab) if tab.mode == "tui" => (true, tab.id),
+            _ => (false, 0),
         }
     };
     let branch = git_branch(&workspace);
@@ -7664,6 +7696,30 @@ fn app() -> Element {
                             }
                         }
                     }
+                    // Persistent TUI terminals: every "tui" tab renders here ALWAYS,
+                    // with a stable key, so switching tabs never unmounts it — which
+                    // would close its PTY and kill the CLI (codex/claude), losing the
+                    // session. Only the active tui tab is shown (display:contents so
+                    // .xterm-host fills the content area exactly as before); the rest
+                    // stay mounted but hidden (display:none). This is the only place
+                    // TerminalView is mounted. (Synara lesson: persist via mount +
+                    // stable id, hide with CSS — never mount/unmount on tab switch.)
+                    for t in tabs.read().iter().filter(|t| t.mode == "tui") {
+                        div {
+                            key: "tuihost-{t.id}",
+                            class: if active_is_tui && t.id == active_tab_id {
+                                "tui-host-live"
+                            } else {
+                                "tui-host-off"
+                            },
+                            TerminalView {
+                                id: t.id,
+                                bin: t.bin.clone(),
+                                ws: workspace.display().to_string(),
+                                resume: t.resume.clone(),
+                            }
+                        }
+                    }
                     if *show_split.read() && cfg.read().workspace.is_some() {
                         SplitView {
                             node: split_layout.read().clone(),
@@ -7768,7 +7824,8 @@ fn app() -> Element {
                             }
                         }
                     } else if active_is_tui {
-                        TerminalView { key: "{active_tab_id}", id: active_tab_id, bin: active_bin.clone(), ws: workspace.display().to_string() }
+                        // The active terminal is rendered by the persistent TUI layer
+                        // above (kept mounted across tab switches); nothing here.
                     } else if cfg.read().workspace.is_none() {
                         div { class: "hero welcome-screen",
                             img { class: "welcome-logo", src: logo_uri() }
@@ -9006,6 +9063,7 @@ fn new_agent_tab(
         mode: "gui".to_string(),
         bin: String::new(),
         session: None,
+        resume: None,
     });
     let idx = tabs.read().len() - 1;
     active_tab.set(idx);
@@ -9036,6 +9094,26 @@ fn new_tui_tab(
     if let Some(t) = tabs.write().get_mut(cur) {
         t.messages = messages.read().clone();
     }
+    // If opened FROM a codex/claude chat, resume that chat's native CLI session so
+    // the terminal continues the conversation instead of starting blank. Only when
+    // the originating provider matches the CLI bin (a chatgpt/anthropic API chat has
+    // no CLI session to hand off).
+    let resume = {
+        let tabs_ro = tabs.read();
+        tabs_ro.get(cur).and_then(|t| {
+            let matches = match bin {
+                "codex" => t.provider == "codex",
+                "claude" => t.provider == "claude" || t.provider == "claude_interactive",
+                _ => false,
+            };
+            if !matches {
+                return None;
+            }
+            t.session
+                .as_ref()
+                .and_then(|p| oxide_core::db::cli_session(&sid(p)))
+        })
+    };
     let id = *next_id.read();
     next_id.set(id + 1);
     tabs.write().push(AgentTab {
@@ -9049,6 +9127,7 @@ fn new_tui_tab(
         mode: "tui".to_string(),
         bin: bin.to_string(),
         session: None,
+        resume,
     });
     let idx = tabs.read().len() - 1;
     active_tab.set(idx);
@@ -11201,9 +11280,13 @@ fn StatusPill(text: String, #[props(default)] elapsed_s: u64) -> Element {
         div { class: "status-pill",
             span { key: "status-spin", class: "status-spinner" }
             if let Some((icon, _)) = icon_parts {
-                span { class: "status-icon", Icon { name: icon } }
+                span { key: "status-icon", class: "status-icon", Icon { name: icon } }
             }
-            span { class: "status-shimmer", "{shown}" }
+            // Stable key: without it, the conditional status-icon appearing/
+            // disappearing shifts this sibling positionally and Dioxus remounts
+            // it — restarting the ox-shimmer gradient mid-sweep on every label/
+            // icon change. Keyed, the label node is stable so the sweep is smooth.
+            span { key: "status-label", class: "status-shimmer", "{shown}" }
             if elapsed_s >= 3 {
                 {
                     let txt = if elapsed_s >= 3600 {
@@ -11296,13 +11379,14 @@ fn Message(author: Author, text: String, #[props(default)] live: bool) -> Elemen
 /// Embedded interactive terminal: runs `bin` in a PTY and bridges it to an
 /// xterm.js instance in the webview via Dioxus eval.
 #[component]
-fn TerminalView(id: u64, bin: String, ws: String) -> Element {
+fn TerminalView(id: u64, bin: String, ws: String, resume: Option<String>) -> Element {
     let host = format!("term-{id}");
     let host_js = host.clone();
     use_future(move || {
         let host = host_js.clone();
         let bin = bin.clone();
         let ws = ws.clone();
+        let resume = resume.clone();
         async move {
             let setup = format!(
                 r##"
@@ -11362,8 +11446,21 @@ fn TerminalView(id: u64, bin: String, ws: String) -> Element {
             let mut cmd = portable_pty::CommandBuilder::new(&bin);
             // Launch the agent CLIs with permissions bypassed (yolo), like the rest of Oxide.
             match bin.as_str() {
-                "codex" => cmd.arg("--dangerously-bypass-approvals-and-sandbox"),
-                "claude" => cmd.arg("--dangerously-skip-permissions"),
+                "codex" => {
+                    cmd.arg("--dangerously-bypass-approvals-and-sandbox");
+                    // Continue the originating chat's native codex session.
+                    if let Some(sid) = &resume {
+                        cmd.arg("resume");
+                        cmd.arg(sid);
+                    }
+                }
+                "claude" => {
+                    cmd.arg("--dangerously-skip-permissions");
+                    if let Some(sid) = &resume {
+                        cmd.arg("--resume");
+                        cmd.arg(sid);
+                    }
+                }
                 _ => {}
             }
             cmd.cwd(&ws);
@@ -11957,7 +12054,7 @@ fn SplitLeaf(
                 }
             }
             if is_tui {
-                TerminalView { id: pane_id, bin: target.clone(), ws: workspace.display().to_string() }
+                TerminalView { id: pane_id, bin: target.clone(), ws: workspace.display().to_string(), resume: None }
             } else {
                 ChatPane { pane_id, workspace: workspace.clone(), provider: target.clone(), model: model.clone(), isolate: pane_id != 0 }
             }
@@ -12038,7 +12135,7 @@ fn PipWindow(
         style { {XTERM_CSS} }
         div { class: "app pip-win", "data-theme": "{theme}",
             if mode == "tui" {
-                TerminalView { id: 990_001, bin: bin.clone(), ws: workspace.display().to_string() }
+                TerminalView { id: 990_001, bin: bin.clone(), ws: workspace.display().to_string(), resume: None }
             } else {
                 ChatPane { pane_id: 990_001, workspace, provider, model, initial }
             }
@@ -12071,7 +12168,9 @@ fn ChatPane(
     let pane = use_coroutine(move |mut rx: UnboundedReceiver<PaneCmd>| {
         let (p, m, w) = (p0.clone(), m0.clone(), w0.clone());
         async move {
-            let (ev_tx, mut ev_rx) = tokio::sync::mpsc::channel::<Event>(256);
+            // Unbounded: same rationale as the primary engine coroutine — a bounded
+            // forwarder would back-propagate into core and stall the pane's turn.
+            let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
             let mut cfg = Config::load().unwrap_or_default();
             // Isolate non-primary panes in their own git worktree so parallel
             // agents never clobber each other's working tree.
@@ -12095,7 +12194,7 @@ fn ChatPane(
                     let tx = ev_tx.clone();
                     tokio::spawn(async move {
                         while let Some(e) = events.recv().await {
-                            if tx.send(e).await.is_err() {
+                            if tx.send(e).is_err() {
                                 break;
                             }
                         }

@@ -14,7 +14,7 @@ use oxide_protocol::{ApprovalDecision, Event, Op};
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block as RatBlock, Borders, Paragraph, Wrap};
 use tokio::sync::mpsc;
 
 /// The terminal UI. Construct with [`Tui::new`] and run via [`Frontend`].
@@ -32,9 +32,50 @@ impl Tui {
     }
 }
 
+/// Warp-style "block": a command/tool/message and its output grouped into one
+/// addressable unit with a stable id, instead of a flat scrollback of lines. A
+/// keyed block (tool call_id / command id) is UPDATED in place when its result
+/// lands, so begin+end render as one block, not two stray lines.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum BlockStatus {
+    /// A plain note/message with no run state (no gutter glyph).
+    Plain,
+    Running,
+    Ok,
+    Fail,
+}
+
+#[derive(Clone)]
+struct Block {
+    /// Stable block id — the addressability anchor for Phase-2 (block nav,
+    /// select, collapse). Assigned now so the render path is ready for it.
+    #[allow(dead_code)]
+    id: u64,
+    /// Stable id (tool call_id / command id) for in-place updates; None = not updatable.
+    key: Option<String>,
+    status: BlockStatus,
+    /// Header content (gutter glyph is prepended at render).
+    title: Line<'static>,
+    /// Indented detail lines beneath the header.
+    body: Vec<Line<'static>>,
+}
+
+impl Block {
+    fn note(id: u64, title: Line<'static>) -> Self {
+        Block {
+            id,
+            key: None,
+            status: BlockStatus::Plain,
+            title,
+            body: Vec::new(),
+        }
+    }
+}
+
 #[derive(Default)]
 struct State {
-    transcript: Vec<Line<'static>>,
+    blocks: Vec<Block>,
+    next_block_id: u64,
     input: String,
     /// Buffer for the assistant message currently streaming in.
     streaming: String,
@@ -49,24 +90,93 @@ struct State {
 }
 
 impl State {
+    fn next_id(&mut self) -> u64 {
+        let id = self.next_block_id;
+        self.next_block_id += 1;
+        id
+    }
+
+    /// Append a standalone single-header block (the common case for notes,
+    /// info, errors, todos, etc. — keeps every existing call site working).
     fn push(&mut self, line: Line<'static>) {
-        self.transcript.push(line);
+        let id = self.next_id();
+        self.blocks.push(Block::note(id, line));
+    }
+
+    /// Start a fresh keyed/status block (tool, command) and return its index.
+    fn push_block(
+        &mut self,
+        key: Option<String>,
+        status: BlockStatus,
+        title: Line<'static>,
+    ) -> usize {
+        let id = self.next_id();
+        self.blocks.push(Block {
+            id,
+            key,
+            status,
+            title,
+            body: Vec::new(),
+        });
+        self.blocks.len() - 1
+    }
+
+    /// Find a keyed block (newest first) for an in-place update.
+    fn block_by_key(&mut self, key: &str) -> Option<&mut Block> {
+        self.blocks
+            .iter_mut()
+            .rev()
+            .find(|b| b.key.as_deref() == Some(key))
     }
 
     fn flush_streaming(&mut self) {
         if !self.streaming.is_empty() {
             let text = std::mem::take(&mut self.streaming);
-            self.push(Line::from(vec![
-                Span::styled(
-                    "oxide ",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(text),
-            ]));
+            let id = self.next_id();
+            self.blocks.push(Block {
+                id,
+                key: None,
+                status: BlockStatus::Plain,
+                title: Line::from(vec![
+                    Span::styled(
+                        "oxide ",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(text),
+                ]),
+                body: Vec::new(),
+            });
         }
     }
+}
+
+/// Flatten a block to render lines: a header (status gutter + title) and its
+/// 2-space-indented body. A Plain block with no body renders as a single line,
+/// identical to the old flat transcript — so notes look unchanged.
+fn block_render_lines(b: &Block) -> Vec<Line<'static>> {
+    let (gutter, gcolor) = match b.status {
+        BlockStatus::Running => ("◐ ", Color::Yellow),
+        BlockStatus::Ok => ("✓ ", Color::Green),
+        BlockStatus::Fail => ("✗ ", Color::Red),
+        BlockStatus::Plain => ("", Color::DarkGray),
+    };
+    let mut header: Vec<Span<'static>> = Vec::new();
+    if !gutter.is_empty() {
+        header.push(Span::styled(
+            gutter,
+            Style::default().fg(gcolor).add_modifier(Modifier::BOLD),
+        ));
+    }
+    header.extend(b.title.spans.iter().cloned());
+    let mut out = vec![Line::from(header)];
+    for bl in &b.body {
+        let mut spans = vec![Span::raw("  ")];
+        spans.extend(bl.spans.iter().cloned());
+        out.push(Line::from(spans));
+    }
+    out
 }
 
 #[async_trait]
@@ -282,57 +392,123 @@ fn apply_event(event: Event, state: &mut State) {
         Event::ToolCallDelta { tool, .. } => {
             state.status = format!("preparing {tool} input…");
         }
-        Event::ToolCallBegin { tool, .. } => {
+        Event::ToolCallBegin { call_id, tool, .. } => {
             state.flush_streaming();
-            state.push(Line::from(Span::styled(
-                format!("⚙ {tool} …"),
-                Style::default().fg(Color::Yellow),
-            )));
+            // Open a running block keyed by call_id; ToolCallEnd updates THIS block
+            // in place (begin+end = one block, not two stray lines).
+            state.push_block(
+                Some(call_id),
+                BlockStatus::Running,
+                Line::from(Span::styled(
+                    format!("⚙ {tool}"),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )),
+            );
         }
         Event::ToolCallEnd {
-            tool, output, ok, ..
+            call_id,
+            tool,
+            output,
+            ok,
+            ..
         } => {
-            let color = if ok { Color::Yellow } else { Color::Red };
-            state.push(Line::from(Span::styled(
-                format!("⚙ {tool}: {output}"),
-                Style::default().fg(color),
-            )));
+            let status = if ok {
+                BlockStatus::Ok
+            } else {
+                BlockStatus::Fail
+            };
+            let out = output.trim().to_string();
+            if let Some(b) = state.block_by_key(&call_id) {
+                b.status = status;
+                if !out.is_empty() {
+                    for l in out.lines() {
+                        b.body.push(Line::from(Span::raw(l.to_string())));
+                    }
+                }
+            } else {
+                // No matching begin block (shell/ask_user, or merged) — standalone.
+                let color = if ok { Color::Green } else { Color::Red };
+                state.push(Line::from(Span::styled(
+                    format!("⚙ {tool}: {out}"),
+                    Style::default().fg(color),
+                )));
+            }
         }
         Event::CommandStarted {
+            command_id,
             command,
             background,
             ..
         } => {
-            state.push(Line::from(Span::styled(
-                format!("⌘ {}{command}", if background { "background " } else { "" }),
-                Style::default().fg(Color::Yellow),
-            )));
+            state.flush_streaming();
+            state.push_block(
+                Some(command_id),
+                BlockStatus::Running,
+                Line::from(Span::styled(
+                    format!("⌘ {}{command}", if background { "background " } else { "" }),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )),
+            );
         }
-        Event::CommandOutput { stream, chunk, .. } => {
+        Event::CommandOutput {
+            command_id,
+            stream,
+            chunk,
+            ..
+        } => {
             let text = chunk.trim_end();
             if !text.is_empty() {
-                state.push(Line::from(Span::styled(
-                    format!("{stream}: {text}"),
-                    Style::default().fg(Color::DarkGray),
-                )));
+                let line = if stream == "stderr" {
+                    Line::from(Span::styled(
+                        format!("stderr: {text}"),
+                        Style::default().fg(Color::Red),
+                    ))
+                } else {
+                    Line::from(Span::styled(
+                        text.to_string(),
+                        Style::default().fg(Color::DarkGray),
+                    ))
+                };
+                if let Some(b) = state.block_by_key(&command_id) {
+                    b.body.push(line);
+                } else {
+                    state.push(line);
+                }
             }
         }
         Event::CommandFinished {
+            command_id,
             ok,
             exit_code,
             duration_ms,
             ..
         } => {
-            state.push(Line::from(Span::styled(
-                format!(
-                    "⌘ {} · exit {} · {duration_ms}ms",
-                    if ok { "done" } else { "failed" },
-                    exit_code
-                        .map(|c| c.to_string())
-                        .unwrap_or_else(|| "?".into())
-                ),
-                Style::default().fg(if ok { Color::Green } else { Color::Red }),
-            )));
+            let footer = format!(
+                "exit {} · {duration_ms}ms",
+                exit_code
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "?".into())
+            );
+            if let Some(b) = state.block_by_key(&command_id) {
+                b.status = if ok {
+                    BlockStatus::Ok
+                } else {
+                    BlockStatus::Fail
+                };
+                b.body.push(Line::from(Span::styled(
+                    footer,
+                    Style::default().fg(if ok { Color::Green } else { Color::Red }),
+                )));
+            } else {
+                state.push(Line::from(Span::styled(
+                    format!("⌘ {} · {footer}", if ok { "done" } else { "failed" }),
+                    Style::default().fg(if ok { Color::Green } else { Color::Red }),
+                )));
+            }
         }
         Event::Todos { items } => {
             let done = items
@@ -535,8 +711,11 @@ fn draw(terminal: &mut ratatui::DefaultTerminal, state: &State) -> anyhow::Resul
         ])
         .split(frame.area());
 
-        // Transcript (+ in-flight streaming line).
-        let mut lines = state.transcript.clone();
+        // Flatten blocks to render lines (+ the in-flight streaming line).
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        for b in &state.blocks {
+            lines.extend(block_render_lines(b));
+        }
         if !state.streaming.is_empty() {
             lines.push(Line::from(vec![
                 Span::styled(
@@ -552,7 +731,7 @@ fn draw(terminal: &mut ratatui::DefaultTerminal, state: &State) -> anyhow::Resul
         let start = lines.len().saturating_sub(visible);
         let transcript = Paragraph::new(lines[start..].to_vec())
             .block(
-                Block::default()
+                RatBlock::default()
                     .borders(Borders::ALL)
                     .title(format!(" Oxide · {} ", state.harness)),
             )
@@ -561,7 +740,7 @@ fn draw(terminal: &mut ratatui::DefaultTerminal, state: &State) -> anyhow::Resul
 
         // Input box.
         let input = Paragraph::new(state.input.as_str())
-            .block(Block::default().borders(Borders::ALL).title(" message "));
+            .block(RatBlock::default().borders(Borders::ALL).title(" message "));
         frame.render_widget(input, chunks[1]);
 
         // Status line.
@@ -572,4 +751,95 @@ fn draw(terminal: &mut ratatui::DefaultTerminal, state: &State) -> anyhow::Resul
         frame.render_widget(status, chunks[2]);
     })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oxide_protocol::TurnId;
+
+    #[test]
+    fn tool_begin_and_end_collapse_into_one_block() {
+        let mut state = State::default();
+        apply_event(
+            Event::ToolCallBegin {
+                turn: TurnId(1),
+                call_id: "c1".into(),
+                tool: "read".into(),
+                args: serde_json::Value::Null,
+            },
+            &mut state,
+        );
+        assert_eq!(state.blocks.len(), 1);
+        assert_eq!(state.blocks[0].status, BlockStatus::Running);
+        assert_eq!(state.blocks[0].key.as_deref(), Some("c1"));
+
+        apply_event(
+            Event::ToolCallEnd {
+                turn: TurnId(1),
+                call_id: "c1".into(),
+                tool: "read".into(),
+                output: "hello\nworld".into(),
+                ok: true,
+            },
+            &mut state,
+        );
+        // Same block, updated in place — NOT a second stray block.
+        assert_eq!(state.blocks.len(), 1);
+        assert_eq!(state.blocks[0].status, BlockStatus::Ok);
+        assert_eq!(state.blocks[0].body.len(), 2);
+    }
+
+    #[test]
+    fn command_lifecycle_is_one_block() {
+        let mut state = State::default();
+        for ev in [
+            Event::CommandStarted {
+                turn: TurnId(1),
+                command_id: "k1".into(),
+                worker_id: None,
+                command: "cargo build".into(),
+                cwd: ".".into(),
+                background: false,
+            },
+            Event::CommandOutput {
+                turn: TurnId(1),
+                command_id: "k1".into(),
+                worker_id: None,
+                stream: "stdout".into(),
+                chunk: "compiling\n".into(),
+            },
+            Event::CommandFinished {
+                turn: TurnId(1),
+                command_id: "k1".into(),
+                worker_id: None,
+                ok: false,
+                exit_code: Some(1),
+                duration_ms: 42,
+            },
+        ] {
+            apply_event(ev, &mut state);
+        }
+        assert_eq!(state.blocks.len(), 1);
+        assert_eq!(state.blocks[0].status, BlockStatus::Fail);
+        // output line + exit footer
+        assert_eq!(state.blocks[0].body.len(), 2);
+    }
+
+    #[test]
+    fn unkeyed_tool_end_without_begin_is_standalone() {
+        let mut state = State::default();
+        apply_event(
+            Event::ToolCallEnd {
+                turn: TurnId(1),
+                call_id: "missing".into(),
+                tool: "shell".into(),
+                output: "ok".into(),
+                ok: true,
+            },
+            &mut state,
+        );
+        assert_eq!(state.blocks.len(), 1);
+        assert!(state.blocks[0].key.is_none());
+    }
 }

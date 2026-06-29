@@ -123,19 +123,44 @@ impl Provider for AnthropicProvider {
         if self.api_key.is_empty() {
             anyhow::bail!("ANTHROPIC_API_KEY not set");
         }
-        let resp = self
-            .client
-            .post(format!("{}/messages", self.base_url))
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", API_VERSION)
-            .json(&body(&req))
-            .send()
-            .await?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("anthropic {status}: {text}");
-        }
+        // Initial POST with bounded backoff on transient 429 / 5xx (Anthropic 529
+        // "overloaded" is routine) / connection errors. Idempotent: no SSE bytes
+        // are emitted until a 2xx, so a resend cannot duplicate output.
+        let payload = body(&req);
+        let mut attempt = 0u32;
+        let resp = loop {
+            let send = self
+                .client
+                .post(format!("{}/messages", self.base_url))
+                .header("x-api-key", &self.api_key)
+                .header("anthropic-version", API_VERSION)
+                .json(&payload)
+                .send()
+                .await;
+            match send {
+                Ok(r) if r.status().is_success() => break r,
+                Ok(r) => {
+                    let status = r.status();
+                    if (status.as_u16() == 429 || status.is_server_error())
+                        && attempt < crate::MAX_HTTP_RETRIES
+                    {
+                        let wait = crate::http_retry_delay_ms(Some(&r), attempt);
+                        attempt += 1;
+                        tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
+                        continue;
+                    }
+                    let text = r.text().await.unwrap_or_default();
+                    anyhow::bail!("anthropic {status}: {text}");
+                }
+                Err(_e) if attempt < crate::MAX_HTTP_RETRIES => {
+                    let wait = crate::http_retry_delay_ms(None, attempt);
+                    attempt += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        };
 
         // Tool-use accumulation for the currently open content block.
         let mut cur_tool: Option<String> = None;

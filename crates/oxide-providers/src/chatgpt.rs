@@ -251,6 +251,29 @@ fn account_id_from_access_token(access: &str) -> Option<String> {
     account_id_from_claims(&claims)
 }
 
+/// The access token's `exp` (unix seconds), read from the JWT payload.
+fn access_token_exp(access: &str) -> Option<u64> {
+    let payload = access.split('.').nth(1)?;
+    let decoded = base64url_decode(payload)?;
+    let claims: Value = serde_json::from_slice(&decoded).ok()?;
+    claims["exp"].as_u64()
+}
+
+/// True when the access token is missing an `exp` we can read, already expired,
+/// or within a 60s skew window — i.e. refresh proactively instead of burning a
+/// guaranteed-401 round-trip on the next cold turn.
+fn access_token_near_expiry(access: &str) -> bool {
+    let Some(exp) = access_token_exp(access) else {
+        // Unreadable exp: don't force a refresh on an opaque-but-maybe-valid token.
+        return false;
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    exp <= now.saturating_add(60)
+}
+
 fn refresh_form(refresh: &str) -> [(&'static str, &str); 3] {
     [
         ("client_id", OAUTH_CLIENT_ID),
@@ -378,17 +401,37 @@ impl ChatGptProvider {
     /// Exchange a refresh token for a fresh `(access_token, refresh_token)` at the
     /// OAuth endpoint (same flow the codex CLI uses). The refresh token may rotate.
     async fn refresh_access(&self, refresh: &str) -> anyhow::Result<(String, String)> {
-        let resp = self
-            .client
-            .post(OAUTH_TOKEN_URL)
-            .form(&refresh_form(refresh))
-            .send()
-            .await?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("ChatGPT token refresh failed ({status}): {text}. Run `codex login` to sign in again.");
-        }
+        let mut attempt = 0u32;
+        let resp = loop {
+            match self
+                .client
+                .post(OAUTH_TOKEN_URL)
+                .form(&refresh_form(refresh))
+                .send()
+                .await
+            {
+                Ok(r) if r.status().is_success() => break r,
+                Ok(r) => {
+                    let status = r.status();
+                    // Retry only transient SERVER-side failures (429/5xx): the
+                    // server rejected without rotating the refresh token, so
+                    // resending the same token is safe. Do NOT retry connection
+                    // errors — a refresh can rotate the token server-side with the
+                    // response lost, and resending a consumed token hard-fails the
+                    // login. A blip from auth.openai.com no longer kills the turn.
+                    if (status.as_u16() == 429 || status.is_server_error()) && attempt < MAX_RETRIES
+                    {
+                        let wait = retry_delay_ms(Some(&r), attempt);
+                        attempt += 1;
+                        tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
+                        continue;
+                    }
+                    let text = r.text().await.unwrap_or_default();
+                    anyhow::bail!("ChatGPT token refresh failed ({status}): {text}. Run `codex login` to sign in again.");
+                }
+                Err(e) => return Err(e.into()),
+            }
+        };
         let v: Value = resp.json().await?;
         let access = v["access_token"]
             .as_str()
@@ -418,7 +461,20 @@ impl ChatGptProvider {
             v["last_refresh"] = json!(format!("{secs}"));
         }
         if let Ok(serialized) = serde_json::to_string_pretty(&v) {
-            let _ = std::fs::write(&self.auth_path, serialized);
+            // Atomic write: this file is SHARED with the codex CLI. A bare
+            // `fs::write` truncates-then-writes, so a crash or a concurrent codex
+            // writer mid-write leaves auth.json torn → both tools lose their login.
+            // Write a sibling temp then rename (atomic on the same filesystem).
+            let tmp = format!("{}.oxide-tmp", self.auth_path);
+            if std::fs::write(&tmp, &serialized).is_ok()
+                && std::fs::rename(&tmp, &self.auth_path).is_err()
+            {
+                // Cross-device or rename race — fall back to a direct write so the
+                // refreshed token still lands, and drop the temp. (rename is only
+                // attempted when the temp write succeeded — `&&` short-circuits.)
+                let _ = std::fs::write(&self.auth_path, &serialized);
+                let _ = std::fs::remove_file(&tmp);
+            }
         }
     }
 }
@@ -766,7 +822,12 @@ impl Provider for ChatGptProvider {
     async fn stream(&self, req: TurnRequest, sink: mpsc::Sender<StreamItem>) -> anyhow::Result<()> {
         let (mut access, mut account, mut refresh) = self.credentials()?;
         let mut refreshed = false;
-        if access.trim().is_empty() && !refresh.trim().is_empty() {
+        // Refresh proactively when the token is missing OR expired/near-expiry —
+        // not just when empty. An expired-but-present token used to cost every cold
+        // turn a wasted POST→401→refresh→retry; checking `exp` skips that round-trip.
+        if (access.trim().is_empty() || access_token_near_expiry(&access))
+            && !refresh.trim().is_empty()
+        {
             let (new_access, new_refresh) = self.refresh_access(&refresh).await?;
             self.persist_refreshed(&new_access, &new_refresh);
             account = account
@@ -885,6 +946,10 @@ impl Provider for ChatGptProvider {
         let mut stream_completed = false;
         let mut stream_stalled = false;
         let mut connection_lost = false;
+        // True once any model OUTPUT (text or a tool call) has been sent downstream.
+        // Decides truncation handling: cut off BEFORE any output → bail so the
+        // engine can cleanly re-request; cut off AFTER output → preserve it.
+        let mut emitted_output = false;
         let mut last_progress = tokio::time::Instant::now();
         loop {
             let Some(ev) = (match tokio::time::timeout(STREAM_POLL_TIMEOUT, stream.next()).await {
@@ -940,6 +1005,7 @@ impl Provider for ChatGptProvider {
                         {
                             return Ok(());
                         }
+                        emitted_output = true;
                     }
                 }
                 Some("response.reasoning_summary_text.delta")
@@ -994,6 +1060,7 @@ impl Provider for ChatGptProvider {
                         if !send_tool_call(&sink, &mut sent_tools, ids, name, arguments).await {
                             return Ok(());
                         }
+                        emitted_output = true;
                     }
                 }
                 Some("response.function_call_arguments.delta") => {
@@ -1091,28 +1158,67 @@ impl Provider for ChatGptProvider {
                     };
                     anyhow::bail!("ChatGPT stream error: {detail}");
                 }
-                _ => {}
+                // Model declined: stream the refusal as visible text instead of
+                // letting it fall through to a silent empty reply.
+                Some("response.refusal.delta") => {
+                    last_progress = tokio::time::Instant::now();
+                    if let Some(t) = v["delta"].as_str() {
+                        if sink
+                            .send(StreamItem::TextDelta(t.to_string()))
+                            .await
+                            .is_err()
+                        {
+                            return Ok(());
+                        }
+                        emitted_output = true;
+                    }
+                }
+                Some("response.refusal.done") => {
+                    last_progress = tokio::time::Instant::now();
+                }
+                // Any other recognized-but-unhandled event (keepalive, reasoning
+                // part boundaries, future event types) STILL counts as progress —
+                // otherwise a long quiet reasoning phase trips the idle-stall bail.
+                _ => {
+                    last_progress = tokio::time::Instant::now();
+                }
             }
             if last_progress.elapsed() >= STREAM_IDLE_TIMEOUT {
                 stream_stalled = true;
                 break;
             }
         }
-        if stream_stalled {
-            anyhow::bail!(
-                "ChatGPT subscription stream stalled for {}s without model output; stopped this turn so the UI does not stay stuck. Retry, compact the chat, or re-authenticate if it repeats.",
-                STREAM_IDLE_TIMEOUT.as_secs()
-            );
-        }
-        if connection_lost && !stream_completed {
-            anyhow::bail!(
-                "ChatGPT subscription connection lost mid-stream; response may be truncated. Retry if needed."
-            );
-        }
-        if !stream_completed {
-            anyhow::bail!(
-                "ChatGPT subscription stream ended before a completion event; response may be truncated. Retry if needed."
-            );
+        // Stream ended without a clean completion (idle stall, dropped connection,
+        // or early EOF). Two cases, mirroring `response.incomplete`:
+        //   • output already emitted → DON'T error. Surface a truncation Notice and
+        //     fall through to the tool-call drain + Done so partial text + pending
+        //     tool calls are preserved (the engine keeps the round, no red error).
+        //   • nothing emitted yet → bail, so the engine's transient-retry can
+        //     re-request from a clean slate (its retry is gated on an empty round).
+        if stream_stalled || connection_lost || !stream_completed {
+            if emitted_output {
+                let why = if stream_stalled {
+                    "stream stalled"
+                } else if connection_lost {
+                    "connection lost"
+                } else {
+                    "stream ended early"
+                };
+                let _ = sink
+                    .send(StreamItem::Notice(format!(
+                        "⚠ ChatGPT response may be truncated ({why})."
+                    )))
+                    .await;
+            } else if stream_stalled {
+                anyhow::bail!(
+                    "ChatGPT subscription stream stalled for {}s without model output; stopped this turn so the UI does not stay stuck. Retry, compact the chat, or re-authenticate if it repeats.",
+                    STREAM_IDLE_TIMEOUT.as_secs()
+                );
+            } else {
+                anyhow::bail!(
+                    "ChatGPT subscription connection lost or ended before completion; response may be truncated. Retry if needed."
+                );
+            }
         }
         for (item_id, (name, raw_args, call_id)) in pending_function_args {
             // Skip buffers that never received a tool name (seeded by an
