@@ -354,6 +354,22 @@ def main() -> int:
         "if !*streaming.read() && !thinking.read().is_empty()" in gui,
         f"{rel(GUI)} prevents duplicate live/global thinking blocks while streaming",
     )
+    require(
+        "stream follow respects reader intent",
+        contains_all(
+            gui,
+            [
+                "bottomDistance",
+                "hasSelection",
+                "typingTarget",
+                "userScrollIntent",
+                "requestAnimationFrame(() =>",
+                "window.__oxstick !== false",
+            ],
+        )
+        and contains_all(css, [".scroll", "overflow-anchor: none"]),
+        "streaming autoscroll stays smooth without pulling the reader away from scrollback",
+    )
     accept_block = re.search(
         r'button \{ class: "review-accept"[\s\S]{0,320}accepted\.write\(\)\.insert\(cp\);[\s\S]{0,180}SlotText \{ text: "Accept"\.to_string\(\)',
         gui,
@@ -460,6 +476,34 @@ def main() -> int:
         ),
         "GUI exposes a local-only Agents tab with session switching, review, changes, preview, and Bugbot actions",
     )
+    require(
+        "local servers and editor controls",
+        contains_all(
+            gui,
+            [
+                '"Local Servers"',
+                'class: "local-server-row"',
+                'title: "Stop dev server"',
+                'Icon { name: "stop" }',
+                "preview_proxy::set_target(port)",
+                'title: "Open dev server"',
+                '"Editor view"',
+                '"Open in Cursor"',
+                'tokio::process::Command::new("open").arg("-a").arg("Cursor")',
+            ],
+        )
+        and contains_all(
+            css,
+            [
+                ".env-card-section-head",
+                ".local-server-list",
+                ".local-server-main",
+                ".local-server-stop",
+                ".local-server-empty",
+            ],
+        ),
+        "Environment card exposes local server status/actions and local editor launch controls",
+    )
     checklist_needles = [
         "pre-first-token shimmer",
         "Reasoning",
@@ -470,6 +514,8 @@ def main() -> int:
         "Rust-native UI Spec",
         "Agents Window",
         "Bugbot review",
+        "Local Servers",
+        "Open in Cursor",
     ]
     require(
         "manual checklist covers motion-critical states",

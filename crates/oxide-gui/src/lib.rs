@@ -3466,7 +3466,6 @@ fn app() -> Element {
     let mut env_tab = use_signal(|| "files".to_string());
     let env_tab_by_tab = use_signal(HashMap::<u64, String>::new);
     // Environment card: running-process dropdown (port, name, pid).
-    let mut procs_menu = use_signal(|| false);
     let mut procs_list = use_signal(Vec::<(u16, String, u32)>::new);
     // Environment card menus + per-thread extras.
     let mut git_menu = use_signal(|| false);
@@ -3581,6 +3580,10 @@ fn app() -> Element {
     // Toast notifications (bottom-right stack, auto-dismiss).
     let toasts = use_signal(Vec::<ToastSpec>::new);
     let toast_seq = use_signal(|| 0u64);
+    use_future(move || async move {
+        procs_list.set(scan_procs().await);
+        preview_ports.set(scan_ports().await);
+    });
     use_future(move || async move {
         let mut last_root = PathBuf::new();
         let mut last_sync: Option<std::time::Instant> = None;
@@ -3995,9 +3998,21 @@ fn app() -> Element {
                 cur = s;
                 if (inner) { inner.disconnect(); inner = null; }
                 if (!s) return;
+                let ignoreScroll = false;
+                const bottomDistance = () => Math.max(0, s.scrollHeight - s.scrollTop - s.clientHeight);
+                const hasSelection = () => {
+                  const sel = window.getSelection && window.getSelection();
+                  return !!sel && String(sel).length > 0;
+                };
+                const typingTarget = () => {
+                  const el = document.activeElement;
+                  if (!el || !s.contains(el)) return false;
+                  const tag = String(el.tagName || '').toLowerCase();
+                  return tag === 'input' || tag === 'textarea' || el.isContentEditable;
+                };
                 const upd = () => {
-                  const d = s.scrollHeight - s.scrollTop - s.clientHeight;
-                  window.__oxstick = d < 140;
+                  const d = bottomDistance();
+                  window.__oxstick = d < 160;
                   const b = s.querySelector('.jump-bottom');
                   if (b) b.classList.toggle('show', d > 300);
                 };
@@ -4012,19 +4027,37 @@ fn app() -> Element {
                   stickQueued = true;
                   requestAnimationFrame(() => {
                     stickQueued = false;
-                    if (window.__oxstick !== false) s.scrollTop = s.scrollHeight;
+                    if (window.__oxstick !== false && !hasSelection() && !typingTarget()) {
+                      ignoreScroll = true;
+                      s.scrollTop = s.scrollHeight;
+                      requestAnimationFrame(() => { ignoreScroll = false; });
+                    }
                     // Keep the LIVE reasoning panel pinned to its latest line as it
                     // streams (Cursor-style), but only when already near the bottom
                     // so a manual scroll-up to re-read isn't yanked back down.
                     const tb = s.querySelector('.thinking-box[open] .thinking-body');
-                    if (tb) {
+                    if (tb && window.__oxstick !== false && !hasSelection()) {
                       const dd = tb.scrollHeight - tb.scrollTop - tb.clientHeight;
                       if (dd < 60) tb.scrollTop = tb.scrollHeight;
                     }
                     upd();
                   });
                 };
-                s.addEventListener('scroll', upd, { passive: true });
+                s.addEventListener('scroll', () => {
+                  if (ignoreScroll) return;
+                  upd();
+                }, { passive: true });
+                // Wheel/touch/key scrolls are the user's intent to inspect history.
+                // Do not let incoming streaming tokens pull them back down until
+                // they return near the bottom or press the jump button.
+                const userScrollIntent = () => {
+                  if (bottomDistance() > 80) window.__oxstick = false;
+                };
+                s.addEventListener('wheel', userScrollIntent, { passive: true });
+                s.addEventListener('touchmove', userScrollIntent, { passive: true });
+                s.addEventListener('keydown', (ev) => {
+                  if (['PageUp', 'ArrowUp', 'Home', ' '].includes(ev.key)) userScrollIntent();
+                }, { passive: true });
                 inner = new MutationObserver(stick);
                 inner.observe(s, { childList: true, subtree: true, characterData: true });
                 // Fresh transcript mount (app start, welcome to chat): start at the bottom.
@@ -4828,11 +4861,11 @@ fn app() -> Element {
                                 }
                                 Event::ApprovalRequested { request_id, tool, summary } => {
                                     parked_appr.entry(ev_tid).or_default().push((request_id, tool.clone(), summary));
-                                    buf.push(ChatMsg { author: Author::Note, text: format!("{} waiting for approval ({tool}) — open this tab to respond", '\u{23f8}') });
+                                    buf.push(ChatMsg { author: Author::Note, text: format!("Waiting for approval ({tool}) - open this tab to respond") });
                                 }
                                 Event::QuestionAsked { request_id, question, options } => {
                                     parked_q.entry(ev_tid).or_default().push((request_id, question.clone(), options));
-                                    buf.push(ChatMsg { author: Author::Note, text: format!("{} {question} — open this tab to answer", '\u{2753}') });
+                                    buf.push(ChatMsg { author: Author::Note, text: format!("Question: {question} - open this tab to answer") });
                                 }
                                 Event::TurnFinished { .. } => {
                                     if buf.last().map(|m| m.author == Author::Agent && m.text.is_empty()).unwrap_or(false) {
@@ -5428,11 +5461,11 @@ fn app() -> Element {
                                     }
                                 }
                                 // Background tasks the agent kicked off won't stream their
-                                // result back this turn — tell the user plainly so the
+                                // result back this turn - tell the user plainly so the
                                 // "I'll let you know when done" never silently dangles.
                                 if !bg_jobs.peek().is_empty() {
                                     let jobs = bg_jobs.peek().join(", ");
-                                    messages.write().push(ChatMsg { author: Author::Note, text: format!("{} Background task(s) still running: {jobs} — the result won't return automatically. Ask the agent to check the output, or check the Environment / Terminals panel.", '\u{23f3}') });
+                                    messages.write().push(ChatMsg { author: Author::Note, text: format!("Background task(s) still running: {jobs} - the result won't return automatically. Ask the agent to check the output, or check the Environment / Local Servers panel.") });
                                 }
                                 if let Some(start) = turn_start.write().take() {
                                     let secs = start.elapsed().as_secs();
@@ -6529,36 +6562,63 @@ fn app() -> Element {
                                         Icon { name: "spark" } span { "Agents" }
                                         span { class: "env-card-badge", "{busy_tabs.read().len()} running" }
                                     }
-                                    div { class: "env-card-anchor",
-                                        button { class: "env-card-row", onclick: move |_| {
-                                                let v = *procs_menu.read();
-                                                procs_menu.set(!v);
-                                                if !v { spawn(async move { procs_list.set(scan_procs().await); }); }
+                                    button { class: "env-card-row", onclick: move |_| select_env_tab(env_tab, show_env, env_tab_by_tab, tabs, active_tab, "term", false),
+                                        Icon { name: "terminal" } span { "Terminals" } span { class: "env-card-badge", "{n_terms}" }
+                                    }
+                                    div { class: "env-card-section-head",
+                                        span { class: "env-card-label inline", "Local Servers" }
+                                        span { class: "env-card-badge", "{procs_list.read().len()}" }
+                                        button { class: "env-card-mini", title: "Refresh local servers",
+                                            onclick: move |e: dioxus::prelude::MouseEvent| {
+                                                e.stop_propagation();
+                                                spawn(async move {
+                                                    procs_list.set(scan_procs().await);
+                                                    preview_ports.set(scan_ports().await);
+                                                });
                                             },
-                                            Icon { name: "terminal" } span { "Terminals" } span { class: "env-card-badge", "{n_terms} · " Icon { name: "chevron" } }
+                                            Icon { name: "refresh" }
                                         }
-                                        if *procs_menu.read() {
-                                            div { class: "env-procs",
-                                                if procs_list.read().is_empty() {
-                                                    div { class: "env-proc-empty", "No running processes" }
-                                                }
-                                                for (port, name, pid) in procs_list.read().iter().cloned() {
-                                                    div { class: "env-proc",
-                                                        span { class: "port-dot" }
-                                                        span { class: "env-proc-name", "{name}" }
-                                                        span { class: "env-proc-port", ":{port}" }
-                                                        button { class: "env-proc-kill", title: "Kill process",
-                                                            onclick: move |_| {
-                                                                spawn(async move {
-                                                                    let _ = tokio::process::Command::new("kill").arg("-9").arg(pid.to_string()).output().await;
-                                                                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                                                                    procs_list.set(scan_procs().await);
-                                                                });
-                                                            }, Icon { name: "x" } }
+                                    }
+                                    div { class: "local-server-list",
+                                        if procs_list.read().is_empty() {
+                                            div { class: "local-server-empty", "No local servers running" }
+                                        }
+                                        for (port, name, pid) in procs_list.read().iter().cloned() {
+                                            div { class: "local-server-row",
+                                                button { class: "local-server-main", title: "Open localhost:{port} in Preview ({name})",
+                                                    onclick: move |_| {
+                                                        select_env_tab(env_tab, show_env, env_tab_by_tab, tabs, active_tab, "preview", false);
+                                                        spawn(async move {
+                                                            preview_proxy::set_target(port);
+                                                            let pp = preview_proxy::ensure_proxy().await;
+                                                            if pp != 0 { preview_url.set(format!("http://127.0.0.1:{pp}/")); }
+                                                            else { preview_url.set(format!("http://localhost:{port}")); }
+                                                        });
+                                                    },
+                                                    span { class: "server-dot" }
+                                                    span { class: "local-server-copy",
+                                                        span { class: "local-server-title", "{name}" }
+                                                        span { class: "local-server-meta", "localhost:{port}" }
                                                     }
+                                                    span { class: "local-server-port", ":{port}" }
                                                 }
-                                                button { class: "env-proc-open", onclick: move |_| { procs_menu.set(false); select_env_tab(env_tab, show_env, env_tab_by_tab, tabs, active_tab, "term", false); },
-                                                    "Open terminals" Icon { name: "corner-up-right" }
+                                                button { class: "local-server-icon", title: "Open dev server",
+                                                    onclick: move |_| {
+                                                        let url = format!("http://localhost:{port}");
+                                                        spawn(async move { let _ = tokio::process::Command::new("open").arg(url).output().await; });
+                                                    },
+                                                    Icon { name: "external-link" }
+                                                }
+                                                button { class: "local-server-stop", title: "Stop dev server",
+                                                    onclick: move |_| {
+                                                        spawn(async move {
+                                                            let _ = tokio::process::Command::new("kill").arg("-9").arg(pid.to_string()).output().await;
+                                                            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                                                            procs_list.set(scan_procs().await);
+                                                            preview_ports.set(scan_ports().await);
+                                                        });
+                                                    },
+                                                    Icon { name: "stop" }
                                                 }
                                             }
                                         }
@@ -6568,6 +6628,21 @@ fn app() -> Element {
                                     }
                                     button { class: "env-card-row", onclick: move |_| select_env_tab(env_tab, show_env, env_tab_by_tab, tabs, active_tab, "files", false),
                                         Icon { name: "plugins" } span { "Files" }
+                                    }
+                                    div { class: "env-card-sep" }
+                                    div { class: "env-card-label", "Editor" }
+                                    button { class: "env-card-row", onclick: move |_| select_env_tab(env_tab, show_env, env_tab_by_tab, tabs, active_tab, "files", false),
+                                        Icon { name: "split-right" } span { "Editor view" }
+                                    }
+                                    button { class: "env-card-row", onclick: move |_| {
+                                            let ws = ui.workspace.peek().clone();
+                                            spawn(async move {
+                                                let result = tokio::process::Command::new("open").arg("-a").arg("Cursor").arg(&ws).output().await;
+                                                let ok = result.map(|out| out.status.success()).unwrap_or(false);
+                                                push_toast(toasts, toast_seq, if ok { "ok" } else { "err" }, if ok { "Opened in Cursor" } else { "Could not open Cursor" });
+                                            });
+                                        },
+                                        Icon { name: "laptop" } span { "Open in Cursor" } span { class: "env-card-badge", Icon { name: "external-link" } }
                                     }
                                     if !pinned_msgs.read().is_empty() {
                                         div { class: "env-card-sep" }
@@ -12099,7 +12174,7 @@ fn ChatPane(
                         Some(Event::Info { text }) => { if is_stage_status(&text) { status.set(text); } }
                         Some(Event::Error { message }) => { messages.write().push(ChatMsg { author: Author::Note, text: format!("error: {message}") }); streaming.set(false); }
                         Some(Event::QuestionAsked { question, options, .. }) => {
-                            messages.write().push(ChatMsg { author: Author::Note, text: format!("{} {question}", '\u{2753}') });
+                            messages.write().push(ChatMsg { author: Author::Note, text: format!("Question: {question}") });
                             pane_question.set(Some((question, options)));
                         }
                         Some(Event::AuditLog { .. })
