@@ -53,14 +53,13 @@ It focuses on states that compile tests cannot prove.
 - Click `Bugbot review` with local git changes and confirm it submits or queues a `/review (Bugbot)` prompt built from local `git diff`.
 - Confirm sub-agent and recent-activity sections render empty states cleanly when nothing is running.
 
-## Local Servers And Editor
+## Local Servers
 
 - Start a local dev server in the workspace, then confirm the Environment card `Local Servers` section shows its process name, `localhost:<port>`, and a green running dot after refresh.
+- Confirm internal agent processes such as `agent-*` do not appear in the Local Servers list or count.
 - Click the server row and confirm it opens the right Preview target through the local preview proxy.
 - Click `Open dev server` and confirm it opens the same localhost URL in the system browser.
 - Click `Stop dev server` and confirm the process exits and the server list refreshes without leaving a stale running row.
-- Click `Editor view` and confirm it opens the local file/editor pane.
-- Click `Open in Cursor` and confirm it launches Cursor on the current workspace, with no cloud sync or remote project dependency.
 
 ## Tab And Session Replay
 
@@ -79,6 +78,6 @@ It focuses on states that compile tests cannot prove.
 - Edit/remove slot text freezes cleanly when Reduce Motion is enabled.
 - Structured UI artifacts render from the native catalog and never expose arbitrary HTML/JS.
 - Agents Window controls stay local-only: no cloud sync/index/background execution dependency is required.
-- Local Servers and Editor controls work with local processes and the current workspace path only.
+- Local Servers controls work with local dev-server processes only.
 - No stale session opens with the wrong provider/model/harness/effort.
 - Console has no new runtime errors.

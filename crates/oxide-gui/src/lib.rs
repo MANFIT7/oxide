@@ -3205,6 +3205,7 @@ async fn scan_procs() -> Vec<(u16, String, u32)> {
         "launchd",
         "deleted",
         "syncdefa",
+        "agent-",
     ];
     let mut found: std::collections::BTreeMap<u16, (String, u32)> =
         std::collections::BTreeMap::new();
@@ -3266,6 +3267,7 @@ async fn scan_ports() -> Vec<(u16, String)> {
         "launchd",
         "deleted",
         "syncdefa",
+        "agent-",
     ];
     // Runtimes that *are* dev servers — these we always surface.
     const DEV: &[&str] = &[
@@ -6628,21 +6630,6 @@ fn app() -> Element {
                                     }
                                     button { class: "env-card-row", onclick: move |_| select_env_tab(env_tab, show_env, env_tab_by_tab, tabs, active_tab, "files", false),
                                         Icon { name: "plugins" } span { "Files" }
-                                    }
-                                    div { class: "env-card-sep" }
-                                    div { class: "env-card-label", "Editor" }
-                                    button { class: "env-card-row", onclick: move |_| select_env_tab(env_tab, show_env, env_tab_by_tab, tabs, active_tab, "files", false),
-                                        Icon { name: "split-right" } span { "Editor view" }
-                                    }
-                                    button { class: "env-card-row", onclick: move |_| {
-                                            let ws = ui.workspace.peek().clone();
-                                            spawn(async move {
-                                                let result = tokio::process::Command::new("open").arg("-a").arg("Cursor").arg(&ws).output().await;
-                                                let ok = result.map(|out| out.status.success()).unwrap_or(false);
-                                                push_toast(toasts, toast_seq, if ok { "ok" } else { "err" }, if ok { "Opened in Cursor" } else { "Could not open Cursor" });
-                                            });
-                                        },
-                                        Icon { name: "laptop" } span { "Open in Cursor" } span { class: "env-card-badge", Icon { name: "external-link" } }
                                     }
                                     if !pinned_msgs.read().is_empty() {
                                         div { class: "env-card-sep" }

@@ -477,7 +477,7 @@ def main() -> int:
         "GUI exposes a local-only Agents tab with session switching, review, changes, preview, and Bugbot actions",
     )
     require(
-        "local servers and editor controls",
+        "local server controls",
         contains_all(
             gui,
             [
@@ -487,9 +487,7 @@ def main() -> int:
                 'Icon { name: "stop" }',
                 "preview_proxy::set_target(port)",
                 'title: "Open dev server"',
-                '"Editor view"',
-                '"Open in Cursor"',
-                'tokio::process::Command::new("open").arg("-a").arg("Cursor")',
+                '"agent-"',
             ],
         )
         and contains_all(
@@ -502,7 +500,7 @@ def main() -> int:
                 ".local-server-empty",
             ],
         ),
-        "Environment card exposes local server status/actions and local editor launch controls",
+        "Environment card exposes local server status/actions without internal agent ports",
     )
     checklist_needles = [
         "pre-first-token shimmer",
@@ -515,7 +513,6 @@ def main() -> int:
         "Agents Window",
         "Bugbot review",
         "Local Servers",
-        "Open in Cursor",
     ]
     require(
         "manual checklist covers motion-critical states",
