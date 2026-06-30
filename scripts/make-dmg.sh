@@ -30,6 +30,20 @@ exec "$DIR/oxide-bin" gui
 LAUNCH
 chmod +x "$APPDIR/Contents/MacOS/$APP" "$APPDIR/Contents/MacOS/oxide-bin"
 
+# Native GPU terminal (oxide-term) — a standalone wgpu/Metal terminal, excluded
+# from the workspace, so build it on its own and bundle it next to the binary.
+# The GUI's "Native GPU terminal" button launches it via a current_exe-relative
+# path. Best-effort: a build failure must NOT fail the dmg (the button just stays
+# inert and prints a build hint).
+echo "▶ building native GPU terminal (oxide-term)…"
+if cargo build --release --manifest-path crates/oxide-term/Cargo.toml; then
+  cp crates/oxide-term/target/release/oxide-term "$APPDIR/Contents/MacOS/oxide-term"
+  chmod +x "$APPDIR/Contents/MacOS/oxide-term"
+  echo "  ✓ bundled oxide-term"
+else
+  echo "  ⚠ oxide-term build failed — GPU terminal button will be inert in this build"
+fi
+
 # icon: logo.png -> oxide.icns
 echo "▶ building icon…"
 ICONSET="$DIST/oxide.iconset"

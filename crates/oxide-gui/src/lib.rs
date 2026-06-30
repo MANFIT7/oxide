@@ -77,6 +77,31 @@ fn provider_logo(provider: &str) -> Option<String> {
     }
 }
 
+/// Launch the standalone native GPU terminal (`oxide-term`) as a separate window.
+/// Resolves the binary next to the running app executable (bundled inside
+/// Oxide.app/Contents/MacOS), then a dev build under the repo, then falls back to
+/// PATH. Returns false if nothing could be spawned. It's a separate native wgpu/
+/// Metal window because a GPU surface can't live inside the Dioxus webview.
+fn launch_native_terminal() -> bool {
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("oxide-term"));
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join("crates/oxide-term/target/release/oxide-term"));
+        candidates.push(cwd.join("crates/oxide-term/target/debug/oxide-term"));
+    }
+    for p in &candidates {
+        if p.exists() && std::process::Command::new(p).spawn().is_ok() {
+            return true;
+        }
+    }
+    // Last resort: a PATH lookup.
+    std::process::Command::new("oxide-term").spawn().is_ok()
+}
+
 struct ModelPreset {
     provider: &'static str,
     model: &'static str,
@@ -7714,6 +7739,12 @@ fn app() -> Element {
                                                 let n = terms.read().len(); term_sel.set(n - 1);
                                             }, Icon { name: "plus" } }
                                             button { class: "term-tab add", title: "Clear output", onclick: move |_| { let sel = *term_sel.read(); if let Some(t) = terms.write().get_mut(sel) { t.2.clear(); } }, Icon { name: "backspace" } }
+                                            button { class: "term-tab add", title: "Native GPU terminal (Metal · oxide-term)", onclick: move |_| {
+                                                if !launch_native_terminal() {
+                                                    let sel = *term_sel.read();
+                                                    if let Some(t) = terms.write().get_mut(sel) { t.2.push("oxide-term not found — build it: cargo build --release --manifest-path crates/oxide-term/Cargo.toml".to_string()); }
+                                                }
+                                            }, Icon { name: "terminal" } }
                                         }
                                         div { class: "term-body",
                                             {
