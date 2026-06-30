@@ -35,7 +35,6 @@ const NERD_FONT: &[u8] =
 const FONT_FAMILY: &str = "JetBrainsMono Nerd Font Mono";
 const FONT_SIZE: f32 = 14.0;
 const LINE_HEIGHT: f32 = 18.0;
-const CELL_W: f32 = FONT_SIZE * 0.6;
 const PAD_X: f32 = 6.0;
 const PAD_Y: f32 = 4.0;
 const DEFAULT_FG: Rgb = Rgb {
@@ -545,6 +544,7 @@ impl QuadRenderer {
         queue: &wgpu::Queue,
         quads: &[Quad],
         res: [f32; 2],
+        cell_w: f32,
     ) {
         queue.write_buffer(
             &self.ubuf,
@@ -556,9 +556,9 @@ impl QuadRenderer {
         );
         let mut verts: Vec<Vertex> = Vec::with_capacity(quads.len() * 6);
         for q in quads {
-            let x0 = PAD_X + q.col as f32 * CELL_W;
+            let x0 = PAD_X + q.col as f32 * cell_w;
             let y0 = PAD_Y + q.line as f32 * LINE_HEIGHT;
-            let x1 = x0 + CELL_W;
+            let x1 = x0 + cell_w;
             let y1 = y0 + LINE_HEIGHT;
             let c = [
                 q.color.r as f32 / 255.0,
@@ -627,6 +627,10 @@ struct Gpu {
     text_renderer: TextRenderer,
     text_buffer: TextBuffer,
     quads: QuadRenderer,
+    /// The loaded font's REAL family name (queried, not guessed).
+    family: String,
+    /// Measured monospace cell advance in px (so bg quads/cursor align to glyphs).
+    cell_w: f32,
     window: Arc<Window>,
 }
 
@@ -660,6 +664,34 @@ impl Gpu {
 
         let mut font_system = FontSystem::new();
         font_system.db_mut().load_font_data(NERD_FONT.to_vec());
+        // Use the loaded font's REAL family name. Guessing the string is fragile —
+        // a mismatch makes cosmic-text fall back to a default face, so the Nerd
+        // glyphs vanish or the text renders in the wrong font (a likely "weird").
+        let family = font_system
+            .db()
+            .faces()
+            .last()
+            .and_then(|f| f.families.first().map(|(n, _)| n.clone()))
+            .unwrap_or_else(|| FONT_FAMILY.to_string());
+        // Measure the real monospace advance so background quads + the cursor line
+        // up with the glyphs (the 0.6-em guess drifts on some faces).
+        let cell_w = {
+            let mut probe = TextBuffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
+            probe.set_text(
+                &mut font_system,
+                "MMMMMMMMMMMMMMMMMMMM",
+                &Attrs::new().family(Family::Name(&family)),
+                Shaping::Advanced,
+                None,
+            );
+            probe.shape_until_scroll(&mut font_system, false);
+            probe
+                .layout_runs()
+                .next()
+                .map(|r| r.line_w / 20.0)
+                .filter(|w| *w > 0.5)
+                .unwrap_or(FONT_SIZE * 0.6)
+        };
         let swash_cache = SwashCache::new();
         let cache = Cache::new(&device);
         let viewport = Viewport::new(&device, &cache);
@@ -687,16 +719,19 @@ impl Gpu {
             text_renderer,
             text_buffer,
             quads,
+            family,
+            cell_w,
             window,
         }
     }
 
     fn set_runs(&mut self, runs: &[Run]) {
+        let fam = self.family.clone();
         let spans: Vec<(&str, Attrs)> = runs
             .iter()
             .map(|r| {
                 let attrs = Attrs::new()
-                    .family(Family::Name(FONT_FAMILY))
+                    .family(Family::Name(&fam))
                     .color(Color::rgb(r.fg.r, r.fg.g, r.fg.b))
                     .weight(if r.bold { Weight::BOLD } else { Weight::NORMAL });
                 (r.text.as_str(), attrs)
@@ -705,7 +740,7 @@ impl Gpu {
         self.text_buffer.set_rich_text(
             &mut self.font_system,
             spans,
-            &Attrs::new().family(Family::Name(FONT_FAMILY)),
+            &Attrs::new().family(Family::Name(&fam)),
             Shaping::Advanced,
             None,
         );
@@ -728,7 +763,7 @@ impl Gpu {
             self.surface_config.height as f32,
         ];
         self.quads
-            .prepare(&self.device, &self.queue, &frame.quads, res);
+            .prepare(&self.device, &self.queue, &frame.quads, res, self.cell_w);
 
         self.viewport.update(
             &self.queue,
@@ -823,8 +858,8 @@ struct App {
 }
 
 impl App {
-    fn grid_size(w: u32, h: u32) -> TermSize {
-        let cols = ((w as f32 - PAD_X * 2.0) / CELL_W).floor().max(1.0) as usize;
+    fn grid_size(cell_w: f32, w: u32, h: u32) -> TermSize {
+        let cols = ((w as f32 - PAD_X * 2.0) / cell_w).floor().max(1.0) as usize;
         let lines = ((h as f32 - PAD_Y * 2.0) / LINE_HEIGHT).floor().max(1.0) as usize;
         TermSize { cols, lines }
     }
@@ -853,7 +888,7 @@ impl ApplicationHandler<UserEvent> for App {
         let window = Arc::new(event_loop.create_window(attrs).unwrap());
         let gpu = pollster::block_on(Gpu::new(window.clone(), event_loop));
         let size = window.inner_size();
-        let grid = Self::grid_size(size.width, size.height);
+        let grid = Self::grid_size(gpu.cell_w, size.width, size.height);
         let pty = Pty::spawn(grid, self.proxy.clone(), self.cwd.clone(), self.cmd.clone())
             .expect("spawn pty");
         self.gpu = Some(gpu);
@@ -879,7 +914,7 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::Resized(size) => {
                 if let (Some(gpu), Some(pty)) = (self.gpu.as_mut(), self.pty.as_mut()) {
                     gpu.resize(size.width, size.height);
-                    pty.resize(Self::grid_size(size.width, size.height));
+                    pty.resize(Self::grid_size(gpu.cell_w, size.width, size.height));
                     gpu.window.request_redraw();
                 }
             }
