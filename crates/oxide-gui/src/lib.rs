@@ -45,6 +45,7 @@ fn logo_uri() -> &'static str {
 const XTERM_CSS: &str = include_str!("../assets/xterm/xterm.css");
 const XTERM_JS: &str = include_str!("../assets/xterm/xterm.js");
 const XTERM_FIT_JS: &str = include_str!("../assets/xterm/addon-fit.js");
+const XTERM_WEBGL_JS: &str = include_str!("../assets/xterm/addon-webgl.js");
 
 // Brand logos for the provider picker (inline SVG).
 const SVG_CLAUDE: &str = include_str!("../assets/providers/claude-icon.svg");
@@ -11453,6 +11454,15 @@ fn TerminalView(id: u64, bin: String, ws: String, resume: Option<String>) -> Ele
                 try {{ fit = new window.FitAddon.FitAddon(); term.loadAddon(fit); }} catch (e) {{}}
                 try {{ await document.fonts.load("12.5px 'JetBrainsMono Nerd Font Mono'"); await document.fonts.ready; }} catch (e) {{}}
                 term.open(el);
+                // GPU-accelerated renderer (canvas/WebGL) — smoother scroll + lower
+                // latency than the default DOM renderer. On GPU context loss, dispose
+                // so xterm falls back to the DOM renderer instead of going blank;
+                // if WebGL is unavailable the try/catch leaves the DOM renderer.
+                try {{
+                    const gl = new window.WebglAddon.WebglAddon();
+                    gl.onContextLoss(() => {{ try {{ gl.dispose(); }} catch (e) {{}} }});
+                    term.loadAddon(gl);
+                }} catch (e) {{}}
                 try {{ if (fit) fit.fit(); }} catch (e) {{}}
                 term.focus();
                 // macOS clipboard shortcuts inside the TUI.
@@ -11484,7 +11494,7 @@ fn TerminalView(id: u64, bin: String, ws: String, resume: Option<String>) -> Ele
             "##
             );
             // Inject the xterm runtime inline (asset!() isn't served under plain `cargo run`).
-            let setup = format!("{XTERM_JS}\n;\n{XTERM_FIT_JS}\n;\n{setup}");
+            let setup = format!("{XTERM_JS}\n;\n{XTERM_FIT_JS}\n;\n{XTERM_WEBGL_JS}\n;\n{setup}");
             let mut eval = dioxus::document::eval(&setup);
 
             let pty = portable_pty::native_pty_system();
