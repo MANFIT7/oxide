@@ -142,33 +142,6 @@ const MODEL_PRESETS: &[ModelPreset] = &[
         badge: "Fast",
         fast: true,
     },
-    ModelPreset {
-        provider: "claude_interactive",
-        model: "claude-fable-5",
-        provider_label: "Claude Code Interactive",
-        label: "Fable 5",
-        summary: "Interactive Claude Code session, no claude -p",
-        badge: "TTY",
-        fast: false,
-    },
-    ModelPreset {
-        provider: "claude_interactive",
-        model: "claude-opus-4-8",
-        provider_label: "Claude Code Interactive",
-        label: "Opus 4.8",
-        summary: "Interactive Claude Code session for deep work",
-        badge: "TTY",
-        fast: false,
-    },
-    ModelPreset {
-        provider: "claude_interactive",
-        model: "claude-sonnet-4-6",
-        provider_label: "Claude Code Interactive",
-        label: "Sonnet 4.6",
-        summary: "Interactive Claude Code session, experimental",
-        badge: "TTY",
-        fast: true,
-    },
     // API-key providers (OpenAI/Anthropic) intentionally omitted — Oxide is a
     // GUI wrapper around the user's logged-in CLIs + ChatGPT subscription, with
     // no raw API-key entry (Synara-style).
@@ -6424,16 +6397,6 @@ fn app() -> Element {
                                         if let Some(l) = provider_logo("claude") { span { class: "agent-tab-logo prov-logo", dangerous_inner_html: l } }
                                         span { class: "menu-name", "Claude Code" }
                                     }
-                                    button { class: "menu-item", onclick: move |_| {
-                                            show_newtab.set(false);
-                                            new_agent_tab(tabs, active_tab, messages, cfg, engine, next_tab_id, "claude_interactive", "", "Claude Code Interactive");
-                                        },
-                                        if let Some(l) = provider_logo("claude_interactive") { span { class: "agent-tab-logo prov-logo", dangerous_inner_html: l } }
-                                        span { class: "menu-copy",
-                                            span { class: "menu-name", "Claude Code Interactive" }
-                                            span { class: "menu-meta", "Experimental · no claude -p" }
-                                        }
-                                    }
                                 }
                             }
                         }
@@ -9876,14 +9839,7 @@ fn SettingsModal(
 
     // Oxide is a GUI wrapper around the user's logged-in agent CLIs + the ChatGPT
     // subscription — no raw API-key providers (openai/anthropic) in the picker.
-    let providers = [
-        "chatgpt",
-        "codex",
-        "claude",
-        "claude_interactive",
-        "echo",
-        "mock",
-    ];
+    let providers = ["chatgpt", "codex", "claude", "echo", "mock"];
 
     let save = move |_| {
         let mut c = cfg.read().clone();
@@ -12135,10 +12091,6 @@ fn SplitLeaf(
                             button { class: "menu-item", onclick: move |_| { show_menu.set(false); on_set_mode.call(("tui".into(), "claude".into())); },
                                 if let Some(l) = provider_logo("claude") { span { class: "agent-tab-logo prov-logo", dangerous_inner_html: l } }
                                 span { class: "menu-name", "TUI · Claude Code" }
-                            }
-                            button { class: "menu-item", onclick: move |_| { show_menu.set(false); on_set_mode.call(("gui".into(), "claude_interactive".into())); },
-                                if let Some(l) = provider_logo("claude_interactive") { span { class: "agent-tab-logo prov-logo", dangerous_inner_html: l } }
-                                span { class: "menu-name", "GUI · Claude Code Interactive" }
                             }
                         }
                     }
