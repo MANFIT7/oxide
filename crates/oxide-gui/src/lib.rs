@@ -9497,6 +9497,16 @@ fn md_live_html(src: &str) -> String {
         None => ("", src),
     };
 
+    // A markdown TABLE row is being streamed: a table needs its rows in one
+    // contiguous block, so keeping this "| … |" tail raw (below) would render it
+    // as literal text beneath the already-parsed rows — the table looks broken
+    // mid-stream. Render the whole buffer so the in-progress row joins its table,
+    // same idea as the open code-fence case above. (Costs a re-parse per token
+    // only while a table row streams, which is cheap and short-lived.)
+    if tail.trim_start().starts_with('|') {
+        return md_to_html_uncached(src, true);
+    }
+
     // The stable prefix only changes when a line completes — not on every
     // streamed token (the tail carries the in-progress line) — so cache its
     // markdown render and re-parse only when the prefix actually changes.
