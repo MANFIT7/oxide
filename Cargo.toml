@@ -14,6 +14,10 @@ members = [
     "crates/oxide-desktop",
     "crates/oxide-cli",
 ]
+# Standalone native GPU terminal PoC — excluded from the main build/release so its
+# heavy wgpu/winit deps don't slow CI or gate releases. Build it on its own:
+#   cargo build --manifest-path crates/oxide-term/Cargo.toml
+exclude = ["crates/oxide-term"]
 
 [workspace.package]
 version = "0.0.116"
