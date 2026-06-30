@@ -1,8 +1,17 @@
 #!/usr/bin/env python3
 """Generate a clean install-window background for the Oxide dmg, matching the
-electron-builder default proportions (540x380) used by apps like synara."""
+electron-builder default proportions (540x380) used by apps like synara.
+
+Pillow is OPTIONAL: if it isn't installed (some macOS CI runner images ship
+without it), skip the background and exit 0 — the dmg still builds correctly,
+just without the styled install window. Never fail the release for cosmetics."""
 import sys
-from PIL import Image, ImageDraw, ImageFont
+
+try:
+    from PIL import Image, ImageDraw, ImageFont
+except ModuleNotFoundError:
+    print("dmg-bg: Pillow not installed — skipping styled background", file=sys.stderr)
+    sys.exit(0)
 
 W, H = 540, 380
 OUT = sys.argv[1] if len(sys.argv) > 1 else "dist/dmg-bg.png"

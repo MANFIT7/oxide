@@ -180,6 +180,13 @@ jobs:
           echo "identity=$identity" >> "$GITHUB_OUTPUT"
           echo "available=true" >> "$GITHUB_OUTPUT"
 
+      - name: Install dmg background deps (Pillow)
+        # Optional — dmg-bg.py skips the styled background gracefully if absent.
+        # Newer macOS runner images dropped Pillow from the default python3, which
+        # is why v0.0.104's dmg step failed; install it (best-effort) to restore
+        # the styled install window.
+        run: pip3 install --quiet Pillow || pip3 install --quiet --break-system-packages Pillow || true
+
       - name: Build dmg
         run: |
           if [ "${{ steps.signing.outputs.available }}" = "true" ]; then

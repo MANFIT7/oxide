@@ -1,4 +1,5 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -148,19 +149,157 @@ pub fn run_from_spec(
 }
 
 pub fn is_due(spec: &AutomationSpec, runs: &[AutomationRunSpec], now_ms: u64) -> bool {
-    if spec.status != "ACTIVE" {
-        return false;
-    }
-    let Some(interval_ms) = interval_ms(&spec.schedule) else {
-        return false;
+    next_due(spec, runs).is_some_and(|at| at <= now_ms)
+}
+
+const DAY_MS: i64 = 86_400_000;
+const MIN_MS: i64 = 60_000;
+
+struct Parsed {
+    once: Option<u64>,
+    freq: Option<String>,
+    interval: u64,
+    /// Minute-of-day for time-anchored schedules (`AT=HH:MM`), else None.
+    at_min: Option<u32>,
+    /// Timezone offset east of UTC, in minutes (from `TZ=±HH:MM`); 0 = UTC.
+    tz_off: i32,
+    /// Weekday set for WEEKLY (0=Sun..6=Sat), from `BYDAY=MO,WE,FR`.
+    byday: Vec<u8>,
+    /// Plain-interval period (no time-of-day), reused from [`interval_ms`].
+    period_ms: Option<u64>,
+}
+
+fn parse_hhmm(s: &str) -> Option<u32> {
+    let (h, m) = s.split_once(':')?;
+    let h: u32 = h.trim().parse().ok()?;
+    let m: u32 = m.trim().parse().ok()?;
+    (h < 24 && m < 60).then_some(h * 60 + m)
+}
+
+fn parse_tz(s: &str) -> Option<i32> {
+    let s = s.trim();
+    let (sign, rest) = if let Some(r) = s.strip_prefix('-') {
+        (-1, r)
+    } else {
+        (1, s.strip_prefix('+').unwrap_or(s))
     };
+    let (h, m) = rest.split_once(':').unwrap_or((rest, "0"));
+    let h: i32 = h.trim().parse().ok()?;
+    let m: i32 = m.trim().parse().ok()?;
+    Some(sign * (h * 60 + m))
+}
+
+fn parse_weekday(s: &str) -> Option<u8> {
+    match s.trim().to_ascii_uppercase().as_str() {
+        "SU" => Some(0),
+        "MO" => Some(1),
+        "TU" => Some(2),
+        "WE" => Some(3),
+        "TH" => Some(4),
+        "FR" => Some(5),
+        "SA" => Some(6),
+        _ => None,
+    }
+}
+
+fn parse_schedule(schedule: &str) -> Option<Parsed> {
+    let mut once = None;
+    let mut freq = None;
+    let mut interval = 1u64;
+    let mut at_min = None;
+    let mut tz_off = 0i32;
+    let mut byday = Vec::new();
+    for part in schedule.split(';') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let (k, v) = part.split_once('=')?;
+        let v = v.trim();
+        match k.trim().to_ascii_uppercase().as_str() {
+            "ONCE" | "AT_MS" => once = v.parse::<u64>().ok(),
+            "FREQ" => freq = Some(v.to_ascii_uppercase()),
+            "INTERVAL" => interval = v.parse::<u64>().ok()?.max(1),
+            "AT" => at_min = parse_hhmm(v),
+            "TZ" => tz_off = parse_tz(v).unwrap_or(0),
+            "BYDAY" => byday = v.split(',').filter_map(parse_weekday).collect(),
+            _ => {}
+        }
+    }
+    if once.is_none() && freq.is_none() {
+        return None;
+    }
+    Some(Parsed {
+        once,
+        freq,
+        interval,
+        at_min,
+        tz_off,
+        byday,
+        period_ms: interval_ms(schedule),
+    })
+}
+
+/// Next scheduled fire time (unix ms), strictly after the last run (or creation),
+/// or None if there is no future occurrence (paused, one-shot already fired, or an
+/// unparseable schedule). Supports one-shot (`ONCE=<ms>`), plain interval
+/// (`FREQ=MINUTELY|HOURLY|DAILY;INTERVAL=N`), daily-at-time
+/// (`FREQ=DAILY;INTERVAL=N;AT=HH:MM[;TZ=±HH:MM]`), and weekly-by-day
+/// (`FREQ=WEEKLY;BYDAY=MO,WE,FR;AT=HH:MM[;TZ=±HH:MM]`). Pure integer time math —
+/// no cron/chrono dependency; fixed TZ offsets only (no DST).
+pub fn next_due(spec: &AutomationSpec, runs: &[AutomationRunSpec]) -> Option<u64> {
+    if spec.status != "ACTIVE" {
+        return None;
+    }
+    let p = parse_schedule(&spec.schedule)?;
     let last_run = runs
         .iter()
         .filter(|run| run.automation_id == spec.id)
         .map(|run| run.started_ms)
         .max();
+    // One-shot fires exactly once, ever.
+    if let Some(at) = p.once {
+        return last_run.is_none().then_some(at);
+    }
     let anchor = last_run.unwrap_or(spec.created_ms);
-    now_ms >= anchor.saturating_add(interval_ms)
+    // Plain interval (no time-of-day): next = last fire + period.
+    if p.at_min.is_none() {
+        return Some(anchor.saturating_add(p.period_ms?));
+    }
+    let at_min = p.at_min? as i64;
+    let tz = p.tz_off as i64;
+    let anchor_local = anchor as i64 + tz * MIN_MS;
+    let mut day = anchor_local.div_euclid(DAY_MS);
+    match p.freq.as_deref() {
+        Some("DAILY") => {
+            let created_day = (spec.created_ms as i64 + tz * MIN_MS).div_euclid(DAY_MS);
+            let interval = p.interval.max(1) as i64;
+            for _ in 0..(interval * 2 + 2) {
+                let cand = day * DAY_MS + at_min * MIN_MS;
+                if cand > anchor_local && (day - created_day).rem_euclid(interval) == 0 {
+                    return Some((cand - tz * MIN_MS).max(0) as u64);
+                }
+                day += 1;
+            }
+            None
+        }
+        Some("WEEKLY") => {
+            if p.byday.is_empty() {
+                return None;
+            }
+            for _ in 0..15 {
+                // 1970-01-01 was a Thursday; weekday 0=Sun..6=Sat.
+                let weekday = ((day + 4).rem_euclid(7)) as u8;
+                let cand = day * DAY_MS + at_min * MIN_MS;
+                if cand > anchor_local && p.byday.contains(&weekday) {
+                    return Some((cand - tz * MIN_MS).max(0) as u64);
+                }
+                day += 1;
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 pub fn interval_ms(schedule: &str) -> Option<u64> {
@@ -228,6 +367,111 @@ fn slug_fragment(value: &str) -> String {
         "branch".to_string()
     } else {
         slug
+    }
+}
+
+// ── Run lifecycle ────────────────────────────────────────────────────────────
+
+/// Canonical automation-run statuses. A run moves queued → running → done|failed;
+/// `interrupted` is set by crash recovery for a run that was mid-flight when the
+/// host died.
+pub mod run_status {
+    pub const QUEUED: &str = "queued";
+    pub const RUNNING: &str = "running";
+    pub const DONE: &str = "done";
+    pub const FAILED: &str = "failed";
+    pub const INTERRUPTED: &str = "interrupted";
+
+    /// True for a status that is still in-flight (not a terminal outcome).
+    pub fn is_active(status: &str) -> bool {
+        status == QUEUED || status == RUNNING
+    }
+}
+
+/// Update one run's status in place (persisted). No-op if the run id is unknown.
+pub fn set_run_status(workspace: &Path, run_id: &str, status: &str) -> anyhow::Result<()> {
+    let mut runs = read_runs(workspace)?;
+    if let Some(run) = runs.iter_mut().find(|r| r.id == run_id) {
+        run.status = status.to_string();
+        write_run(workspace, run)?;
+    }
+    Ok(())
+}
+
+/// Crash recovery: any run still in an ACTIVE status (queued/running) from a
+/// prior process that died is reconciled to `interrupted`, so the UI/scheduler
+/// never shows a perpetually-"running" ghost. Returns the count reconciled. Call
+/// once at scheduler/app startup.
+pub fn reconcile_orphaned_runs(workspace: &Path) -> anyhow::Result<usize> {
+    let runs = read_runs(workspace)?;
+    let mut reconciled = 0usize;
+    for mut run in runs {
+        if run_status::is_active(&run.status) {
+            run.status = run_status::INTERRUPTED.to_string();
+            write_run(workspace, &run)?;
+            reconciled += 1;
+        }
+    }
+    Ok(reconciled)
+}
+
+// ── Scheduler ────────────────────────────────────────────────────────────────
+
+/// All ACTIVE automations whose next fire time has arrived at `now_ms`.
+pub fn due_automations<'a>(
+    specs: &'a [AutomationSpec],
+    runs: &[AutomationRunSpec],
+    now_ms: u64,
+) -> Vec<&'a AutomationSpec> {
+    specs
+        .iter()
+        .filter(|spec| is_due(spec, runs, now_ms))
+        .collect()
+}
+
+/// Soonest upcoming fire time across all specs (unix ms), or None if nothing is
+/// scheduled — lets the scheduler sleep exactly until the next event instead of
+/// busy-polling on a fixed cadence.
+pub fn next_wakeup_ms(specs: &[AutomationSpec], runs: &[AutomationRunSpec]) -> Option<u64> {
+    specs.iter().filter_map(|spec| next_due(spec, runs)).min()
+}
+
+/// Headless automation scheduler loop. Reconciles orphaned runs once, then on
+/// each tick fires every due automation via `fire` and sleeps until the next one
+/// is due (clamped to [min_tick, max_tick] so newly-added/edited specs are still
+/// picked up promptly, and a stuck clock can't busy-spin).
+///
+/// `fire(spec)` is the host's hook to actually run the automation — it should
+/// record a run (e.g. [`run_from_spec`] + [`write_run`] with status `queued`) and
+/// dispatch the prompt to an engine; recording the run is what stops the next
+/// tick from re-firing it. The loop owns NO agent logic and survives app close
+/// ONLY while the host keeps this future alive (e.g. a background/tray process) —
+/// that hosting is the remaining wiring.
+pub async fn run_scheduler<F>(
+    workspace: PathBuf,
+    min_tick: Duration,
+    max_tick: Duration,
+    mut fire: F,
+) where
+    F: FnMut(&AutomationSpec),
+{
+    let _ = reconcile_orphaned_runs(&workspace);
+    loop {
+        let specs = read_specs(&workspace).unwrap_or_default();
+        let runs = read_runs(&workspace).unwrap_or_default();
+        let now = now_ms();
+        for spec in due_automations(&specs, &runs, now) {
+            fire(spec);
+        }
+        // Re-read after firing (a fire may have written a queued run) so the
+        // wakeup reflects the new schedule horizon.
+        let specs = read_specs(&workspace).unwrap_or_default();
+        let runs = read_runs(&workspace).unwrap_or_default();
+        let delay_ms = next_wakeup_ms(&specs, &runs)
+            .map(|t| t.saturating_sub(now_ms()))
+            .unwrap_or(u64::MAX)
+            .clamp(min_tick.as_millis() as u64, max_tick.as_millis() as u64);
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
     }
 }
 
@@ -374,5 +618,113 @@ mod tests {
     fn id_from_name_uses_automation_fallback() {
         assert_eq!(id_from_name("!!!", 42), "automation-42");
         assert_eq!(id_from_name("Daily Review", 42), "daily-review-42");
+    }
+
+    #[test]
+    fn once_fires_exactly_once() {
+        let mut s = spec();
+        s.created_ms = 0;
+        s.schedule = "ONCE=500000".into();
+        assert_eq!(next_due(&s, &[]), Some(500_000));
+        assert!(is_due(&s, &[], 500_000));
+        assert!(!is_due(&s, &[], 400_000));
+        let run = run_from_spec(&s, "scheduled", "done", 500_000);
+        assert_eq!(next_due(&s, &[run]), None);
+    }
+
+    #[test]
+    fn daily_at_time_utc_advances_per_run() {
+        let mut s = spec();
+        s.created_ms = 0; // 1970-01-01 00:00 UTC
+        s.schedule = "FREQ=DAILY;AT=09:00".into();
+        // first occurrence = 09:00 on day 0
+        assert_eq!(next_due(&s, &[]), Some(32_400_000));
+        // after firing at day0 09:00, next is day1 09:00
+        let run = run_from_spec(&s, "scheduled", "done", 32_400_000);
+        assert_eq!(next_due(&s, &[run]), Some(32_400_000 + 86_400_000));
+    }
+
+    #[test]
+    fn daily_at_time_honors_tz_offset() {
+        let mut s = spec();
+        s.created_ms = 0;
+        // 09:00 at +07:00 == 02:00 UTC == 7_200_000 ms
+        s.schedule = "FREQ=DAILY;AT=09:00;TZ=+07:00".into();
+        assert_eq!(next_due(&s, &[]), Some(7_200_000));
+    }
+
+    #[test]
+    fn weekly_by_day_finds_next_matching_weekday() {
+        let mut s = spec();
+        s.created_ms = 0; // Thursday
+        s.schedule = "FREQ=WEEKLY;BYDAY=MO;AT=00:00".into();
+        // next Monday after day-0 Thursday is day 4
+        assert_eq!(next_due(&s, &[]), Some(4 * 86_400_000));
+    }
+
+    #[test]
+    fn interval_schedule_still_works_via_next_due() {
+        let s = AutomationSpec {
+            schedule: "FREQ=MINUTELY;INTERVAL=5".to_string(),
+            created_ms: 1_000,
+            ..spec()
+        };
+        assert_eq!(next_due(&s, &[]), Some(301_000));
+        assert!(is_due(&s, &[], 310_000));
+        assert!(!is_due(&s, &[], 120_000));
+    }
+
+    #[test]
+    fn reconcile_marks_only_active_runs_interrupted() {
+        let tmp = unique_tmp("reconcile");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let running = AutomationRunSpec {
+            id: "r1".into(),
+            automation_id: "a".into(),
+            automation_name: "A".into(),
+            trigger: "scheduled".into(),
+            status: run_status::RUNNING.into(),
+            prompt: "p".into(),
+            started_ms: 1,
+        };
+        let done = AutomationRunSpec {
+            id: "r2".into(),
+            status: run_status::DONE.into(),
+            started_ms: 2,
+            ..running.clone()
+        };
+        write_run(&tmp, &running).unwrap();
+        write_run(&tmp, &done).unwrap();
+
+        assert_eq!(reconcile_orphaned_runs(&tmp).unwrap(), 1);
+
+        let runs = read_runs(&tmp).unwrap();
+        let r1 = runs.iter().find(|r| r.id == "r1").unwrap();
+        let r2 = runs.iter().find(|r| r.id == "r2").unwrap();
+        assert_eq!(r1.status, run_status::INTERRUPTED);
+        assert_eq!(r2.status, run_status::DONE);
+        std::fs::remove_dir_all(tmp).ok();
+    }
+
+    #[test]
+    fn due_batch_and_next_wakeup() {
+        let s1 = AutomationSpec {
+            id: "s1".into(),
+            schedule: "FREQ=MINUTELY;INTERVAL=5".into(),
+            created_ms: 0,
+            ..spec()
+        };
+        let s2 = AutomationSpec {
+            id: "s2".into(),
+            schedule: "ONCE=100000".into(),
+            created_ms: 0,
+            ..spec()
+        };
+        let specs = vec![s1, s2];
+        // now=0: s1 due at 300000, s2 at 100000 → nothing due, soonest is 100000
+        assert!(due_automations(&specs, &[], 0).is_empty());
+        assert_eq!(next_wakeup_ms(&specs, &[]), Some(100_000));
+        // now past both
+        assert_eq!(due_automations(&specs, &[], 300_001).len(), 2);
     }
 }

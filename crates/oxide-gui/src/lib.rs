@@ -1859,7 +1859,7 @@ why it's wrong, and the concrete fix. If the diff is clean, say so plainly.{}\n\
         } else if let Some(rest) = tkn.strip_prefix("automation:") {
             if rest == "create" {
                 ctx_block.push_str(
-                    "\n## Automation request\nThe user selected Create automation from the @ menu. Help them define a useful workspace automation. If enough details are present, create a `.oxide/automations/*.toml` automation spec with fields `id`, `name`, `kind = \"cron\"`, `status = \"ACTIVE\"`, `schedule`, `prompt`, and `created_ms`. Use schedules like `FREQ=DAILY;INTERVAL=1`, `FREQ=HOURLY;INTERVAL=2`, or `FREQ=MINUTELY;INTERVAL=30`.\n",
+                    "\n## Automation request\nThe user selected Create automation from the @ menu. Help them define a useful workspace automation. If enough details are present, create a `.oxide/automations/*.toml` automation spec with fields `id`, `name`, `kind = \"cron\"`, `status = \"ACTIVE\"`, `schedule`, `prompt`, and `created_ms`. Schedule formats: interval `FREQ=MINUTELY|HOURLY|DAILY;INTERVAL=N`; daily at a clock time `FREQ=DAILY;AT=09:00` (add `;TZ=+07:00` for a timezone offset, `;INTERVAL=N` for every N days); weekly on weekdays `FREQ=WEEKLY;BYDAY=MO,WE,FR;AT=09:00`; one-shot `ONCE=<unix_ms>`.\n",
                 );
             } else {
                 let (id, name) = rest.split_once('|').unwrap_or((rest, rest));
@@ -5671,29 +5671,49 @@ fn app() -> Element {
             }
         });
     use_future(move || async move {
+        // Crash recovery once: a run left queued/running by a previous app session
+        // (closed mid-run) is reconciled to "interrupted" so it never shows as a
+        // perpetual ghost and the scheduler starts clean.
+        if let Some(root) = cfg.peek().workspace.clone() {
+            if let Ok(n) = automation::reconcile_orphaned_runs(&root) {
+                if n > 0 {
+                    if let Ok(next) = automation::read_runs(&root) {
+                        automation_runs.set(next);
+                    }
+                }
+            }
+        }
         loop {
             let root = cfg.peek().workspace.clone();
+            let mut delay_ms = 30_000u64;
             if let Some(root) = root {
                 let now = automation::now_ms();
                 let specs = automations.peek().clone();
                 let runs_snapshot = automation_runs.peek().clone();
-                for spec in specs {
-                    if automation::is_due(&spec, &runs_snapshot, now) {
-                        run_automation_turn(
-                            root.clone(),
-                            spec,
-                            "scheduled",
-                            engine,
-                            streaming,
-                            queue,
-                            automation_runs,
-                            automation_status,
-                        );
-                        break;
-                    }
+                // Fire EVERY due automation (each run_automation_turn records its
+                // run, so the next tick won't re-fire it; a busy engine queues them).
+                for spec in automation::due_automations(&specs, &runs_snapshot, now) {
+                    run_automation_turn(
+                        root.clone(),
+                        spec.clone(),
+                        "scheduled",
+                        engine,
+                        streaming,
+                        queue,
+                        automation_runs,
+                        automation_status,
+                    );
                 }
+                // Sleep until the soonest upcoming automation (clamped to [10s,30s])
+                // instead of a fixed 30s — efficient, still responsive to edits.
+                let specs = automations.peek().clone();
+                let runs = automation_runs.peek().clone();
+                delay_ms = automation::next_wakeup_ms(&specs, &runs)
+                    .map(|t| t.saturating_sub(automation::now_ms()))
+                    .unwrap_or(30_000)
+                    .clamp(10_000, 30_000);
             }
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
         }
     });
     // Effort is shown by its own pill — keep the model label clean.

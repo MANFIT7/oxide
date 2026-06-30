@@ -16,7 +16,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.104"
+version = "0.0.105"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Oxide contributors"]
@@ -38,7 +38,7 @@ oxide-gui = { path = "crates/oxide-gui" }
 oxide-desktop = { path = "crates/oxide-desktop" }
 
 # external
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "signal", "time", "io-std", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "signal", "time", "io-std", "io-util", "net", "sync"] }
 tokio-stream = "0.1"
 tokio-util = "0.7"
 futures = "0.3"

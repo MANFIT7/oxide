@@ -938,10 +938,76 @@ const STREAM_QUEUE: usize = 256;
 type ExternalMcpCache =
     std::sync::Mutex<HashMap<String, (std::time::Instant, Vec<McpServerConfig>)>>;
 
+/// Fan-out depth for the multi-subscriber event bus. A subscriber that lags
+/// further behind than this loses the gap and must resnapshot (Synara model);
+/// the in-memory log keeps the full history for replay regardless.
+const BROADCAST_CAP: usize = 4096;
+
+/// A globally-sequenced engine event: `(seq, event)`. The `seq` is a monotonic
+/// per-engine counter so any subscriber can order + dedup, and a late or
+/// reconnecting one can ask for everything `after` a seq it already applied.
+pub type SeqEvent = (u64, Event);
+
+/// Multi-subscriber event fan-out + replay log for ONE engine run.
+///
+/// The primary `mpsc::Receiver` returned by [`spawn`] is unchanged (it drives the
+/// main frontend). The bus is additive: it lets ADDITIONAL surfaces attach to the
+/// SAME run — e.g. a TUI tab co-observing a GUI tab's turn — by taking a snapshot
+/// (every event so far) plus a live tail, all keyed by a global monotonic `seq`.
+/// This is the foundation for cross-surface continuity, reconnect/resnapshot, and
+/// replay/audit (the Synara event-sourcing model, minus durability for now —
+/// the log is in-memory; a file/SQLite backing can be added later).
+pub struct EventBus {
+    seq: AtomicU64,
+    log: std::sync::Mutex<Vec<SeqEvent>>,
+    tx: tokio::sync::broadcast::Sender<SeqEvent>,
+}
+
+impl EventBus {
+    fn new() -> Arc<Self> {
+        let (tx, _rx) = tokio::sync::broadcast::channel(BROADCAST_CAP);
+        Arc::new(Self {
+            seq: AtomicU64::new(0),
+            log: std::sync::Mutex::new(Vec::new()),
+            tx,
+        })
+    }
+
+    /// Record one event in the replay log and fan it out live. Returns its `seq`.
+    fn publish(&self, ev: &Event) -> u64 {
+        let seq = self.seq.fetch_add(1, Ordering::SeqCst);
+        if let Ok(mut log) = self.log.lock() {
+            log.push((seq, ev.clone()));
+        }
+        // Err only when there are no live subscribers — harmless; the log still
+        // has it for a future subscriber's snapshot.
+        let _ = self.tx.send((seq, ev.clone()));
+        seq
+    }
+
+    /// Attach a new subscriber: a snapshot of every event with `seq >= after`
+    /// plus a live receiver for the tail. Subscribe to the live tail FIRST so no
+    /// event can slip between the snapshot and the tail; a small snapshot/tail
+    /// overlap is fine because the caller orders + dedups by `seq`.
+    pub fn subscribe(
+        &self,
+        after: u64,
+    ) -> (Vec<SeqEvent>, tokio::sync::broadcast::Receiver<SeqEvent>) {
+        let rx = self.tx.subscribe();
+        let snapshot = self
+            .log
+            .lock()
+            .map(|log| log.iter().filter(|(s, _)| *s >= after).cloned().collect())
+            .unwrap_or_default();
+        (snapshot, rx)
+    }
+}
+
 /// Cloneable handle a frontend uses to submit [`Op`]s into the engine.
 #[derive(Clone)]
 pub struct EngineHandle {
     op_tx: mpsc::Sender<Op>,
+    bus: Arc<EventBus>,
 }
 
 impl EngineHandle {
@@ -952,6 +1018,99 @@ impl EngineHandle {
             .map_err(|_| anyhow::anyhow!("engine task is gone"))?;
         Ok(())
     }
+
+    /// Attach an ADDITIONAL surface to this engine's live event stream: a snapshot
+    /// (everything emitted so far, from `after` exclusive of lower seqs) + a live
+    /// tail. The primary [`spawn`] receiver keeps working independently.
+    pub fn subscribe(
+        &self,
+        after: u64,
+    ) -> (Vec<SeqEvent>, tokio::sync::broadcast::Receiver<SeqEvent>) {
+        self.bus.subscribe(after)
+    }
+
+    /// The engine's event bus, for serving its stream to OTHER processes over a
+    /// local socket — see [`serve_events`].
+    pub fn bus(&self) -> Arc<EventBus> {
+        self.bus.clone()
+    }
+}
+
+/// Serve one engine's event stream to OTHER PROCESSES over a Unix domain socket.
+///
+/// Each connecting client receives a snapshot (every event so far) then the live
+/// tail, as newline-delimited JSON `[seq, event]`, ordered by `seq`. This is the
+/// cross-process half of the Synara model: a separate process (e.g. a TUI tab)
+/// can co-observe a running GUI engine. Pair with [`subscribe_over_socket`].
+///
+/// Runs until the future is dropped or the socket errors. A lagged client is
+/// disconnected so it reconnects and re-snapshots (no silent gaps).
+pub async fn serve_events(path: PathBuf, bus: Arc<EventBus>) -> anyhow::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    // Replace any stale socket from a prior run.
+    let _ = std::fs::remove_file(&path);
+    let listener = tokio::net::UnixListener::bind(&path)?;
+    loop {
+        let (mut stream, _) = listener.accept().await?;
+        let (snapshot, mut rx) = bus.subscribe(0);
+        tokio::spawn(async move {
+            for ev in snapshot {
+                let Ok(mut line) = serde_json::to_vec(&ev) else {
+                    continue;
+                };
+                line.push(b'\n');
+                if stream.write_all(&line).await.is_err() {
+                    return;
+                }
+            }
+            loop {
+                match rx.recv().await {
+                    Ok(ev) => {
+                        let Ok(mut line) = serde_json::to_vec(&ev) else {
+                            continue;
+                        };
+                        line.push(b'\n');
+                        if stream.write_all(&line).await.is_err() {
+                            return;
+                        }
+                    }
+                    // Fell too far behind — drop so the client reconnects + resnapshots.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => return,
+                    Err(_) => return,
+                }
+            }
+        });
+    }
+}
+
+/// Connect to a [`serve_events`] socket and receive its `(seq, Event)` stream.
+/// Reconnects are the caller's job (re-call after the channel closes). Retries the
+/// initial connect briefly so a just-started server isn't missed.
+pub fn subscribe_over_socket(path: PathBuf) -> tokio::sync::mpsc::UnboundedReceiver<SeqEvent> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        use tokio::io::AsyncBufReadExt;
+        let mut stream = None;
+        for _ in 0..25 {
+            match tokio::net::UnixStream::connect(&path).await {
+                Ok(s) => {
+                    stream = Some(s);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+            }
+        }
+        let Some(stream) = stream else { return };
+        let mut lines = tokio::io::BufReader::new(stream).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            if let Ok(ev) = serde_json::from_str::<SeqEvent>(&line) {
+                if tx.send(ev).is_err() {
+                    return;
+                }
+            }
+        }
+    });
+    rx
 }
 
 fn registry_from_config(config: &Config) -> anyhow::Result<Registry> {
@@ -977,6 +1136,7 @@ fn registry_from_config(config: &Config) -> anyhow::Result<Registry> {
 pub fn spawn(config: Config) -> anyhow::Result<(EngineHandle, mpsc::Receiver<Event>)> {
     let (op_tx, op_rx) = mpsc::channel(OP_QUEUE);
     let (event_tx, event_rx) = mpsc::channel(EVENT_QUEUE);
+    let bus = EventBus::new();
     let registry = registry_from_config(&config)?;
 
     let workspace = config
@@ -1065,10 +1225,11 @@ pub fn spawn(config: Config) -> anyhow::Result<(EngineHandle, mpsc::Receiver<Eve
         last_tool_reps: 0,
         user_interrupted: false,
         event_tx,
+        bus: bus.clone(),
     };
 
     tokio::spawn(engine.run(op_rx));
-    Ok((EngineHandle { op_tx }, event_rx))
+    Ok((EngineHandle { op_tx, bus }, event_rx))
 }
 
 /// Stream idle limit per provider. CLI drivers (claude/codex) manage their OWN
@@ -1383,6 +1544,8 @@ struct Engine {
     /// instruction. Reset once consumed.
     user_interrupted: bool,
     event_tx: mpsc::Sender<Event>,
+    /// Multi-subscriber fan-out + replay log, mirrored by every `emit`.
+    bus: Arc<EventBus>,
 }
 
 #[derive(Clone)]
@@ -1582,6 +1745,9 @@ fn subagent_profile_for(task: &str, provider: &str, effort: &str) -> WorkerProfi
 
 impl Engine {
     async fn emit(&self, ev: Event) {
+        // Mirror to the multi-subscriber bus (seq + replay log) before handing the
+        // event to the primary frontend channel.
+        self.bus.publish(&ev);
         let _ = self.event_tx.send(ev).await;
     }
 
@@ -3302,6 +3468,9 @@ Reply with text only: summarize what you changed, what you verified, and what re
             last_tool_reps: 0,
             user_interrupted: self.user_interrupted,
             event_tx: self.event_tx.clone(),
+            // Subagent shares the parent's bus so its events land in the same
+            // seq'd log/stream as the parent run.
+            bus: self.bus.clone(),
         })
     }
 
@@ -5524,6 +5693,51 @@ fn normalize_todo_status(status: &str) -> String {
 mod map_test {
     use oxide_config::{McpEnvVar, McpServerConfig};
     use oxide_protocol::ToolSpec;
+
+    #[tokio::test]
+    async fn event_bus_snapshot_then_live_tail_by_seq() {
+        use oxide_protocol::{Event, TurnId};
+        let bus = super::EventBus::new();
+        let s0 = bus.publish(&Event::Ready {
+            harness: "h".into(),
+        });
+        let s1 = bus.publish(&Event::TurnStarted { turn: TurnId(1) });
+        // A late subscriber gets BOTH prior events in the snapshot, ordered by seq.
+        let (snap, mut rx) = bus.subscribe(0);
+        assert_eq!(snap.len(), 2);
+        assert_eq!(snap[0].0, s0);
+        assert_eq!(snap[1].0, s1);
+        assert!(s1 > s0);
+        // A subsequent event arrives on the live tail with the next seq.
+        let s2 = bus.publish(&Event::TurnFinished { turn: TurnId(1) });
+        let (rseq, _ev) = rx.recv().await.unwrap();
+        assert_eq!(rseq, s2);
+        // `after` filters the snapshot to only events newer than an applied seq.
+        let (snap2, _rx2) = bus.subscribe(s1 + 1);
+        assert_eq!(snap2.len(), 1);
+        assert_eq!(snap2[0].0, s2);
+    }
+
+    #[tokio::test]
+    async fn event_socket_bridges_to_a_separate_consumer() {
+        use oxide_protocol::{Event, TurnId};
+        let bus = super::EventBus::new();
+        // Published BEFORE any client connects → must arrive via the snapshot.
+        bus.publish(&Event::Ready {
+            harness: "h".into(),
+        });
+        let path = std::env::temp_dir().join(format!("oxide-evsock-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        tokio::spawn(super::serve_events(path.clone(), bus.clone()));
+        let mut rx = super::subscribe_over_socket(path.clone());
+        // Snapshot delivers the pre-connect event.
+        let (s0, _) = rx.recv().await.expect("snapshot event");
+        // A live event after the client connected reaches it too, with a higher seq.
+        bus.publish(&Event::TurnFinished { turn: TurnId(1) });
+        let (s1, _) = rx.recv().await.expect("live event");
+        assert!(s1 > s0);
+        std::fs::remove_file(&path).ok();
+    }
 
     #[test]
     fn todo_status_variants_normalize_for_ui() {
