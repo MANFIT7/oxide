@@ -542,7 +542,17 @@ impl Provider for CodexCliProvider {
 
         let skey_cb = skey.clone();
         let timeout = codex_cli_timeout()?;
-        run_jsonl(
+        // codex flushes its agent_message text atomically at item.completed, and
+        // not reliably BEFORE the tool/command events that preceded it — so the
+        // final answer could render ABOVE the command that produced it. Buffer the
+        // agent text and emit it AFTER run_jsonl (i.e. after every live command/
+        // edit/search row), so the transcript always reads command → answer, never
+        // answer → command. Activity rows stay live for feedback. (claude_interactive
+        // solves the same ordering with per-block transcript positions; codex's JSONL
+        // carries no position, so we use "text last" instead.)
+        let text_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let text_buf_cb = text_buf.clone();
+        let result = run_jsonl(
             &self.bin,
             &args,
             &req.cwd,
@@ -604,7 +614,11 @@ impl Provider for CodexCliProvider {
                         match item["type"].as_str() {
                             Some("agent_message") => {
                                 if let Some(t) = item["text"].as_str() {
-                                    send(sink, StreamItem::TextDelta(t.to_string()));
+                                    // Held until after the run so it lands below the
+                                    // command/activity rows (see text_buf above).
+                                    if let Ok(mut buf) = text_buf_cb.lock() {
+                                        buf.push(t.to_string());
+                                    }
                                 }
                             }
                             Some("reasoning") => {
@@ -703,7 +717,15 @@ impl Provider for CodexCliProvider {
                 true
             },
         )
-        .await
+        .await;
+        // Emit the buffered agent text now — after every live command/activity row
+        // — so the answer renders below the commands that produced it, never above.
+        if let Ok(mut buf) = text_buf.lock() {
+            for t in buf.drain(..) {
+                send(&sink, StreamItem::TextDelta(t));
+            }
+        }
+        result
     }
 }
 
