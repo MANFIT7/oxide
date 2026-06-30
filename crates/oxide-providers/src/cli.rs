@@ -464,6 +464,24 @@ where
     Ok(())
 }
 
+/// A claude `tool_result` content is either a plain string or an array of
+/// content blocks ({type:"text", text:"…"}); flatten either to a string.
+fn tool_result_text(v: &serde_json::Value) -> String {
+    if let Some(s) = v.as_str() {
+        return s.to_string();
+    }
+    if let Some(arr) = v.as_array() {
+        let mut out = String::new();
+        for b in arr {
+            if let Some(t) = b["text"].as_str() {
+                out.push_str(t);
+            }
+        }
+        return out;
+    }
+    String::new()
+}
+
 fn send(sink: &mpsc::Sender<StreamItem>, item: StreamItem) {
     // Best-effort: the channel is generously sized; drop on the rare overflow.
     let _ = sink.try_send(item);
@@ -545,14 +563,16 @@ impl Provider for CodexCliProvider {
         // codex flushes its agent_message text atomically at item.completed, and
         // not reliably BEFORE the tool/command events that preceded it — so the
         // final answer could render ABOVE the command that produced it. Buffer the
-        // agent text and emit it AFTER run_jsonl (i.e. after every live command/
-        // edit/search row), so the transcript always reads command → answer, never
-        // answer → command. Activity rows stay live for feedback. (claude_interactive
-        // solves the same ordering with per-block transcript positions; codex's JSONL
-        // carries no position, so we use "text last" instead.)
+        // agent text and flush it at turn.completed / error — after every live
+        // command/edit/search row — so the transcript reads command → answer, never
+        // the reverse. CRUCIAL: the flush happens INSIDE the stream, before
+        // run_jsonl emits its terminal StreamItem::Done. The engine consumer stops
+        // reading at Done, so text emitted AFTER the run is dropped and the answer
+        // would vanish entirely. (claude_interactive solves the same ordering with
+        // per-block transcript positions; codex's JSONL carries none, so we buffer
+        // and flush at the turn boundary instead.)
         let text_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-        let text_buf_cb = text_buf.clone();
-        let result = run_jsonl(
+        run_jsonl(
             &self.bin,
             &args,
             &req.cwd,
@@ -614,9 +634,9 @@ impl Provider for CodexCliProvider {
                         match item["type"].as_str() {
                             Some("agent_message") => {
                                 if let Some(t) = item["text"].as_str() {
-                                    // Held until after the run so it lands below the
+                                    // Held until turn.completed so it lands below the
                                     // command/activity rows (see text_buf above).
-                                    if let Ok(mut buf) = text_buf_cb.lock() {
+                                    if let Ok(mut buf) = text_buf.lock() {
                                         buf.push(t.to_string());
                                     }
                                 }
@@ -693,6 +713,13 @@ impl Provider for CodexCliProvider {
                         }
                     }
                     Some("turn.completed") => {
+                        // Flush the buffered answer now — after all command/edit rows
+                        // and before run_jsonl's terminal Done (see text_buf above).
+                        if let Ok(mut buf) = text_buf.lock() {
+                            for t in buf.drain(..) {
+                                send(sink, StreamItem::TextDelta(t));
+                            }
+                        }
                         let u = &v["usage"];
                         send(
                             sink,
@@ -709,6 +736,13 @@ impl Provider for CodexCliProvider {
                         );
                     }
                     Some("error") => {
+                        // Preserve any partial answer captured before the error, again
+                        // before run_jsonl's Done (see text_buf above).
+                        if let Ok(mut buf) = text_buf.lock() {
+                            for t in buf.drain(..) {
+                                send(sink, StreamItem::TextDelta(t));
+                            }
+                        }
                         let msg = v["message"].as_str().unwrap_or("codex error");
                         send(sink, StreamItem::Notice(format!("error: {msg}")));
                     }
@@ -717,15 +751,7 @@ impl Provider for CodexCliProvider {
                 true
             },
         )
-        .await;
-        // Emit the buffered agent text now — after every live command/activity row
-        // — so the answer renders below the commands that produced it, never above.
-        if let Ok(mut buf) = text_buf.lock() {
-            for t in buf.drain(..) {
-                send(&sink, StreamItem::TextDelta(t));
-            }
-        }
-        result
+        .await
     }
 }
 
@@ -806,6 +832,12 @@ impl Provider for ClaudeCliProvider {
         // With partial messages on, text arrives via stream_event deltas; the
         // final `assistant` message would duplicate it, so skip its text blocks.
         let mut saw_partial = false;
+        // tool_use ids we surfaced as command rows (Bash/Shell). claude -p never
+        // emits a command-finished event; the matching tool_result arrives later as
+        // a `user` message, so we remember which ids are commands and finish exactly
+        // those rows there — without this the command row spins forever and a failed
+        // command is silently masked as success by the GUI's turn-end sweep.
+        let mut command_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
         run_jsonl(
             &self.bin,
             &args,
@@ -895,6 +927,11 @@ impl Provider for ClaudeCliProvider {
                                                 .unwrap_or_else(|| {
                                                     format!("claude-command-{command}")
                                                 });
+                                            // Backgrounded commands never stream a result
+                                            // back, so don't wait on one (it'd never finish).
+                                            if !bg {
+                                                command_ids.insert(id.clone());
+                                            }
                                             send(
                                                 sink,
                                                 StreamItem::CommandStarted {
@@ -923,6 +960,43 @@ impl Provider for ClaudeCliProvider {
                                     }
                                     _ => {}
                                 }
+                            }
+                        }
+                    }
+                    Some("user") => {
+                        // Tool results arrive as a `user` message whose content carries
+                        // tool_result blocks. Finish exactly the command rows we started
+                        // (see command_ids above) with their real success/failure.
+                        if let Some(content) = v["message"]["content"].as_array() {
+                            for block in content {
+                                if block["type"].as_str() != Some("tool_result") {
+                                    continue;
+                                }
+                                let id = match block["tool_use_id"].as_str() {
+                                    Some(id) if command_ids.remove(id) => id.to_string(),
+                                    _ => continue,
+                                };
+                                let out = tool_result_text(&block["content"]);
+                                if !out.is_empty() {
+                                    send(
+                                        sink,
+                                        StreamItem::CommandOutput {
+                                            id: id.clone(),
+                                            stream: "stdout".to_string(),
+                                            chunk: out.chars().take(4000).collect(),
+                                        },
+                                    );
+                                }
+                                let ok = block["is_error"].as_bool() != Some(true);
+                                send(
+                                    sink,
+                                    StreamItem::CommandFinished {
+                                        id,
+                                        ok,
+                                        exit_code: if ok { None } else { Some(1) },
+                                        duration_ms: 0,
+                                    },
+                                );
                             }
                         }
                     }

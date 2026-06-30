@@ -5445,6 +5445,13 @@ fn app() -> Element {
                                 // a read that was mislabeled, or a path that didn't match) so
                                 // no spinner lingers after the turn is done.
                                 turn_edits.write().retain(|e| !(e.4.is_empty() && e.3 == 0));
+                                // Subagent cards are turn-scoped too: if a SubagentFinished
+                                // never arrived (worker died, or a card was synthesized from a
+                                // status), settle them so the "Agents" badge + running counter
+                                // don't keep spinning/over-reporting after the turn ends.
+                                for c in subagent_cards.write().iter_mut() {
+                                    c.running = false;
+                                }
                                 {
                                     let mut mw = messages.write();
                                     if mw.last().map(|m| m.author == Author::Agent && m.text.is_empty()).unwrap_or(false) {
@@ -9484,10 +9491,10 @@ fn md_to_html(src: &str, live: bool) -> String {
 /// the trailing in-progress line is kept raw so the actively-streaming line
 /// doesn't relayout on every token.
 fn md_live_html(src: &str) -> String {
-    // Inside an unclosed ``` fence, render the whole buffer as markdown so the
+    // Inside an unclosed code fence, render the whole buffer as markdown so the
     // partial code streams as a code block (pulldown extends an open fence to
-    // EOF) instead of leaking raw ``` lines.
-    if src.matches("```").count() % 2 == 1 {
+    // EOF) instead of leaking raw fence lines. Both ``` and ~~~ open fences.
+    if src.matches("```").count() % 2 == 1 || src.matches("~~~").count() % 2 == 1 {
         return md_to_html_uncached(src, true);
     }
 
@@ -9502,8 +9509,22 @@ fn md_live_html(src: &str) -> String {
     // as literal text beneath the already-parsed rows — the table looks broken
     // mid-stream. Render the whole buffer so the in-progress row joins its table,
     // same idea as the open code-fence case above. (Costs a re-parse per token
-    // only while a table row streams, which is cheap and short-lived.)
-    if tail.trim_start().starts_with('|') {
+    // only while a table row streams, which is cheap and short-lived.) Also catch
+    // GFM tables WITHOUT outer pipes ("a | b" / "--- | ---" / "c | d"): if the
+    // in-progress tail and the line just above both carry an inner pipe, it's
+    // almost certainly a mid-stream table body row. Worst-case false positive is
+    // a harmless extra re-parse of prose — pulldown won't fabricate a table.
+    let tail_is_table = {
+        let t = tail.trim_start();
+        t.starts_with('|')
+            || (tail.contains('|')
+                && stable
+                    .lines()
+                    .rev()
+                    .find(|l| !l.trim().is_empty())
+                    .is_some_and(|l| l.contains('|')))
+    };
+    if tail_is_table {
         return md_to_html_uncached(src, true);
     }
 
