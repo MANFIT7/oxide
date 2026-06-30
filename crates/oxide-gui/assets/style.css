@@ -3495,6 +3495,32 @@ details::details-content { overflow: clip; }
 .git-act-logo svg { width: 13px; height: 13px; }
 .git-act { display: inline-flex; align-items: center; }
 
+/* ── Tool-call polish (v0.0.112) — Cursor-grade activity cards ───────── */
+/* Status border/bg now TWEENS running(amber)→done(revert)→fail(red) instead
+   of snapping. Same for the grouped-actions header. */
+.activity-card, .act-group-head {
+  transition: border-color .28s var(--ease-out),
+              background-color .28s var(--ease-out), color .18s ease;
+}
+/* Hover affordance: a faint accent border (no transform → no layout shift on
+   an inline-flex card). */
+.activity-card:hover { border-color: color-mix(in srgb, var(--syn-accent) 26%, var(--border)); }
+.act-group-head:hover { border-color: color-mix(in srgb, var(--syn-accent) 22%, var(--border)); }
+/* Expanding a card's output (or a grouped card) reveals the content with a soft
+   fade+slide instead of a hard pop. Fires once on [open] (rows are keyed, so a
+   re-render doesn't re-fire it). */
+@keyframes oxide-reveal-down {
+  from { opacity: 0; transform: translateY(-4px); }
+  to   { opacity: 1; transform: none; }
+}
+.activity-card.has-out[open] .activity-out { animation: oxide-reveal-down .2s var(--ease-out) both; }
+.act-group[open] > .row.activity { animation: oxide-reveal-down .18s var(--ease-out) both; }
+
+@media (prefers-reduced-motion: reduce) {
+  .activity-card.has-out[open] .activity-out,
+  .act-group[open] > .row.activity { animation: none; }
+}
+
 /* Keyboard a11y: a visible focus ring on interactive chrome (mouse focus
    stays clean via :focus-visible). */
 .pill:focus-visible, .row-act-btn:focus-visible, .send:focus-visible,
