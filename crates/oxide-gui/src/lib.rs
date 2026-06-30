@@ -42,11 +42,6 @@ fn logo_uri() -> &'static str {
     .as_str()
 }
 
-const XTERM_CSS: &str = include_str!("../assets/xterm/xterm.css");
-const XTERM_JS: &str = include_str!("../assets/xterm/xterm.js");
-const XTERM_FIT_JS: &str = include_str!("../assets/xterm/addon-fit.js");
-const XTERM_WEBGL_JS: &str = include_str!("../assets/xterm/addon-webgl.js");
-
 // Brand logos for the provider picker (inline SVG).
 const SVG_CLAUDE: &str = include_str!("../assets/providers/claude-icon.svg");
 const SVG_OPENAI: &str = include_str!("../assets/providers/openai-icon.svg");
@@ -77,29 +72,49 @@ fn provider_logo(provider: &str) -> Option<String> {
     }
 }
 
-/// Launch the standalone native GPU terminal (`oxide-term`) as a separate window.
-/// Resolves the binary next to the running app executable (bundled inside
-/// Oxide.app/Contents/MacOS), then a dev build under the repo, then falls back to
-/// PATH. Returns false if nothing could be spawned. It's a separate native wgpu/
-/// Metal window because a GPU surface can't live inside the Dioxus webview.
-fn launch_native_terminal() -> bool {
-    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+/// Resolve the `oxide-term` binary: bundled next to the app exe (inside
+/// Oxide.app/Contents/MacOS), a dev build under the repo, then PATH.
+fn oxide_term_bin() -> std::path::PathBuf {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            candidates.push(dir.join("oxide-term"));
+            let p = dir.join("oxide-term");
+            if p.exists() {
+                return p;
+            }
         }
     }
     if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd.join("crates/oxide-term/target/release/oxide-term"));
-        candidates.push(cwd.join("crates/oxide-term/target/debug/oxide-term"));
-    }
-    for p in &candidates {
-        if p.exists() && std::process::Command::new(p).spawn().is_ok() {
-            return true;
+        for rel in [
+            "crates/oxide-term/target/release/oxide-term",
+            "crates/oxide-term/target/debug/oxide-term",
+        ] {
+            let p = cwd.join(rel);
+            if p.exists() {
+                return p;
+            }
         }
     }
-    // Last resort: a PATH lookup.
-    std::process::Command::new("oxide-term").spawn().is_ok()
+    std::path::PathBuf::from("oxide-term")
+}
+
+/// Open the standalone native GPU terminal (oxide-term) in a separate wgpu/Metal
+/// window running `cmd` (empty = $SHELL) in `cwd`. A GPU surface can't live in the
+/// Dioxus webview, so it's a sibling native window. Returns false if it couldn't
+/// spawn (binary absent).
+fn spawn_oxide_term(cwd: &str, cmd: &[String]) -> bool {
+    let mut c = std::process::Command::new(oxide_term_bin());
+    if !cwd.is_empty() {
+        c.arg("--cwd").arg(cwd);
+    }
+    for a in cmd {
+        c.arg(a);
+    }
+    c.spawn().is_ok()
+}
+
+/// Open a plain native GPU terminal ($SHELL) — the terminal-panel button.
+fn launch_native_terminal() -> bool {
+    spawn_oxide_term("", &[])
 }
 
 struct ModelPreset {
@@ -5828,7 +5843,6 @@ fn app() -> Element {
 
     rsx! {
         style { {CSS} }
-        style { {XTERM_CSS} }
         div { class: "app", "data-theme": "{cfg.read().theme}", "data-density": "{cfg.read().density}", style: "{accent_style}",
             onmousemove: move |e: dioxus::prelude::MouseEvent| {
                 if let Some((which, sx, sw)) = *panel_drag.read() {
@@ -11462,171 +11476,78 @@ fn Message(author: Author, text: String, #[props(default)] live: bool) -> Elemen
     }
 }
 
-/// Embedded interactive terminal: runs `bin` in a PTY and bridges it to an
-/// xterm.js instance in the webview via Dioxus eval.
+/// Embedded terminal entry: opens the standalone native GPU terminal (oxide-term)
+/// in a separate window running `bin` (codex / claude / shell) and shows a small
+/// in-panel card. A wgpu/Metal surface can't render inside the Dioxus webview, so
+/// the terminal is a sibling native window, not embedded in the panel.
 #[component]
 fn TerminalView(id: u64, bin: String, ws: String, resume: Option<String>) -> Element {
-    let host = format!("term-{id}");
-    let host_js = host.clone();
-    use_future(move || {
-        let host = host_js.clone();
-        let bin = bin.clone();
+    let cmd = agent_tui_command(&bin, resume.as_deref());
+    // Auto-open the native window once per tab id (dedup so multiple mounts of the
+    // same logical tab don't spawn duplicate windows).
+    {
         let ws = ws.clone();
-        let resume = resume.clone();
-        async move {
-            let setup = format!(
-                r##"
-                for (let i = 0; i < 300 && !window.Terminal; i++) {{ await new Promise(r => setTimeout(r, 20)); }}
-                const el = document.getElementById("{host}");
-                if (!el || !window.Terminal) return;
-                el.innerHTML = "";
-                const term = new window.Terminal({{ fontSize: 12.5, macOptionIsMeta: true, fontFamily: "'JetBrainsMono Nerd Font Mono', 'JetBrainsMono Nerd Font', 'MesloLGS NF', 'Symbols Nerd Font Mono', ui-monospace, Menlo, monospace", cursorBlink: true, theme: (function(){{ const cs=getComputedStyle(document.querySelector('.app')); const bg=(cs.getPropertyValue('--composer')||'#0e0e10').trim(); const fg=(cs.getPropertyValue('--text')||'#cdd0d6').trim(); return {{ background: bg, foreground: fg, cursor: fg }}; }})() }});
-                let fit = null;
-                try {{ fit = new window.FitAddon.FitAddon(); term.loadAddon(fit); }} catch (e) {{}}
-                try {{ await document.fonts.load("12.5px 'JetBrainsMono Nerd Font Mono'"); await document.fonts.ready; }} catch (e) {{}}
-                term.open(el);
-                // GPU-accelerated renderer (canvas/WebGL) — smoother scroll + lower
-                // latency than the default DOM renderer. On GPU context loss, dispose
-                // so xterm falls back to the DOM renderer instead of going blank;
-                // if WebGL is unavailable the try/catch leaves the DOM renderer.
-                try {{
-                    const gl = new window.WebglAddon.WebglAddon();
-                    gl.onContextLoss(() => {{ try {{ gl.dispose(); }} catch (e) {{}} }});
-                    term.loadAddon(gl);
-                }} catch (e) {{}}
-                try {{ if (fit) fit.fit(); }} catch (e) {{}}
-                term.focus();
-                // macOS clipboard shortcuts inside the TUI.
-                term.attachCustomKeyEventHandler((e) => {{
-                    if (e.type !== 'keydown' || !(e.metaKey && !e.ctrlKey && !e.altKey)) return true;
-                    const k = (e.key || '').toLowerCase();
-                    if (k === 'c') {{
-                        const sel = term.getSelection();
-                        if (sel) {{ navigator.clipboard.writeText(sel); return false; }}
-                        return true;
-                    }}
-                    if (k === 'v') {{
-                        navigator.clipboard.readText().then(t => {{ if (t) dioxus.send(JSON.stringify({{ inp: t }})); }});
-                        return false;
-                    }}
-                    if (k === 'a') {{ term.selectAll(); return false; }}
-                    if (k === 'k') {{ term.clear(); return false; }}
-                    // macOS line editing sends the readline control sequence.
-                    if (e.key === 'Backspace') {{ dioxus.send(JSON.stringify({{ inp: '\x15' }})); return false; }}  // command-backspace delete to line start
-                    if (e.key === 'ArrowLeft') {{ dioxus.send(JSON.stringify({{ inp: '\x01' }})); return false; }}  // command-left line start
-                    if (e.key === 'ArrowRight') {{ dioxus.send(JSON.stringify({{ inp: '\x05' }})); return false; }} // command-right line end
-                    return false;  // swallow other Cmd combos so app shortcuts don't fire
-                }});
-                term.onData(d => dioxus.send(JSON.stringify({{ inp: d }})));
-                const ro = new ResizeObserver(() => {{ try {{ if (fit) fit.fit(); dioxus.send(JSON.stringify({{ resize: [term.rows, term.cols] }})); }} catch (e) {{}} }});
-                ro.observe(el);
-                dioxus.send(JSON.stringify({{ resize: [term.rows, term.cols] }}));
-                (async () => {{ while (true) {{ const m = await dioxus.recv(); if (typeof m === "string" && m.length) {{ term.write(Uint8Array.from(atob(m), c => c.charCodeAt(0))); }} }} }})();
-            "##
-            );
-            // Inject the xterm runtime inline (asset!() isn't served under plain `cargo run`).
-            let setup = format!("{XTERM_JS}\n;\n{XTERM_FIT_JS}\n;\n{XTERM_WEBGL_JS}\n;\n{setup}");
-            let mut eval = dioxus::document::eval(&setup);
-
-            let pty = portable_pty::native_pty_system();
-            let pair = match pty.openpty(portable_pty::PtySize {
-                rows: 32,
-                cols: 110,
-                pixel_width: 0,
-                pixel_height: 0,
-            }) {
-                Ok(p) => p,
-                Err(_) => return,
-            };
-            let mut cmd = portable_pty::CommandBuilder::new(&bin);
-            // Launch the agent CLIs with permissions bypassed (yolo), like the rest of Oxide.
-            match bin.as_str() {
-                "codex" => {
-                    cmd.arg("--dangerously-bypass-approvals-and-sandbox");
-                    // Continue the originating chat's native codex session.
-                    if let Some(sid) = &resume {
-                        cmd.arg("resume");
-                        cmd.arg(sid);
-                    }
-                }
-                "claude" => {
-                    cmd.arg("--dangerously-skip-permissions");
-                    if let Some(sid) = &resume {
-                        cmd.arg("--resume");
-                        cmd.arg(sid);
-                    }
-                }
-                _ => {}
+        let cmd = cmd.clone();
+        use_hook(move || {
+            static LAUNCHED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<u64>>> =
+                std::sync::OnceLock::new();
+            let first = LAUNCHED
+                .get_or_init(Default::default)
+                .lock()
+                .map(|mut s| s.insert(id))
+                .unwrap_or(false);
+            if first {
+                spawn_oxide_term(&ws, &cmd);
             }
-            cmd.cwd(&ws);
-            cmd.env("TERM", "xterm-256color");
-            if let Ok(home) = std::env::var("HOME") {
-                let path = std::env::var("PATH").unwrap_or_default();
-                cmd.env("PATH", format!("{home}/.superconductor/bin:{home}/.local/bin:{home}/.bun/bin:/opt/homebrew/bin:/usr/local/bin:{path}"));
-            }
-            let mut child = match pair.slave.spawn_command(cmd) {
-                Ok(c) => c,
-                Err(_) => return,
-            };
-            drop(pair.slave);
-            let mut reader = match pair.master.try_clone_reader() {
-                Ok(r) => r,
-                Err(_) => return,
-            };
-            let mut writer = match pair.master.take_writer() {
-                Ok(w) => w,
-                Err(_) => return,
-            };
-            let master = pair.master;
-
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-            std::thread::spawn(move || {
-                use std::io::Read;
-                let mut buf = [0u8; 8192];
-                loop {
-                    match reader.read(&mut buf) {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => {
-                            if tx.send(buf[..n].to_vec()).is_err() {
-                                break;
-                            }
-                        }
-                    }
-                }
-            });
-
-            use base64::Engine;
-            use std::io::Write;
-            loop {
-                tokio::select! {
-                    bytes = rx.recv() => match bytes {
-                        Some(bytes) => {
-                            let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                            if eval.send(serde_json::Value::String(b64)).is_err() { break; }
-                        }
-                        None => break,
-                    },
-                    msg = eval.recv::<String>() => match msg {
-                        Ok(s) => {
-                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
-                                if let Some(inp) = v.get("inp").and_then(|x| x.as_str()) {
-                                    let _ = writer.write_all(inp.as_bytes());
-                                    let _ = writer.flush();
-                                } else if let Some(rc) = v.get("resize").and_then(|x| x.as_array()) {
-                                    let rows = rc.first().and_then(|x| x.as_u64()).unwrap_or(32) as u16;
-                                    let cols = rc.get(1).and_then(|x| x.as_u64()).unwrap_or(110) as u16;
-                                    let _ = master.resize(portable_pty::PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
-                                }
-                            }
-                        }
-                        Err(_) => break,
-                    },
+        });
+    }
+    let reopen_ws = ws.clone();
+    let reopen_cmd = cmd.clone();
+    let label = if bin.is_empty() {
+        "shell".to_string()
+    } else {
+        bin.clone()
+    };
+    rsx! {
+        div { class: "native-term-host",
+            div { class: "native-term-card",
+                div { class: "native-term-badge", "GPU · Metal" }
+                div { class: "native-term-title", "Native terminal" }
+                div { class: "native-term-sub", "{label} — runs in a separate oxide-term window" }
+                button { class: "native-term-reopen",
+                    onclick: move |_| { spawn_oxide_term(&reopen_ws, &reopen_cmd); },
+                    "Open / reopen window"
                 }
             }
-            let _ = child.kill();
         }
-    });
-    rsx! { div { id: "{host}", class: "xterm-host" } }
+    }
+}
+
+/// Build the argv for a TUI agent (codex / claude) run inside oxide-term. Empty
+/// `bin` → empty argv → oxide-term falls back to $SHELL.
+fn agent_tui_command(bin: &str, resume: Option<&str>) -> Vec<String> {
+    if bin.is_empty() {
+        return Vec::new();
+    }
+    let mut v = vec![bin.to_string()];
+    match bin {
+        "codex" => {
+            v.push("--dangerously-bypass-approvals-and-sandbox".to_string());
+            if let Some(s) = resume {
+                v.push("resume".to_string());
+                v.push(s.to_string());
+            }
+        }
+        "claude" => {
+            v.push("--dangerously-skip-permissions".to_string());
+            if let Some(s) = resume {
+                v.push("--resume".to_string());
+                v.push(s.to_string());
+            }
+        }
+        _ => {}
+    }
+    v
 }
 
 /// Commands into a ChatPane's own engine.
@@ -12223,7 +12144,6 @@ fn PipWindow(
 ) -> Element {
     rsx! {
         style { {CSS} }
-        style { {XTERM_CSS} }
         div { class: "app pip-win", "data-theme": "{theme}",
             if mode == "tui" {
                 TerminalView { id: 990_001, bin: bin.clone(), ws: workspace.display().to_string(), resume: None }

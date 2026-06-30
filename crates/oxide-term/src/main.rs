@@ -232,7 +232,12 @@ struct Pty {
 }
 
 impl Pty {
-    fn spawn(size: TermSize, proxy: EventLoopProxy<UserEvent>) -> anyhow::Result<Self> {
+    fn spawn(
+        size: TermSize,
+        proxy: EventLoopProxy<UserEvent>,
+        cwd: Option<String>,
+        command: Vec<String>,
+    ) -> anyhow::Result<Self> {
         let pty_system = portable_pty::native_pty_system();
         let pair = pty_system.openpty(portable_pty::PtySize {
             rows: size.lines as u16,
@@ -240,10 +245,23 @@ impl Pty {
             pixel_width: 0,
             pixel_height: 0,
         })?;
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
-        let mut cmd = portable_pty::CommandBuilder::new(shell);
-        if let Ok(cwd) = std::env::current_dir() {
-            cmd.cwd(cwd);
+        // Run the requested program (e.g. codex / claude), or fall back to $SHELL.
+        let mut cmd = if let Some((prog, rest)) = command.split_first() {
+            let mut c = portable_pty::CommandBuilder::new(prog);
+            for a in rest {
+                c.arg(a);
+            }
+            c
+        } else {
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+            portable_pty::CommandBuilder::new(shell)
+        };
+        let dir = cwd
+            .map(std::path::PathBuf::from)
+            .filter(|p| p.is_dir())
+            .or_else(|| std::env::current_dir().ok());
+        if let Some(d) = dir {
+            cmd.cwd(d);
         }
         cmd.env("TERM", "xterm-256color");
         let _child = pair.slave.spawn_command(cmd)?;
@@ -800,6 +818,8 @@ struct App {
     pty: Option<Pty>,
     proxy: EventLoopProxy<UserEvent>,
     mods: ModifiersState,
+    cwd: Option<String>,
+    cmd: Vec<String>,
 }
 
 impl App {
@@ -823,14 +843,19 @@ impl ApplicationHandler<UserEvent> for App {
         if self.gpu.is_some() {
             return;
         }
+        let title = match self.cmd.first() {
+            Some(prog) => format!("oxide-term — {prog}"),
+            None => "oxide-term".to_string(),
+        };
         let attrs = Window::default_attributes()
             .with_inner_size(LogicalSize::new(900.0, 560.0))
-            .with_title("oxide-term");
+            .with_title(title);
         let window = Arc::new(event_loop.create_window(attrs).unwrap());
         let gpu = pollster::block_on(Gpu::new(window.clone(), event_loop));
         let size = window.inner_size();
         let grid = Self::grid_size(size.width, size.height);
-        let pty = Pty::spawn(grid, self.proxy.clone()).expect("spawn pty");
+        let pty = Pty::spawn(grid, self.proxy.clone(), self.cwd.clone(), self.cmd.clone())
+            .expect("spawn pty");
         self.gpu = Some(gpu);
         self.pty = Some(pty);
         window.request_redraw();
@@ -936,6 +961,15 @@ fn key_to_bytes(
 }
 
 fn main() -> anyhow::Result<()> {
+    // Usage: oxide-term [--cwd DIR] [PROGRAM ARGS...]   (default PROGRAM = $SHELL)
+    let mut args = std::env::args().skip(1).peekable();
+    let mut cwd = None;
+    if args.peek().map(|a| a == "--cwd").unwrap_or(false) {
+        args.next();
+        cwd = args.next();
+    }
+    let cmd: Vec<String> = args.collect();
+
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
     let mut app = App {
@@ -943,6 +977,8 @@ fn main() -> anyhow::Result<()> {
         pty: None,
         proxy,
         mods: ModifiersState::empty(),
+        cwd,
+        cmd,
     };
     event_loop.run_app(&mut app)?;
     Ok(())

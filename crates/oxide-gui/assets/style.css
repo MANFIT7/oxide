@@ -3534,3 +3534,34 @@ details::details-content { overflow: clip; }
   .pill:active, .row-act-btn:active, .copy-btn:active,
   .msg-copy:active, .followups-x:active, .queue-steer:active { transform: none; }
 }
+
+/* ── Native GPU terminal placeholder ─────────────────────────────────────
+   The embedded xterm.js terminal was removed; the terminal now runs in a
+   separate native oxide-term (wgpu/Metal) window. This in-panel card opens /
+   reopens it. */
+.native-term-host {
+  display: flex; align-items: center; justify-content: center;
+  height: 100%; padding: 24px;
+}
+.native-term-card {
+  display: flex; flex-direction: column; gap: 8px; align-items: flex-start;
+  max-width: 440px; padding: 18px 20px;
+  border: 1px solid var(--border); border-radius: 12px; background: var(--surface);
+}
+.native-term-badge {
+  font-size: 10.5px; letter-spacing: .06em; text-transform: uppercase;
+  color: var(--syn-accent); padding: 2px 7px; border-radius: 6px;
+  border: 1px solid color-mix(in srgb, var(--syn-accent) 35%, var(--border));
+}
+.native-term-title { font-size: 15px; font-weight: 600; color: var(--text); }
+.native-term-sub { font-size: 12.5px; color: var(--muted); }
+.native-term-reopen {
+  margin-top: 6px; padding: 7px 13px; border-radius: 8px; cursor: pointer;
+  border: 1px solid var(--border); background: var(--surface-hi, var(--surface));
+  color: var(--text); font-size: 12.5px;
+  transition: border-color var(--dur-fast) var(--ease-out),
+              transform var(--dur-fast) var(--ease-out);
+}
+.native-term-reopen:hover { border-color: color-mix(in srgb, var(--syn-accent) 40%, var(--border)); }
+.native-term-reopen:active { transform: scale(.97); }
+@media (prefers-reduced-motion: reduce) { .native-term-reopen:active { transform: none; } }
