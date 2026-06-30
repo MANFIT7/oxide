@@ -3455,3 +3455,56 @@ details::details-content { overflow: clip; }
     scroll-behavior: auto !important;
   }
 }
+
+/* ════════════════════════════════════════════════════════════════════
+   Cursor-grade micro-polish (v0.0.111) — compositor-only (transform /
+   opacity / box-shadow), additive, reduced-motion guarded. No layout or
+   render-tree change; safe to ship without a live visual pass.
+   ════════════════════════════════════════════════════════════════════ */
+
+/* #11 — press feedback on the controls that lacked it (.send keeps its own).
+   Scoped to specific pill/button classes so we never smooth a transform that
+   a keyframe already drives. */
+.pill, .row-act-btn, .copy-btn, .msg-copy, .followups-x, .queue-steer {
+  transition: transform var(--dur-fast) var(--ease-out),
+              background var(--dur-fast) ease, color var(--dur-fast) ease;
+}
+.pill:active, .row-act-btn:active, .copy-btn:active,
+.msg-copy:active, .followups-x:active, .queue-steer:active {
+  transform: scale(.96);
+}
+
+/* #15 (CSS portion) — soften the hard spinner→check/x swap: the result icon
+   settles in (scale + fade) instead of snapping. Runs once, on the done paint. */
+@keyframes oxide-ic-settle {
+  from { opacity: 0; transform: scale(.5); }
+  60%  { opacity: 1; transform: scale(1.08); }
+  to   { opacity: 1; transform: scale(1); }
+}
+.activity-ic.ok, .activity-ic.fail { animation: oxide-ic-settle .26s var(--ease-spring) both; }
+
+/* #27 — calmer jump-to-bottom entrance (8px travel read as a jump). */
+.jump-bottom { transform: translateY(4px); }
+.jump-bottom.show { transform: none; }
+
+/* Accent text selection (premium touch, matches the brand amber). */
+::selection { background: color-mix(in srgb, var(--syn-accent) 30%, transparent); }
+
+/* GitHub mark inside the Create-PR button. */
+.git-act-logo { width: 13px; height: 13px; margin-right: 6px; display: inline-flex; align-items: center; }
+.git-act-logo svg { width: 13px; height: 13px; }
+.git-act { display: inline-flex; align-items: center; }
+
+/* Keyboard a11y: a visible focus ring on interactive chrome (mouse focus
+   stays clean via :focus-visible). */
+.pill:focus-visible, .row-act-btn:focus-visible, .send:focus-visible,
+.copy-btn:focus-visible, button.suggestion:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--syn-accent) 55%, transparent);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .activity-ic.ok, .activity-ic.fail { animation: none; }
+  .pill:active, .row-act-btn:active, .copy-btn:active,
+  .msg-copy:active, .followups-x:active, .queue-steer:active { transform: none; }
+}

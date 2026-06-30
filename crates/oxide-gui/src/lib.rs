@@ -51,6 +51,7 @@ const SVG_CLAUDE: &str = include_str!("../assets/providers/claude-icon.svg");
 const SVG_OPENAI: &str = include_str!("../assets/providers/openai-icon.svg");
 const SVG_CURSOR: &str = include_str!("../assets/providers/cursor.svg");
 const SVG_MCP: &str = include_str!("../assets/providers/mcp-icon.svg");
+const SVG_GITHUB: &str = include_str!("../assets/providers/github.svg");
 
 /// SVG markup from `<svg` onward (drops the `<?xml?>` prolog) for inline use.
 fn svg_inner(s: &str) -> String {
@@ -70,6 +71,7 @@ fn provider_logo(provider: &str) -> Option<String> {
         "claude" | "claude_interactive" | "anthropic" => Some(svg_inner(SVG_CLAUDE)),
         "cursor" => Some(svg_inner(SVG_CURSOR)),
         "mcp" => Some(svg_inner(SVG_MCP).replace("#000000", "currentColor")),
+        "github" => Some(svg_inner(SVG_GITHUB).replace("#181717", "currentColor")),
         _ => None,
     }
 }
@@ -6858,7 +6860,10 @@ fn app() -> Element {
                                                         let _ = run_cmd(&ws, "git", &["push", "-u", "origin", &b]).await;
                                                         let _ = run_cmd(&ws, "gh", &["pr", "create", "--fill"]).await;
                                                     });
-                                                }, "Create PR" }
+                                                },
+                                                    if let Some(l) = provider_logo("github") { span { class: "git-act-logo prov-logo", dangerous_inner_html: l } }
+                                                    "Create PR"
+                                                }
                                                 button { class: "term-x", onclick: move |_| show_env.set(false), Icon { name: "x" } }
                                             }
                                             div { class: "changes-list",
