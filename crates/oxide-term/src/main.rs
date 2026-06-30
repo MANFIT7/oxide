@@ -1,54 +1,65 @@
-//! oxide-term — native GPU terminal (Milestone 1).
+//! oxide-term — native GPU terminal (Milestones 1–2).
 //!
-//! Pipeline: portable-pty (shell) → alacritty_terminal::Term (VTE emulation,
-//! the grid) → glyphon (GPU text via wgpu) in a winit window. On macOS wgpu
-//! selects the Metal backend automatically. Nerd Font is loaded so powerline /
-//! dev-icon glyphs render. M1 renders the visible grid as monospaced text
-//! (per-cell color + cursor + selection come in M1.5/M2); keyboard input is
-//! forwarded to the PTY.
+//! Pipeline: portable-pty (shell) → alacritty_terminal::Term (VTE emulation +
+//! cell grid) → glyphon (GPU text via wgpu) + a small wgpu quad pipeline (cell
+//! backgrounds + cursor) in a winit window. On macOS wgpu selects the Metal
+//! backend automatically. JetBrainsMono Nerd Font is bundled.
+//!
+//! Done: per-cell fg color + bold, per-cell bg color, an inverse block cursor,
+//! scrollback (mouse wheel), and keyboard input incl. Ctrl-combos. Selection +
+//! Oxide-window integration are the remaining steps.
 
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::{Event as TermEvent, EventListener};
-use alacritty_terminal::grid::Dimensions;
-use alacritty_terminal::index::{Column, Line};
+use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::term::{Config as TermConfig, Term};
-use alacritty_terminal::vte::ansi::Processor;
+use alacritty_terminal::vte::ansi::{Color as TermColor, CursorShape, NamedColor, Processor, Rgb};
 
 use glyphon::{
     Attrs, Buffer as TextBuffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping,
-    SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
+    SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Weight,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::WindowEvent;
+use winit::event::{MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
-use winit::keyboard::{Key, NamedKey};
+use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::Window;
 
-/// The bundled monospace Nerd Font (reuse the Oxide GUI asset).
 const NERD_FONT: &[u8] =
     include_bytes!("../../oxide-gui/assets/fonts/JetBrainsMonoNerdFontMono-Regular.ttf");
 const FONT_FAMILY: &str = "JetBrainsMono Nerd Font Mono";
 const FONT_SIZE: f32 = 14.0;
 const LINE_HEIGHT: f32 = 18.0;
-/// Approx monospace advance width at FONT_SIZE (tuned to JetBrains Mono ~0.6 em).
 const CELL_W: f32 = FONT_SIZE * 0.6;
+const PAD_X: f32 = 6.0;
+const PAD_Y: f32 = 4.0;
+const DEFAULT_FG: Rgb = Rgb {
+    r: 228,
+    g: 231,
+    b: 223,
+};
+const DEFAULT_BG: Rgb = Rgb {
+    r: 13,
+    g: 12,
+    b: 11,
+};
 
 /// Wakes the winit loop when the PTY produced output.
 enum UserEvent {
     PtyData,
 }
 
-/// No-op terminal event sink (M1 ignores bell/title/clipboard events).
 #[derive(Clone)]
 struct Listener;
 impl EventListener for Listener {
     fn send_event(&self, _event: TermEvent) {}
 }
 
-/// Grid dimensions handed to `Term`.
 #[derive(Clone, Copy)]
 struct TermSize {
     cols: usize,
@@ -66,7 +77,151 @@ impl Dimensions for TermSize {
     }
 }
 
-/// Owns the PTY + emulation; shared between the reader thread and the UI loop.
+/// One run of same-styled glyphs (built per visible row).
+struct Run {
+    text: String,
+    fg: Rgb,
+    bold: bool,
+}
+
+/// A solid-color cell rectangle (background or cursor), in pixel coords.
+#[derive(Clone, Copy)]
+struct Quad {
+    col: usize,
+    line: usize,
+    color: Rgb,
+}
+
+/// Everything needed to draw one frame, extracted from the terminal grid.
+struct Frame {
+    runs: Vec<Run>,
+    quads: Vec<Quad>,
+}
+
+/// Standard xterm 256-color palette fallback (used when the Term's palette slot
+/// is unset — a fresh Term doesn't preload a full theme).
+fn palette_256(idx: usize) -> Rgb {
+    match idx {
+        0 => Rgb { r: 0, g: 0, b: 0 },
+        1 => Rgb {
+            r: 205,
+            g: 49,
+            b: 49,
+        },
+        2 => Rgb {
+            r: 13,
+            g: 188,
+            b: 121,
+        },
+        3 => Rgb {
+            r: 229,
+            g: 229,
+            b: 16,
+        },
+        4 => Rgb {
+            r: 36,
+            g: 114,
+            b: 200,
+        },
+        5 => Rgb {
+            r: 188,
+            g: 63,
+            b: 188,
+        },
+        6 => Rgb {
+            r: 17,
+            g: 168,
+            b: 205,
+        },
+        7 => Rgb {
+            r: 229,
+            g: 229,
+            b: 229,
+        },
+        8 => Rgb {
+            r: 102,
+            g: 102,
+            b: 102,
+        },
+        9 => Rgb {
+            r: 241,
+            g: 76,
+            b: 76,
+        },
+        10 => Rgb {
+            r: 35,
+            g: 209,
+            b: 139,
+        },
+        11 => Rgb {
+            r: 245,
+            g: 245,
+            b: 67,
+        },
+        12 => Rgb {
+            r: 59,
+            g: 142,
+            b: 234,
+        },
+        13 => Rgb {
+            r: 214,
+            g: 112,
+            b: 214,
+        },
+        14 => Rgb {
+            r: 41,
+            g: 184,
+            b: 219,
+        },
+        15 => Rgb {
+            r: 255,
+            g: 255,
+            b: 255,
+        },
+        16..=231 => {
+            let i = idx - 16;
+            let conv = |v: usize| -> u8 {
+                if v == 0 {
+                    0
+                } else {
+                    (v * 40 + 55) as u8
+                }
+            };
+            Rgb {
+                r: conv((i / 36) % 6),
+                g: conv((i / 6) % 6),
+                b: conv(i % 6),
+            }
+        }
+        _ => {
+            let v = (8 + (idx.saturating_sub(232)) * 10).min(238) as u8;
+            Rgb { r: v, g: v, b: v }
+        }
+    }
+}
+
+/// Resolve a terminal cell color to concrete RGB.
+fn resolve(c: TermColor, palette: &Colors, is_fg: bool) -> Rgb {
+    match c {
+        TermColor::Spec(rgb) => rgb,
+        TermColor::Indexed(i) => palette[i as usize].unwrap_or_else(|| palette_256(i as usize)),
+        TermColor::Named(n) => palette[n].unwrap_or_else(|| match n {
+            NamedColor::Background => DEFAULT_BG,
+            NamedColor::Foreground => DEFAULT_FG,
+            other => {
+                let idx = other as usize;
+                if idx < 256 {
+                    palette_256(idx)
+                } else if is_fg {
+                    DEFAULT_FG
+                } else {
+                    DEFAULT_BG
+                }
+            }
+        }),
+    }
+}
+
 struct Pty {
     term: Arc<Mutex<Term<Listener>>>,
     parser: Arc<Mutex<Processor>>,
@@ -130,7 +285,6 @@ impl Pty {
         })
     }
 
-    /// Drain any PTY output and advance the emulator.
     fn pump(&mut self) {
         let chunks: Vec<Vec<u8>> = self.rx.try_iter().collect();
         if chunks.is_empty() {
@@ -144,8 +298,20 @@ impl Pty {
     }
 
     fn write_input(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        // Any keypress jumps back to the live screen.
+        self.term.lock().unwrap().scroll_display(Scroll::Bottom);
         let _ = self.writer.write_all(bytes);
         let _ = self.writer.flush();
+    }
+
+    fn scroll(&mut self, lines: i32) {
+        self.term
+            .lock()
+            .unwrap()
+            .scroll_display(Scroll::Delta(lines));
     }
 
     fn resize(&mut self, size: TermSize) {
@@ -159,21 +325,277 @@ impl Pty {
         self.term.lock().unwrap().resize(size);
     }
 
-    /// Snapshot the visible grid as plain text (M1: monochrome).
-    fn snapshot_text(&self) -> String {
+    /// Walk the visible grid into draw runs + background/cursor quads.
+    fn frame(&self) -> Frame {
         let term = self.term.lock().unwrap();
-        let grid = term.grid();
-        let mut out = String::with_capacity(self.size.lines * (self.size.cols + 1));
-        for line in 0..self.size.lines as i32 {
-            for col in 0..self.size.cols {
-                let cell = &grid[Line(line)][Column(col)];
-                out.push(cell.c);
+        let content = term.renderable_content();
+        let palette = content.colors;
+        let cursor_pt = content.cursor.point;
+        let cursor_visible = !matches!(content.cursor.shape, CursorShape::Hidden);
+
+        let mut runs: Vec<Run> = Vec::new();
+        let mut quads: Vec<Quad> = Vec::new();
+        let mut cur_line: i32 = i32::MIN;
+
+        for indexed in content.display_iter {
+            let point = indexed.point;
+            let cell = indexed.cell;
+            let line = point.line.0; // 0-based within the visible region
+            let col = point.column.0;
+            if line < 0 {
+                continue;
             }
-            out.push('\n');
+            let uline = line as usize;
+
+            let mut fg = resolve(cell.fg, palette, true);
+            let mut bg = resolve(cell.bg, palette, false);
+            let bold = cell.flags.intersects(Flags::BOLD | Flags::BOLD_ITALIC);
+            if cell.flags.contains(Flags::INVERSE) {
+                std::mem::swap(&mut fg, &mut bg);
+            }
+            let is_cursor = cursor_visible
+                && line == cursor_pt.line.0
+                && col == cursor_pt.column.0
+                && matches!(
+                    content.cursor.shape,
+                    CursorShape::Block | CursorShape::HollowBlock
+                );
+            if is_cursor {
+                std::mem::swap(&mut fg, &mut bg);
+            }
+
+            // Background quad when not the default bg.
+            if bg.r != DEFAULT_BG.r || bg.g != DEFAULT_BG.g || bg.b != DEFAULT_BG.b {
+                quads.push(Quad {
+                    col,
+                    line: uline,
+                    color: bg,
+                });
+            }
+
+            // Break rows with newlines; merge consecutive same-styled cells.
+            let need_newline = cur_line >= 0 && line != cur_line;
+            if need_newline {
+                if let Some(last) = runs.last_mut() {
+                    for _ in 0..(line - cur_line) {
+                        last.text.push('\n');
+                    }
+                }
+            }
+            cur_line = line;
+            let same_style = runs
+                .last()
+                .map(|r| r.fg == fg && r.bold == bold)
+                .unwrap_or(false);
+            if same_style && !need_newline {
+                runs.last_mut().unwrap().text.push(cell.c);
+            } else {
+                runs.push(Run {
+                    text: cell.c.to_string(),
+                    fg,
+                    bold,
+                });
+            }
         }
-        out
+
+        Frame { runs, quads }
     }
 }
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct Vertex {
+    pos: [f32; 2],
+    color: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct Uniforms {
+    resolution: [f32; 2],
+    _pad: [f32; 2],
+}
+
+/// Minimal solid-color quad pipeline for cell backgrounds + cursor.
+struct QuadRenderer {
+    pipeline: wgpu::RenderPipeline,
+    vbuf: wgpu::Buffer,
+    vbuf_cap: u64,
+    ubuf: wgpu::Buffer,
+    bind: wgpu::BindGroup,
+    n: u32,
+}
+
+impl QuadRenderer {
+    fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("quad"),
+            source: wgpu::ShaderSource::Wgsl(QUAD_WGSL.into()),
+        });
+        let bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[Some(&bind_layout)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("quad"),
+            layout: Some(&pl),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs"),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<Vertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &[
+                        wgpu::VertexAttribute {
+                            offset: 0,
+                            shader_location: 0,
+                            format: wgpu::VertexFormat::Float32x2,
+                        },
+                        wgpu::VertexAttribute {
+                            offset: 8,
+                            shader_location: 1,
+                            format: wgpu::VertexFormat::Float32x4,
+                        },
+                    ],
+                }],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        let ubuf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: std::mem::size_of::<Uniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &bind_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: ubuf.as_entire_binding(),
+            }],
+        });
+        let vbuf_cap = 4096 * std::mem::size_of::<Vertex>() as u64;
+        let vbuf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: vbuf_cap,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        Self {
+            pipeline,
+            vbuf,
+            vbuf_cap,
+            ubuf,
+            bind,
+            n: 0,
+        }
+    }
+
+    fn prepare(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        quads: &[Quad],
+        res: [f32; 2],
+    ) {
+        queue.write_buffer(
+            &self.ubuf,
+            0,
+            bytemuck::bytes_of(&Uniforms {
+                resolution: res,
+                _pad: [0.0, 0.0],
+            }),
+        );
+        let mut verts: Vec<Vertex> = Vec::with_capacity(quads.len() * 6);
+        for q in quads {
+            let x0 = PAD_X + q.col as f32 * CELL_W;
+            let y0 = PAD_Y + q.line as f32 * LINE_HEIGHT;
+            let x1 = x0 + CELL_W;
+            let y1 = y0 + LINE_HEIGHT;
+            let c = [
+                q.color.r as f32 / 255.0,
+                q.color.g as f32 / 255.0,
+                q.color.b as f32 / 255.0,
+                1.0,
+            ];
+            for p in [[x0, y0], [x1, y0], [x1, y1], [x0, y0], [x1, y1], [x0, y1]] {
+                verts.push(Vertex { pos: p, color: c });
+            }
+        }
+        self.n = verts.len() as u32;
+        if verts.is_empty() {
+            return;
+        }
+        let bytes = bytemuck::cast_slice(&verts);
+        let needed = bytes.len() as u64;
+        if needed > self.vbuf_cap {
+            self.vbuf_cap = needed.next_power_of_two();
+            self.vbuf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: self.vbuf_cap,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        queue.write_buffer(&self.vbuf, 0, bytes);
+    }
+
+    fn render<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
+        if self.n == 0 {
+            return;
+        }
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &self.bind, &[]);
+        pass.set_vertex_buffer(0, self.vbuf.slice(..));
+        pass.draw(0..self.n, 0..1);
+    }
+}
+
+const QUAD_WGSL: &str = r#"
+struct Uniforms { resolution: vec2<f32>, pad: vec2<f32> };
+@group(0) @binding(0) var<uniform> u: Uniforms;
+struct VsOut { @builtin(position) clip: vec4<f32>, @location(0) color: vec4<f32> };
+@vertex
+fn vs(@location(0) pos: vec2<f32>, @location(1) color: vec4<f32>) -> VsOut {
+    var out: VsOut;
+    let ndc = vec2<f32>(pos.x / u.resolution.x * 2.0 - 1.0, 1.0 - pos.y / u.resolution.y * 2.0);
+    out.clip = vec4<f32>(ndc, 0.0, 1.0);
+    out.color = color;
+    return out;
+}
+@fragment
+fn fs(in: VsOut) -> @location(0) vec4<f32> { return in.color; }
+"#;
 
 struct Gpu {
     device: wgpu::Device,
@@ -186,6 +608,7 @@ struct Gpu {
     atlas: TextAtlas,
     text_renderer: TextRenderer,
     text_buffer: TextBuffer,
+    quads: QuadRenderer,
     window: Arc<Window>,
 }
 
@@ -232,6 +655,7 @@ impl Gpu {
             Some(size.width as f32),
             Some(size.height as f32),
         );
+        let quads = QuadRenderer::new(&device, format);
 
         Self {
             device,
@@ -244,14 +668,25 @@ impl Gpu {
             atlas,
             text_renderer,
             text_buffer,
+            quads,
             window,
         }
     }
 
-    fn set_text(&mut self, text: &str) {
-        self.text_buffer.set_text(
+    fn set_runs(&mut self, runs: &[Run]) {
+        let spans: Vec<(&str, Attrs)> = runs
+            .iter()
+            .map(|r| {
+                let attrs = Attrs::new()
+                    .family(Family::Name(FONT_FAMILY))
+                    .color(Color::rgb(r.fg.r, r.fg.g, r.fg.b))
+                    .weight(if r.bold { Weight::BOLD } else { Weight::NORMAL });
+                (r.text.as_str(), attrs)
+            })
+            .collect();
+        self.text_buffer.set_rich_text(
             &mut self.font_system,
-            text,
+            spans,
             &Attrs::new().family(Family::Name(FONT_FAMILY)),
             Shaping::Advanced,
             None,
@@ -268,7 +703,15 @@ impl Gpu {
             .set_size(&mut self.font_system, Some(w as f32), Some(h as f32));
     }
 
-    fn render(&mut self) {
+    fn render(&mut self, frame: &Frame) {
+        self.set_runs(&frame.runs);
+        let res = [
+            self.surface_config.width as f32,
+            self.surface_config.height as f32,
+        ];
+        self.quads
+            .prepare(&self.device, &self.queue, &frame.quads, res);
+
         self.viewport.update(
             &self.queue,
             Resolution {
@@ -284,8 +727,8 @@ impl Gpu {
             &self.viewport,
             [TextArea {
                 buffer: &self.text_buffer,
-                left: 6.0,
-                top: 4.0,
+                left: PAD_X,
+                top: PAD_Y,
                 scale: 1.0,
                 bounds: TextBounds {
                     left: 0,
@@ -293,7 +736,7 @@ impl Gpu {
                     right: self.surface_config.width as i32,
                     bottom: self.surface_config.height as i32,
                 },
-                default_color: Color::rgb(228, 231, 223),
+                default_color: Color::rgb(DEFAULT_FG.r, DEFAULT_FG.g, DEFAULT_FG.b),
                 custom_glyphs: &[],
             }],
             &mut self.swash_cache,
@@ -301,7 +744,7 @@ impl Gpu {
         if prepared.is_err() {
             return;
         }
-        let frame = match self.surface.get_current_texture() {
+        let surface_tex = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) => f,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Suboptimal(_) => {
                 self.surface.configure(&self.device, &self.surface_config);
@@ -313,7 +756,7 @@ impl Gpu {
                 return;
             }
         };
-        let view = frame
+        let view = surface_tex
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
         let mut encoder = self
@@ -328,9 +771,9 @@ impl Gpu {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.05,
-                            g: 0.05,
-                            b: 0.04,
+                            r: DEFAULT_BG.r as f64 / 255.0,
+                            g: DEFAULT_BG.g as f64 / 255.0,
+                            b: DEFAULT_BG.b as f64 / 255.0,
                             a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
@@ -341,12 +784,13 @@ impl Gpu {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+            self.quads.render(&mut pass);
             let _ = self
                 .text_renderer
                 .render(&self.atlas, &self.viewport, &mut pass);
         }
         self.queue.submit(Some(encoder.finish()));
-        frame.present();
+        surface_tex.present();
         self.atlas.trim();
     }
 }
@@ -355,14 +799,22 @@ struct App {
     gpu: Option<Gpu>,
     pty: Option<Pty>,
     proxy: EventLoopProxy<UserEvent>,
+    mods: ModifiersState,
 }
 
 impl App {
-    /// Compute the grid size from the window pixels + cell metrics.
     fn grid_size(w: u32, h: u32) -> TermSize {
-        let cols = ((w as f32 - 12.0) / CELL_W).floor().max(1.0) as usize;
-        let lines = ((h as f32 - 8.0) / LINE_HEIGHT).floor().max(1.0) as usize;
+        let cols = ((w as f32 - PAD_X * 2.0) / CELL_W).floor().max(1.0) as usize;
+        let lines = ((h as f32 - PAD_Y * 2.0) / LINE_HEIGHT).floor().max(1.0) as usize;
         TermSize { cols, lines }
+    }
+
+    fn redraw(&mut self) {
+        if let (Some(pty), Some(gpu)) = (self.pty.as_mut(), self.gpu.as_mut()) {
+            pty.pump();
+            let frame = pty.frame();
+            gpu.render(&frame);
+        }
     }
 }
 
@@ -385,10 +837,7 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: UserEvent) {
-        if let (Some(pty), Some(gpu)) = (self.pty.as_mut(), self.gpu.as_mut()) {
-            pty.pump();
-            let text = pty.snapshot_text();
-            gpu.set_text(&text);
+        if let Some(gpu) = self.gpu.as_ref() {
             gpu.window.request_redraw();
         }
     }
@@ -401,6 +850,7 @@ impl ApplicationHandler<UserEvent> for App {
     ) {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
             WindowEvent::Resized(size) => {
                 if let (Some(gpu), Some(pty)) = (self.gpu.as_mut(), self.pty.as_mut()) {
                     gpu.resize(size.width, size.height);
@@ -408,31 +858,63 @@ impl ApplicationHandler<UserEvent> for App {
                     gpu.window.request_redraw();
                 }
             }
-            WindowEvent::KeyboardInput { event, .. } => {
-                if event.state.is_pressed() {
-                    if let Some(pty) = self.pty.as_mut() {
-                        let bytes = key_to_bytes(&event.logical_key, &event.text);
-                        if !bytes.is_empty() {
-                            pty.write_input(&bytes);
+            WindowEvent::MouseWheel { delta, .. } => {
+                if let Some(pty) = self.pty.as_mut() {
+                    let lines = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => y.round() as i32,
+                        MouseScrollDelta::PixelDelta(p) => {
+                            (p.y / LINE_HEIGHT as f64).round() as i32
+                        }
+                    };
+                    if lines != 0 {
+                        pty.scroll(lines);
+                        if let Some(gpu) = self.gpu.as_ref() {
+                            gpu.window.request_redraw();
                         }
                     }
                 }
             }
-            WindowEvent::RedrawRequested => {
-                if let (Some(pty), Some(gpu)) = (self.pty.as_mut(), self.gpu.as_mut()) {
-                    pty.pump();
-                    let text = pty.snapshot_text();
-                    gpu.set_text(&text);
-                    gpu.render();
+            WindowEvent::KeyboardInput { event, .. } => {
+                if event.state.is_pressed() {
+                    let bytes = key_to_bytes(&event.logical_key, &event.text, self.mods);
+                    if !bytes.is_empty() {
+                        if let Some(pty) = self.pty.as_mut() {
+                            pty.write_input(&bytes);
+                            if let Some(gpu) = self.gpu.as_ref() {
+                                gpu.window.request_redraw();
+                            }
+                        }
+                    }
                 }
             }
+            WindowEvent::RedrawRequested => self.redraw(),
             _ => {}
         }
     }
 }
 
-/// Map a key press to the bytes the PTY expects.
-fn key_to_bytes(key: &Key, text: &Option<winit::keyboard::SmolStr>) -> Vec<u8> {
+fn key_to_bytes(
+    key: &Key,
+    text: &Option<winit::keyboard::SmolStr>,
+    mods: ModifiersState,
+) -> Vec<u8> {
+    // Ctrl-letter → control byte (Ctrl-C = 0x03, etc.).
+    if mods.control_key() {
+        if let Key::Character(s) = key {
+            if let Some(ch) = s.chars().next() {
+                let lower = ch.to_ascii_lowercase();
+                if lower.is_ascii_alphabetic() {
+                    return vec![(lower as u8) & 0x1f];
+                }
+                match lower {
+                    '[' => return vec![0x1b],
+                    '\\' => return vec![0x1c],
+                    ']' => return vec![0x1d],
+                    _ => {}
+                }
+            }
+        }
+    }
     match key {
         Key::Named(NamedKey::Enter) => vec![b'\r'],
         Key::Named(NamedKey::Backspace) => vec![0x7f],
@@ -442,6 +924,9 @@ fn key_to_bytes(key: &Key, text: &Option<winit::keyboard::SmolStr>) -> Vec<u8> {
         Key::Named(NamedKey::ArrowDown) => b"\x1b[B".to_vec(),
         Key::Named(NamedKey::ArrowRight) => b"\x1b[C".to_vec(),
         Key::Named(NamedKey::ArrowLeft) => b"\x1b[D".to_vec(),
+        Key::Named(NamedKey::Home) => b"\x1b[H".to_vec(),
+        Key::Named(NamedKey::End) => b"\x1b[F".to_vec(),
+        Key::Named(NamedKey::Delete) => b"\x1b[3~".to_vec(),
         Key::Named(NamedKey::Space) => vec![b' '],
         _ => text
             .as_ref()
@@ -457,6 +942,7 @@ fn main() -> anyhow::Result<()> {
         gpu: None,
         pty: None,
         proxy,
+        mods: ModifiersState::empty(),
     };
     event_loop.run_app(&mut app)?;
     Ok(())
