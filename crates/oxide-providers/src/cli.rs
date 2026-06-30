@@ -572,6 +572,13 @@ impl Provider for CodexCliProvider {
         // per-block transcript positions; codex's JSONL carries none, so we buffer
         // and flush at the turn boundary instead.)
         let text_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        // Has the model acted (run a command / edited / searched) yet this turn?
+        // An agent_message BEFORE any action is a preamble ("First I'll check…")
+        // and must stay inline, ABOVE the command rows; one AFTER an action is the
+        // answer and is buffered to land below them. (Buffering everything put the
+        // preamble below the command too.) Emitting inline is also safe vs the
+        // Done-ordering trap — it streams mid-turn, well before run_jsonl's Done.
+        let mut acted = false;
         run_jsonl(
             &self.bin,
             &args,
@@ -584,6 +591,12 @@ impl Provider for CodexCliProvider {
                     Some("item.started") => {
                         // Live status while the CLI runs a command/edits a file.
                         let item = &v["item"];
+                        if matches!(
+                            item["type"].as_str(),
+                            Some("command_execution" | "file_change" | "web_search")
+                        ) {
+                            acted = true;
+                        }
                         match item["type"].as_str() {
                             Some("command_execution") => {
                                 let cmd = clean_cli_command(item["command"].as_str().unwrap_or(""));
@@ -634,10 +647,17 @@ impl Provider for CodexCliProvider {
                         match item["type"].as_str() {
                             Some("agent_message") => {
                                 if let Some(t) = item["text"].as_str() {
-                                    // Held until turn.completed so it lands below the
-                                    // command/activity rows (see text_buf above).
-                                    if let Ok(mut buf) = text_buf.lock() {
-                                        buf.push(t.to_string());
+                                    if acted {
+                                        // Post-action text = the answer. Hold until
+                                        // turn.completed so it lands below the command/
+                                        // activity rows (see text_buf above).
+                                        if let Ok(mut buf) = text_buf.lock() {
+                                            buf.push(t.to_string());
+                                        }
+                                    } else {
+                                        // Preamble before any action — stream inline so
+                                        // it stays above the command rows it precedes.
+                                        send(sink, StreamItem::TextDelta(t.to_string()));
                                     }
                                 }
                             }

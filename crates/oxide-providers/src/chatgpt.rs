@@ -458,13 +458,27 @@ impl ChatGptProvider {
             .unwrap_or_else(|| refresh.to_string());
         let mut attempt = 0u32;
         let resp = loop {
-            match self
-                .client
-                .post(OAUTH_TOKEN_URL)
-                .form(&refresh_form(&refresh_now))
-                .send()
-                .await
+            // Bound the POST: it runs while holding the per-file refresh lock, so a
+            // hung connection (we set connect_timeout but no overall request timeout —
+            // streaming turns need none) would pin every other caller behind it
+            // indefinitely. On timeout, bail (dropping the lock) rather than retry —
+            // a refresh can rotate the token server-side with the response lost, so
+            // resending a possibly-consumed token is unsafe (same as connection errors).
+            let sent = match tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                self.client
+                    .post(OAUTH_TOKEN_URL)
+                    .form(&refresh_form(&refresh_now))
+                    .send(),
+            )
+            .await
             {
+                Ok(sent) => sent,
+                Err(_) => anyhow::bail!(
+                    "ChatGPT token refresh timed out after 30s. Run `codex login` to sign in again."
+                ),
+            };
+            match sent {
                 Ok(r) if r.status().is_success() => break r,
                 Ok(r) => {
                     let status = r.status();

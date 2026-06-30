@@ -4498,6 +4498,11 @@ fn app() -> Element {
                                 messages.write().push(ChatMsg { author: Author::Agent, text: String::new() });
                                 scroll_chat_bottom();
                                 streaming.set(true);
+                                // Reset the elapsed clock at send, not just at TurnStarted —
+                                // otherwise the status pill flashes the PREVIOUS turn's seconds
+                                // in the gap before the engine's TurnStarted arrives.
+                                turn_start.set(Some(std::time::Instant::now()));
+                                elapsed_s.set(0);
                                 busy_tabs.write().insert(aid);
                                 tab_statuses.write().insert(aid, TabStatus::Running);
                                 let _ = h.submit(Op::UserTurn { text: eng }).await;
@@ -5552,6 +5557,10 @@ fn app() -> Element {
                                         messages.write().push(ChatMsg { author: Author::Agent, text: String::new() });
                                         scroll_chat_bottom();
                                         streaming.set(true);
+                                        // See the send-site above: zero the clock now so the
+                                        // pill doesn't flash the prior turn's elapsed seconds.
+                                        turn_start.set(Some(std::time::Instant::now()));
+                                        elapsed_s.set(0);
                                         busy_tabs.write().insert(ev_tid);
                                         tab_statuses.write().insert(ev_tid, TabStatus::Running);
                                         let _ = h.submit(Op::UserTurn { text }).await;
