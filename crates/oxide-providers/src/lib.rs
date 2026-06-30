@@ -167,6 +167,11 @@ pub enum StreamItem {
         input: u64,
         output: u64,
         context_window: Option<u64>,
+        /// Of `input`, how many tokens were served from the prompt cache (0 if the
+        /// backend doesn't report it). Drives the cache-hit % in the usage UI.
+        cached_input: u64,
+        /// Of `output`, how many were reasoning tokens (0 if unreported).
+        reasoning_output: u64,
     },
     /// Subscription rate-limit snapshot (from ChatGPT-subscription headers).
     RateLimit {
@@ -231,6 +236,8 @@ impl Provider for EchoProvider {
                 input: last_user.split_whitespace().count() as u64,
                 output: reply.split_whitespace().count() as u64,
                 context_window: None,
+                cached_input: 0,
+                reasoning_output: 0,
             })
             .await;
         let _ = sink.send(StreamItem::Done).await;

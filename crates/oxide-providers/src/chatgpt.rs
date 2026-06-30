@@ -14,8 +14,24 @@ use eventsource_stream::Eventsource;
 use futures::StreamExt;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
+
+/// Per-auth-file async lock so concurrent refreshes (e.g. two tabs hitting an
+/// expired token at once) serialize instead of both POSTing /oauth/token and
+/// double-rotating the refresh token — the loser of a double-rotation otherwise
+/// holds a server-consumed token and dead-ends on "run codex login".
+fn refresh_lock(auth_path: &str) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: OnceLock<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+        OnceLock::new();
+    let map = LOCKS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut guard = map.lock().unwrap_or_else(|p| p.into_inner());
+    guard
+        .entry(auth_path.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
 
 const ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
 const USAGE_ENDPOINT: &str = "https://chatgpt.com/backend-api/wham/usage";
@@ -298,6 +314,21 @@ fn error_summary(error: &Value, fallback: &str) -> String {
     }
 }
 
+/// True when an error frame means the prompt exceeded the model's context window.
+/// Used to mark an SSE `response.failed`/`error` overflow with a message the engine
+/// recognizes (contains "context"), so it compacts + retries instead of hard-failing
+/// — matching the existing HTTP-413 path.
+fn error_is_context_overflow(error: &Value) -> bool {
+    let code = error["code"].as_str().unwrap_or("");
+    let kind = error["type"].as_str().unwrap_or("");
+    let msg = error["message"].as_str().unwrap_or("").to_ascii_lowercase();
+    code == "context_length_exceeded"
+        || kind == "context_length_exceeded"
+        || msg.contains("context length")
+        || msg.contains("maximum context")
+        || (msg.contains("context") && msg.contains("exceed"))
+}
+
 async fn send_rate_limit(
     sink: &mpsc::Sender<StreamItem>,
     plan: String,
@@ -401,12 +432,36 @@ impl ChatGptProvider {
     /// Exchange a refresh token for a fresh `(access_token, refresh_token)` at the
     /// OAuth endpoint (same flow the codex CLI uses). The refresh token may rotate.
     async fn refresh_access(&self, refresh: &str) -> anyhow::Result<(String, String)> {
+        // Serialize refreshes for this auth file so two callers don't both rotate.
+        let lock = refresh_lock(&self.auth_path);
+        let _guard = lock.lock().await;
+        // Another caller may have refreshed while we waited: if the on-disk access
+        // token is now valid, reuse it instead of POSTing again (avoids a second,
+        // token-rotating round-trip).
+        if let Ok((disk_access, _acct, disk_refresh)) = self.credentials() {
+            if !disk_access.trim().is_empty() && !access_token_near_expiry(&disk_access) {
+                let refresh_out = if disk_refresh.trim().is_empty() {
+                    refresh.to_string()
+                } else {
+                    disk_refresh
+                };
+                return Ok((disk_access, refresh_out));
+            }
+        }
+        // Refresh with the freshest refresh token on disk (it may have rotated
+        // since this provider instance was built).
+        let refresh_now: String = self
+            .credentials()
+            .ok()
+            .map(|(_, _, r)| r)
+            .filter(|r| !r.trim().is_empty())
+            .unwrap_or_else(|| refresh.to_string());
         let mut attempt = 0u32;
         let resp = loop {
             match self
                 .client
                 .post(OAUTH_TOKEN_URL)
-                .form(&refresh_form(refresh))
+                .form(&refresh_form(&refresh_now))
                 .send()
                 .await
             {
@@ -743,7 +798,9 @@ fn response_tool_call(
                 .unwrap_or_default();
             Some((vec![call_id, item_id], name, parse_tool_args(&raw)))
         }
-        "shell_call" => {
+        // `local_shell_call` is the codex backend's native shell item; treat it
+        // exactly like `shell_call` so a native shell call isn't silently dropped.
+        "shell_call" | "local_shell_call" => {
             let commands: Vec<String> = item["action"]["commands"]
                 .as_array()
                 .map(|items| {
@@ -808,6 +865,13 @@ async fn send_response_usage(
         input: usage["input_tokens"].as_u64().unwrap_or(0),
         output: usage["output_tokens"].as_u64().unwrap_or(0),
         context_window: Some(model_context_window(model)),
+        // The `prompt_cache_key` we send makes the backend report cache hits here.
+        cached_input: usage["input_tokens_details"]["cached_tokens"]
+            .as_u64()
+            .unwrap_or(0),
+        reasoning_output: usage["output_tokens_details"]["reasoning_tokens"]
+            .as_u64()
+            .unwrap_or(0),
     })
     .await
     .is_ok()
@@ -1009,7 +1073,11 @@ impl Provider for ChatGptProvider {
                     }
                 }
                 Some("response.reasoning_summary_text.delta")
-                | Some("response.reasoning_text.delta") => {
+                | Some("response.reasoning_text.delta")
+                // Bare `reasoning_summary.delta` (no `_text`) is the variant some
+                // backend builds emit — without this arm the thinking stream is
+                // silently dropped on those builds.
+                | Some("response.reasoning_summary.delta") => {
                     last_progress = tokio::time::Instant::now();
                     if let Some(t) = v["delta"].as_str() {
                         let _ = sink.send(StreamItem::ReasoningDelta(t.to_string())).await;
@@ -1130,7 +1198,11 @@ impl Provider for ChatGptProvider {
                     break;
                 }
                 Some("response.failed") => {
-                    let detail = error_summary(&v["response"]["error"], "response failed");
+                    let err = &v["response"]["error"];
+                    let detail = error_summary(err, "response failed");
+                    if error_is_context_overflow(err) {
+                        anyhow::bail!("ChatGPT context length exceeded: {detail}");
+                    }
                     anyhow::bail!("ChatGPT response failed: {detail}");
                 }
                 Some("response.incomplete") => {
@@ -1151,11 +1223,11 @@ impl Provider for ChatGptProvider {
                 }
                 // Top-level error frame (not wrapped in a response object).
                 Some("error") => {
-                    let detail = if v["error"].is_object() {
-                        error_summary(&v["error"], "stream error")
-                    } else {
-                        error_summary(&v, "stream error")
-                    };
+                    let err = if v["error"].is_object() { &v["error"] } else { &v };
+                    let detail = error_summary(err, "stream error");
+                    if error_is_context_overflow(err) {
+                        anyhow::bail!("ChatGPT context length exceeded: {detail}");
+                    }
                     anyhow::bail!("ChatGPT stream error: {detail}");
                 }
                 // Model declined: stream the refusal as visible text instead of

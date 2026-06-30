@@ -238,6 +238,10 @@ impl Provider for AnthropicProvider {
                             input: input_tokens,
                             output,
                             context_window: None,
+                            cached_input: data["usage"]["cache_read_input_tokens"]
+                                .as_u64()
+                                .unwrap_or(0),
+                            reasoning_output: 0,
                         })
                         .await;
                 }

@@ -192,6 +192,12 @@ impl Provider for OpenAiProvider {
                         input: usage["prompt_tokens"].as_u64().unwrap_or(0),
                         output: usage["completion_tokens"].as_u64().unwrap_or(0),
                         context_window: None,
+                        cached_input: usage["prompt_tokens_details"]["cached_tokens"]
+                            .as_u64()
+                            .unwrap_or(0),
+                        reasoning_output: usage["completion_tokens_details"]["reasoning_tokens"]
+                            .as_u64()
+                            .unwrap_or(0),
                     })
                     .await;
             }

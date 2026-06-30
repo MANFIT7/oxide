@@ -72,6 +72,17 @@ pub enum Event {
     Followups { items: Vec<String> },
     /// A new turn began.
     TurnStarted { turn: TurnId },
+    /// Authoritative working-state for the turn, pushed by the engine so a
+    /// frontend renders it directly instead of inferring from lifecycle events
+    /// (which is fragile — a dropped TurnFinished leaves a tab stuck "running").
+    /// `state` ∈ "working" | "retrying" | "idle". Carries the reason for transient
+    /// retries so the UI shows "retrying…" instead of an apparent freeze.
+    TurnStatus {
+        turn: TurnId,
+        state: String,
+        #[serde(default)]
+        detail: String,
+    },
     /// A chunk of the assistant's streamed message.
     AgentMessageDelta { turn: TurnId, text: String },
     /// Model reasoning/thinking delta (optional to render).
@@ -215,6 +226,12 @@ pub enum Event {
         turn: TurnId,
         input: u64,
         output: u64,
+        /// Of `input`, tokens served from the prompt cache (0 if unreported).
+        #[serde(default)]
+        cached_input: u64,
+        /// Of `output`, reasoning tokens (0 if unreported).
+        #[serde(default)]
+        reasoning_output: u64,
     },
     /// The active model's context window size (tokens), reported by the backend.
     ContextWindow { limit: u64 },

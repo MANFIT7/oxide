@@ -203,6 +203,7 @@ async fn run_exec(
             }
             Event::SessionPath { .. } => {}
             Event::Followups { .. } => {}
+            Event::TurnStatus { .. } => {}
             Event::TurnStarted { turn } => {
                 if !json_events {
                     println!("[{turn}] started");

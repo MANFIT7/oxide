@@ -687,6 +687,10 @@ impl Provider for CodexCliProvider {
                                 output: u["output_tokens"].as_u64().unwrap_or(0),
                                 // codex doesn't report the window here; default 272k.
                                 context_window: Some(272_000),
+                                cached_input: u["cached_input_tokens"].as_u64().unwrap_or(0),
+                                reasoning_output: u["reasoning_output_tokens"]
+                                    .as_u64()
+                                    .unwrap_or(0),
                             },
                         );
                     }
@@ -920,6 +924,10 @@ impl Provider for ClaudeCliProvider {
                                 input: u["input_tokens"].as_u64().unwrap_or(0),
                                 output: u["output_tokens"].as_u64().unwrap_or(0),
                                 context_window: window,
+                                cached_input: u["cached_input_tokens"].as_u64().unwrap_or(0),
+                                reasoning_output: u["reasoning_output_tokens"]
+                                    .as_u64()
+                                    .unwrap_or(0),
                             },
                         );
                     }
@@ -1446,6 +1454,8 @@ fn emit_claude_usage(
                     input,
                     output,
                     context_window,
+                    cached_input: 0,
+                    reasoning_output: 0,
                 },
             );
             *usage_emitted = true;

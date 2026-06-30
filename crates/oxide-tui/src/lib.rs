@@ -372,6 +372,17 @@ fn apply_event(event: Event, state: &mut State) {
         Event::SessionPath { .. } => {}
         Event::Followups { .. } => {}
         Event::TurnStarted { turn } => state.status = format!("{turn} running…"),
+        Event::TurnStatus {
+            state: s, detail, ..
+        } => {
+            if s == "retrying" {
+                state.status = if detail.is_empty() {
+                    "retrying…".into()
+                } else {
+                    format!("retrying… ({detail})")
+                };
+            }
+        }
         Event::ApprovalRequested {
             request_id,
             tool,

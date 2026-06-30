@@ -3651,7 +3651,8 @@ fn app() -> Element {
     let mut session_replay = use_signal(|| None::<SessionReplay>);
     let mut approvals = use_signal(Vec::<(u64, String, String)>::new);
     let mut checkpoints = use_signal(Vec::<(u64, String)>::new);
-    let mut usage = use_signal(|| (0u64, 0u64));
+    // (input, output, cached_input) tokens for the latest turn.
+    let mut usage = use_signal(|| (0u64, 0u64, 0u64));
     // Git / Browser / Goal tab state.
     let mut git_status = use_signal(Vec::<String>::new);
     let mut git_busy = use_signal(String::new);
@@ -3827,7 +3828,11 @@ fn app() -> Element {
     use_effect(move || {
         spawn(async move {
             let _ = dioxus::document::eval(
-                "if(!window.__oxnoctx){window.__oxnoctx=1;document.addEventListener('contextmenu',function(e){e.preventDefault();},{capture:true});}",
+                "if(!window.__oxnoctx){window.__oxnoctx=1;document.addEventListener('contextmenu',function(e){e.preventDefault();},{capture:true});}\
+                 if(!window.__oxzoom){window.__oxzoom=1;var z=parseFloat(localStorage.getItem('oxzoom')||'1')||1;document.documentElement.style.zoom=z;\
+                 document.addEventListener('keydown',function(e){if(!(e.metaKey||e.ctrlKey))return;var k=e.key;\
+                 if(k==='='||k==='+'){z=Math.min(2.5,z+0.1);}else if(k==='-'){z=Math.max(0.5,z-0.1);}else if(k==='0'){z=1;}else return;\
+                 e.preventDefault();document.documentElement.style.zoom=z;localStorage.setItem('oxzoom',String(z));},true);}",
             );
         });
     });
@@ -5411,8 +5416,20 @@ fn app() -> Element {
                                 // Confirm in the transcript too — the timeline tab is rarely open.
                                 messages.write().push(ChatMsg { author: Author::Note, text: format!("⎌ Restored {restored} file(s) (checkpoint #{id})") });
                             }
-                            Event::TokensUsed { input, output, .. } => {
-                                usage.set((input, output));
+                            Event::TokensUsed { input, output, cached_input, .. } => {
+                                usage.set((input, output, cached_input));
+                            }
+                            Event::TurnStatus { state: s, detail, .. } => {
+                                // Authoritative pushed working-state. The visible new
+                                // signal is "retrying" — show it instead of an apparent
+                                // freeze while the engine re-requests after a transient cut.
+                                if s == "retrying" {
+                                    status.set(if detail.is_empty() {
+                                        "Retrying…".to_string()
+                                    } else {
+                                        format!("Retrying… ({detail})")
+                                    });
+                                }
                             }
                             Event::Compacted { dropped, tokens } => {
                                 timeline.write().push(TimelineItem { title: "∿ context compacted".into(), sub: format!("dropped {dropped} · ~{tokens} tok") });
@@ -5717,11 +5734,27 @@ fn app() -> Element {
         }
     });
     // Effort is shown by its own pill — keep the model label clean.
-    let model_label = match *context_limit.read() {
-        Some(limit) => format!("{model_name} · {}", fmt_tokens(limit)),
-        None => model_name.clone(),
+    let (ctx_used, ctx_cached) = {
+        let u = usage.read();
+        (u.0, u.2)
     };
-    let ctx_used = usage.read().0;
+    // Prompt-cache hit rate (ChatGPT/Codex + OpenAI/Anthropic report it) — shows
+    // how much of the input was served from cache (cheaper + faster).
+    let cache_suffix = if ctx_cached > 0 && ctx_used > 0 {
+        format!(
+            " · {}% cached",
+            ctx_cached
+                .saturating_mul(100)
+                .saturating_div(ctx_used)
+                .min(100)
+        )
+    } else {
+        String::new()
+    };
+    let model_label = match *context_limit.read() {
+        Some(limit) => format!("{model_name} · {}{cache_suffix}", fmt_tokens(limit)),
+        None => format!("{model_name}{cache_suffix}"),
+    };
     let ctx_limit = context_limit.read().unwrap_or(0);
     // Show the hero until a real conversation starts (ignore stray notes).
     let is_empty = !messages
@@ -7637,7 +7670,7 @@ fn app() -> Element {
                                     },
                                     "usage" => rsx! {
                                         {
-                                            let (tin, tout) = *usage.read();
+                                            let (tin, tout, _cached) = *usage.read();
                                             let limit = context_limit.read().unwrap_or(0);
                                             let pct = if limit > 0 { (tin as f64 / limit as f64 * 100.0).min(100.0) } else { 0.0 };
                                             rsx! {

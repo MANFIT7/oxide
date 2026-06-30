@@ -977,6 +977,10 @@ impl OxideDesktop {
                     request_id: None,
                 });
             }
+            Event::TurnStatus { .. } => {
+                // Authoritative working-state hint; the timeline tracks lifecycle
+                // events directly, so this is informational here.
+            }
             Event::AgentMessageDelta { text, .. } => {
                 if let Some(last) = self.chat.last_mut() {
                     if last.kind == MsgKind::Agent {
@@ -1114,6 +1118,7 @@ impl OxideDesktop {
                 turn,
                 input,
                 output,
+                ..
             } => {
                 record_token_usage(&mut self.token_usage, turn.0, input, output, now_ms());
                 self.timeline.push(TimelineItem {

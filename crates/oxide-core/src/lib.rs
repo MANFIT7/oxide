@@ -2996,11 +2996,15 @@ Rules:
                     input,
                     output,
                     context_window,
+                    cached_input,
+                    reasoning_output,
                 } => {
                     self.emit(Event::TokensUsed {
                         turn,
                         input,
                         output,
+                        cached_input,
+                        reasoning_output,
                     })
                     .await;
                     if let Some(limit) = context_window {
@@ -3238,8 +3242,8 @@ Rules:
                                         duration_ms,
                                     }).await;
                                 }
-                                Some(StreamItem::Usage { input, output, context_window }) => {
-                                    self.emit(Event::TokensUsed { turn, input, output }).await;
+                                Some(StreamItem::Usage { input, output, context_window, cached_input, reasoning_output }) => {
+                                    self.emit(Event::TokensUsed { turn, input, output, cached_input, reasoning_output }).await;
                                 if let Some(limit) = context_window {
                                     self.ctx_window = Some(limit);
                                     self.emit(Event::ContextWindow { limit }).await;
@@ -3638,6 +3642,12 @@ Reply with text only: summarize what you changed, what you verified, and what re
         let turn = TurnId(self.next_turn);
         self.next_turn += 1;
         self.emit(Event::TurnStarted { turn }).await;
+        self.emit(Event::TurnStatus {
+            turn,
+            state: "working".into(),
+            detail: String::new(),
+        })
+        .await;
         if self.required_mcp_unavailable {
             self.emit(Event::Error {
                 message: "required MCP server unavailable; fix MCP settings or disable required before starting a turn".to_string(),
@@ -4272,8 +4282,8 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                                         duration_ms,
                                     }).await;
                                 }
-                                Some(StreamItem::Usage { input, output, context_window }) => {
-                                    self.emit(Event::TokensUsed { turn, input, output }).await;
+                                Some(StreamItem::Usage { input, output, context_window, cached_input, reasoning_output }) => {
+                                    self.emit(Event::TokensUsed { turn, input, output, cached_input, reasoning_output }).await;
                                 if let Some(limit) = context_window {
                                     self.ctx_window = Some(limit);
                                     self.emit(Event::ContextWindow { limit }).await;
@@ -4404,6 +4414,12 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                     transient_retries += 1;
                     let backoff =
                         std::time::Duration::from_millis(400u64 << (transient_retries - 1));
+                    self.emit(Event::TurnStatus {
+                        turn,
+                        state: "retrying".into(),
+                        detail: format!("{transient_retries}/3"),
+                    })
+                    .await;
                     self.emit(Event::Info {
                         text: format!("stream interrupted — retrying ({transient_retries}/3)"),
                     })
