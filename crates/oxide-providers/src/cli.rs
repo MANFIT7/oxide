@@ -1086,6 +1086,27 @@ impl Provider for ClaudeInteractiveProvider {
     }
 
     async fn stream(&self, req: TurnRequest, sink: mpsc::Sender<StreamItem>) -> anyhow::Result<()> {
+        // The PTY + JSONL-transcript-scrape interactive driver scrambled the
+        // transcript on any degraded turn: its error path dumped the raw TUI
+        // framebuffer, which strip_ansi can't linearize (no cursor/erase model),
+        // so each redraw appended into a jumble of meta-narration + chopped
+        // answer. Route through the clean headless stream-json provider instead —
+        // text and tool rows arrive already correctly ordered, with no scrape.
+        // Mid-run steering returns when the persistent stream-json driver
+        // (--input-format stream-json) lands.
+        ClaudeCliProvider::new().stream(req, sink).await
+    }
+}
+
+/// Superseded PTY + JSONL-scrape interactive driver, kept for reference only —
+/// `stream()` above now delegates to the clean stream-json provider.
+#[allow(dead_code)]
+impl ClaudeInteractiveProvider {
+    pub async fn stream_pty_legacy(
+        &self,
+        req: TurnRequest,
+        sink: mpsc::Sender<StreamItem>,
+    ) -> anyhow::Result<()> {
         let (mut prompt, images) = extract_cli_images(&req);
         if !images.is_empty() {
             prompt.push_str("\n\nAttached image file(s) — use your Read tool to view:\n");
