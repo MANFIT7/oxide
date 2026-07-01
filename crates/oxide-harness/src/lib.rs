@@ -142,6 +142,18 @@ pub trait Harness: Send + Sync {
     fn display_name(&self) -> &str;
     /// System prompt prepended to every turn (stable-prefix for prompt caching).
     fn system_prompt(&self) -> String;
+    /// Extra system-prompt text to APPEND when driving an external agent CLI
+    /// (claude `--append-system-prompt`) — the CLI analog of a Managed-Agents
+    /// `agent_with_overrides` `system` field. Distinct from [`system_prompt`]:
+    /// that is the full prompt for API providers, but CLI agents (Claude Code)
+    /// carry their own tuned base prompt and gather the workspace themselves, so
+    /// injecting the full `system_prompt()` would bloat every turn (busting the
+    /// CLI's prompt cache) and fight its base behavior. Return only the
+    /// harness-specific persona/policy to layer on top. `None` (default) leaves
+    /// the CLI agent's own prompt untouched.
+    fn cli_system_append(&self) -> Option<String> {
+        None
+    }
     /// Tools this harness exposes to the model.
     fn tools(&self) -> Vec<ToolSpec>;
     /// Per-turn loop tunables.

@@ -639,6 +639,31 @@ fn activity_group_display(rows: &[(String, bool, bool)]) -> (&'static str, Strin
     }
 }
 
+/// Coalesce consecutive same-file edit rows into one. Three back-to-back
+/// `Edit /path/main.rs` activity rows collapse to a single entry carrying a
+/// repeat count, so the stream shows one animated `+/−` row instead of N
+/// identical tool rows. Non-edit rows (and edits to a different file) pass
+/// through with count 1. Returns `(text, running, ok, count)`.
+fn coalesce_activity_rows(rows: Vec<(String, bool, bool)>) -> Vec<(String, bool, bool, usize)> {
+    let mut out: Vec<(String, bool, bool, usize)> = Vec::with_capacity(rows.len());
+    for (text, running, ok) in rows {
+        let view = activity_view(&text);
+        if matches!(view.kind, ActivityKind::FileChange) && !view.detail.is_empty() {
+            if let Some(last) = out.last_mut() {
+                let lview = activity_view(&last.0);
+                if matches!(lview.kind, ActivityKind::FileChange) && lview.detail == view.detail {
+                    last.1 |= running; // any still running keeps the row live
+                    last.2 &= ok; // all must succeed for the row to read done
+                    last.3 += 1;
+                    continue;
+                }
+            }
+        }
+        out.push((text, running, ok, 1));
+    }
+    out
+}
+
 fn prefixed_icon_text(text: &str) -> Option<(&'static str, String)> {
     let trimmed = text.trim_start();
     let mut chars = trimmed.chars();
@@ -8016,7 +8041,31 @@ fn app() -> Element {
                                                                 "{label}"
                                                             }
                                                             if hidden > 0 { div { class: "act-more", "… {hidden} earlier" } }
-                                                            for (t, r, o) in shown { ActivityRow { text: t, running: r, ok: o } }
+                                                            for (t, r, o, count) in coalesce_activity_rows(shown) {
+                                                                {
+                                                                    let view = activity_view(&t);
+                                                                    if matches!(view.kind, ActivityKind::FileChange) {
+                                                                        // Join the file's cumulative +/− from turn_edits by
+                                                                        // basename so the coalesced row carries live counts.
+                                                                        let want = std::path::Path::new(&view.detail)
+                                                                            .file_name()
+                                                                            .map(|n| n.to_owned());
+                                                                        let (adds, dels) = turn_edits
+                                                                            .read()
+                                                                            .iter()
+                                                                            .filter(|e| {
+                                                                                std::path::Path::new(&e.0)
+                                                                                    .file_name()
+                                                                                    .map(|n| n.to_owned())
+                                                                                    == want
+                                                                            })
+                                                                            .fold((0u32, 0u32), |(a, d), e| (a + e.1, d + e.2));
+                                                                        rsx! { EditActivityRow { text: t, running: r, ok: o, count, adds, dels } }
+                                                                    } else {
+                                                                        rsx! { ActivityRow { text: t, running: r, ok: o } }
+                                                                    }
+                                                                }
+                                                            }
                                                         }
                                                     }
                                                 }
@@ -8369,11 +8418,6 @@ fn app() -> Element {
                                                         span { class: "edits-undone slot-status icon-slot", Icon { name: "check" } SlotText { text: "Undone".to_string(), reverse: true } }
                                                     } else {
                                                         div { class: "edits-actions",
-                                                            button { class: "edits-keepall", title: "Keep every change in this turn", onclick: move |_| {
-                                                                let cps: Vec<u64> = turn_edits.read().iter().map(|e| e.3).filter(|cp| *cp != 0).collect();
-                                                                let mut a = accepted.write();
-                                                                for cp in cps { a.insert(cp); }
-                                                            }, Icon { name: "check" } SlotText { text: "Keep all".to_string() } }
                                                             button { class: "edits-undo", onclick: move |_| {
                                                                 for (_, _, _, cp, _) in turn_edits.read().iter() { engine.send(EngineCmd::Rewind { id: *cp }); reverted.write().insert(*cp); }
                                                                 edits_undone.set(true);
@@ -11877,6 +11921,51 @@ fn ActivityRow(text: String, running: bool, ok: bool) -> Element {
                         }
                     }
                     pre { class: "activity-out", "{view.output}" }
+                }
+            }
+        }
+    }
+}
+
+/// One coalesced file-edit row: the verb + path, an optional `×N` repeat badge
+/// when the same file was edited multiple times in a row, and animated
+/// `+adds −dels` line counts (the `countup` CSS animates the numbers up as more
+/// edits land). Replaces N identical `Edit /path` rows in the activity stream
+/// with a single entry, so the stream stops wasting space on repeated tools.
+#[component]
+fn EditActivityRow(
+    text: String,
+    running: bool,
+    ok: bool,
+    count: usize,
+    adds: u32,
+    dels: u32,
+) -> Element {
+    let view = activity_view(&text);
+    let state = if running {
+        "running"
+    } else if ok {
+        "done"
+    } else {
+        "fail"
+    };
+    let cls = format!("activity-card {state} activity-{}", view.kind.class_name());
+    rsx! {
+        div { class: "row activity",
+            div { class: "{cls}",
+                span { class: "activity-tic", Icon { name: icon_static(&view.icon) } }
+                if running { span { class: "activity-spin" } }
+                else if ok { span { class: "activity-ic ok", Icon { name: "check" } } }
+                else { span { class: "activity-ic fail", Icon { name: "x" } } }
+                span { class: "activity-verb", "{view.verb}" }
+                if !view.detail.is_empty() { span { class: "activity-text", "{view.detail}" } }
+                if count > 1 { span { class: "activity-count", "×{count}" } }
+                if adds + dels > 0 {
+                    span { class: "activity-editcounts",
+                        span { class: "diff-adds countup plus", style: "--n:{adds}" }
+                        " "
+                        span { class: "diff-dels countup minus", style: "--n:{dels}" }
+                    }
                 }
             }
         }

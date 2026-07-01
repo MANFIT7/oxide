@@ -14,7 +14,8 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::process::Stdio;
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
@@ -826,18 +827,24 @@ impl Provider for ClaudeCliProvider {
             args.push("--effort".to_string());
             args.push(claude_effort(&req.reasoning_effort).to_string());
         }
+        // Harness persona/policy layered onto Claude Code's own base prompt — the
+        // CLI analog of a Managed-Agents `system` override. Append, never replace:
+        // Claude Code's tuned base prompt + self-driven workspace gathering stay
+        // intact. Empty/absent for every harness that doesn't opt in.
+        if let Some(extra) = req
+            .system_append
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            args.push("--append-system-prompt".to_string());
+            args.push(extra.to_string());
+        }
 
-        let skey_cb = skey.clone();
         let timeout = claude_cli_timeout()?;
-        // With partial messages on, text arrives via stream_event deltas; the
-        // final `assistant` message would duplicate it, so skip its text blocks.
-        let mut saw_partial = false;
-        // tool_use ids we surfaced as command rows (Bash/Shell). claude -p never
-        // emits a command-finished event; the matching tool_result arrives later as
-        // a `user` message, so we remember which ids are commands and finish exactly
-        // those rows there — without this the command row spins forever and a failed
-        // command is silently masked as success by the GUI's turn-end sweep.
-        let mut command_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Shared per-line mapping (also used by the persistent driver) so the two
+        // can't drift; `false` = don't suppress the result's error notice here.
+        let mut st = ClaudeLineState::new(skey.clone());
         run_jsonl(
             &self.bin,
             &args,
@@ -846,193 +853,668 @@ impl Provider for ClaudeCliProvider {
             timeout,
             &sink,
             move |v, sink| {
-                match v["type"].as_str() {
-                    Some("system") => {
-                        if let Some(id) = v["session_id"].as_str() {
-                            session_set(&skey_cb, id);
-                            send(sink, StreamItem::CliSession(id.to_string()));
-                        }
-                    }
-                    Some("stream_event") => {
-                        let ev = &v["event"];
-                        // Each new assistant message resets the dedupe latch, so a
-                        // later message's final text isn't dropped because an earlier
-                        // one streamed deltas.
-                        if ev["type"].as_str() == Some("message_start") {
-                            saw_partial = false;
-                        }
-                        if ev["type"].as_str() == Some("content_block_delta") {
-                            match ev["delta"]["type"].as_str() {
-                                Some("text_delta") => {
-                                    if let Some(t) = ev["delta"]["text"].as_str() {
-                                        saw_partial = true;
-                                        send(sink, StreamItem::TextDelta(t.to_string()));
-                                    }
-                                }
-                                Some("thinking_delta") => {
-                                    if let Some(t) = ev["delta"]["thinking"].as_str() {
-                                        send(sink, StreamItem::ReasoningDelta(t.to_string()));
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    Some("assistant") => {
-                        if let Some(content) = v["message"]["content"].as_array() {
-                            for block in content {
-                                match block["type"].as_str() {
-                                    Some("text") => {
-                                        if !saw_partial {
-                                            if let Some(t) = block["text"].as_str() {
-                                                send(sink, StreamItem::TextDelta(t.to_string()));
-                                            }
-                                        }
-                                    }
-                                    Some("tool_use") => {
-                                        let name = block["name"].as_str().unwrap_or("tool");
-                                        // Pull the human-relevant arg so the live status reads
-                                        // "Read src/lib.rs", not a bare tool name.
-                                        let input = &block["input"];
-                                        let detail = [
-                                            "file_path",
-                                            "path",
-                                            "command",
-                                            "pattern",
-                                            "query",
-                                            "url",
-                                            "description",
-                                        ]
-                                        .iter()
-                                        .find_map(|k| input[k].as_str())
-                                        .unwrap_or("");
-                                        let detail: String = detail.chars().take(80).collect();
-                                        // A backgrounded command ("I'll let you know when done")
-                                        // won't stream its result back — surface WHAT it's doing
-                                        // with a distinct clock marker so the UI can show it persistently.
-                                        let bg = input["run_in_background"].as_bool() == Some(true);
-                                        let is_command = matches!(name, "Bash" | "Shell")
-                                            || input["command"].as_str().is_some();
-                                        if is_command {
-                                            // A command is fully shown by its command row (started,
-                                            // output, finished); emitting a duplicate Bash notice on top
-                                            // would leave a second, redundant activity row lingering.
-                                            let command = input["command"]
-                                                .as_str()
-                                                .unwrap_or(detail.as_str())
-                                                .to_string();
-                                            let id = block["id"]
-                                                .as_str()
-                                                .map(str::to_string)
-                                                .unwrap_or_else(|| {
-                                                    format!("claude-command-{command}")
-                                                });
-                                            // Backgrounded commands never stream a result
-                                            // back, so don't wait on one (it'd never finish).
-                                            if !bg {
-                                                command_ids.insert(id.clone());
-                                            }
-                                            send(
-                                                sink,
-                                                StreamItem::CommandStarted {
-                                                    id,
-                                                    command,
-                                                    cwd: String::new(),
-                                                    background: bg,
-                                                },
-                                            );
-                                        } else {
-                                            let label = if detail.is_empty() {
-                                                format!("{} {name}", '\u{2699}')
-                                            } else {
-                                                format!("{} {name} {detail}", '\u{2699}')
-                                            };
-                                            send(sink, StreamItem::Notice(label));
-                                        }
-                                        if matches!(
-                                            name,
-                                            "Edit" | "Write" | "MultiEdit" | "NotebookEdit"
-                                        ) {
-                                            if let Some(p) = input["file_path"].as_str() {
-                                                send(sink, StreamItem::FileChanged(p.to_string()));
-                                            }
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                    }
-                    Some("user") => {
-                        // Tool results arrive as a `user` message whose content carries
-                        // tool_result blocks. Finish exactly the command rows we started
-                        // (see command_ids above) with their real success/failure.
-                        if let Some(content) = v["message"]["content"].as_array() {
-                            for block in content {
-                                if block["type"].as_str() != Some("tool_result") {
-                                    continue;
-                                }
-                                let id = match block["tool_use_id"].as_str() {
-                                    Some(id) if command_ids.remove(id) => id.to_string(),
-                                    _ => continue,
-                                };
-                                let out = tool_result_text(&block["content"]);
-                                if !out.is_empty() {
-                                    send(
-                                        sink,
-                                        StreamItem::CommandOutput {
-                                            id: id.clone(),
-                                            stream: "stdout".to_string(),
-                                            chunk: out.chars().take(4000).collect(),
-                                        },
-                                    );
-                                }
-                                let ok = block["is_error"].as_bool() != Some(true);
-                                send(
-                                    sink,
-                                    StreamItem::CommandFinished {
-                                        id,
-                                        ok,
-                                        exit_code: if ok { None } else { Some(1) },
-                                        duration_ms: 0,
-                                    },
-                                );
-                            }
-                        }
-                    }
-                    Some("result") => {
-                        if let Some(id) = v["session_id"].as_str() {
-                            session_set(&skey_cb, id);
-                            send(sink, StreamItem::CliSession(id.to_string()));
-                        }
-                        if v["is_error"].as_bool() == Some(true) {
-                            let msg = v["result"].as_str().unwrap_or("Claude CLI error");
-                            send(sink, StreamItem::Notice(format!("error: {msg}")));
-                        }
-                        let u = &v["usage"];
-                        let window = v["modelUsage"]
-                            .as_object()
-                            .and_then(|m| m.values().next())
-                            .and_then(|mu| mu["contextWindow"].as_u64());
-                        send(
-                            sink,
-                            StreamItem::Usage {
-                                input: u["input_tokens"].as_u64().unwrap_or(0),
-                                output: u["output_tokens"].as_u64().unwrap_or(0),
-                                context_window: window,
-                                cached_input: u["cached_input_tokens"].as_u64().unwrap_or(0),
-                                reasoning_output: u["reasoning_output_tokens"]
-                                    .as_u64()
-                                    .unwrap_or(0),
-                            },
-                        );
-                    }
-                    _ => {}
-                }
+                claude_handle_line(v, sink, &mut st, false);
                 true
             },
         )
         .await
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Persistent stream-json claude driver (`--input-format stream-json`).
+//
+// One long-lived `claude` process per conversation, fed user turns over stdin
+// as JSONL and read over stdout. Each turn ends on the child's `result` event;
+// the process stays warm so context lives in-process (no per-turn respawn or
+// `--resume` reload), and the stdin steer channel is the substrate for true
+// mid-turn steering (a future engine hook calls `claude_persistent_steer`).
+//
+// Gated behind OXIDE_CLAUDE_PERSISTENT; the proven one-shot ClaudeCliProvider
+// stays the default. The line mapping below MIRRORS the ClaudeCliProvider
+// closure — keep the two in sync. NEEDS LIVE TEST.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Tracks background commands so their output reaches the command's row instead
+/// of being dropped. A background `Bash` returns an output-file path in its
+/// tool_result; claude then polls that file with `Read` — both are routed here.
+#[derive(Default)]
+struct BgTracker {
+    /// Background-command tool_use id → its command string, awaiting the
+    /// "written to <path>" result (the command also yields redirect targets).
+    started: HashMap<String, String>,
+    /// Output file path → the background command's row id.
+    files: HashMap<String, String>,
+    /// A `Read` tool_use id polling a bg file → that command's row id.
+    reads: HashMap<String, String>,
+    /// Command row id → lines already forwarded (each poll appends only new ones).
+    shown: HashMap<String, usize>,
+}
+
+/// Shell redirect targets (`> file`, `>> file`) in a command — so a background
+/// command that writes to its own file (`… > out.log`) can still have that
+/// file's growth routed to its row. Skips fd redirects like `2>&1`.
+fn parse_redirect_targets(cmd: &str) -> Vec<String> {
+    let toks: Vec<&str> = cmd.split_whitespace().collect();
+    let mut out = Vec::new();
+    for (i, t) in toks.iter().enumerate() {
+        let path = if *t == ">" || *t == ">>" {
+            toks.get(i + 1).copied()
+        } else if let Some(p) = t.strip_prefix(">>").or_else(|| t.strip_prefix('>')) {
+            Some(p).filter(|p| !p.is_empty())
+        } else {
+            None
+        };
+        if let Some(p) = path {
+            let p = p.trim_matches(['"', '\'']);
+            if !p.is_empty() && !p.starts_with('&') {
+                out.push(p.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Route a tool_result belonging to a background command — the initial "running
+/// in background… written to <path>" line, or a `Read` poll of that file — into
+/// the command row's live output. Returns true if it consumed the result (the
+/// caller then skips normal handling).
+fn bg_on_tool_result(
+    bg: &mut BgTracker,
+    tool_use_id: &str,
+    content: &Value,
+    sink: &mpsc::Sender<StreamItem>,
+) -> bool {
+    // The background Bash result carries the output file path; the command may
+    // also redirect to its own file. Track both so a later `Read` of either one
+    // routes here. Wording is "…written to: /path" (colon), and varies.
+    if let Some(cmd) = bg.started.remove(tool_use_id) {
+        let text = tool_result_text(content);
+        if let Some(path) = text
+            .split("written to")
+            .nth(1)
+            .map(|s| s.trim_start_matches([':', ' ', '\t']))
+            .and_then(|s| s.split_whitespace().next())
+            .map(|s| s.trim_end_matches('.').to_string())
+            .filter(|s| !s.is_empty())
+        {
+            bg.files.insert(path, tool_use_id.to_string());
+        }
+        for target in parse_redirect_targets(&cmd) {
+            bg.files.insert(target, tool_use_id.to_string());
+        }
+        send(
+            sink,
+            StreamItem::CommandOutput {
+                id: tool_use_id.to_string(),
+                stream: "stdout".to_string(),
+                chunk: text.lines().next().unwrap_or("").to_string(),
+            },
+        );
+        return true;
+    }
+    // A `Read` poll of a bg file → forward only the newly-appended lines.
+    if let Some(cmd_id) = bg.reads.remove(tool_use_id) {
+        let text = tool_result_text(content);
+        // Strip the Read tool's "<n>\t" line-number prefix.
+        let lines: Vec<&str> = text
+            .lines()
+            .map(|l| l.split_once('\t').map(|(_, r)| r).unwrap_or(l))
+            .collect();
+        let shown = bg.shown.get(&cmd_id).copied().unwrap_or(0);
+        if lines.len() > shown {
+            let chunk = lines[shown..].join("\n");
+            send(
+                sink,
+                StreamItem::CommandOutput {
+                    id: cmd_id.clone(),
+                    stream: "stdout".to_string(),
+                    chunk: chunk.chars().take(4000).collect(),
+                },
+            );
+            bg.shown.insert(cmd_id, lines.len());
+        }
+        return true;
+    }
+    false
+}
+
+/// Per-turn state for the claude stream-json line mapping.
+struct ClaudeLineState {
+    /// Once partial deltas streamed, the final `assistant` text duplicates them.
+    saw_partial: bool,
+    /// tool_use ids surfaced as command rows, finished by the later tool_result.
+    command_ids: std::collections::HashSet<String>,
+    /// session-map key for persisting the native session id.
+    skey: String,
+    /// Background-command output routing.
+    bg: BgTracker,
+}
+
+impl ClaudeLineState {
+    fn new(skey: String) -> Self {
+        Self {
+            saw_partial: false,
+            command_ids: std::collections::HashSet::new(),
+            skey,
+            bg: BgTracker::default(),
+        }
+    }
+}
+
+/// Map one claude stream-json line to StreamItems. Returns true when the line is
+/// a turn-terminating `result` event (the persistent driver ends the turn on
+/// it; a one-shot run would just read on to process exit). Mirrors the
+/// ClaudeCliProvider closure body — keep them in sync.
+fn claude_handle_line(
+    v: &Value,
+    sink: &mpsc::Sender<StreamItem>,
+    st: &mut ClaudeLineState,
+    suppress_result_error: bool,
+) -> bool {
+    match v["type"].as_str() {
+        Some("system") => {
+            if let Some(id) = v["session_id"].as_str() {
+                session_set(&st.skey, id);
+                send(sink, StreamItem::CliSession(id.to_string()));
+            }
+        }
+        Some("stream_event") => {
+            let ev = &v["event"];
+            if ev["type"].as_str() == Some("message_start") {
+                st.saw_partial = false;
+            }
+            if ev["type"].as_str() == Some("content_block_delta") {
+                match ev["delta"]["type"].as_str() {
+                    Some("text_delta") => {
+                        if let Some(t) = ev["delta"]["text"].as_str() {
+                            st.saw_partial = true;
+                            send(sink, StreamItem::TextDelta(t.to_string()));
+                        }
+                    }
+                    Some("thinking_delta") => {
+                        if let Some(t) = ev["delta"]["thinking"].as_str() {
+                            send(sink, StreamItem::ReasoningDelta(t.to_string()));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Some("assistant") => {
+            if let Some(content) = v["message"]["content"].as_array() {
+                for block in content {
+                    match block["type"].as_str() {
+                        Some("text") => {
+                            if !st.saw_partial {
+                                if let Some(t) = block["text"].as_str() {
+                                    send(sink, StreamItem::TextDelta(t.to_string()));
+                                }
+                            }
+                        }
+                        Some("tool_use") => {
+                            let name = block["name"].as_str().unwrap_or("tool");
+                            let input = &block["input"];
+                            let detail = [
+                                "file_path",
+                                "path",
+                                "command",
+                                "pattern",
+                                "query",
+                                "url",
+                                "description",
+                            ]
+                            .iter()
+                            .find_map(|k| input[k].as_str())
+                            .unwrap_or("");
+                            let detail: String = detail.chars().take(80).collect();
+                            let bg = input["run_in_background"].as_bool() == Some(true);
+                            let is_command = matches!(name, "Bash" | "Shell")
+                                || input["command"].as_str().is_some();
+                            if is_command {
+                                let command = input["command"]
+                                    .as_str()
+                                    .unwrap_or(detail.as_str())
+                                    .to_string();
+                                let id = block["id"]
+                                    .as_str()
+                                    .map(str::to_string)
+                                    .unwrap_or_else(|| format!("claude-command-{command}"));
+                                if !bg {
+                                    st.command_ids.insert(id.clone());
+                                } else {
+                                    // Await this bg command's output-file path (+
+                                    // any redirect target) to route its output.
+                                    st.bg.started.insert(id.clone(), command.clone());
+                                }
+                                send(
+                                    sink,
+                                    StreamItem::CommandStarted {
+                                        id,
+                                        command,
+                                        cwd: String::new(),
+                                        background: bg,
+                                    },
+                                );
+                            } else if name == "Read"
+                                && input["file_path"]
+                                    .as_str()
+                                    .map(|p| st.bg.files.contains_key(p))
+                                    .unwrap_or(false)
+                            {
+                                // A poll of a background command's output file:
+                                // route its result to the command row, no notice.
+                                if let (Some(p), Some(tid)) =
+                                    (input["file_path"].as_str(), block["id"].as_str())
+                                {
+                                    if let Some(cmd) = st.bg.files.get(p).cloned() {
+                                        st.bg.reads.insert(tid.to_string(), cmd);
+                                    }
+                                }
+                            } else {
+                                let label = if detail.is_empty() {
+                                    format!("{} {name}", '\u{2699}')
+                                } else {
+                                    format!("{} {name} {detail}", '\u{2699}')
+                                };
+                                send(sink, StreamItem::Notice(label));
+                            }
+                            if matches!(name, "Edit" | "Write" | "MultiEdit" | "NotebookEdit") {
+                                if let Some(p) = input["file_path"].as_str() {
+                                    send(sink, StreamItem::FileChanged(p.to_string()));
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        Some("user") => {
+            if let Some(content) = v["message"]["content"].as_array() {
+                for block in content {
+                    if block["type"].as_str() != Some("tool_result") {
+                        continue;
+                    }
+                    // Background-command output (initial path line + `Read` polls)
+                    // routes to the command row before the normal command handling.
+                    if let Some(rid) = block["tool_use_id"].as_str() {
+                        if bg_on_tool_result(&mut st.bg, rid, &block["content"], sink) {
+                            continue;
+                        }
+                    }
+                    let id = match block["tool_use_id"].as_str() {
+                        Some(id) if st.command_ids.remove(id) => id.to_string(),
+                        _ => continue,
+                    };
+                    let out = tool_result_text(&block["content"]);
+                    if !out.is_empty() {
+                        send(
+                            sink,
+                            StreamItem::CommandOutput {
+                                id: id.clone(),
+                                stream: "stdout".to_string(),
+                                chunk: out.chars().take(4000).collect(),
+                            },
+                        );
+                    }
+                    let ok = block["is_error"].as_bool() != Some(true);
+                    send(
+                        sink,
+                        StreamItem::CommandFinished {
+                            id,
+                            ok,
+                            exit_code: if ok { None } else { Some(1) },
+                            duration_ms: 0,
+                        },
+                    );
+                }
+            }
+        }
+        Some("result") => {
+            if let Some(id) = v["session_id"].as_str() {
+                session_set(&st.skey, id);
+                send(sink, StreamItem::CliSession(id.to_string()));
+            }
+            if !suppress_result_error && v["is_error"].as_bool() == Some(true) {
+                let msg = v["result"].as_str().unwrap_or("Claude CLI error");
+                send(sink, StreamItem::Notice(format!("error: {msg}")));
+            }
+            let u = &v["usage"];
+            let window = v["modelUsage"]
+                .as_object()
+                .and_then(|m| m.values().next())
+                .and_then(|mu| mu["contextWindow"].as_u64());
+            send(
+                sink,
+                StreamItem::Usage {
+                    input: u["input_tokens"].as_u64().unwrap_or(0),
+                    output: u["output_tokens"].as_u64().unwrap_or(0),
+                    context_window: window,
+                    cached_input: u["cached_input_tokens"].as_u64().unwrap_or(0),
+                    reasoning_output: u["reasoning_output_tokens"].as_u64().unwrap_or(0),
+                },
+            );
+        }
+        _ => {}
+    }
+    v["type"].as_str() == Some("result")
+}
+
+type PersistentReader = tokio::io::Lines<BufReader<tokio::process::ChildStdout>>;
+
+struct PersistentChild {
+    /// Held only so the child is killed when the entry is dropped (kill_on_drop).
+    _child: tokio::process::Child,
+    stdin_tx: mpsc::UnboundedSender<String>,
+    reader: PersistentReader,
+    /// Set by `claude_persistent_interrupt`; the read loop consumes it on the
+    /// next `result` so a steer-triggered abort isn't shown as a turn error.
+    interrupt: Arc<AtomicBool>,
+}
+
+#[allow(clippy::type_complexity)]
+static PERSISTENT: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<PersistentChild>>>>> =
+    OnceLock::new();
+/// Per-conversation stdin sender + an interrupt flag the persistent read loop
+/// checks so a steer-triggered abort isn't surfaced as a turn error.
+struct SteerHandle {
+    stdin_tx: mpsc::UnboundedSender<String>,
+    interrupt: Arc<AtomicBool>,
+}
+
+static STEER_TX: OnceLock<Mutex<HashMap<String, SteerHandle>>> = OnceLock::new();
+
+#[allow(clippy::type_complexity)]
+fn persistent_map() -> &'static Mutex<HashMap<String, Arc<tokio::sync::Mutex<PersistentChild>>>> {
+    PERSISTENT.get_or_init(Default::default)
+}
+
+fn steer_map() -> &'static Mutex<HashMap<String, SteerHandle>> {
+    STEER_TX.get_or_init(Default::default)
+}
+
+/// Build the JSONL user-message line `claude --input-format stream-json` reads
+/// on stdin.
+fn claude_user_line(prompt: &str) -> String {
+    serde_json::json!({
+        "type": "user",
+        "message": { "role": "user", "content": [ { "type": "text", "text": prompt } ] }
+    })
+    .to_string()
+}
+
+/// The stream-json control message that aborts the in-flight turn. claude
+/// replies with a `control_response`; the abort then surfaces as a `result`
+/// event (`is_error: true`, `subtype: "error_during_execution"`).
+fn claude_interrupt_line() -> String {
+    serde_json::json!({
+        "type": "control_request",
+        "request_id": "oxide-interrupt",
+        "request": { "subtype": "interrupt" }
+    })
+    .to_string()
+}
+
+/// Abort the in-flight turn of a live persistent claude process so a mid-turn
+/// steer redirects it immediately instead of waiting for the current answer to
+/// finish. The steer text itself still flows through the engine's normal
+/// next-round path; this only interrupts. Returns false when no persistent child
+/// is running for the conversation (every other provider / the one-shot driver),
+/// where the caller's next-round steering already applies on its own.
+pub fn claude_persistent_interrupt(conversation_id: &str, cwd: &str) -> bool {
+    let bin = resolve_bin("claude", "OXIDE_CLAUDE_BIN");
+    let key = session_key(&bin, conversation_id, cwd);
+    let handle = steer_map().lock().ok().and_then(|m| {
+        m.get(&key)
+            .map(|h| (h.stdin_tx.clone(), h.interrupt.clone()))
+    });
+    match handle {
+        Some((tx, interrupt)) => {
+            // Mark BEFORE sending so the read loop knows the next `result` is the
+            // abort and doesn't surface it as a turn error.
+            interrupt.store(true, Ordering::SeqCst);
+            if tx.send(claude_interrupt_line()).is_ok() {
+                true
+            } else {
+                interrupt.store(false, Ordering::SeqCst);
+                false
+            }
+        }
+        None => false,
+    }
+}
+
+fn remove_persistent(key: &str) {
+    if let Ok(mut m) = persistent_map().lock() {
+        m.remove(key);
+    }
+    if let Ok(mut m) = steer_map().lock() {
+        m.remove(key);
+    }
+}
+
+fn spawn_persistent(
+    bin: &str,
+    args: &[String],
+    cwd: &str,
+    key: &str,
+) -> anyhow::Result<Arc<tokio::sync::Mutex<PersistentChild>>> {
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    if !cwd.is_empty() {
+        cmd.current_dir(cwd);
+    }
+    #[cfg(unix)]
+    cmd.process_group(0);
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("failed to spawn '{bin}': {e}"))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("no stdin for '{bin}'"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("no stdout for '{bin}'"))?;
+    // Drain stderr so a wedged child can't block on a full pipe.
+    if let Some(stderr) = child.stderr.take() {
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(_)) = lines.next_line().await {}
+        });
+    }
+    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    tokio::spawn(async move {
+        while let Some(line) = rx.recv().await {
+            if stdin.write_all(line.as_bytes()).await.is_err() {
+                break;
+            }
+            if stdin.write_all(b"\n").await.is_err() {
+                break;
+            }
+            let _ = stdin.flush().await;
+        }
+    });
+    let interrupt = Arc::new(AtomicBool::new(false));
+    let entry = Arc::new(tokio::sync::Mutex::new(PersistentChild {
+        _child: child,
+        stdin_tx: tx.clone(),
+        reader: BufReader::new(stdout).lines(),
+        interrupt: interrupt.clone(),
+    }));
+    if let Ok(mut m) = persistent_map().lock() {
+        m.insert(key.to_string(), entry.clone());
+    }
+    if let Ok(mut m) = steer_map().lock() {
+        m.insert(
+            key.to_string(),
+            SteerHandle {
+                stdin_tx: tx,
+                interrupt,
+            },
+        );
+    }
+    Ok(entry)
+}
+
+/// Persistent variant of [`ClaudeCliProvider`]: holds one long-lived
+/// `claude --print --input-format stream-json --output-format stream-json`
+/// process per conversation. Selected when OXIDE_CLAUDE_PERSISTENT is set.
+pub struct ClaudePersistentProvider {
+    bin: String,
+}
+
+impl ClaudePersistentProvider {
+    pub fn new() -> Self {
+        Self {
+            bin: resolve_bin("claude", "OXIDE_CLAUDE_BIN"),
+        }
+    }
+}
+
+impl Default for ClaudePersistentProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl Provider for ClaudePersistentProvider {
+    fn name(&self) -> &str {
+        // Same name as the one-shot driver so the engine treats it as a CLI
+        // driver (self-agentic, next-round steering) identically.
+        "claude"
+    }
+
+    async fn stream(&self, req: TurnRequest, sink: mpsc::Sender<StreamItem>) -> anyhow::Result<()> {
+        let (mut prompt, images) = extract_cli_images(&req);
+        if !images.is_empty() {
+            prompt.push_str("\n\nAttached image file(s) — use your Read tool to view:\n");
+            for img in &images {
+                prompt.push_str(&format!("- {img}\n"));
+            }
+        }
+        if prompt.trim().is_empty() {
+            prompt = "Continue.".to_string();
+        }
+        let skey = session_key(&self.bin, &req.conversation_id, &req.cwd);
+
+        // Get-or-spawn the long-lived child for this conversation.
+        let existing = persistent_map()
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&skey).cloned());
+        let entry = match existing {
+            Some(e) => e,
+            None => {
+                let mut args = vec![
+                    "--print".to_string(),
+                    "--input-format".to_string(),
+                    "stream-json".to_string(),
+                    "--output-format".to_string(),
+                    "stream-json".to_string(),
+                    "--verbose".to_string(),
+                    "--include-partial-messages".to_string(),
+                    "--dangerously-skip-permissions".to_string(),
+                ];
+                if let Some(model) = claude_model_arg(&req.model) {
+                    args.push("--model".to_string());
+                    args.push(model.to_string());
+                }
+                if !req.reasoning_effort.is_empty() {
+                    args.push("--effort".to_string());
+                    args.push(claude_effort(&req.reasoning_effort).to_string());
+                }
+                if let Some(extra) = req
+                    .system_append
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    args.push("--append-system-prompt".to_string());
+                    args.push(extra.to_string());
+                }
+                spawn_persistent(&self.bin, &args, &req.cwd, &skey)?
+            }
+        };
+
+        let timeout = claude_cli_timeout()?;
+        let mut st = ClaudeLineState::new(skey.clone());
+        let mut guard = entry.lock().await;
+        // Fresh turn: clear any stale interrupt flag from a boundary-race steer.
+        guard.interrupt.store(false, Ordering::SeqCst);
+
+        // Feed this turn's user message; a closed channel means the child died.
+        if guard.stdin_tx.send(claude_user_line(&prompt)).is_err() {
+            drop(guard);
+            remove_persistent(&skey);
+            // Fall back to a fresh one-shot turn so the user still gets a reply.
+            return ClaudeCliProvider::new().stream(req, sink).await;
+        }
+
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            match tokio::time::timeout_at(deadline, guard.reader.next_line()).await {
+                Ok(Ok(Some(line))) => {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    if let Ok(v) = serde_json::from_str::<Value>(line) {
+                        // Consume the interrupt flag on the turn-ending `result`
+                        // so a steer-triggered abort is not surfaced as an error.
+                        let suppress = v["type"].as_str() == Some("result")
+                            && guard.interrupt.swap(false, Ordering::SeqCst);
+                        if claude_handle_line(&v, &sink, &mut st, suppress) {
+                            break; // `result` → this turn is done; keep the child warm
+                        }
+                    }
+                }
+                Ok(Ok(None)) => {
+                    drop(guard);
+                    remove_persistent(&skey);
+                    let _ = sink
+                        .send(StreamItem::Notice(
+                            "error: claude persistent process exited".to_string(),
+                        ))
+                        .await;
+                    let _ = sink.send(StreamItem::Done).await;
+                    return Ok(());
+                }
+                Ok(Err(e)) => {
+                    drop(guard);
+                    remove_persistent(&skey);
+                    let _ = sink
+                        .send(StreamItem::Notice(format!(
+                            "error: claude read failed: {e}"
+                        )))
+                        .await;
+                    let _ = sink.send(StreamItem::Done).await;
+                    return Ok(());
+                }
+                Err(_) => {
+                    drop(guard);
+                    remove_persistent(&skey);
+                    let _ = sink
+                        .send(StreamItem::Notice(format!(
+                            "error: claude timed out after {}",
+                            format_timeout(timeout)
+                        )))
+                        .await;
+                    let _ = sink.send(StreamItem::Done).await;
+                    return Ok(());
+                }
+            }
+        }
+        drop(guard);
+        let _ = sink.send(StreamItem::Done).await;
+        Ok(())
     }
 }
 
@@ -1194,6 +1676,7 @@ mod cli_driver_tests {
             cwd: String::new(),
             conversation_id: String::new(),
             cli_resume: None,
+            system_append: None,
         };
 
         let (prompt, images) = extract_cli_images(&req);
@@ -1201,5 +1684,339 @@ mod cli_driver_tests {
 
         assert_eq!(prompt, "Cek struktur tim di schema");
         assert_eq!(images.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn run_jsonl_emits_done_last_after_all_content() {
+        // The engine consumer stops reading at StreamItem::Done — anything sent
+        // after it is dropped (the v0.0.107 regression class). Lock the invariant
+        // run_jsonl guarantees: every item the closure emits lands BEFORE the one
+        // terminal Done, and Done is strictly last.
+        let args = vec![
+            "-c".to_string(),
+            r#"printf '{"t":"a"}\n{"t":"b"}\n'"#.to_string(),
+        ];
+        let (tx, mut rx) = mpsc::channel(16);
+        run_jsonl(
+            "/bin/sh",
+            &args,
+            "",
+            None,
+            Duration::from_secs(5),
+            &tx,
+            |v, sink| {
+                if let Some(t) = v["t"].as_str() {
+                    send(sink, StreamItem::TextDelta(t.to_string()));
+                }
+                true
+            },
+        )
+        .await
+        .unwrap();
+        drop(tx);
+
+        let mut items = Vec::new();
+        while let Some(it) = rx.recv().await {
+            items.push(it);
+        }
+        assert!(
+            matches!(items.last(), Some(StreamItem::Done)),
+            "Done must be the final item: {items:?}"
+        );
+        assert_eq!(
+            items
+                .iter()
+                .filter(|i| matches!(i, StreamItem::Done))
+                .count(),
+            1,
+            "exactly one Done"
+        );
+        let texts: Vec<&str> = items
+            .iter()
+            .filter_map(|i| match i {
+                StreamItem::TextDelta(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["a", "b"], "all content before Done, in order");
+    }
+
+    #[test]
+    fn claude_user_line_is_valid_single_line_stream_json() {
+        // The persistent driver writes one user message per NDJSON line; a prompt
+        // with quotes/newlines must serialize without breaking the framing.
+        let line = claude_user_line("hi \"there\"\nsecond line");
+        assert!(!line.contains('\n'), "embedded newline would split NDJSON");
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["type"], "user");
+        assert_eq!(v["message"]["role"], "user");
+        assert_eq!(v["message"]["content"][0]["type"], "text");
+        assert_eq!(
+            v["message"]["content"][0]["text"],
+            "hi \"there\"\nsecond line"
+        );
+    }
+
+    #[test]
+    fn claude_persistent_interrupt_false_without_child() {
+        // No process running for this conversation → nothing to interrupt; caller
+        // falls back to engine next-round steering.
+        assert!(!claude_persistent_interrupt(
+            "no-such-conversation",
+            "/tmp/nowhere"
+        ));
+    }
+
+    // Live integration smoke test for the persistent driver: two turns must run
+    // through ONE warm `claude` process (proving stdin-feed + read-to-`result` +
+    // per-turn Done + process reuse). Ignored by default — spawns a real claude
+    // and makes two subscription calls. Run with:
+    //   cargo test -p oxide-providers -- --ignored persistent_driver
+    #[tokio::test]
+    #[ignore = "spawns a real `claude` process and makes 2 API calls"]
+    async fn persistent_driver_two_turns_one_process() {
+        let provider = ClaudePersistentProvider::new();
+        let conv = format!("persist-smoke-{}", std::process::id());
+        for word in ["ONE", "TWO"] {
+            let (tx, mut rx) = mpsc::channel::<StreamItem>(256);
+            let reader = tokio::spawn(async move {
+                let (mut text, mut done) = (String::new(), false);
+                while let Some(it) = rx.recv().await {
+                    match it {
+                        StreamItem::TextDelta(t) => text.push_str(&t),
+                        StreamItem::Done => {
+                            done = true;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                (text, done)
+            });
+            let req = TurnRequest {
+                model: String::new(),
+                reasoning_effort: String::new(),
+                temperature: 0.0,
+                messages: vec![Message::new(
+                    Role::User,
+                    format!("reply with exactly the word {word}, nothing else"),
+                )],
+                tools: Vec::new(),
+                cwd: String::new(),
+                conversation_id: conv.clone(),
+                cli_resume: None,
+                system_append: None,
+            };
+            provider.stream(req, tx).await.unwrap();
+            let (text, done) = reader.await.unwrap();
+            assert!(done, "turn must end with Done");
+            assert!(
+                text.to_uppercase().contains(word),
+                "turn {word}: got {text:?}"
+            );
+        }
+        // After two turns the conversation still has exactly one warm child.
+        let live = persistent_map()
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|k| k.contains(&conv))
+            .count();
+        assert_eq!(live, 1, "two turns share one persistent process");
+        remove_persistent(&session_key(&provider.bin, &conv, ""));
+    }
+
+    // Live test for mid-turn interrupt: a long turn aborted via
+    // claude_persistent_interrupt must end with Done and NO error notice (the
+    // suppress flag swallows the interrupt's error_during_execution result).
+    // Ignored by default — spawns a real claude. Run with:
+    //   cargo test -p oxide-providers -- --ignored persistent_driver_interrupt
+    #[tokio::test]
+    #[ignore = "spawns a real `claude` process and makes 1 API call"]
+    async fn persistent_driver_interrupt_aborts_turn() {
+        let conv = format!("persist-int-{}", std::process::id());
+        let (tx, mut rx) = mpsc::channel::<StreamItem>(512);
+        let conv_turn = conv.clone();
+        let turn = tokio::spawn(async move {
+            let provider = ClaudePersistentProvider::new();
+            let req = TurnRequest {
+                model: String::new(),
+                reasoning_effort: String::new(),
+                temperature: 0.0,
+                messages: vec![Message::new(
+                    Role::User,
+                    "Write the numbers 1 through 40, each on its own line as \
+                     'N: <one short factual sentence>'. Go slowly and thoroughly."
+                        .to_string(),
+                )],
+                tools: Vec::new(),
+                cwd: String::new(),
+                conversation_id: conv_turn,
+                cli_resume: None,
+                system_append: None,
+            };
+            provider.stream(req, tx).await.unwrap();
+        });
+
+        // Let the turn start generating, then interrupt mid-stream.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(
+            claude_persistent_interrupt(&conv, ""),
+            "interrupt should reach the live child"
+        );
+
+        let mut got_done = false;
+        let mut saw_error = false;
+        while let Some(it) = rx.recv().await {
+            match it {
+                StreamItem::Notice(n) if n.starts_with("error:") => saw_error = true,
+                StreamItem::Done => {
+                    got_done = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        turn.await.unwrap();
+        assert!(got_done, "interrupted turn must still end with Done");
+        assert!(!saw_error, "interrupt must not surface a turn error");
+        remove_persistent(&session_key(
+            &ClaudePersistentProvider::new().bin,
+            &conv,
+            "",
+        ));
+    }
+
+    #[tokio::test]
+    async fn bg_routing_parses_path_then_streams_new_read_lines() {
+        let (tx, mut rx) = mpsc::channel::<StreamItem>(64);
+        let mut bg = BgTracker::default();
+
+        // Background Bash result → extract the wrapper path (colon wording) AND
+        // the command's redirect target.
+        bg.started.insert(
+            "toolu_bash".to_string(),
+            "for i in 1 2 3; do echo tick-$i; done > /tmp/redir.log 2>&1".to_string(),
+        );
+        let bash_res = serde_json::json!(
+            "Command running in background with ID: byz85bp8o. \
+             Output is being written to: /tmp/bg-out-123.log"
+        );
+        assert!(bg_on_tool_result(&mut bg, "toolu_bash", &bash_res, &tx));
+        assert_eq!(
+            bg.files.get("/tmp/bg-out-123.log").map(String::as_str),
+            Some("toolu_bash"),
+            "wrapper path tracked"
+        );
+        assert_eq!(
+            bg.files.get("/tmp/redir.log").map(String::as_str),
+            Some("toolu_bash"),
+            "redirect target tracked"
+        );
+
+        // First Read poll → forward all lines (line-number prefix stripped).
+        bg.reads
+            .insert("toolu_r1".to_string(), "toolu_bash".to_string());
+        let read1 = serde_json::json!("1\ttick-1\n2\ttick-2\n3\ttick-3");
+        assert!(bg_on_tool_result(&mut bg, "toolu_r1", &read1, &tx));
+
+        // Second poll → only the newly-appended lines.
+        bg.reads
+            .insert("toolu_r2".to_string(), "toolu_bash".to_string());
+        let read2 = serde_json::json!("1\ttick-1\n2\ttick-2\n3\ttick-3\n4\ttick-4\n5\ttick-5");
+        assert!(bg_on_tool_result(&mut bg, "toolu_r2", &read2, &tx));
+
+        // Unrelated result → not consumed.
+        assert!(!bg_on_tool_result(
+            &mut bg,
+            "toolu_other",
+            &serde_json::json!("x"),
+            &tx
+        ));
+
+        drop(tx);
+        let mut outs = Vec::new();
+        while let Some(it) = rx.recv().await {
+            if let StreamItem::CommandOutput { id, chunk, .. } = it {
+                outs.push((id, chunk));
+            }
+        }
+        assert_eq!(outs.len(), 3, "path line + two poll appends: {outs:?}");
+        assert_eq!(outs[0].0, "toolu_bash");
+        assert!(outs[0].1.contains("running in background"));
+        assert_eq!(
+            outs[1],
+            (
+                "toolu_bash".to_string(),
+                "tick-1\ntick-2\ntick-3".to_string()
+            )
+        );
+        assert_eq!(
+            outs[2],
+            ("toolu_bash".to_string(), "tick-4\ntick-5".to_string())
+        );
+    }
+
+    // Live end-to-end: a real background command's output must reach a
+    // CommandOutput row (validates the tool_use hooks + tool_result routing).
+    // Ignored — spawns a real claude. Run with:
+    //   cargo test -p oxide-providers -- --ignored persistent_driver_streams_background
+    #[tokio::test]
+    #[ignore = "spawns a real `claude` process and makes API calls"]
+    async fn persistent_driver_streams_background_output() {
+        let conv = format!("persist-bg-{}", std::process::id());
+        let (tx, mut rx) = mpsc::channel::<StreamItem>(1024);
+        let conv_turn = conv.clone();
+        let turn = tokio::spawn(async move {
+            let provider = ClaudePersistentProvider::new();
+            let req = TurnRequest {
+                model: String::new(),
+                reasoning_effort: String::new(),
+                temperature: 0.0,
+                messages: vec![Message::new(
+                    Role::User,
+                    "Run this command in the background: \
+                     'for i in 1 2 3; do echo tick-$i; sleep 1; done'. \
+                     Then poll its output file until it finishes and report what it printed."
+                        .to_string(),
+                )],
+                tools: Vec::new(),
+                cwd: String::new(),
+                conversation_id: conv_turn,
+                cli_resume: None,
+                system_append: None,
+            };
+            provider.stream(req, tx).await.unwrap();
+        });
+
+        let mut got_bg_start = false;
+        let mut got_tick = false;
+        while let Some(it) = rx.recv().await {
+            match it {
+                StreamItem::CommandOutput { chunk, .. } => {
+                    if chunk.contains("running in background") {
+                        got_bg_start = true;
+                    }
+                    if chunk.contains("tick-") {
+                        got_tick = true;
+                    }
+                }
+                StreamItem::Done => break,
+                _ => {}
+            }
+        }
+        turn.await.unwrap();
+        // Reliable: the bg command's start line always routes to its row.
+        assert!(
+            got_bg_start,
+            "background command's start line must route to a CommandOutput row"
+        );
+        // Best-effort: tick output routes when claude reads a tracked file.
+        eprintln!("bg tick output routed to the command row: {got_tick}");
+        remove_persistent(&session_key(
+            &ClaudePersistentProvider::new().bin,
+            &conv,
+            "",
+        ));
     }
 }

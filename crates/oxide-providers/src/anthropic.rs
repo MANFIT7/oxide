@@ -273,6 +273,7 @@ mod tests {
             cwd: "/tmp".into(),
             conversation_id: "session".into(),
             cli_resume: None,
+            system_append: None,
         }
     }
 

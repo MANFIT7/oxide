@@ -2547,6 +2547,7 @@ Rules:
                 .map(|s| format!("{}:cli-self-improve:{}", s.id, turn.0))
                 .unwrap_or_else(|| format!("cli-self-improve:{}", turn.0)),
             cli_resume: None,
+            system_append: None,
         };
 
         let raw = match collect_provider_text_silent("chatgpt", req).await {
@@ -2938,6 +2939,7 @@ Rules:
                 .map(|s| s.id.clone())
                 .unwrap_or_default(),
             cli_resume: None,
+            system_append: None,
         };
         let (tx, mut rx) = mpsc::channel::<StreamItem>(STREAM_QUEUE);
         let provider = oxide_providers::build(provider_id);
@@ -3154,6 +3156,7 @@ Rules:
                 cwd: self.workspace.display().to_string(),
                 conversation_id,
                 cli_resume: None,
+                system_append: None,
             };
 
             let (stream_tx, mut stream_rx) = mpsc::channel::<StreamItem>(STREAM_QUEUE);
@@ -3708,6 +3711,11 @@ Treat the following as the only current, top-priority instruction:]\n\n{user_tex
         let harness = self.active_harness();
         let policy = harness.loop_policy();
         let mut sys = harness.system_prompt();
+        // Harness persona/policy to append to a CLI agent's own prompt (claude
+        // `--append-system-prompt`). Captured once here — owned, so it doesn't
+        // extend the `harness` borrow into the turn loop. None unless the harness
+        // opts in; deliberately NOT `sys` (that carries the workspace tree etc.).
+        let cli_system_append = harness.cli_system_append();
         if let Some(route) = selected_skill_route(harness, &user_text) {
             sys.push_str(&render_skill_route(&route));
         }
@@ -4175,6 +4183,7 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                     .session_store
                     .as_ref()
                     .and_then(|s| db::cli_session(&s.id)),
+                system_append: cli_system_append.clone(),
             };
 
             let (stream_tx, mut stream_rx) = mpsc::channel::<StreamItem>(STREAM_QUEUE);
@@ -4321,6 +4330,21 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                                 }
                                 self.session.push(Message::new(Role::User, text.clone()));
                                 self.emit(Event::Info { text: format!("Steering: {text}") }).await;
+                                // Persistent claude driver: abort the in-flight
+                                // generation NOW so the steer redirects mid-turn
+                                // instead of waiting for the current answer. The
+                                // steer text still flows via the next round
+                                // (steered=true). No-op for every other provider /
+                                // the one-shot driver.
+                                if self.config.provider == "claude" {
+                                    let conv = self
+                                        .session_store
+                                        .as_ref()
+                                        .map(|s| s.id.clone())
+                                        .unwrap_or_default();
+                                    let cwd = self.workspace.display().to_string();
+                                    oxide_providers::claude_persistent_interrupt(&conv, &cwd);
+                                }
                                 steered = true;
                             }
                             // Rewind works mid-turn too — restoring a checkpoint
@@ -4640,6 +4664,7 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
                         cwd: String::new(),
                         conversation_id: String::new(),
                         cli_resume: None,
+                        system_append: None,
                     };
                     let (stx, mut srx) = mpsc::channel::<StreamItem>(64);
                     let task = tokio::spawn(async move { provider.stream(req, stx).await });
@@ -4706,6 +4731,7 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
                             cwd: String::new(),
                             conversation_id: String::new(),
                             cli_resume: None,
+                            system_append: None,
                         };
                         let (stx, mut srx) = mpsc::channel::<StreamItem>(64);
                         let task = tokio::spawn(async move { provider.stream(req, stx).await });

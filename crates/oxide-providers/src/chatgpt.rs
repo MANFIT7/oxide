@@ -1351,6 +1351,7 @@ mod tests {
             cwd: "/tmp".to_string(),
             conversation_id: "session".to_string(),
             cli_resume: None,
+            system_append: None,
         }
     }
 

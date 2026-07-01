@@ -16,7 +16,10 @@ pub use catalog::{
     DiagnosticStatus, ProviderAuth, ProviderCapability, ProviderDiagnostic, ProviderInfo,
     ProviderKind, ProviderModel, ProviderStability,
 };
-pub use cli::{ClaudeCliProvider, ClaudeInteractiveProvider, CodexCliProvider};
+pub use cli::{
+    claude_persistent_interrupt, ClaudeCliProvider, ClaudeInteractiveProvider,
+    ClaudePersistentProvider, CodexCliProvider,
+};
 
 use async_trait::async_trait;
 use oxide_protocol::ToolSpec;
@@ -106,6 +109,11 @@ pub struct TurnRequest {
     /// from a previous run, so a resume after an app restart reattaches to the
     /// real CLI session instead of starting fresh. None = no prior link.
     pub cli_resume: Option<String>,
+    /// Harness persona/policy to append to an external agent CLI's own system
+    /// prompt (claude `--append-system-prompt`). The CLI analog of a Managed-
+    /// Agents `agent_with_overrides` `system` override. None = leave the CLI
+    /// agent's prompt untouched (the default for every non-opted-in harness).
+    pub system_append: Option<String>,
 }
 
 /// Normalized streaming output. Each provider maps its SSE events to these.
@@ -475,7 +483,19 @@ pub fn build(provider: &str) -> Box<dyn Provider> {
         "anthropic" => Box::new(anthropic::AnthropicProvider::from_env()),
         // CLI drivers — use the user's logged-in codex/claude, no API key.
         "codex" => Box::new(cli::CodexCliProvider::new()),
-        "claude" => Box::new(cli::ClaudeCliProvider::new()),
+        // OXIDE_CLAUDE_PERSISTENT swaps in the long-lived `--input-format
+        // stream-json` driver (one warm process per conversation); unset keeps
+        // the proven one-shot driver.
+        "claude" => {
+            if std::env::var("OXIDE_CLAUDE_PERSISTENT")
+                .map(|v| v != "0" && !v.is_empty())
+                .unwrap_or(false)
+            {
+                Box::new(cli::ClaudePersistentProvider::new())
+            } else {
+                Box::new(cli::ClaudeCliProvider::new())
+            }
+        }
         "claude_interactive" => Box::new(cli::ClaudeInteractiveProvider::new()),
         // ChatGPT subscription, no API key / no CLI (reuses codex OAuth login).
         "chatgpt" => Box::new(chatgpt::ChatGptProvider::new()),

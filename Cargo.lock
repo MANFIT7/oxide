@@ -5434,7 +5434,7 @@ checksum = "c1b04fb49957986fdce4d6ee7a65027d55d4b6d2265e5848bbb507b58ccfdb6f"
 
 [[package]]
 name = "oxide-cli"
-version = "0.0.119"
+version = "0.0.120"
 dependencies = [
  "anyhow",
  "clap",
@@ -5454,7 +5454,7 @@ dependencies = [
 
 [[package]]
 name = "oxide-config"
-version = "0.0.119"
+version = "0.0.120"
 dependencies = [
  "anyhow",
  "oxide-protocol",
@@ -5464,7 +5464,7 @@ dependencies = [
 
 [[package]]
 name = "oxide-core"
-version = "0.0.119"
+version = "0.0.120"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5492,7 +5492,7 @@ dependencies = [
 
 [[package]]
 name = "oxide-design"
-version = "0.0.119"
+version = "0.0.120"
 dependencies = [
  "serde",
  "serde_json",
@@ -5500,7 +5500,7 @@ dependencies = [
 
 [[package]]
 name = "oxide-desktop"
-version = "0.0.119"
+version = "0.0.120"
 dependencies = [
  "anyhow",
  "eframe",
@@ -5516,7 +5516,7 @@ dependencies = [
 
 [[package]]
 name = "oxide-frontend"
-version = "0.0.119"
+version = "0.0.120"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5527,7 +5527,7 @@ dependencies = [
 
 [[package]]
 name = "oxide-gui"
-version = "0.0.119"
+version = "0.0.120"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -5554,7 +5554,7 @@ dependencies = [
 
 [[package]]
 name = "oxide-harness"
-version = "0.0.119"
+version = "0.0.120"
 dependencies = [
  "anyhow",
  "oxide-protocol",
@@ -5566,7 +5566,7 @@ dependencies = [
 
 [[package]]
 name = "oxide-mcp"
-version = "0.0.119"
+version = "0.0.120"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5580,7 +5580,7 @@ dependencies = [
 
 [[package]]
 name = "oxide-protocol"
-version = "0.0.119"
+version = "0.0.120"
 dependencies = [
  "oxide-design",
  "serde",
@@ -5589,7 +5589,7 @@ dependencies = [
 
 [[package]]
 name = "oxide-providers"
-version = "0.0.119"
+version = "0.0.120"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5607,7 +5607,7 @@ dependencies = [
 
 [[package]]
 name = "oxide-tui"
-version = "0.0.119"
+version = "0.0.120"
 dependencies = [
  "anyhow",
  "async-trait",

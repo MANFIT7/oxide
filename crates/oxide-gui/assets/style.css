@@ -2509,6 +2509,8 @@ svg { stroke-width: 1.6; }
 /* status pill text changes crossfade slightly */
 .status-pill { transition: opacity .2s ease; }
 @media (prefers-reduced-motion: reduce) { .countup { transition: none; } .edits-row-d { animation: none; } }
+.activity-count { margin-left: 6px; font-size: 11px; opacity: .55; font-variant-numeric: tabular-nums; }
+.activity-editcounts { margin-left: 8px; display: inline-flex; align-items: center; gap: 6px; font-size: 11px; font-variant-numeric: tabular-nums; }
 
 /* syntect class-based palette — dark */
 .hl .comment { color: #7d7d88; font-style: italic; }
