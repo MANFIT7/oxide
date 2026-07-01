@@ -10,8 +10,8 @@ BIN="target/release/oxide"
 SIGN_NAME="${OXIDE_SIGN_IDENTITY:-Oxide Dev}"
 REQUIRE_SIGNING="${OXIDE_REQUIRE_SIGNING:-0}"
 
-echo "▶ building release binary…"
-cargo build --release -p oxide-cli
+echo "▶ building release binaries (oxide + oxide-term)…"
+cargo build --release -p oxide-cli -p oxide-term
 
 echo "▶ assembling $APP.app…"
 rm -rf "$DIST"
@@ -30,19 +30,18 @@ exec "$DIR/oxide-bin" gui
 LAUNCH
 chmod +x "$APPDIR/Contents/MacOS/$APP" "$APPDIR/Contents/MacOS/oxide-bin"
 
-# Native GPU terminal (oxide-term) — a standalone wgpu/Metal terminal, excluded
-# from the workspace, so build it on its own and bundle it next to the binary.
-# The GUI's "Native GPU terminal" button launches it via a current_exe-relative
-# path. Best-effort: a build failure must NOT fail the dmg (the button just stays
-# inert and prints a build hint).
-echo "▶ building native GPU terminal (oxide-term)…"
-if cargo build --release --manifest-path crates/oxide-term/Cargo.toml; then
-  cp crates/oxide-term/target/release/oxide-term "$APPDIR/Contents/MacOS/oxide-term"
-  chmod +x "$APPDIR/Contents/MacOS/oxide-term"
-  echo "  ✓ bundled oxide-term"
-else
-  echo "  ⚠ oxide-term build failed — GPU terminal button will be inert in this build"
+# Native GPU terminal (oxide-term) — built above as a workspace member, so it's
+# in the shared target/ next to the main binary. Bundle it (the GUI launches it
+# via a current_exe-relative path). REQUIRED: fail the dmg rather than silently
+# ship an app whose terminal button is inert.
+echo "▶ bundling native GPU terminal (oxide-term)…"
+if [ ! -x target/release/oxide-term ]; then
+  echo "✗ oxide-term missing at target/release/oxide-term — build failed?" >&2
+  exit 1
 fi
+cp target/release/oxide-term "$APPDIR/Contents/MacOS/oxide-term"
+chmod +x "$APPDIR/Contents/MacOS/oxide-term"
+echo "  ✓ bundled oxide-term"
 
 # icon: logo.png -> oxide.icns
 echo "▶ building icon…"

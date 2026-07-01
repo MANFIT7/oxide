@@ -21,6 +21,3 @@ alacritty_terminal = "0.26"
 # Cross-platform PTY (same crate the Oxide GUI already uses).
 portable-pty = "0.9"
 anyhow = "1"
-
-[profile.release]
-opt-level = 3

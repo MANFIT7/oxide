@@ -84,10 +84,8 @@ fn oxide_term_bin() -> std::path::PathBuf {
         }
     }
     if let Ok(cwd) = std::env::current_dir() {
-        for rel in [
-            "crates/oxide-term/target/release/oxide-term",
-            "crates/oxide-term/target/debug/oxide-term",
-        ] {
+        // oxide-term is a workspace member → built into the shared target/.
+        for rel in ["target/release/oxide-term", "target/debug/oxide-term"] {
             let p = cwd.join(rel);
             if p.exists() {
                 return p;

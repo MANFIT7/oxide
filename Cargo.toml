@@ -13,14 +13,14 @@ members = [
     "crates/oxide-gui",
     "crates/oxide-desktop",
     "crates/oxide-cli",
+    # Native GPU (wgpu/Metal) terminal — a workspace member so it's built + tested
+    # together with the app (and bundled from the shared target/ next to the main
+    # binary). Heavy wgpu/winit deps, but both CI jobs are macOS-only.
+    "crates/oxide-term",
 ]
-# Standalone native GPU terminal PoC — excluded from the main build/release so its
-# heavy wgpu/winit deps don't slow CI or gate releases. Build it on its own:
-#   cargo build --manifest-path crates/oxide-term/Cargo.toml
-exclude = ["crates/oxide-term"]
 
 [workspace.package]
-version = "0.0.123"
+version = "0.0.124"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Oxide contributors"]
