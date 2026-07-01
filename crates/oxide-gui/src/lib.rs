@@ -123,8 +123,8 @@ fn launch_native_terminal() -> bool {
 /// User-facing hint when oxide-term can't be launched (missing binary).
 fn oxide_term_not_found_msg() -> String {
     format!(
-        "oxide-term not found at {}. Reinstall the app, or build it: \
-         cargo build --release --manifest-path crates/oxide-term/Cargo.toml",
+        "oxide-term not found at {}. Update the app (OTA now ships the terminal \
+         too) or reinstall the latest dmg; in a dev build run `cargo build`.",
         oxide_term_bin().display()
     )
 }

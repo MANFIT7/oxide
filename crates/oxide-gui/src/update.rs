@@ -177,7 +177,46 @@ pub async fn apply<F: Fn(f32)>(info: &UpdateInfo, on_progress: F) -> anyhow::Res
     }
     self_replace::self_replace(&tmp)?;
     let _ = std::fs::remove_file(&tmp);
+    // self-replace only swaps the main binary; refresh the sibling native
+    // terminal (oxide-term) too, so OTA-only users get it without reinstalling
+    // the dmg. Best-effort — never fail the update over it.
+    let _ = update_oxide_term(&client, &info.url).await;
     on_progress(1.0);
+    Ok(())
+}
+
+/// Download the matching `oxide-term-*.gz` from the same release and place it
+/// next to the (just-updated) main binary. The main-binary self-replace doesn't
+/// touch oxide-term, so without this an OTA-only user never receives the native
+/// terminal. Best-effort: any failure is ignored by the caller.
+async fn update_oxide_term(client: &reqwest::Client, main_url: &str) -> anyhow::Result<()> {
+    let term_url = main_url.replace("oxide-macos-arm64.gz", "oxide-term-macos-arm64.gz");
+    if term_url == main_url {
+        return Ok(()); // unrecognized asset naming — nothing to fetch
+    }
+    let dir = std::env::current_exe()?
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("no exe dir"))?
+        .to_path_buf();
+    let resp = client.get(&term_url).send().await?;
+    if !resp.status().is_success() {
+        anyhow::bail!("oxide-term download failed: {}", resp.status());
+    }
+    let buf = resp.bytes().await?;
+    use std::io::Read;
+    let mut d = flate2::read::GzDecoder::new(&buf[..]);
+    let mut out = Vec::new();
+    d.read_to_end(&mut out)?;
+    // Write to a temp in the same dir then rename, so a partial download never
+    // leaves a torn oxide-term binary.
+    let tmp = dir.join(".oxide-term.new");
+    std::fs::write(&tmp, &out)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
+    }
+    std::fs::rename(&tmp, dir.join("oxide-term"))?;
     Ok(())
 }
 

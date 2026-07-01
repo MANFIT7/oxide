@@ -195,13 +195,16 @@ jobs:
           fi
           bash scripts/make-dmg.sh
 
-      - name: Package OTA binary (gzip)
-        run: gzip -9 -c target/release/oxide > oxide-macos-arm64.gz
+      - name: Package OTA binaries (gzip)
+        run: |
+          gzip -9 -c target/release/oxide > oxide-macos-arm64.gz
+          gzip -9 -c target/release/oxide-term > oxide-term-macos-arm64.gz
 
       - name: Generate asset checksums
         run: |
           shasum -a 256 dist/Oxide.dmg > dist/Oxide.dmg.sha256
           shasum -a 256 oxide-macos-arm64.gz > oxide-macos-arm64.gz.sha256
+          shasum -a 256 oxide-term-macos-arm64.gz > oxide-term-macos-arm64.gz.sha256
 
       - name: Generate release notes
         env:
@@ -261,4 +264,6 @@ jobs:
             dist/Oxide.dmg.sha256
             oxide-macos-arm64.gz
             oxide-macos-arm64.gz.sha256
+            oxide-term-macos-arm64.gz
+            oxide-term-macos-arm64.gz.sha256
           fail_on_unmatched_files: true
