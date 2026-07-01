@@ -17,6 +17,7 @@ reqwest = { workspace = true }
 eventsource-stream = { workspace = true }
 futures = { workspace = true }
 portable-pty = { workspace = true }
+sha2 = { workspace = true }
 
 # killpg(2): kill the CLI driver's whole process group on interrupt so a build
 # (or other grandchild) it spawned dies with it instead of being orphaned.

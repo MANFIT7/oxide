@@ -12,6 +12,7 @@
 use crate::{Provider, Role, StreamItem, TurnRequest};
 use async_trait::async_trait;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1238,6 +1239,9 @@ struct PersistentChild {
     /// Set by `claude_persistent_interrupt`; the read loop consumes it on the
     /// next `result` so a steer-triggered abort isn't shown as a turn error.
     interrupt: Arc<AtomicBool>,
+    /// The model this child was spawned with; a per-turn mismatch triggers a live
+    /// `set_model` control message instead of a respawn.
+    model: String,
 }
 
 #[allow(clippy::type_complexity)]
@@ -1279,6 +1283,37 @@ fn claude_interrupt_line() -> String {
         "type": "control_request",
         "request_id": "oxide-interrupt",
         "request": { "subtype": "interrupt" }
+    })
+    .to_string()
+}
+
+/// Deterministic RFC-4122 v5-style UUID derived from Oxide's conversation id
+/// (which is `{ms}-{pid}`, not a UUID). Used as claude's `--session-id` so the
+/// session id is stable/known and can be `--resume`d after an app restart.
+fn stable_session_uuid(conv: &str) -> String {
+    let d = Sha256::digest(conv.as_bytes());
+    let mut b = [0u8; 16];
+    b.copy_from_slice(&d[..16]);
+    b[6] = (b[6] & 0x0f) | 0x50; // version 5
+    b[8] = (b[8] & 0x3f) | 0x80; // RFC-4122 variant
+    let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &h[0..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..32]
+    )
+}
+
+/// Control message to switch the live persistent process's model mid-session
+/// (GUI Reconfigure) without respawning — keeps the in-process context.
+fn claude_set_model_line(model: &str) -> String {
+    serde_json::json!({
+        "type": "control_request",
+        "request_id": "oxide-set-model",
+        "request": { "subtype": "set_model", "model": model }
     })
     .to_string()
 }
@@ -1326,6 +1361,7 @@ fn spawn_persistent(
     args: &[String],
     cwd: &str,
     key: &str,
+    model: &str,
 ) -> anyhow::Result<Arc<tokio::sync::Mutex<PersistentChild>>> {
     let mut cmd = tokio::process::Command::new(bin);
     cmd.args(args)
@@ -1374,6 +1410,7 @@ fn spawn_persistent(
         stdin_tx: tx.clone(),
         reader: BufReader::new(stdout).lines(),
         interrupt: interrupt.clone(),
+        model: model.to_string(),
     }));
     if let Ok(mut m) = persistent_map().lock() {
         m.insert(key.to_string(), entry.clone());
@@ -1450,8 +1487,18 @@ impl Provider for ClaudePersistentProvider {
                     "--include-partial-messages".to_string(),
                     "--dangerously-skip-permissions".to_string(),
                 ];
+                // Resume a persisted session (context survives an app restart —
+                // the process map is per-run) or pin a deterministic session id.
+                if let Some(id) = req.cli_resume.clone().or_else(|| session_get(&skey)) {
+                    args.push("--resume".to_string());
+                    args.push(id);
+                } else {
+                    args.push("--session-id".to_string());
+                    args.push(stable_session_uuid(&req.conversation_id));
+                }
                 args.extend(claude_tuning_args(&req));
-                spawn_persistent(&self.bin, &args, &req.cwd, &skey)?
+                let model = claude_model_arg(&req.model).unwrap_or("").to_string();
+                spawn_persistent(&self.bin, &args, &req.cwd, &skey, &model)?
             }
         };
 
@@ -1460,6 +1507,13 @@ impl Provider for ClaudePersistentProvider {
         let mut guard = entry.lock().await;
         // Fresh turn: clear any stale interrupt flag from a boundary-race steer.
         guard.interrupt.store(false, Ordering::SeqCst);
+        // Model changed since spawn (e.g. GUI Reconfigure) → switch the live
+        // process with a control message instead of respawning, keeping context.
+        let want_model = claude_model_arg(&req.model).unwrap_or("");
+        if !want_model.is_empty() && guard.model != want_model {
+            let _ = guard.stdin_tx.send(claude_set_model_line(want_model));
+            guard.model = want_model.to_string();
+        }
 
         // Feed this turn's user message; a closed channel means the child died.
         if guard.stdin_tx.send(claude_user_line(&prompt)).is_err() {
@@ -1885,6 +1939,67 @@ mod cli_driver_tests {
             .count();
         assert_eq!(live, 1, "two turns share one persistent process");
         remove_persistent(&session_key(&provider.bin, &conv, ""));
+    }
+
+    #[cfg(test)]
+    async fn drive_persist_turn(
+        provider: &ClaudePersistentProvider,
+        conv: &str,
+        text: &str,
+    ) -> String {
+        let (tx, mut rx) = mpsc::channel::<StreamItem>(256);
+        let reader = tokio::spawn(async move {
+            let mut out = String::new();
+            while let Some(it) = rx.recv().await {
+                match it {
+                    StreamItem::TextDelta(t) => out.push_str(&t),
+                    StreamItem::Done => break,
+                    _ => {}
+                }
+            }
+            out
+        });
+        let req = TurnRequest {
+            model: String::new(),
+            reasoning_effort: String::new(),
+            temperature: 0.0,
+            messages: vec![Message::new(Role::User, text.to_string())],
+            tools: Vec::new(),
+            cwd: String::new(),
+            conversation_id: conv.to_string(),
+            cli_resume: None,
+            system_append: None,
+            claude_agents: None,
+        };
+        provider.stream(req, tx).await.unwrap();
+        reader.await.unwrap()
+    }
+
+    // Live #4: a fresh persistent process must `--resume` the same (deterministic)
+    // session id after a restart (registry cleared) and recall prior context.
+    //   cargo test -p oxide-providers -- --ignored persistent_driver_resumes
+    #[tokio::test]
+    #[ignore = "spawns a real `claude` process and makes 2 API calls"]
+    async fn persistent_driver_resumes_after_restart() {
+        let provider = ClaudePersistentProvider::new();
+        let conv = format!("persist-resume-{}", std::process::id());
+        let key = session_key(&provider.bin, &conv, "");
+
+        drive_persist_turn(&provider, &conv, "Remember the number 7788. Reply OK.").await;
+        // Simulate an app restart: drop the warm process from the registry.
+        remove_persistent(&key);
+
+        let reply = drive_persist_turn(
+            &provider,
+            &conv,
+            "What number did I ask you to remember? Reply with just the number.",
+        )
+        .await;
+        assert!(
+            reply.contains("7788"),
+            "resumed session must recall prior context: {reply:?}"
+        );
+        remove_persistent(&key);
     }
 
     // Live test for mid-turn interrupt: a long turn aborted via
