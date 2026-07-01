@@ -55,6 +55,8 @@ const SVG_OPENAI: &str = include_str!("../assets/providers/openai-icon.svg");
 const SVG_CURSOR: &str = include_str!("../assets/providers/cursor.svg");
 const SVG_MCP: &str = include_str!("../assets/providers/mcp-icon.svg");
 const SVG_GITHUB: &str = include_str!("../assets/providers/github.svg");
+const SVG_VSCODE: &str = include_str!("../assets/providers/vscode.svg");
+const SVG_ZED: &str = include_str!("../assets/providers/zed.svg");
 
 /// SVG markup from `<svg` onward (drops the `<?xml?>` prolog) for inline use.
 fn svg_inner(s: &str) -> String {
@@ -77,6 +79,31 @@ fn provider_logo(provider: &str) -> Option<String> {
         "github" => Some(svg_inner(SVG_GITHUB).replace("#181717", "currentColor")),
         _ => None,
     }
+}
+
+/// Logo markup for an external editor button. The Zed mark ships black, so it
+/// is recolored to follow the UI text color.
+fn editor_logo(editor: &str) -> Option<String> {
+    match editor {
+        "vscode" => Some(svg_inner(SVG_VSCODE)),
+        "cursor" => Some(svg_inner(SVG_CURSOR)),
+        "zed" => Some(svg_inner(SVG_ZED).replace("\"black\"", "\"currentColor\"")),
+        _ => None,
+    }
+}
+
+/// Open a path (workspace dir or single file) in an external editor via
+/// `open -a`, which resolves the app bundle without relying on CLI shims
+/// being on the GUI's limited PATH. Runs off the UI thread; failure (app not
+/// installed) is silent — `open` shows its own dialog in that case.
+fn open_in_editor(app: &'static str, path: std::path::PathBuf) {
+    std::thread::spawn(move || {
+        let _ = std::process::Command::new("open")
+            .arg("-a")
+            .arg(app)
+            .arg(&path)
+            .status();
+    });
 }
 
 /// Resolve the `oxide-term` binary: bundled next to the app exe (inside
@@ -7428,6 +7455,27 @@ fn app() -> Element {
                                         }
                                     },
                                     "files" => rsx! {
+                                        div { class: "openin-row",
+                                            span { class: "openin-label", "Open in" }
+                                            for (app, key, label) in [
+                                                ("Visual Studio Code", "vscode", "VS Code"),
+                                                ("Cursor", "cursor", "Cursor"),
+                                                ("Zed", "zed", "Zed"),
+                                            ] {
+                                                button {
+                                                    class: "openin-btn",
+                                                    title: "Open workspace in {label}",
+                                                    onclick: {
+                                                        let ws = workspace.clone();
+                                                        move |_| open_in_editor(app, ws.clone())
+                                                    },
+                                                    if let Some(logo) = editor_logo(key) {
+                                                        span { class: "openin-ic", dangerous_inner_html: "{logo}" }
+                                                    }
+                                                    "{label}"
+                                                }
+                                            }
+                                        }
                                         div { class: "tree",
                                             FileNode { path: workspace.clone(), depth: 0, is_root: true }
                                         }
@@ -9848,6 +9896,23 @@ fn Editor() -> Element {
                     if dirty && !is_pdf && !is_img { span { class: "dot-dirty", "●" } }
                 }
                 div { class: "editor-actions",
+                    for (app, key, label) in [
+                        ("Visual Studio Code", "vscode", "VS Code"),
+                        ("Cursor", "cursor", "Cursor"),
+                        ("Zed", "zed", "Zed"),
+                    ] {
+                        button {
+                            class: "openin-btn openin-icon",
+                            title: "Open file in {label}",
+                            onclick: {
+                                let p = path.clone();
+                                move |_| open_in_editor(app, p.clone())
+                            },
+                            if let Some(logo) = editor_logo(key) {
+                                span { class: "openin-ic", dangerous_inner_html: "{logo}" }
+                            }
+                        }
+                    }
                     if !is_pdf && !is_img {
                         button {
                             class: "ed-save",
