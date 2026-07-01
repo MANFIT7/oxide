@@ -3567,3 +3567,4 @@ details::details-content { overflow: clip; }
 .native-term-reopen:hover { border-color: color-mix(in srgb, var(--syn-accent) 40%, var(--border)); }
 .native-term-reopen:active { transform: scale(.97); }
 @media (prefers-reduced-motion: reduce) { .native-term-reopen:active { transform: none; } }
+.native-term-err { margin-top: 10px; font-size: 12px; line-height: 1.45; color: var(--danger, #c0392b); word-break: break-word; }

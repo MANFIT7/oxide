@@ -109,12 +109,26 @@ fn spawn_oxide_term(cwd: &str, cmd: &[String]) -> bool {
     for a in cmd {
         c.arg(a);
     }
+    // Capture oxide-term's stderr to a log so a GPU/Metal init crash (which makes
+    // the window silently fail to appear) is diagnosable instead of vanishing.
+    if let Ok(f) = std::fs::File::create(std::env::temp_dir().join("oxide-term.log")) {
+        c.stderr(std::process::Stdio::from(f));
+    }
     c.spawn().is_ok()
 }
 
 /// Open a plain native GPU terminal ($SHELL) — the terminal-panel button.
 fn launch_native_terminal() -> bool {
     spawn_oxide_term("", &[])
+}
+
+/// User-facing hint when oxide-term can't be launched (missing binary).
+fn oxide_term_not_found_msg() -> String {
+    format!(
+        "oxide-term not found at {}. Reinstall the app, or build it: \
+         cargo build --release --manifest-path crates/oxide-term/Cargo.toml",
+        oxide_term_bin().display()
+    )
 }
 
 struct ModelPreset {
@@ -11527,8 +11541,10 @@ fn Message(author: Author, text: String, #[props(default)] live: bool) -> Elemen
 #[component]
 fn TerminalView(id: u64, bin: String, ws: String, resume: Option<String>) -> Element {
     let cmd = agent_tui_command(&bin, resume.as_deref());
+    let mut launch_err = use_signal(|| Option::<String>::None);
     // Auto-open the native window once per tab id (dedup so multiple mounts of the
-    // same logical tab don't spawn duplicate windows).
+    // same logical tab don't spawn duplicate windows). Surface a failure so a
+    // missing binary shows an actionable hint instead of silently doing nothing.
     {
         let ws = ws.clone();
         let cmd = cmd.clone();
@@ -11540,8 +11556,8 @@ fn TerminalView(id: u64, bin: String, ws: String, resume: Option<String>) -> Ele
                 .lock()
                 .map(|mut s| s.insert(id))
                 .unwrap_or(false);
-            if first {
-                spawn_oxide_term(&ws, &cmd);
+            if first && !spawn_oxide_term(&ws, &cmd) {
+                launch_err.set(Some(oxide_term_not_found_msg()));
             }
         });
     }
@@ -11552,6 +11568,7 @@ fn TerminalView(id: u64, bin: String, ws: String, resume: Option<String>) -> Ele
     } else {
         bin.clone()
     };
+    let err = launch_err.read().clone();
     rsx! {
         div { class: "native-term-host",
             div { class: "native-term-card",
@@ -11559,8 +11576,17 @@ fn TerminalView(id: u64, bin: String, ws: String, resume: Option<String>) -> Ele
                 div { class: "native-term-title", "Native terminal" }
                 div { class: "native-term-sub", "{label} — runs in a separate oxide-term window" }
                 button { class: "native-term-reopen",
-                    onclick: move |_| { spawn_oxide_term(&reopen_ws, &reopen_cmd); },
+                    onclick: move |_| {
+                        if spawn_oxide_term(&reopen_ws, &reopen_cmd) {
+                            launch_err.set(None);
+                        } else {
+                            launch_err.set(Some(oxide_term_not_found_msg()));
+                        }
+                    },
                     "Open / reopen window"
+                }
+                if let Some(e) = err {
+                    div { class: "native-term-err", "{e}" }
                 }
             }
         }

@@ -804,9 +804,15 @@ impl Provider for ClaudeCliProvider {
                     .strip_prefix("claude-")
                     .map(str::to_string)
             });
+        // The prompt goes on STDIN, never argv: a large prompt as a CLI arg
+        // overflows ARG_MAX and the spawn fails with E2BIG ("Argument list too
+        // long"), which silently killed steer/continue turns. `claude -p` with
+        // no prompt arg reads the prompt from stdin.
+        if prompt.trim().is_empty() {
+            prompt = "Continue.".to_string();
+        }
         let mut args = vec![
             "-p".to_string(),
-            prompt,
             "--output-format".to_string(),
             "stream-json".to_string(),
             "--verbose".to_string(),
@@ -819,32 +825,7 @@ impl Provider for ClaudeCliProvider {
             args.push("--resume".to_string());
             args.push(id.clone());
         }
-        if let Some(model) = claude_model_arg(&req.model) {
-            args.push("--model".to_string());
-            args.push(model.to_string());
-        }
-        if !req.reasoning_effort.is_empty() {
-            args.push("--effort".to_string());
-            args.push(claude_effort(&req.reasoning_effort).to_string());
-        }
-        // Harness persona/policy layered onto Claude Code's own base prompt — the
-        // CLI analog of a Managed-Agents `system` override. Append, never replace:
-        // Claude Code's tuned base prompt + self-driven workspace gathering stay
-        // intact. Empty/absent for every harness that doesn't opt in.
-        if let Some(extra) = req
-            .system_append
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            args.push("--append-system-prompt".to_string());
-            args.push(extra.to_string());
-        }
-        // Harness-defined subagents (claude `--agents <json>`).
-        if let Some(agents) = &req.claude_agents {
-            args.push("--agents".to_string());
-            args.push(agents.to_string());
-        }
+        args.extend(claude_tuning_args(&req));
 
         let timeout = claude_cli_timeout()?;
         // Shared per-line mapping (also used by the persistent driver) so the two
@@ -854,7 +835,7 @@ impl Provider for ClaudeCliProvider {
             &self.bin,
             &args,
             &req.cwd,
-            None,
+            Some(prompt),
             timeout,
             &sink,
             move |v, sink| {
@@ -1469,27 +1450,7 @@ impl Provider for ClaudePersistentProvider {
                     "--include-partial-messages".to_string(),
                     "--dangerously-skip-permissions".to_string(),
                 ];
-                if let Some(model) = claude_model_arg(&req.model) {
-                    args.push("--model".to_string());
-                    args.push(model.to_string());
-                }
-                if !req.reasoning_effort.is_empty() {
-                    args.push("--effort".to_string());
-                    args.push(claude_effort(&req.reasoning_effort).to_string());
-                }
-                if let Some(extra) = req
-                    .system_append
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                {
-                    args.push("--append-system-prompt".to_string());
-                    args.push(extra.to_string());
-                }
-                if let Some(agents) = &req.claude_agents {
-                    args.push("--agents".to_string());
-                    args.push(agents.to_string());
-                }
+                args.extend(claude_tuning_args(&req));
                 spawn_persistent(&self.bin, &args, &req.cwd, &skey)?
             }
         };
@@ -1613,6 +1574,54 @@ fn codex_effort(effort: &str) -> &str {
 fn claude_effort(effort: &str) -> &str {
     // claude --effort accepts low|medium|high|xhigh|max directly.
     effort
+}
+
+/// Model/effort/system/agents/perf flags shared by both claude drivers so they
+/// can't drift. Always adds `--exclude-dynamic-system-prompt-sections` (moves
+/// per-machine sections into the first user message → better cross-turn
+/// prompt-cache reuse) + env-gated reliability/cost knobs
+/// (`OXIDE_CLAUDE_FALLBACK_MODEL`, `OXIDE_CLAUDE_MAX_BUDGET_USD`).
+fn claude_tuning_args(req: &TurnRequest) -> Vec<String> {
+    let mut a = Vec::new();
+    if let Some(model) = claude_model_arg(&req.model) {
+        a.push("--model".to_string());
+        a.push(model.to_string());
+    }
+    if !req.reasoning_effort.is_empty() {
+        a.push("--effort".to_string());
+        a.push(claude_effort(&req.reasoning_effort).to_string());
+    }
+    a.push("--exclude-dynamic-system-prompt-sections".to_string());
+    if let Some(m) = std::env::var("OXIDE_CLAUDE_FALLBACK_MODEL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+    {
+        a.push("--fallback-model".to_string());
+        a.push(m);
+    }
+    if let Some(b) = std::env::var("OXIDE_CLAUDE_MAX_BUDGET_USD")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+    {
+        a.push("--max-budget-usd".to_string());
+        a.push(b);
+    }
+    // Harness persona/policy appended to Claude Code's own base prompt (opt-in).
+    if let Some(extra) = req
+        .system_append
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        a.push("--append-system-prompt".to_string());
+        a.push(extra.to_string());
+    }
+    // Harness-defined subagents (opt-in).
+    if let Some(agents) = &req.claude_agents {
+        a.push("--agents".to_string());
+        a.push(agents.to_string());
+    }
+    a
 }
 
 fn claude_model_arg(model: &str) -> Option<&str> {
