@@ -25,6 +25,13 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 const CSS: &str = include_str!("../assets/style.css");
+// Embedded terminal: wterm (DOM renderer + Zig/WASM VT core, Apache-2.0), bundled
+// self-contained (WASM inlined as base64) via esbuild so it needs no network and
+// no separate .wasm fetch. The IIFE exposes `var OxideWTerm`; TerminalView injects
+// it once (guarded) and re-attaches it to `window` since dioxus wraps eval in an
+// async fn. Replaces the old xterm.js embed and the oxide-term separate window.
+const WTERM_JS: &str = include_str!("../assets/wterm.bundle.js");
+const WTERM_CSS: &str = include_str!("../assets/wterm.css");
 const MERMAID_JS: &[u8] = include_bytes!("../assets/vendor/mermaid.min.js");
 const NERD_FONT: &[u8] = include_bytes!("../assets/fonts/JetBrainsMonoNerdFontMono-Regular.ttf");
 const LOGO_BYTES: &[u8] = include_bytes!("../assets/logo.png");
@@ -118,15 +125,6 @@ fn spawn_oxide_term(cwd: &str, cmd: &[String]) -> bool {
 /// Open a plain native GPU terminal ($SHELL) — the terminal-panel button.
 fn launch_native_terminal() -> bool {
     spawn_oxide_term("", &[])
-}
-
-/// User-facing hint when oxide-term can't be launched (missing binary).
-fn oxide_term_not_found_msg() -> String {
-    format!(
-        "oxide-term not found at {}. Update the app (OTA now ships the terminal \
-         too) or reinstall the latest dmg; in a dev build run `cargo build`.",
-        oxide_term_bin().display()
-    )
 }
 
 struct ModelPreset {
@@ -3821,7 +3819,7 @@ fn app() -> Element {
               window.__oxkeys = 1;
               document.addEventListener('keydown', function(e){
                 // Don't hijack shortcuts while a terminal/TUI has focus.
-                if (e.target && e.target.closest && e.target.closest('.xterm, .terminal, .term-host')) return;
+                if (e.target && e.target.closest && e.target.closest('.xterm, .terminal, .term-host, .wterm, .wterm-host')) return;
                 if ((e.metaKey || e.ctrlKey) && (e.key === 'k' || e.key === 'K')) { e.preventDefault(); dioxus.send('palette'); }
                 else if ((e.metaKey || e.ctrlKey) && e.key === '/') { e.preventDefault(); dioxus.send('shortcuts'); }
                 else if ((e.metaKey || e.ctrlKey) && (e.key === 'b' || e.key === 'B')) { e.preventDefault(); dioxus.send('files'); }
@@ -5880,6 +5878,7 @@ fn app() -> Element {
 
     rsx! {
         style { {CSS} }
+        style { {WTERM_CSS} }
         div { class: "app", "data-theme": "{cfg.read().theme}", "data-density": "{cfg.read().density}", style: "{accent_style}",
             onmousemove: move |e: dioxus::prelude::MouseEvent| {
                 if let Some((which, sx, sw)) = *panel_drag.read() {
@@ -7793,7 +7792,7 @@ fn app() -> Element {
                                             button { class: "term-tab add", title: "Native GPU terminal (Metal · oxide-term)", onclick: move |_| {
                                                 if !launch_native_terminal() {
                                                     let sel = *term_sel.read();
-                                                    if let Some(t) = terms.write().get_mut(sel) { t.2.push("oxide-term not found — build it: cargo build --release --manifest-path crates/oxide-term/Cargo.toml".to_string()); }
+                                                    if let Some(t) = terms.write().get_mut(sel) { t.2.push("oxide-term not found — build it: cargo build -p oxide-term".to_string()); }
                                                 }
                                             }, Icon { name: "terminal" } }
                                         }
@@ -11538,84 +11537,160 @@ fn Message(author: Author, text: String, #[props(default)] live: bool) -> Elemen
 /// the terminal is a sibling native window, not embedded in the panel.
 #[component]
 fn TerminalView(id: u64, bin: String, ws: String, resume: Option<String>) -> Element {
-    let cmd = agent_tui_command(&bin, resume.as_deref());
-    let mut launch_err = use_signal(|| Option::<String>::None);
-    // Auto-open the native window once per tab id (dedup so multiple mounts of the
-    // same logical tab don't spawn duplicate windows). Surface a failure so a
-    // missing binary shows an actionable hint instead of silently doing nothing.
-    {
+    let host = format!("term-{id}");
+    let host_js = host.clone();
+    use_future(move || {
+        let host = host_js.clone();
+        let bin = bin.clone();
         let ws = ws.clone();
-        let cmd = cmd.clone();
-        use_hook(move || {
-            static LAUNCHED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<u64>>> =
-                std::sync::OnceLock::new();
-            let first = LAUNCHED
-                .get_or_init(Default::default)
-                .lock()
-                .map(|mut s| s.insert(id))
-                .unwrap_or(false);
-            if first && !spawn_oxide_term(&ws, &cmd) {
-                launch_err.set(Some(oxide_term_not_found_msg()));
-            }
-        });
-    }
-    let reopen_ws = ws.clone();
-    let reopen_cmd = cmd.clone();
-    let label = if bin.is_empty() {
-        "shell".to_string()
-    } else {
-        bin.clone()
-    };
-    let err = launch_err.read().clone();
-    rsx! {
-        div { class: "native-term-host",
-            div { class: "native-term-card",
-                div { class: "native-term-badge", "GPU · Metal" }
-                div { class: "native-term-title", "Native terminal" }
-                div { class: "native-term-sub", "{label} — runs in a separate oxide-term window" }
-                button { class: "native-term-reopen",
-                    onclick: move |_| {
-                        if spawn_oxide_term(&reopen_ws, &reopen_cmd) {
-                            launch_err.set(None);
-                        } else {
-                            launch_err.set(Some(oxide_term_not_found_msg()));
-                        }
-                    },
-                    "Open / reopen window"
-                }
-                if let Some(e) = err {
-                    div { class: "native-term-err", "{e}" }
-                }
-            }
-        }
-    }
-}
+        let resume = resume.clone();
+        async move {
+            // Inject the self-contained wterm bundle once (it declares `var
+            // OxideWTerm`); dioxus wraps eval in an async fn, so re-attach it to
+            // window explicitly or later terminals won't see it.
+            let inject = format!(
+                r#"if (!window.OxideWTerm) {{ {WTERM_JS}
+                try {{ window.OxideWTerm = OxideWTerm; }} catch (e) {{}} }}"#
+            );
+            // Mount wterm into the host div and wire its I/O: keystrokes/responses
+            // (onData) → dioxus.send, PTY output (dioxus.recv) → term.write.
+            let body = format!(
+                r##"
+                for (let i = 0; i < 300 && !window.OxideWTerm; i++) {{ await new Promise(r => setTimeout(r, 20)); }}
+                const el = document.getElementById("{host}");
+                if (!el || !window.OxideWTerm) return;
+                el.innerHTML = "";
+                try {{ await document.fonts.load("12.5px 'JetBrainsMono Nerd Font Mono'"); await document.fonts.ready; }} catch (e) {{}}
+                let term;
+                try {{
+                    term = new window.OxideWTerm.WTerm(el, {{
+                        cols: 110, rows: 32,
+                        autoResize: true,
+                        cursorBlink: true,
+                        onData: (d) => dioxus.send(JSON.stringify({{ inp: d }})),
+                        onResize: (cols, rows) => dioxus.send(JSON.stringify({{ resize: [rows, cols] }})),
+                    }});
+                    await term.init();
+                }} catch (e) {{ return; }}
+                term.focus();
+                el.addEventListener('mousedown', () => term.focus());
+                // Keep macOS clipboard shortcuts working and swallow other Cmd
+                // combos so app shortcuts don't fire while the TUI has focus.
+                el.addEventListener('keydown', (e) => {{
+                    if (!(e.metaKey && !e.ctrlKey && !e.altKey)) return;
+                    const k = (e.key || '').toLowerCase();
+                    if (k === 'v') {{ e.preventDefault(); navigator.clipboard.readText().then(t => {{ if (t) dioxus.send(JSON.stringify({{ inp: t }})); }}); }}
+                    else if (k === 'c') {{ const s = (window.getSelection() || '').toString(); if (s) {{ e.preventDefault(); navigator.clipboard.writeText(s); }} }}
+                }}, true);
+                (async () => {{ while (true) {{ const m = await dioxus.recv(); if (typeof m === "string" && m.length) term.write(Uint8Array.from(atob(m), c => c.charCodeAt(0))); }} }})();
+                "##
+            );
+            let mut eval = dioxus::document::eval(&format!("{inject}\n{body}"));
 
-/// Build the argv for a TUI agent (codex / claude) run inside oxide-term. Empty
-/// `bin` → empty argv → oxide-term falls back to $SHELL.
-fn agent_tui_command(bin: &str, resume: Option<&str>) -> Vec<String> {
-    if bin.is_empty() {
-        return Vec::new();
-    }
-    let mut v = vec![bin.to_string()];
-    match bin {
-        "codex" => {
-            v.push("--dangerously-bypass-approvals-and-sandbox".to_string());
-            if let Some(s) = resume {
-                v.push("resume".to_string());
-                v.push(s.to_string());
+            let pty = portable_pty::native_pty_system();
+            let pair = match pty.openpty(portable_pty::PtySize {
+                rows: 32,
+                cols: 110,
+                pixel_width: 0,
+                pixel_height: 0,
+            }) {
+                Ok(p) => p,
+                Err(_) => return,
+            };
+            // Empty bin → a plain login shell; codex/claude → their TUI with
+            // permissions bypassed (yolo), resuming the originating session.
+            let shell = if bin.is_empty() {
+                std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string())
+            } else {
+                bin.clone()
+            };
+            let mut cmd = portable_pty::CommandBuilder::new(&shell);
+            match bin.as_str() {
+                "codex" => {
+                    cmd.arg("--dangerously-bypass-approvals-and-sandbox");
+                    if let Some(sid) = &resume {
+                        cmd.arg("resume");
+                        cmd.arg(sid);
+                    }
+                }
+                "claude" => {
+                    cmd.arg("--dangerously-skip-permissions");
+                    if let Some(sid) = &resume {
+                        cmd.arg("--resume");
+                        cmd.arg(sid);
+                    }
+                }
+                _ => {}
             }
-        }
-        "claude" => {
-            v.push("--dangerously-skip-permissions".to_string());
-            if let Some(s) = resume {
-                v.push("--resume".to_string());
-                v.push(s.to_string());
+            cmd.cwd(&ws);
+            cmd.env("TERM", "xterm-256color");
+            if let Ok(home) = std::env::var("HOME") {
+                let path = std::env::var("PATH").unwrap_or_default();
+                cmd.env("PATH", format!("{home}/.superconductor/bin:{home}/.local/bin:{home}/.bun/bin:/opt/homebrew/bin:/usr/local/bin:{path}"));
             }
+            let mut child = match pair.slave.spawn_command(cmd) {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            drop(pair.slave);
+            let mut reader = match pair.master.try_clone_reader() {
+                Ok(r) => r,
+                Err(_) => return,
+            };
+            let mut writer = match pair.master.take_writer() {
+                Ok(w) => w,
+                Err(_) => return,
+            };
+            let master = pair.master;
+
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+            std::thread::spawn(move || {
+                use std::io::Read;
+                let mut buf = [0u8; 8192];
+                loop {
+                    match reader.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if tx.send(buf[..n].to_vec()).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+
+            use base64::Engine;
+            use std::io::Write;
+            loop {
+                tokio::select! {
+                    bytes = rx.recv() => match bytes {
+                        Some(bytes) => {
+                            let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                            if eval.send(serde_json::Value::String(b64)).is_err() { break; }
+                        }
+                        None => break,
+                    },
+                    msg = eval.recv::<String>() => match msg {
+                        Ok(s) => {
+                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+                                if let Some(inp) = v.get("inp").and_then(|x| x.as_str()) {
+                                    let _ = writer.write_all(inp.as_bytes());
+                                    let _ = writer.flush();
+                                } else if let Some(rc) = v.get("resize").and_then(|x| x.as_array()) {
+                                    let rows = rc.first().and_then(|x| x.as_u64()).unwrap_or(32) as u16;
+                                    let cols = rc.get(1).and_then(|x| x.as_u64()).unwrap_or(110) as u16;
+                                    let _ = master.resize(portable_pty::PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
+                                }
+                            }
+                        }
+                        Err(_) => break,
+                    },
+                }
+            }
+            let _ = child.kill();
         }
-        _ => {}
-    }
-    v
+    });
+    rsx! { div { id: "{host}", class: "wterm-host", tabindex: "0" } }
 }
 
 /// Commands into a ChatPane's own engine.
@@ -12257,6 +12332,7 @@ fn PipWindow(
 ) -> Element {
     rsx! {
         style { {CSS} }
+        style { {WTERM_CSS} }
         div { class: "app pip-win", "data-theme": "{theme}",
             if mode == "tui" {
                 TerminalView { id: 990_001, bin: bin.clone(), ws: workspace.display().to_string(), resume: None }
