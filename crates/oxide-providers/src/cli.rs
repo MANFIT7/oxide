@@ -840,6 +840,11 @@ impl Provider for ClaudeCliProvider {
             args.push("--append-system-prompt".to_string());
             args.push(extra.to_string());
         }
+        // Harness-defined subagents (claude `--agents <json>`).
+        if let Some(agents) = &req.claude_agents {
+            args.push("--agents".to_string());
+            args.push(agents.to_string());
+        }
 
         let timeout = claude_cli_timeout()?;
         // Shared per-line mapping (also used by the persistent driver) so the two
@@ -989,6 +994,8 @@ struct ClaudeLineState {
     skey: String,
     /// Background-command output routing.
     bg: BgTracker,
+    /// Streaming tool-call args: content-block index → (id, name, accumulated json).
+    tool_blocks: HashMap<i64, (String, String, String)>,
 }
 
 impl ClaudeLineState {
@@ -998,6 +1005,7 @@ impl ClaudeLineState {
             command_ids: std::collections::HashSet::new(),
             skey,
             bg: BgTracker::default(),
+            tool_blocks: HashMap::new(),
         }
     }
 }
@@ -1021,8 +1029,28 @@ fn claude_handle_line(
         }
         Some("stream_event") => {
             let ev = &v["event"];
-            if ev["type"].as_str() == Some("message_start") {
-                st.saw_partial = false;
+            match ev["type"].as_str() {
+                Some("message_start") => st.saw_partial = false,
+                // Tool-call args stream as input_json_delta; track the block so
+                // each fragment can be forwarded as a live ToolInputDelta preview.
+                Some("content_block_start")
+                    if ev["content_block"]["type"].as_str() == Some("tool_use") =>
+                {
+                    if let Some(idx) = ev["index"].as_i64() {
+                        let id = ev["content_block"]["id"].as_str().unwrap_or("").to_string();
+                        let name = ev["content_block"]["name"]
+                            .as_str()
+                            .unwrap_or("tool")
+                            .to_string();
+                        st.tool_blocks.insert(idx, (id, name, String::new()));
+                    }
+                }
+                Some("content_block_stop") => {
+                    if let Some(idx) = ev["index"].as_i64() {
+                        st.tool_blocks.remove(&idx);
+                    }
+                }
+                _ => {}
             }
             if ev["type"].as_str() == Some("content_block_delta") {
                 match ev["delta"]["type"].as_str() {
@@ -1035,6 +1063,24 @@ fn claude_handle_line(
                     Some("thinking_delta") => {
                         if let Some(t) = ev["delta"]["thinking"].as_str() {
                             send(sink, StreamItem::ReasoningDelta(t.to_string()));
+                        }
+                    }
+                    Some("input_json_delta") => {
+                        if let (Some(idx), Some(frag)) =
+                            (ev["index"].as_i64(), ev["delta"]["partial_json"].as_str())
+                        {
+                            if let Some((id, name, acc)) = st.tool_blocks.get_mut(&idx) {
+                                acc.push_str(frag);
+                                send(
+                                    sink,
+                                    StreamItem::ToolInputDelta {
+                                        id: id.clone(),
+                                        name: name.clone(),
+                                        delta: frag.to_string(),
+                                        accumulated: acc.clone(),
+                                    },
+                                );
+                            }
                         }
                     }
                     _ => {}
@@ -1440,6 +1486,10 @@ impl Provider for ClaudePersistentProvider {
                     args.push("--append-system-prompt".to_string());
                     args.push(extra.to_string());
                 }
+                if let Some(agents) = &req.claude_agents {
+                    args.push("--agents".to_string());
+                    args.push(agents.to_string());
+                }
                 spawn_persistent(&self.bin, &args, &req.cwd, &skey)?
             }
         };
@@ -1677,6 +1727,7 @@ mod cli_driver_tests {
             conversation_id: String::new(),
             cli_resume: None,
             system_append: None,
+            claude_agents: None,
         };
 
         let (prompt, images) = extract_cli_images(&req);
@@ -1806,6 +1857,7 @@ mod cli_driver_tests {
                 conversation_id: conv.clone(),
                 cli_resume: None,
                 system_append: None,
+                claude_agents: None,
             };
             provider.stream(req, tx).await.unwrap();
             let (text, done) = reader.await.unwrap();
@@ -1854,6 +1906,7 @@ mod cli_driver_tests {
                 conversation_id: conv_turn,
                 cli_resume: None,
                 system_append: None,
+                claude_agents: None,
             };
             provider.stream(req, tx).await.unwrap();
         });
@@ -1985,6 +2038,7 @@ mod cli_driver_tests {
                 conversation_id: conv_turn,
                 cli_resume: None,
                 system_append: None,
+                claude_agents: None,
             };
             provider.stream(req, tx).await.unwrap();
         });

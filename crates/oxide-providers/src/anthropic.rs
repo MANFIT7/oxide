@@ -274,6 +274,7 @@ mod tests {
             conversation_id: "session".into(),
             cli_resume: None,
             system_append: None,
+            claude_agents: None,
         }
     }
 

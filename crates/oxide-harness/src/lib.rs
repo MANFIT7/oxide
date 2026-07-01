@@ -154,6 +154,13 @@ pub trait Harness: Send + Sync {
     fn cli_system_append(&self) -> Option<String> {
         None
     }
+    /// Custom subagents to hand an external agent CLI (claude `--agents <json>`)
+    /// — a JSON object mapping agent name → definition (`description`, `prompt`,
+    /// `tools`, `model`). The CLI analog of a Managed-Agents subagent roster.
+    /// None (default) = the CLI agent's own/no subagents.
+    fn claude_agents(&self) -> Option<serde_json::Value> {
+        None
+    }
     /// Tools this harness exposes to the model.
     fn tools(&self) -> Vec<ToolSpec>;
     /// Per-turn loop tunables.

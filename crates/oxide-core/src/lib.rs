@@ -2548,6 +2548,7 @@ Rules:
                 .unwrap_or_else(|| format!("cli-self-improve:{}", turn.0)),
             cli_resume: None,
             system_append: None,
+            claude_agents: None,
         };
 
         let raw = match collect_provider_text_silent("chatgpt", req).await {
@@ -2940,6 +2941,7 @@ Rules:
                 .unwrap_or_default(),
             cli_resume: None,
             system_append: None,
+            claude_agents: None,
         };
         let (tx, mut rx) = mpsc::channel::<StreamItem>(STREAM_QUEUE);
         let provider = oxide_providers::build(provider_id);
@@ -3157,6 +3159,7 @@ Rules:
                 conversation_id,
                 cli_resume: None,
                 system_append: None,
+                claude_agents: None,
             };
 
             let (stream_tx, mut stream_rx) = mpsc::channel::<StreamItem>(STREAM_QUEUE);
@@ -3716,6 +3719,7 @@ Treat the following as the only current, top-priority instruction:]\n\n{user_tex
         // extend the `harness` borrow into the turn loop. None unless the harness
         // opts in; deliberately NOT `sys` (that carries the workspace tree etc.).
         let cli_system_append = harness.cli_system_append();
+        let cli_claude_agents = harness.claude_agents();
         if let Some(route) = selected_skill_route(harness, &user_text) {
             sys.push_str(&render_skill_route(&route));
         }
@@ -4184,6 +4188,7 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                     .as_ref()
                     .and_then(|s| db::cli_session(&s.id)),
                 system_append: cli_system_append.clone(),
+                claude_agents: cli_claude_agents.clone(),
             };
 
             let (stream_tx, mut stream_rx) = mpsc::channel::<StreamItem>(STREAM_QUEUE);
@@ -4665,6 +4670,7 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
                         conversation_id: String::new(),
                         cli_resume: None,
                         system_append: None,
+                        claude_agents: None,
                     };
                     let (stx, mut srx) = mpsc::channel::<StreamItem>(64);
                     let task = tokio::spawn(async move { provider.stream(req, stx).await });
@@ -4732,6 +4738,7 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
                             conversation_id: String::new(),
                             cli_resume: None,
                             system_append: None,
+                            claude_agents: None,
                         };
                         let (stx, mut srx) = mpsc::channel::<StreamItem>(64);
                         let task = tokio::spawn(async move { provider.stream(req, stx).await });

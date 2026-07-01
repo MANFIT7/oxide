@@ -886,6 +886,8 @@ impl ApplicationHandler<UserEvent> for App {
             .with_inner_size(LogicalSize::new(900.0, 560.0))
             .with_title(title);
         let window = Arc::new(event_loop.create_window(attrs).unwrap());
+        // Bring the new terminal window to the front + give it keyboard focus.
+        window.focus_window();
         let gpu = pollster::block_on(Gpu::new(window.clone(), event_loop));
         let size = window.inner_size();
         let grid = Self::grid_size(gpu.cell_w, size.width, size.height);
@@ -1005,7 +1007,19 @@ fn main() -> anyhow::Result<()> {
     }
     let cmd: Vec<String> = args.collect();
 
-    let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
+    #[cfg(target_os = "macos")]
+    use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
+    let mut builder = EventLoop::<UserEvent>::with_user_event();
+    // macOS: a bare spawned binary (not a .app bundle) defaults to an accessory
+    // process that never becomes the key window — so keyboard input never
+    // reaches it and the window can open behind the launcher. Make it a Regular
+    // foreground app and pull it in front on launch so it takes keyboard focus.
+    #[cfg(target_os = "macos")]
+    {
+        builder.with_activation_policy(ActivationPolicy::Regular);
+        builder.with_activate_ignoring_other_apps(true);
+    }
+    let event_loop = builder.build()?;
     let proxy = event_loop.create_proxy();
     let mut app = App {
         gpu: None,

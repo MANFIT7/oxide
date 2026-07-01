@@ -1352,6 +1352,7 @@ mod tests {
             conversation_id: "session".to_string(),
             cli_resume: None,
             system_append: None,
+            claude_agents: None,
         }
     }
 

@@ -114,6 +114,9 @@ pub struct TurnRequest {
     /// Agents `agent_with_overrides` `system` override. None = leave the CLI
     /// agent's prompt untouched (the default for every non-opted-in harness).
     pub system_append: Option<String>,
+    /// Custom subagents for an external agent CLI (claude `--agents <json>`).
+    /// None = no override.
+    pub claude_agents: Option<serde_json::Value>,
 }
 
 /// Normalized streaming output. Each provider maps its SSE events to these.
