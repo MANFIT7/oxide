@@ -106,10 +106,11 @@
    rows, high-contrast vivid ANSI, and minimal chrome + a subtle scrollbar.
    These come after the vendored rules so equal-specificity selectors win. */
 .wterm {
-  /* High-contrast, vivid ANSI (Hyper-Snazzy) on an Oxide-dark surface. The
-     background follows the panel so the terminal reads as part of the app;
-     foreground is brighter than the muted --text for readability under load. */
-  --term-bg: var(--composer, #16171a);
+  /* High-contrast, vivid ANSI (Hyper-Snazzy) on a fixed dark surface. The
+     terminal stays dark in BOTH Oxide light and dark themes (like an editor's
+     integrated terminal) — the bright fg + vivid palette need a dark ground, and
+     following a light --composer made white text vanish on a light background. */
+  --term-bg: #16171a;
   --term-fg: #eff0eb;
   --term-cursor: #57c7ff;
 
@@ -149,7 +150,7 @@
   padding: 6px 8px;
   border-radius: 0;
   box-shadow: none;
-  background: var(--composer, #16171a);
+  background: #16171a;
 }
 
 /* Clear selection using the Oxide accent. */

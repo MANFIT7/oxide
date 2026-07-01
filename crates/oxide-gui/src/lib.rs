@@ -11573,15 +11573,11 @@ fn TerminalView(id: u64, bin: String, ws: String, resume: Option<String>) -> Ele
                     await term.init();
                 }} catch (e) {{ return; }}
                 term.focus();
-                el.addEventListener('mousedown', () => term.focus());
-                // Keep macOS clipboard shortcuts working and swallow other Cmd
-                // combos so app shortcuts don't fire while the TUI has focus.
-                el.addEventListener('keydown', (e) => {{
-                    if (!(e.metaKey && !e.ctrlKey && !e.altKey)) return;
-                    const k = (e.key || '').toLowerCase();
-                    if (k === 'v') {{ e.preventDefault(); navigator.clipboard.readText().then(t => {{ if (t) dioxus.send(JSON.stringify({{ inp: t }})); }}); }}
-                    else if (k === 'c') {{ const s = (window.getSelection() || '').toString(); if (s) {{ e.preventDefault(); navigator.clipboard.writeText(s); }} }}
-                }}, true);
+                // wterm's InputHandler already does copy (Cmd/Ctrl-C on a
+                // selection falls through to the browser), paste (native paste
+                // event, bracketed-paste aware), and click-to-focus. A custom
+                // Cmd-V handler here previously ate the paste event and sent raw
+                // unbracketed text, so claude/codex didn't register the paste.
                 (async () => {{ while (true) {{ const m = await dioxus.recv(); if (typeof m === "string" && m.length) term.write(Uint8Array.from(atob(m), c => c.charCodeAt(0))); }} }})();
                 "##
             );
