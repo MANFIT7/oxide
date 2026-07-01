@@ -11573,11 +11573,22 @@ fn TerminalView(id: u64, bin: String, ws: String, resume: Option<String>) -> Ele
                     await term.init();
                 }} catch (e) {{ return; }}
                 term.focus();
-                // wterm's InputHandler already does copy (Cmd/Ctrl-C on a
-                // selection falls through to the browser), paste (native paste
-                // event, bracketed-paste aware), and click-to-focus. A custom
-                // Cmd-V handler here previously ate the paste event and sent raw
-                // unbracketed text, so claude/codex didn't register the paste.
+                // Cmd-C (copy on a selection) and click-to-focus are handled by
+                // wterm natively. Paste is NOT: WKWebView returns empty for the
+                // sync clipboardData on a paste event, and navigator.clipboard
+                // .readText() pops the macOS "Paste" confirmation button. So grab
+                // Cmd-V here (capture, before wterm + the app shortcut handler),
+                // and route it to Rust which reads the clipboard via pbpaste and
+                // writes straight to the PTY — no webview clipboard, no prompt. We
+                // ask wterm whether bracketed-paste mode is on so Rust can wrap it.
+                el.addEventListener('keydown', (e) => {{
+                    if (e.metaKey && !e.ctrlKey && !e.altKey && (e.key === 'v' || e.key === 'V')) {{
+                        e.preventDefault(); e.stopPropagation();
+                        let br = false;
+                        try {{ br = !!(term.bridge && term.bridge.bracketedPaste && term.bridge.bracketedPaste()); }} catch (_e) {{}}
+                        dioxus.send(JSON.stringify({{ paste: 1, bracketed: br }}));
+                    }}
+                }}, true);
                 (async () => {{ while (true) {{ const m = await dioxus.recv(); if (typeof m === "string" && m.length) term.write(Uint8Array.from(atob(m), c => c.charCodeAt(0))); }} }})();
                 "##
             );
@@ -11676,6 +11687,31 @@ fn TerminalView(id: u64, bin: String, ws: String, resume: Option<String>) -> Ele
                                     let rows = rc.first().and_then(|x| x.as_u64()).unwrap_or(32) as u16;
                                     let cols = rc.get(1).and_then(|x| x.as_u64()).unwrap_or(110) as u16;
                                     let _ = master.resize(portable_pty::PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
+                                } else if v.get("paste").is_some() {
+                                    // Read the OS clipboard in Rust (no webview
+                                    // clipboard → no macOS "Paste" prompt) and
+                                    // write it to the PTY, wrapping in bracketed
+                                    // paste when the app requested that mode.
+                                    if let Ok(out) =
+                                        tokio::process::Command::new("pbpaste").output().await
+                                    {
+                                        let text = String::from_utf8_lossy(&out.stdout);
+                                        let bracketed = v
+                                            .get("bracketed")
+                                            .and_then(|x| x.as_bool())
+                                            .unwrap_or(false);
+                                        if bracketed {
+                                            // Strip ESC so a payload can't smuggle
+                                            // \x1b[201~ to break out of the paste.
+                                            let safe = text.replace('\u{1b}', "");
+                                            let _ = writer.write_all(b"\x1b[200~");
+                                            let _ = writer.write_all(safe.as_bytes());
+                                            let _ = writer.write_all(b"\x1b[201~");
+                                        } else {
+                                            let _ = writer.write_all(text.as_bytes());
+                                        }
+                                        let _ = writer.flush();
+                                    }
                                 }
                             }
                         }
