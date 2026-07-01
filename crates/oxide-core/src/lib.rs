@@ -2875,10 +2875,8 @@ Rules:
             .map(|m| format!("{:?}: {}", m.role, m.content))
             .collect::<Vec<_>>()
             .join("\n\n");
-        self.emit(Event::Info {
-            text: format!("compacting context ({} earlier messages)…", old.len()),
-        })
-        .await;
+        // Compaction runs silently (no status pill) — like the SDK's automatic
+        // compaction. The post-fact Event::Compacted note is enough.
         let provider = self.config.provider.clone();
         let effort = self.config.reasoning_effort.clone();
         let sys = "You compress conversation history. Summarize the earlier conversation below into a concise but COMPLETE brief that lets the assistant continue seamlessly. Preserve: the user's goal/task, decisions made, files created/edited (with paths), commands run and key results, current state, and open TODOs. Terse bullet points. Output only the summary.";

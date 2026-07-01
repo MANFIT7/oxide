@@ -11596,10 +11596,35 @@ fn Message(author: Author, text: String, #[props(default)] live: bool) -> Elemen
     }
 }
 
-/// Embedded terminal entry: opens the standalone native GPU terminal (oxide-term)
-/// in a separate window running `bin` (codex / claude / shell) and shows a small
-/// in-panel card. A wgpu/Metal surface can't render inside the Dioxus webview, so
-/// the terminal is a sibling native window, not embedded in the panel.
+/// Scan a byte window for the last DECSET mouse-tracking toggle. `Some(true)` if
+/// tracking was last enabled (`?1000/1002/1003 h`), `Some(false)` if last disabled
+/// (`…l`), `None` if absent. Gates wheel→PTY forwarding so we never inject SGR
+/// mouse sequences into a TUI that isn't listening for them.
+fn scan_mouse_mode(bytes: &[u8]) -> Option<bool> {
+    const PATS: [(&[u8], bool); 6] = [
+        (b"[?1000h", true),
+        (b"[?1002h", true),
+        (b"[?1003h", true),
+        (b"[?1000l", false),
+        (b"[?1002l", false),
+        (b"[?1003l", false),
+    ];
+    let mut result = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        for (p, v) in PATS.iter() {
+            if bytes[i..].starts_with(p) {
+                result = Some(*v);
+            }
+        }
+        i += 1;
+    }
+    result
+}
+
+/// Embedded terminal entry: mounts wterm into the panel and bridges it to a real
+/// PTY running `bin` (codex / claude / shell). The terminal renders inside the
+/// Dioxus webview (DOM grid), not a separate native window.
 #[component]
 fn TerminalView(id: u64, bin: String, ws: String, resume: Option<String>) -> Element {
     let host = format!("term-{id}");
@@ -11654,6 +11679,27 @@ fn TerminalView(id: u64, bin: String, ws: String, resume: Option<String>) -> Ele
                         dioxus.send(JSON.stringify({{ paste: 1, bracketed: br }}));
                     }}
                 }}, true);
+                // Scroll. In the NORMAL buffer wterm keeps DOM scrollback and
+                // overflow-y:auto handles the wheel natively — let it. In the
+                // ALT screen (codex/claude full-screen TUIs) there is no DOM
+                // scrollback, so translate the wheel into SGR mouse-wheel events
+                // and hand them to Rust, which forwards them to the PTY only when
+                // the app has enabled mouse tracking (so we never inject garbage).
+                el.addEventListener('wheel', (e) => {{
+                    let alt = false;
+                    try {{ alt = !!(term.bridge && term.bridge.usingAltScreen && term.bridge.usingAltScreen()); }} catch (_e) {{}}
+                    if (!alt) return;
+                    e.preventDefault();
+                    const rect = el.getBoundingClientRect();
+                    let col = 1, row = 1;
+                    if (rect.width > 0 && rect.height > 0) {{
+                        col = Math.max(1, Math.min(110, Math.floor((e.clientX - rect.left) / (rect.width / 110)) + 1));
+                        row = Math.max(1, Math.min(32, Math.floor((e.clientY - rect.top) / (rect.height / 32)) + 1));
+                    }}
+                    const dir = e.deltaY < 0 ? 'up' : 'down';
+                    const steps = Math.max(1, Math.min(5, Math.round(Math.abs(e.deltaY) / 40)));
+                    dioxus.send(JSON.stringify({{ wheel: dir, col: col, row: row, steps: steps }}));
+                }}, {{ passive: false }});
                 (async () => {{ while (true) {{ const m = await dioxus.recv(); if (typeof m === "string" && m.length) term.write(Uint8Array.from(atob(m), c => c.charCodeAt(0))); }} }})();
                 "##
             );
@@ -11715,14 +11761,27 @@ fn TerminalView(id: u64, bin: String, ws: String, resume: Option<String>) -> Ele
             };
             let master = pair.master;
 
+            let mouse_on = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let mouse_on_rd = mouse_on.clone();
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
             std::thread::spawn(move || {
                 use std::io::Read;
+                use std::sync::atomic::Ordering;
                 let mut buf = [0u8; 8192];
+                // Carry the last few bytes so a mouse-mode escape split across two
+                // reads is still detected.
+                let mut carry: Vec<u8> = Vec::new();
                 loop {
                     match reader.read(&mut buf) {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
+                            carry.extend_from_slice(&buf[..n]);
+                            if let Some(v) = scan_mouse_mode(&carry) {
+                                mouse_on_rd.store(v, Ordering::SeqCst);
+                            }
+                            let keep = carry.len().min(6);
+                            let cut = carry.len() - keep;
+                            carry.drain(..cut);
                             if tx.send(buf[..n].to_vec()).is_err() {
                                 break;
                             }
@@ -11774,6 +11833,27 @@ fn TerminalView(id: u64, bin: String, ws: String, resume: Option<String>) -> Ele
                                             let _ = writer.write_all(b"\x1b[201~");
                                         } else {
                                             let _ = writer.write_all(text.as_bytes());
+                                        }
+                                        let _ = writer.flush();
+                                    }
+                                } else if let Some(dir) = v.get("wheel").and_then(|x| x.as_str()) {
+                                    // Alt-screen scroll → SGR mouse-wheel, forwarded
+                                    // only when the app enabled mouse tracking so a
+                                    // non-mouse TUI never receives stray sequences.
+                                    if mouse_on.load(std::sync::atomic::Ordering::SeqCst) {
+                                        let btn = if dir == "up" { 64 } else { 65 };
+                                        let col =
+                                            v.get("col").and_then(|x| x.as_u64()).unwrap_or(1).clamp(1, 223);
+                                        let row =
+                                            v.get("row").and_then(|x| x.as_u64()).unwrap_or(1).clamp(1, 223);
+                                        let steps = v
+                                            .get("steps")
+                                            .and_then(|x| x.as_u64())
+                                            .unwrap_or(1)
+                                            .clamp(1, 8);
+                                        let seq = format!("\x1b[<{btn};{col};{row}M");
+                                        for _ in 0..steps {
+                                            let _ = writer.write_all(seq.as_bytes());
                                         }
                                         let _ = writer.flush();
                                     }
