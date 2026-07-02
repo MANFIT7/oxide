@@ -329,6 +329,11 @@ async fn run_exec(
                     println!("[patch] {path}");
                 }
             }
+            Event::BackgroundJob { command, path, .. } => {
+                if !json_events {
+                    println!("[background] {command} -> {path}");
+                }
+            }
             Event::CheckpointCreated { id, label, .. } => {
                 if !json_events {
                     println!("[checkpoint] #{id}: {label}")

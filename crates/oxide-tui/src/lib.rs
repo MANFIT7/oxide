@@ -719,6 +719,10 @@ fn apply_event(event: Event, state: &mut State) {
                 state.push(Line::from(format!("  {mark} {content}")));
             }
         }
+        Event::BackgroundJob { command, path, .. } => state.push(Line::from(Span::styled(
+            format!("⏳ background: {command} → {path}"),
+            Style::default().fg(Color::DarkGray),
+        ))),
         Event::PatchApplied { path, .. } => state.push(Line::from(Span::styled(
             format!("✎ patched {path}"),
             Style::default().fg(Color::Magenta),

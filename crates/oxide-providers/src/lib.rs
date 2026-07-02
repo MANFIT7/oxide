@@ -17,8 +17,8 @@ pub use catalog::{
     ProviderKind, ProviderModel, ProviderStability,
 };
 pub use cli::{
-    claude_persistent_interrupt, ClaudeCliProvider, ClaudeInteractiveProvider,
-    ClaudePersistentProvider, CodexCliProvider,
+    claude_persistent_close, claude_persistent_interrupt, ClaudeCliProvider,
+    ClaudeInteractiveProvider, ClaudePersistentProvider, CodexCliProvider,
 };
 
 use async_trait::async_trait;
@@ -159,6 +159,13 @@ pub enum StreamItem {
         id: String,
         stream: String,
         chunk: String,
+    },
+    /// A background command's output file path became known (CLI drivers run
+    /// the process themselves; the file is what outlives the turn).
+    BackgroundJob {
+        id: String,
+        command: String,
+        path: String,
     },
     /// A provider-native CLI command finished.
     CommandFinished {
@@ -486,17 +493,19 @@ pub fn build(provider: &str) -> Box<dyn Provider> {
         "anthropic" => Box::new(anthropic::AnthropicProvider::from_env()),
         // CLI drivers — use the user's logged-in codex/claude, no API key.
         "codex" => Box::new(cli::CodexCliProvider::new()),
-        // OXIDE_CLAUDE_PERSISTENT swaps in the long-lived `--input-format
-        // stream-json` driver (one warm process per conversation); unset keeps
-        // the proven one-shot driver.
+        // Persistent (Synara-style) is the DEFAULT: one warm `--input-format
+        // stream-json` process per conversation — in-process context, live
+        // interrupt, background bash that survives turns. Idle children are
+        // reaped after 30 minutes. `OXIDE_CLAUDE_PERSISTENT=0` opts back into
+        // the one-shot-per-round driver.
         "claude" => {
             if std::env::var("OXIDE_CLAUDE_PERSISTENT")
-                .map(|v| v != "0" && !v.is_empty())
+                .map(|v| v == "0" || v.eq_ignore_ascii_case("false"))
                 .unwrap_or(false)
             {
-                Box::new(cli::ClaudePersistentProvider::new())
-            } else {
                 Box::new(cli::ClaudeCliProvider::new())
+            } else {
+                Box::new(cli::ClaudePersistentProvider::new())
             }
         }
         "claude_interactive" => Box::new(cli::ClaudeInteractiveProvider::new()),

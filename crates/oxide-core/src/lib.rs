@@ -1823,6 +1823,22 @@ impl Engine {
         self.checkpoints.lock().await.rewind(checkpoint_id)
     }
 
+    /// Abort the warm persistent-claude child's in-flight generation (no-op for
+    /// every other provider / the one-shot driver). Without this, a plain
+    /// Interrupt only aborts OUR stream task — the warm child keeps generating
+    /// the dead turn and its leftover output desyncs the next one.
+    fn interrupt_persistent_claude(&self) {
+        if self.config.provider == "claude" {
+            let conv = self
+                .session_store
+                .as_ref()
+                .map(|s| s.id.clone())
+                .unwrap_or_default();
+            let cwd = self.workspace.display().to_string();
+            oxide_providers::claude_persistent_interrupt(&conv, &cwd);
+        }
+    }
+
     async fn snapshot_checkpoint(&self, path: &Path) -> u64 {
         self.checkpoints.lock().await.snapshot(path)
     }
@@ -2757,7 +2773,23 @@ Rules:
                     })
                     .await;
                 }
-                Op::Shutdown => break,
+                Op::Shutdown => {
+                    // Kill this conversation's warm persistent-claude child (if
+                    // any) — the static registry outlives the engine otherwise
+                    // (Synara's equivalent: query.close() on session stop).
+                    if self.config.provider == "claude" {
+                        let conv = self
+                            .session_store
+                            .as_ref()
+                            .map(|s| s.id.clone())
+                            .unwrap_or_default();
+                        oxide_providers::claude_persistent_close(
+                            &conv,
+                            &self.workspace.display().to_string(),
+                        );
+                    }
+                    break;
+                }
             }
         }
         self.emit(Event::Shutdown).await;
@@ -2959,6 +2991,8 @@ Rules:
         } {
             match item {
                 StreamItem::FileChanged(_) => {}
+                // Sub-agent background jobs aren't surfaced individually.
+                StreamItem::BackgroundJob { .. } => {}
                 StreamItem::TextDelta(t) => {
                     out.push_str(&t);
                     if silent {
@@ -3226,6 +3260,9 @@ Rules:
                                         cwd: if cwd.is_empty() { self.workspace.display().to_string() } else { cwd },
                                         background,
                                     }).await;
+                                }
+                                Some(StreamItem::BackgroundJob { id, command, path }) => {
+                                    self.emit(Event::BackgroundJob { turn, command_id: id, command, path }).await;
                                 }
                                 Some(StreamItem::CommandOutput { id, stream, chunk }) => {
                                     self.emit(Event::CommandOutput {
@@ -4275,6 +4312,9 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                                         background,
                                     }).await;
                                 }
+                                Some(StreamItem::BackgroundJob { id, command, path }) => {
+                                    self.emit(Event::BackgroundJob { turn, command_id: id, command, path }).await;
+                                }
                                 Some(StreamItem::CommandOutput { id, stream, chunk }) => {
                                     self.emit(Event::CommandOutput {
                                         turn,
@@ -4323,8 +4363,14 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                     }
                     op = op_rx.recv() => {
                         match op {
-                            Some(Op::Interrupt) => { interrupted = true; self.user_interrupted = true; break; }
-                            Some(Op::Shutdown) => { interrupted = true; break; }
+                            Some(Op::Interrupt) => {
+                                self.interrupt_persistent_claude();
+                                interrupted = true; self.user_interrupted = true; break;
+                            }
+                            Some(Op::Shutdown) => {
+                                self.interrupt_persistent_claude();
+                                interrupted = true; break;
+                            }
                             // Steering: a message sent mid-turn is injected into the
                             // conversation; the next agentic round picks it up.
                             Some(Op::UserTurn { text }) => {
@@ -4339,15 +4385,7 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                                 // steer text still flows via the next round
                                 // (steered=true). No-op for every other provider /
                                 // the one-shot driver.
-                                if self.config.provider == "claude" {
-                                    let conv = self
-                                        .session_store
-                                        .as_ref()
-                                        .map(|s| s.id.clone())
-                                        .unwrap_or_default();
-                                    let cwd = self.workspace.display().to_string();
-                                    oxide_providers::claude_persistent_interrupt(&conv, &cwd);
-                                }
+                                self.interrupt_persistent_claude();
                                 steered = true;
                             }
                             // Rewind works mid-turn too — restoring a checkpoint
@@ -4362,7 +4400,10 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                             // Op channel closed (handle dropped — e.g. a pane was
                             // closed): abort the live stream instead of waiting for
                             // the model to finish on its own.
-                            None => { interrupted = true; break; }
+                            None => {
+                                self.interrupt_persistent_claude();
+                                interrupted = true; break;
+                            }
                         }
                     }
                 }
@@ -5666,6 +5707,7 @@ async fn collect_provider_text_silent(
             | StreamItem::CommandStarted { .. }
             | StreamItem::CommandOutput { .. }
             | StreamItem::CommandFinished { .. }
+            | StreamItem::BackgroundJob { .. }
             | StreamItem::ReasoningDelta(_)
             | StreamItem::ReasoningItem(_)
             | StreamItem::ToolInputDelta { .. }

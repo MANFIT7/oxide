@@ -146,6 +146,15 @@ pub enum Event {
         exit_code: Option<i32>,
         duration_ms: u64,
     },
+    /// A background command's output file became known — the GUI can tail it
+    /// across turn boundaries (the process belongs to the CLI driver, so exit
+    /// status is unknowable; the file is the only durable window into it).
+    BackgroundJob {
+        turn: TurnId,
+        command_id: String,
+        command: String,
+        path: String,
+    },
     /// A file patch was applied to disk.
     PatchApplied { turn: TurnId, path: String },
     /// The agent's current task checklist `(content, status)` where status is

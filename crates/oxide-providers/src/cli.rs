@@ -74,6 +74,9 @@ fn session_get(key: &str) -> Option<String> {
         .ok()?
         .get(key)
         .cloned()
+        // An entry cleared by stale-resume recovery is "no session", never
+        // a literal `--resume ""`.
+        .filter(|s| !s.trim().is_empty())
 }
 
 fn session_set(key: &str, id: &str) {
@@ -925,6 +928,16 @@ fn bg_on_tool_result(
             .map(|s| s.trim_end_matches('.').to_string())
             .filter(|s| !s.is_empty())
         {
+            // Announce the durable output file so the GUI can keep tailing the
+            // job after this turn (and this CLI process) are gone.
+            send(
+                sink,
+                StreamItem::BackgroundJob {
+                    id: tool_use_id.to_string(),
+                    command: cmd.clone(),
+                    path: path.clone(),
+                },
+            );
             bg.files.insert(path, tool_use_id.to_string());
         }
         for target in parse_redirect_targets(&cmd) {
@@ -1261,6 +1274,11 @@ struct PersistentChild {
     /// The model this child was spawned with; a per-turn mismatch triggers a live
     /// `set_model` control message instead of a respawn.
     model: String,
+    /// When the child last finished a turn — the idle reaper kills children
+    /// unused past a threshold (Synara: 30-minute reap, guard on active turn).
+    last_used: std::time::Instant,
+    /// Shared with the SteerHandle: true only while a turn is being read.
+    turn_active: Arc<AtomicBool>,
 }
 
 #[allow(clippy::type_complexity)]
@@ -1271,6 +1289,10 @@ static PERSISTENT: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<Persist
 struct SteerHandle {
     stdin_tx: mpsc::UnboundedSender<String>,
     interrupt: Arc<AtomicBool>,
+    /// True while a turn is being read from this child. Interrupts are gated on
+    /// it: a queued interrupt line with NO turn in flight used to sit in the
+    /// stdin buffer and abort the NEXT turn the moment it started.
+    turn_active: Arc<AtomicBool>,
 }
 
 static STEER_TX: OnceLock<Mutex<HashMap<String, SteerHandle>>> = OnceLock::new();
@@ -1347,11 +1369,21 @@ pub fn claude_persistent_interrupt(conversation_id: &str, cwd: &str) -> bool {
     let bin = resolve_bin("claude", "OXIDE_CLAUDE_BIN");
     let key = session_key(&bin, conversation_id, cwd);
     let handle = steer_map().lock().ok().and_then(|m| {
-        m.get(&key)
-            .map(|h| (h.stdin_tx.clone(), h.interrupt.clone()))
+        m.get(&key).map(|h| {
+            (
+                h.stdin_tx.clone(),
+                h.interrupt.clone(),
+                h.turn_active.clone(),
+            )
+        })
     });
     match handle {
-        Some((tx, interrupt)) => {
+        Some((tx, interrupt, turn_active)) => {
+            // No turn in flight → nothing to abort. Sending anyway would queue
+            // the interrupt line in stdin and kill the NEXT turn at its start.
+            if !turn_active.load(Ordering::SeqCst) {
+                return false;
+            }
             // Mark BEFORE sending so the read loop knows the next `result` is the
             // abort and doesn't surface it as a turn error.
             interrupt.store(true, Ordering::SeqCst);
@@ -1366,6 +1398,14 @@ pub fn claude_persistent_interrupt(conversation_id: &str, cwd: &str) -> bool {
     }
 }
 
+/// Kill the conversation's warm persistent child (engine shutdown / tab close).
+/// Synara's `query.close()` equivalent — without it the static registry keeps
+/// one warm `claude` alive per conversation ever opened, for the app lifetime.
+pub fn claude_persistent_close(conversation_id: &str, cwd: &str) {
+    let bin = resolve_bin("claude", "OXIDE_CLAUDE_BIN");
+    remove_persistent(&session_key(&bin, conversation_id, cwd));
+}
+
 fn remove_persistent(key: &str) {
     if let Ok(mut m) = persistent_map().lock() {
         m.remove(key);
@@ -1373,6 +1413,38 @@ fn remove_persistent(key: &str) {
     if let Ok(mut m) = steer_map().lock() {
         m.remove(key);
     }
+}
+
+/// Idle reaper (Synara's ProviderSessionReaper): sweep every 5 minutes, kill
+/// warm children idle for 30+ minutes. A held entry mutex = turn in flight →
+/// `try_lock` fails → skipped. Dropping the Arc from both maps triggers
+/// `kill_on_drop` once the last user releases it.
+fn ensure_persistent_reaper() {
+    static REAPER: OnceLock<()> = OnceLock::new();
+    REAPER.get_or_init(|| {
+        tokio::spawn(async move {
+            const SWEEP: std::time::Duration = std::time::Duration::from_secs(300);
+            const IDLE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+            loop {
+                tokio::time::sleep(SWEEP).await;
+                let entries: Vec<(String, Arc<tokio::sync::Mutex<PersistentChild>>)> =
+                    match persistent_map().lock() {
+                        Ok(m) => m.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                        Err(_) => continue,
+                    };
+                for (key, entry) in entries {
+                    let Ok(guard) = entry.try_lock() else {
+                        continue; // turn in flight — never reap an active child
+                    };
+                    let idle_for = guard.last_used.elapsed();
+                    drop(guard);
+                    if idle_for >= IDLE {
+                        remove_persistent(&key);
+                    }
+                }
+            }
+        });
+    });
 }
 
 fn spawn_persistent(
@@ -1424,12 +1496,15 @@ fn spawn_persistent(
         }
     });
     let interrupt = Arc::new(AtomicBool::new(false));
+    let turn_active = Arc::new(AtomicBool::new(false));
     let entry = Arc::new(tokio::sync::Mutex::new(PersistentChild {
         _child: child,
         stdin_tx: tx.clone(),
         reader: BufReader::new(stdout).lines(),
         interrupt: interrupt.clone(),
         model: model.to_string(),
+        last_used: std::time::Instant::now(),
+        turn_active: turn_active.clone(),
     }));
     if let Ok(mut m) = persistent_map().lock() {
         m.insert(key.to_string(), entry.clone());
@@ -1440,9 +1515,11 @@ fn spawn_persistent(
             SteerHandle {
                 stdin_tx: tx,
                 interrupt,
+                turn_active,
             },
         );
     }
+    ensure_persistent_reaper();
     Ok(entry)
 }
 
@@ -1493,7 +1570,7 @@ impl Provider for ClaudePersistentProvider {
             .lock()
             .ok()
             .and_then(|m| m.get(&skey).cloned());
-        let entry = match existing {
+        let mut entry = match existing {
             Some(e) => e,
             None => {
                 let mut args = vec![
@@ -1541,8 +1618,14 @@ impl Provider for ClaudePersistentProvider {
             // Fall back to a fresh one-shot turn so the user still gets a reply.
             return ClaudeCliProvider::new().stream(req, sink).await;
         }
+        guard.turn_active.store(true, Ordering::SeqCst);
 
         let deadline = tokio::time::Instant::now() + timeout;
+        // One-shot recovery for a dead `--resume` id ("No conversation found
+        // with session ID …", e.g. the transcript was cleaned): drop the stale
+        // cursor, respawn fresh, re-send this turn once (Synara's
+        // clearStaleProviderResumeState + re-ensure).
+        let mut resume_retry_done = false;
         loop {
             match tokio::time::timeout_at(deadline, guard.reader.next_line()).await {
                 Ok(Ok(Some(line))) => {
@@ -1551,6 +1634,47 @@ impl Provider for ClaudePersistentProvider {
                         continue;
                     }
                     if let Ok(v) = serde_json::from_str::<Value>(line) {
+                        if !resume_retry_done
+                            && v["type"].as_str() == Some("result")
+                            && v["is_error"].as_bool() == Some(true)
+                            && v["result"]
+                                .as_str()
+                                .unwrap_or("")
+                                .to_ascii_lowercase()
+                                .contains("no conversation found")
+                        {
+                            resume_retry_done = true;
+                            guard.turn_active.store(false, Ordering::SeqCst);
+                            drop(guard);
+                            remove_persistent(&skey);
+                            session_set(&skey, "");
+                            let mut args = vec![
+                                "--print".to_string(),
+                                "--input-format".to_string(),
+                                "stream-json".to_string(),
+                                "--output-format".to_string(),
+                                "stream-json".to_string(),
+                                "--verbose".to_string(),
+                                "--include-partial-messages".to_string(),
+                                "--dangerously-skip-permissions".to_string(),
+                                "--session-id".to_string(),
+                                stable_session_uuid(&req.conversation_id),
+                            ];
+                            args.extend(claude_tuning_args(&req));
+                            let model = claude_model_arg(&req.model).unwrap_or("").to_string();
+                            let fresh =
+                                spawn_persistent(&self.bin, &args, &req.cwd, &skey, &model)?;
+                            entry = fresh;
+                            guard = entry.lock().await;
+                            if guard.stdin_tx.send(claude_user_line(&prompt)).is_err() {
+                                drop(guard);
+                                remove_persistent(&skey);
+                                return ClaudeCliProvider::new().stream(req, sink).await;
+                            }
+                            guard.turn_active.store(true, Ordering::SeqCst);
+                            st = ClaudeLineState::new(skey.clone());
+                            continue;
+                        }
                         // Consume the interrupt flag on the turn-ending `result`
                         // so a steer-triggered abort is not surfaced as an error.
                         let suppress = v["type"].as_str() == Some("result")
@@ -1561,6 +1685,7 @@ impl Provider for ClaudePersistentProvider {
                     }
                 }
                 Ok(Ok(None)) => {
+                    guard.turn_active.store(false, Ordering::SeqCst);
                     drop(guard);
                     remove_persistent(&skey);
                     let _ = sink
@@ -1572,6 +1697,7 @@ impl Provider for ClaudePersistentProvider {
                     return Ok(());
                 }
                 Ok(Err(e)) => {
+                    guard.turn_active.store(false, Ordering::SeqCst);
                     drop(guard);
                     remove_persistent(&skey);
                     let _ = sink
@@ -1583,6 +1709,7 @@ impl Provider for ClaudePersistentProvider {
                     return Ok(());
                 }
                 Err(_) => {
+                    guard.turn_active.store(false, Ordering::SeqCst);
                     drop(guard);
                     remove_persistent(&skey);
                     let _ = sink
@@ -1596,6 +1723,8 @@ impl Provider for ClaudePersistentProvider {
                 }
             }
         }
+        guard.turn_active.store(false, Ordering::SeqCst);
+        guard.last_used = std::time::Instant::now();
         drop(guard);
         let _ = sink.send(StreamItem::Done).await;
         Ok(())
@@ -1934,6 +2063,46 @@ mod cli_driver_tests {
             "no-such-conversation",
             "/tmp/nowhere"
         ));
+    }
+
+    #[test]
+    fn claude_persistent_interrupt_gated_on_active_turn() {
+        // A registered handle with NO turn in flight must refuse: a queued
+        // interrupt line would otherwise abort the NEXT turn at its start.
+        let bin = resolve_bin("claude", "OXIDE_CLAUDE_BIN");
+        let conv = "gate-test-conv";
+        let key = session_key(&bin, conv, "/tmp/gate");
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        let interrupt = Arc::new(AtomicBool::new(false));
+        let turn_active = Arc::new(AtomicBool::new(false));
+        steer_map().lock().unwrap().insert(
+            key.clone(),
+            SteerHandle {
+                stdin_tx: tx,
+                interrupt: interrupt.clone(),
+                turn_active: turn_active.clone(),
+            },
+        );
+        // Idle: refused, no line queued, flag untouched.
+        assert!(!claude_persistent_interrupt(conv, "/tmp/gate"));
+        assert!(rx.try_recv().is_err());
+        assert!(!interrupt.load(Ordering::SeqCst));
+        // Turn in flight: sent + flagged.
+        turn_active.store(true, Ordering::SeqCst);
+        assert!(claude_persistent_interrupt(conv, "/tmp/gate"));
+        assert!(rx.try_recv().is_ok());
+        assert!(interrupt.load(Ordering::SeqCst));
+        steer_map().lock().unwrap().remove(&key);
+    }
+
+    #[test]
+    fn session_get_treats_cleared_entry_as_none() {
+        // Stale-resume recovery clears the mapping with an empty id — that must
+        // read back as "no session", never a literal `--resume ""`.
+        session_set("cleared-key-test", "");
+        assert_eq!(session_get("cleared-key-test"), None);
+        session_set("cleared-key-test", "real-id");
+        assert_eq!(session_get("cleared-key-test").as_deref(), Some("real-id"));
     }
 
     // Live integration smoke test for the persistent driver: two turns must run

@@ -2748,6 +2748,17 @@ details::details-content { overflow: clip; }
 .app[data-theme="light"] .env-card { box-shadow: 0 14px 38px rgba(20,20,20,.12); }
 .env-card-head { display: flex; align-items: center; justify-content: space-between; padding: 0 8px 8px; color: var(--muted); font-size: 13px; }
 .env-card-title { display: inline-flex; align-items: center; gap: 6px; }
+/* Watched background job: expandable chip with a live tail of its output file. */
+details.bg-chip.bg-watch { display: block; padding: 0; }
+.bg-watch-sum { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; list-style: none; padding: 3px 8px; }
+.bg-watch-sum::-webkit-details-marker { display: none; }
+.bg-watch-out {
+  margin: 4px 8px 7px; padding: 7px 9px; max-height: 160px; overflow-y: auto;
+  background: var(--composer); border: 1px solid var(--border); border-radius: 7px;
+  font-family: ui-monospace, Menlo, monospace; font-size: 11px; line-height: 1.5;
+  color: var(--muted); white-space: pre-wrap; word-break: break-word;
+}
+.bg-watch-out.empty { color: var(--faint); font-style: italic; }
 .ed-save-err { font-size: 11.5px; color: var(--danger, #fa423e); max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .env-card-logo svg { width: 13px; height: 13px; }
 .env-card-gear { background: none; border: none; color: var(--faint); cursor: pointer; padding: 2px; border-radius: 6px; }

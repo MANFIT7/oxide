@@ -408,6 +408,64 @@ fn activity_idx(msgs: &[ChatMsg], key: &str) -> Option<usize> {
         .rposition(|m| matches!(&m.author, Author::Activity { key: Some(k), .. } if k == key))
 }
 
+/// Follow a background job's output file across turn boundaries: poll for
+/// growth, append new bytes to the job's tail (bounded), stop when the job is
+/// dismissed (removed from `bg_watch`). Poll-based on purpose — the process
+/// belongs to the CLI driver (no pid, no exit signal); its file is the only
+/// durable window into it.
+fn spawn_bg_tailer(
+    bg_watch: Signal<Vec<(String, String, String)>>,
+    mut bg_tails: Signal<std::collections::HashMap<String, String>>,
+    id: String,
+    path: String,
+) {
+    spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        let mut pos: u64 = 0;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+            if !bg_watch.peek().iter().any(|j| j.0 == id) {
+                bg_tails.write().remove(&id);
+                break;
+            }
+            let Ok(meta) = tokio::fs::metadata(&path).await else {
+                continue;
+            };
+            let len = meta.len();
+            if len < pos {
+                pos = 0; // truncated/rotated — re-read from the top
+            }
+            if len == pos {
+                continue;
+            }
+            let Ok(mut f) = tokio::fs::File::open(&path).await else {
+                continue;
+            };
+            if f.seek(std::io::SeekFrom::Start(pos)).await.is_err() {
+                continue;
+            }
+            let take = (len - pos).min(64_000);
+            let mut buf = Vec::with_capacity(take as usize);
+            if (&mut f).take(take).read_to_end(&mut buf).await.is_err() {
+                continue;
+            }
+            pos += buf.len() as u64;
+            let chunk = String::from_utf8_lossy(&buf).to_string();
+            let mut tails = bg_tails.write();
+            let entry = tails.entry(id.clone()).or_default();
+            entry.push_str(&chunk);
+            if entry.len() > 4000 {
+                // Keep the tail bounded (cut at a char boundary).
+                let cut = entry.len() - 3500;
+                let cut = (cut..entry.len())
+                    .find(|&i| entry.is_char_boundary(i))
+                    .unwrap_or(0);
+                entry.replace_range(..cut, "");
+            }
+        }
+    });
+}
+
 /// Start (or upgrade) a command's activity row. The args-streaming preview
 /// (`ToolCallDelta` → "Preparing …") may already hold a row under the SAME id —
 /// for CLI drivers the command_id IS the tool_use id — so starting must
@@ -4087,6 +4145,13 @@ fn app() -> Element {
     // Background tasks the CLI agent started ("running in background") — their
     // result won't stream back, so we surface what they are as persistent chips.
     let mut bg_jobs = use_signal(Vec::<String>::new);
+    // Watched background jobs `(command_id, command, output path)` + their live
+    // output tails. These SURVIVE turn boundaries and tab switches on purpose:
+    // the job's process belongs to the CLI driver and outlives the turn — the
+    // GUI keeps reading its output file so the result stays visible instead of
+    // dead-ending at "result won't return automatically". Dismiss to stop.
+    let bg_watch = use_signal(Vec::<(String, String, String)>::new);
+    let bg_tails = use_signal(std::collections::HashMap::<String, String>::new);
     // Tab ids whose engine is mid-turn. Engines are per-tab: leaving a tab no
     // longer kills its turn — this drives the sidebar spinners + view state.
     let mut busy_tabs = use_signal(HashSet::<u64>::new);
@@ -5375,6 +5440,15 @@ fn app() -> Element {
                                     buf.push(ChatMsg::new(Author::Note, format!("error: {message}")));
                                     push_toast(toasts, toast_seq, "err", &message.chars().take(120).collect::<String>());
                                 }
+                                // Background jobs are watched globally — start the tail even
+                                // when the owning tab is backgrounded.
+                                Event::BackgroundJob { command_id, command, path, .. } => {
+                                    if !bg_watch.peek().iter().any(|j| j.0 == command_id) {
+                                        let mut bw = bg_watch;
+                                        bw.write().push((command_id.clone(), command, path.clone()));
+                                        spawn_bg_tailer(bg_watch, bg_tails, command_id, path);
+                                    }
+                                }
                                 // Subagent progress for a backgrounded tab: keep at least the
                                 // chronological anchor row (the cards signal is view-bound and
                                 // turn-scoped, so these events would otherwise vanish entirely).
@@ -5850,6 +5924,14 @@ fn app() -> Element {
                                 let v = *git_refresh.read();
                                 git_refresh.set(v + 1); // trigger git-tab auto-refresh
                             }
+                            Event::BackgroundJob { command_id, command, path, .. } => {
+                                // Keep this job readable past the turn: tail its file.
+                                if !bg_watch.peek().iter().any(|j| j.0 == command_id) {
+                                    let mut bw = bg_watch;
+                                    bw.write().push((command_id.clone(), command, path.clone()));
+                                    spawn_bg_tailer(bg_watch, bg_tails, command_id, path);
+                                }
+                            }
                             Event::FileDiff { path, diff, checkpoint, .. } => {
                                 let base = |p: &str| p.rsplit('/').next().unwrap_or(p).to_string();
                                 let nb = base(&path);
@@ -6056,9 +6138,17 @@ fn app() -> Element {
                                 // Background tasks the agent kicked off won't stream their
                                 // result back this turn - tell the user plainly so the
                                 // "I'll let you know when done" never silently dangles.
+                                // Jobs with a known output file ARE tailed live in the
+                                // Background bar, so they get the accurate message instead.
                                 if !bg_jobs.peek().is_empty() {
-                                    let jobs = bg_jobs.peek().join(", ");
-                                    messages.write().push(ChatMsg::new(Author::Note, format!("Background task(s) still running: {jobs} - the result won't return automatically. Ask the agent to check the output, or check the Environment / Local Servers panel.")));
+                                    let watched: Vec<String> = bg_watch.peek().iter().map(|j| j.1.clone()).collect();
+                                    let unwatched: Vec<String> = bg_jobs.peek().iter().filter(|j| !watched.contains(j)).cloned().collect();
+                                    if !watched.is_empty() {
+                                        messages.write().push(ChatMsg::new(Author::Note, format!("Background task(s) running: {} - live output is tailed in the Background bar below (expand the chip).", watched.join(", "))));
+                                    }
+                                    if !unwatched.is_empty() {
+                                        messages.write().push(ChatMsg::new(Author::Note, format!("Background task(s) still running: {} - the result won't return automatically. Ask the agent to check the output, or check the Environment / Local Servers panel.", unwatched.join(", "))));
+                                    }
                                 }
                                 if let Some(start) = turn_start.write().take() {
                                     let secs = start.elapsed().as_secs();
@@ -7035,7 +7125,7 @@ fn app() -> Element {
                                         button { class: "env-card-gear", title: "Open environment", onclick: move |_| select_env_tab(env_tab, show_env, env_tab_by_tab, tabs, active_tab, "files", false), Icon { name: "settings" } }
                                     }
                                     button { class: "env-card-row", onclick: move |_| select_env_tab(env_tab, show_env, env_tab_by_tab, tabs, active_tab, "changes", false),
-                                        Icon { name: "branch" } span { "Changes" }
+                                        Icon { name: "changes" } span { "Changes" }
                                         if n_changed > 0 {
                                             span { class: "env-card-badge",
                                                 "{n_changed} · "
@@ -7077,7 +7167,7 @@ fn app() -> Element {
                                                         });
                                                     }
                                                 },
-                                                Icon { name: "terminal" } span { "{mode_label}" } span { class: "env-card-badge", Icon { name: "chevron" } }
+                                                Icon { name: "folders" } span { "{mode_label}" } span { class: "env-card-badge", Icon { name: "chevron" } }
                                             }
                                         }
                                     }
@@ -7123,7 +7213,7 @@ fn app() -> Element {
                                     }
                                     div { class: "env-card-anchor",
                                         button { class: "env-card-row", onclick: move |_| { let v = *git_menu.read(); git_menu.set(!v); },
-                                            Icon { name: "spark" } span { "Commit or push" } span { class: "env-card-badge", Icon { name: "chevron" } }
+                                            Icon { name: "commits" } span { "Commit or push" } span { class: "env-card-badge", Icon { name: "chevron" } }
                                         }
                                         if *git_menu.read() {
                                             div { class: "env-procs",
@@ -8826,15 +8916,48 @@ fn app() -> Element {
                                     // key + always-mounted pill lets the spin run continuously.
                                     StatusPill { text: status.read().clone(), elapsed_s: *elapsed_s.read() }
                                 }
-                                if !bg_jobs.read().is_empty() {
+                                if !bg_jobs.read().is_empty() || !bg_watch.read().is_empty() {
                                     div { class: "bg-bar",
                                         span { class: "bg-orbit" }
                                         span { class: "bg-label", "Background" }
+                                        // Watched jobs: their output FILE is tailed across turns,
+                                        // so the result stays readable here — expand for the tail.
+                                        for (id, command, _path) in bg_watch.read().iter().cloned() {
+                                            {
+                                                let tail = bg_tails.read().get(&id).cloned().unwrap_or_default();
+                                                let short: String = command.chars().take(60).collect();
+                                                let did = id.clone();
+                                                rsx! {
+                                                    details { key: "bgw-{id}", class: "bg-chip bg-watch",
+                                                        summary { class: "bg-watch-sum", title: "{command}",
+                                                            span { class: "bg-dot" }
+                                                            span { class: "bg-chip-text", "{short}" }
+                                                            button { class: "bg-x", title: "Stop watching",
+                                                                onclick: move |e: dioxus::prelude::MouseEvent| {
+                                                                    e.prevent_default();
+                                                                    e.stop_propagation();
+                                                                    // Tailer sees the removal and stops itself.
+                                                                    bg_watch.clone().write().retain(|j| j.0 != did);
+                                                                },
+                                                                Icon { name: "x" } }
+                                                        }
+                                                        if tail.is_empty() {
+                                                            div { class: "bg-watch-out empty", "no output yet…" }
+                                                        } else {
+                                                            pre { class: "bg-watch-out", "{tail}" }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        // Legacy chips (no known output file — label only).
                                         for (bi, job) in bg_jobs.read().iter().cloned().enumerate() {
-                                            span { class: "bg-chip", title: "Running in background — result won't auto-return",
-                                                span { class: "bg-dot" }
-                                                span { class: "bg-chip-text", "{job}" }
-                                                button { class: "bg-x", title: "Dismiss", onclick: move |_| { let mut v = bg_jobs.write(); if bi < v.len() { v.remove(bi); } }, Icon { name: "x" } }
+                                            if !bg_watch.read().iter().any(|j| j.1 == job) {
+                                                span { class: "bg-chip", title: "Running in background — result won't auto-return",
+                                                    span { class: "bg-dot" }
+                                                    span { class: "bg-chip-text", "{job}" }
+                                                    button { class: "bg-x", title: "Dismiss", onclick: move |_| { let mut v = bg_jobs.write(); if bi < v.len() { v.remove(bi); } }, Icon { name: "x" } }
+                                                }
                                             }
                                         }
                                     }
@@ -13727,9 +13850,26 @@ fn Icon(name: &'static str) -> Element {
         "laptop" => {
             rsx! { rect { x: "3", y: "4", width: "18", height: "12", rx: "2" } line { x1: "2", y1: "20", x2: "22", y2: "20" } }
         }
+        // Git glyphs follow Synara's central-icon set (outline, currentColor)
+        // so the Environment card reads the same visual language.
         "branch" => rsx! {
-            circle { cx: "6", cy: "6", r: "2" } circle { cx: "6", cy: "18", r: "2" } circle { cx: "18", cy: "8", r: "2" }
-            path { d: "M6 8v8M18 10a6 6 0 0 1-6 6H8" }
+            circle { cx: "6.5", cy: "6", r: "2.25" } circle { cx: "6.5", cy: "18", r: "2.25" } circle { cx: "17.5", cy: "6", r: "2.25" }
+            path { d: "M6.5 8.25V15.75" }
+            path { d: "M17.5 8.25V10C17.5 11.1 16.6 12 15.5 12H8.5C7.4 12 6.5 12.9 6.5 14V15.75" }
+        },
+        "changes" => rsx! {
+            path { d: "M9.25 10.5H14.75M12 7.75V13.25" }
+            path { d: "M9.25 16L14.75 16" }
+            path { d: "M20.25 18.25V5.75C20.25 4.65 19.35 3.75 18.25 3.75H5.75C4.65 3.75 3.75 4.65 3.75 5.75V18.25C3.75 19.35 4.65 20.25 5.75 20.25H18.25C19.35 20.25 20.25 19.35 20.25 18.25Z" }
+        },
+        "folders" => rsx! {
+            path { d: "M1.75 9.75V18.25C1.75 19.35 2.65 20.25 3.75 20.25H16.25C17.35 20.25 18.25 19.35 18.25 18.25V11.75C18.25 10.65 17.35 9.75 16.25 9.75H10.83C10.3 9.75 9.79 9.54 9.41 9.16L8.59 8.34C8.21 7.96 7.7 7.75 7.17 7.75H3.75C2.65 7.75 1.75 8.65 1.75 9.75Z" }
+            path { d: "M18.29 16.25H20.25C21.35 16.25 22.25 15.35 22.25 14.25V7.75C22.25 6.65 21.35 5.75 20.25 5.75H14.83C14.3 5.75 13.79 5.54 13.41 5.16L12.59 4.34C12.21 3.96 11.7 3.75 11.17 3.75H7.75C6.65 3.75 5.75 4.65 5.75 5.75V7.75" }
+        },
+        "commits" => rsx! {
+            circle { cx: "12", cy: "12", r: "5.25" }
+            path { d: "M6.5 12H1.75" }
+            path { d: "M22.25 12H17.5" }
         },
         _ => rsx! { circle { cx: "12", cy: "12", r: "3" } },
     };

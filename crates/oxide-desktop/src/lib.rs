@@ -1064,6 +1064,14 @@ impl OxideDesktop {
                 }
             }
             Event::Todos { .. } => {}
+            Event::BackgroundJob { command, path, .. } => {
+                self.timeline.push(TimelineItem {
+                    title: "Background job".to_string(),
+                    detail: format!("{command} → {path}"),
+                    state: TimelineState::Running,
+                    request_id: None,
+                });
+            }
             Event::PatchApplied { path, .. } => {
                 self.inspector = InspectorTab::Diff;
                 self.refresh_repo_index();
