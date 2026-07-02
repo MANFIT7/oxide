@@ -88,9 +88,14 @@ struct State {
     /// The active model's context window (from the backend), for the status bar.
     context_limit: Option<u64>,
     last_input_tokens: u64,
-    /// Rows scrolled up from the bottom (0 = follow the newest output). Clamped
-    /// to the max offset in `draw` once the wrapped height is known.
-    scroll: usize,
+    /// Rows scrolled up from the bottom (0 = follow the newest output) — the
+    /// value the easing glide moves TOWARD. Wheel/page input mutates this;
+    /// it's clamped to the max offset in `draw` once the wrapped height is known.
+    scroll_target: usize,
+    /// Animated scroll position in fractional rows, eased toward
+    /// `scroll_target` each frame tick and rendered rounded — so a wheel
+    /// flick glides instead of jumping. Kept in sync when snapping.
+    scroll_pos: f32,
     quit: bool,
 }
 
@@ -155,6 +160,20 @@ impl State {
             });
         }
     }
+}
+
+/// One 60fps animation step of the scroll glide: move `pos` toward `target`
+/// by 35% of the remaining distance (exponential ease-out), snapping the last
+/// sub-row step so it settles exactly. Returns true while still moving — the
+/// caller keeps repainting until it settles, then the frame clock goes idle
+/// again (no repaint when nothing changes).
+fn ease_scroll(pos: &mut f32, target: f32) -> bool {
+    let d = target - *pos;
+    if d.abs() < 0.01 {
+        return false;
+    }
+    *pos += if d.abs() < 0.5 { d } else { d * 0.35 };
+    true
 }
 
 /// Flatten a block to render lines: a header (status gutter + title) and its
@@ -297,9 +316,12 @@ async fn run_loop(
                     Some(Ok(CtEvent::Key(key))) => { handle_key(key, handle, state).await?; dirty = true; }
                     Some(Ok(CtEvent::Paste(s))) => { state.input.push_str(&s); dirty = true; }
                     Some(Ok(CtEvent::Mouse(m))) => {
+                        // Only the TARGET moves here; the frame tick below eases the
+                        // rendered position toward it, so fast flicks accumulate into
+                        // one smooth glide instead of 3-row jumps.
                         match m.kind {
-                            MouseEventKind::ScrollUp => { state.scroll = state.scroll.saturating_add(3); dirty = true; }
-                            MouseEventKind::ScrollDown => { state.scroll = state.scroll.saturating_sub(3); dirty = true; }
+                            MouseEventKind::ScrollUp => { state.scroll_target = state.scroll_target.saturating_add(3); dirty = true; }
+                            MouseEventKind::ScrollDown => { state.scroll_target = state.scroll_target.saturating_sub(3); dirty = true; }
                             _ => {}
                         }
                     }
@@ -316,6 +338,11 @@ async fn run_loop(
                 }
             }
             _ = frame.tick() => {
+                // One easing step per frame while the scroll glide is in flight;
+                // it keeps `dirty` set until the position settles on the target.
+                if ease_scroll(&mut state.scroll_pos, state.scroll_target as f32) {
+                    dirty = true;
+                }
                 if dirty {
                     draw(terminal, state)?;
                     dirty = false;
@@ -358,7 +385,9 @@ async fn handle_key(key: KeyEvent, handle: &EngineHandle, state: &mut State) -> 
             if !text.is_empty() {
                 state.input.clear();
                 // Snap to the bottom so the user sees their message + the reply.
-                state.scroll = 0;
+                // Instant (no glide): this is intent to see NOW, not navigation.
+                state.scroll_target = 0;
+                state.scroll_pos = 0.0;
                 state.push(Line::from(vec![
                     Span::styled(
                         "you   ",
@@ -371,8 +400,8 @@ async fn handle_key(key: KeyEvent, handle: &EngineHandle, state: &mut State) -> 
                 handle.submit(Op::UserTurn { text }).await?;
             }
         }
-        (_, KeyCode::PageUp) => state.scroll = state.scroll.saturating_add(10),
-        (_, KeyCode::PageDown) => state.scroll = state.scroll.saturating_sub(10),
+        (_, KeyCode::PageUp) => state.scroll_target = state.scroll_target.saturating_add(10),
+        (_, KeyCode::PageDown) => state.scroll_target = state.scroll_target.saturating_sub(10),
         (_, KeyCode::Backspace) => {
             state.input.pop();
         }
@@ -765,11 +794,15 @@ fn draw(terminal: &mut ratatui::DefaultTerminal, state: &mut State) -> anyhow::R
         let para = Paragraph::new(lines).wrap(Wrap { trim: false });
         let total = para.line_count(inner_w);
         let max_off = total.saturating_sub(inner_h);
-        if state.scroll > max_off {
-            state.scroll = max_off;
+        if state.scroll_target > max_off {
+            state.scroll_target = max_off;
         }
-        let off = (max_off - state.scroll) as u16;
-        let scrolled = if state.scroll > 0 { " ↑" } else { "" };
+        // The animated position renders rounded to whole rows (terminals can't
+        // draw sub-row offsets); clamp it too so a shrinking transcript can't
+        // leave the glide aimed past the top.
+        state.scroll_pos = state.scroll_pos.clamp(0.0, max_off as f32);
+        let off = (max_off as f32 - state.scroll_pos).round() as u16;
+        let scrolled = if state.scroll_target > 0 { " ↑" } else { "" };
         let transcript = para
             .block(
                 RatBlock::default()
@@ -865,6 +898,28 @@ mod tests {
         assert_eq!(state.blocks[0].status, BlockStatus::Fail);
         // output line + exit footer
         assert_eq!(state.blocks[0].body.len(), 2);
+    }
+
+    #[test]
+    fn ease_scroll_converges_and_settles_exactly() {
+        let mut pos = 0.0_f32;
+        let target = 30.0_f32;
+        let mut steps = 0;
+        while ease_scroll(&mut pos, target) {
+            steps += 1;
+            assert!(pos <= target, "no overshoot: {pos}");
+            assert!(steps < 120, "must settle within ~2s of frames");
+        }
+        assert_eq!(pos, target, "settles EXACTLY on the target row");
+        // Idle after settling — the frame clock must go back to no-repaint.
+        assert!(!ease_scroll(&mut pos, target));
+    }
+
+    #[test]
+    fn ease_scroll_glides_down_too() {
+        let mut pos = 50.0_f32;
+        while ease_scroll(&mut pos, 0.0) {}
+        assert_eq!(pos, 0.0);
     }
 
     #[test]

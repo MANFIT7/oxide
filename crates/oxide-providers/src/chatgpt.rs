@@ -50,6 +50,22 @@ const STREAM_POLL_TIMEOUT: Duration = Duration::from_secs(5);
 /// ChatGPT can keep the SSE socket alive without semantic events. Stop the turn
 /// instead of leaving the UI in a permanent Working state.
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(75);
+/// Bound how long the POST may sit waiting for response HEADERS. The client
+/// deliberately has no overall request timeout (streaming turns need none), so
+/// without this a server that accepts the connection but never answers pins the
+/// turn in "Working" forever. Generous: headers normally arrive in seconds.
+const RESPONSE_HEADERS_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Idle-stall bail, scaled by reasoning effort: a high-effort model can think
+/// for minutes emitting only sparse frames, and bailing at the base 75s turns a
+/// healthy long think into "stream stalled" + a wasted transparent retry.
+fn stream_idle_timeout(reasoning_effort: &str) -> Duration {
+    match reasoning_effort.to_ascii_lowercase().as_str() {
+        "high" => Duration::from_secs(150),
+        "xhigh" | "max" => Duration::from_secs(180),
+        _ => STREAM_IDLE_TIMEOUT,
+    }
+}
 
 /// Best-known context window (tokens) for a ChatGPT-backend model, so
 /// compaction adapts automatically per model instead of a fixed number.
@@ -327,6 +343,88 @@ fn error_is_context_overflow(error: &Value) -> bool {
         || msg.contains("context length")
         || msg.contains("maximum context")
         || (msg.contains("context") && msg.contains("exceed"))
+}
+
+/// Overflow classification for non-2xx HTTP bodies. Deliberately NARROWER than
+/// a bare `contains("context")`: server-side noise like Go's
+/// "context deadline exceeded" (routine in 5xx bodies) must not be classified
+/// as prompt overflow — the engine would respond by compacting + retrying a
+/// perfectly sized prompt. Only 413, or a client error whose body names the
+/// context-length condition, counts.
+fn http_error_is_context_overflow(status: u16, body: &str) -> bool {
+    if status == 413 {
+        return true;
+    }
+    if !(400..500).contains(&status) {
+        return false;
+    }
+    let b = body.to_ascii_lowercase();
+    b.contains("context_length_exceeded")
+        || b.contains("context length")
+        || b.contains("maximum context")
+}
+
+/// Full text of a completed `message` output item (output_text + refusal parts).
+/// Fallback for backend builds that never stream `response.output_text.delta`:
+/// without this the reply exists only inside `output_item.done` and would be
+/// dropped → committed turn with an empty bubble (the v0.0.107 codex family).
+fn message_item_text(item: &Value) -> String {
+    let Some(parts) = item["content"].as_array() else {
+        return String::new();
+    };
+    let mut out = String::new();
+    for p in parts {
+        match p["type"].as_str() {
+            Some("output_text") | Some("refusal") => {
+                if let Some(t) = p["text"].as_str() {
+                    out.push_str(t);
+                } else if let Some(t) = p["refusal"].as_str() {
+                    out.push_str(t);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Resolve the leftover `pending_function_args` buffers (calls whose
+/// `output_item.done` never arrived) into calls to emit.
+///
+/// On a CLEAN completion a buffer with unparsable/empty args still emits with
+/// `{}` — the old safety net for a done event that omitted arguments. On a
+/// TRUNCATED stream (stall / connection lost) that net is a hazard: the buffer
+/// holds argument JSON cut mid-stream, and `{}`-defaulting it would EXECUTE a
+/// tool the model only half-specified (e.g. `shell` with no command). Those are
+/// skipped and counted so the caller can surface a Notice.
+fn drain_pending_tool_calls(
+    pending: HashMap<String, (String, String, String)>,
+    stream_completed: bool,
+) -> (Vec<(Vec<String>, String, Value)>, usize) {
+    let mut out = Vec::new();
+    let mut skipped = 0usize;
+    for (item_id, (name, raw_args, call_id)) in pending {
+        // Buffers that never received a tool name aren't real calls.
+        if name.is_empty() {
+            continue;
+        }
+        let parsed: Option<Value> = serde_json::from_str(&raw_args).ok();
+        let args = match parsed {
+            Some(v) => v,
+            None if stream_completed => json!({}),
+            None => {
+                skipped += 1;
+                continue;
+            }
+        };
+        let ids = if call_id.is_empty() {
+            vec![item_id]
+        } else {
+            vec![call_id, item_id]
+        };
+        out.push((ids, name, args));
+    }
+    (out, skipped)
 }
 
 async fn send_rate_limit(
@@ -942,7 +1040,24 @@ impl Provider for ChatGptProvider {
             if !account.trim().is_empty() {
                 builder = builder.header("chatgpt-account-id", &account);
             }
-            let send_result = builder.send().await;
+            // Header-wait bound: see RESPONSE_HEADERS_TIMEOUT. Treated like a
+            // connection error (transient retry) — re-POSTing after a headers
+            // timeout is safe, nothing has streamed yet.
+            let send_result = match tokio::time::timeout(RESPONSE_HEADERS_TIMEOUT, builder.send())
+                .await
+            {
+                Ok(sent) => sent,
+                Err(_) if attempt < MAX_RETRIES => {
+                    let wait = retry_delay_ms(None, attempt);
+                    attempt += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
+                    continue;
+                }
+                Err(_) => anyhow::bail!(
+                    "ChatGPT subscription request timeout: no response headers after {}s. Retry, or check the network/OpenAI status if it repeats.",
+                    RESPONSE_HEADERS_TIMEOUT.as_secs()
+                ),
+            };
             match send_result {
                 Ok(resp) if resp.status().is_success() => break resp,
                 Ok(resp) => {
@@ -982,7 +1097,7 @@ impl Provider for ChatGptProvider {
                     if status.as_u16() == 429 {
                         anyhow::bail!("ChatGPT subscription rate limit reached ({status}). Wait for the plan reset shown in Usage, then retry. ({text})");
                     }
-                    if status.as_u16() == 413 || text.to_ascii_lowercase().contains("context") {
+                    if http_error_is_context_overflow(status.as_u16(), &text) {
                         anyhow::bail!("ChatGPT subscription context is too large ({status}). Compact the chat or remove large attachments, then retry. ({text})");
                     }
                     anyhow::bail!("chatgpt {status}: {text}");
@@ -1004,12 +1119,21 @@ impl Provider for ChatGptProvider {
         if let Some((plan, p, s, p_reset, s_reset)) = parse_usage_headers(&resp) {
             let _ = send_rate_limit(&sink, plan, p, s, p_reset, s_reset).await;
         } else {
-            tokio::spawn(fetch_usage_snapshot(
-                self.client.clone(),
-                sink.clone(),
-                access.clone(),
-                account.clone(),
-            ));
+            // Throttle the fallback poll: usage moves slowly, and without this
+            // every turn on a headerless backend pays an extra HTTP round-trip.
+            static LAST_USAGE_POLL_S: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let now = unix_now_s();
+            let last = LAST_USAGE_POLL_S.load(std::sync::atomic::Ordering::Relaxed);
+            if now.saturating_sub(last) >= 60 {
+                LAST_USAGE_POLL_S.store(now, std::sync::atomic::Ordering::Relaxed);
+                tokio::spawn(fetch_usage_snapshot(
+                    self.client.clone(),
+                    sink.clone(),
+                    access.clone(),
+                    account.clone(),
+                ));
+            }
         }
 
         let mut stream = resp.bytes_stream().eventsource();
@@ -1028,12 +1152,17 @@ impl Provider for ChatGptProvider {
         // Decides truncation handling: cut off BEFORE any output → bail so the
         // engine can cleanly re-request; cut off AFTER output → preserve it.
         let mut emitted_output = false;
+        // True once any output_text/refusal DELTA streamed — gates the
+        // message-done text fallback (only a build that never streams deltas
+        // may emit from the done item, else it would duplicate the reply).
+        let mut any_text_delta = false;
+        let idle_timeout = stream_idle_timeout(&req.reasoning_effort);
         let mut last_progress = tokio::time::Instant::now();
         loop {
             let Some(ev) = (match tokio::time::timeout(STREAM_POLL_TIMEOUT, stream.next()).await {
                 Ok(next) => next,
                 Err(_) => {
-                    if last_progress.elapsed() >= STREAM_IDLE_TIMEOUT {
+                    if last_progress.elapsed() >= idle_timeout {
                         stream_stalled = true;
                         break;
                     }
@@ -1052,7 +1181,7 @@ impl Provider for ChatGptProvider {
             // Skip empty events (SSE keep-alive blank lines) and the [DONE]
             // sentinel some endpoints append after response.completed.
             if ev.data.is_empty() {
-                if last_progress.elapsed() >= STREAM_IDLE_TIMEOUT {
+                if last_progress.elapsed() >= idle_timeout {
                     stream_stalled = true;
                     break;
                 }
@@ -1084,6 +1213,7 @@ impl Provider for ChatGptProvider {
                             return Ok(());
                         }
                         emitted_output = true;
+                        any_text_delta = true;
                     }
                 }
                 Some("response.reasoning_summary_text.delta")
@@ -1135,6 +1265,18 @@ impl Provider for ChatGptProvider {
                     let item = &v["item"];
                     if item["type"].as_str() == Some("reasoning") {
                         let _ = sink.send(StreamItem::ReasoningItem(item.clone())).await;
+                    }
+                    // Delta-less builds: the reply text exists ONLY in this done
+                    // item. Gated on any_text_delta so a normal streaming build
+                    // never gets its reply duplicated.
+                    if item["type"].as_str() == Some("message") && !any_text_delta {
+                        let text = message_item_text(item);
+                        if !text.is_empty() {
+                            if sink.send(StreamItem::TextDelta(text)).await.is_err() {
+                                return Ok(());
+                            }
+                            emitted_output = true;
+                        }
                     }
                     if let Some((ids, name, arguments)) =
                         response_tool_call(item, &mut pending_function_args)
@@ -1257,6 +1399,7 @@ impl Provider for ChatGptProvider {
                             return Ok(());
                         }
                         emitted_output = true;
+                        any_text_delta = true;
                     }
                 }
                 Some("response.refusal.done") => {
@@ -1269,7 +1412,7 @@ impl Provider for ChatGptProvider {
                     last_progress = tokio::time::Instant::now();
                 }
             }
-            if last_progress.elapsed() >= STREAM_IDLE_TIMEOUT {
+            if last_progress.elapsed() >= idle_timeout {
                 stream_stalled = true;
                 break;
             }
@@ -1298,7 +1441,7 @@ impl Provider for ChatGptProvider {
             } else if stream_stalled {
                 anyhow::bail!(
                     "ChatGPT subscription stream stalled for {}s without model output; stopped this turn so the UI does not stay stuck. Retry, compact the chat, or re-authenticate if it repeats.",
-                    STREAM_IDLE_TIMEOUT.as_secs()
+                    idle_timeout.as_secs()
                 );
             } else {
                 anyhow::bail!(
@@ -1306,30 +1449,22 @@ impl Provider for ChatGptProvider {
                 );
             }
         }
-        for (item_id, (name, raw_args, call_id)) in pending_function_args {
-            // Skip buffers that never received a tool name (seeded by an
-            // output_item.added that never resolved) — they aren't real calls.
-            if name.is_empty() {
-                continue;
-            }
-            // Use the real call_id (seeded at output_item.added) so the replay
-            // correctly pairs function_call / function_call_output by call_id.
-            let ids = if call_id.is_empty() {
-                vec![item_id]
-            } else {
-                vec![call_id, item_id]
-            };
-            if !send_tool_call(
-                &sink,
-                &mut sent_tools,
-                ids,
-                name,
-                parse_tool_args(&raw_args),
-            )
-            .await
-            {
+        // Resolve leftover buffers (no output_item.done seen). Ids keep the real
+        // call_id (seeded at output_item.added) so replay pairs function_call /
+        // function_call_output correctly. On truncated streams, half-streamed
+        // argument JSON is dropped instead of executing as a `{}`-args call.
+        let (drained, skipped) = drain_pending_tool_calls(pending_function_args, stream_completed);
+        for (ids, name, args) in drained {
+            if !send_tool_call(&sink, &mut sent_tools, ids, name, args).await {
                 return Ok(());
             }
+        }
+        if skipped > 0 {
+            let _ = sink
+                .send(StreamItem::Notice(format!(
+                    "⚠ dropped {skipped} half-streamed tool call(s) from the truncated response."
+                )))
+                .await;
         }
         let _ = sink.send(StreamItem::Done).await;
         Ok(())
@@ -1622,5 +1757,121 @@ mod tests {
         let content = v["content"].as_array().unwrap();
         assert_eq!(content.len(), 1);
         assert_eq!(content[0]["text"], "just text");
+    }
+
+    #[test]
+    fn idle_timeout_scales_with_reasoning_effort() {
+        assert_eq!(stream_idle_timeout("low"), STREAM_IDLE_TIMEOUT);
+        assert_eq!(stream_idle_timeout("medium"), STREAM_IDLE_TIMEOUT);
+        assert_eq!(stream_idle_timeout(""), STREAM_IDLE_TIMEOUT);
+        assert_eq!(stream_idle_timeout("high"), Duration::from_secs(150));
+        assert_eq!(stream_idle_timeout("HIGH"), Duration::from_secs(150));
+        assert_eq!(stream_idle_timeout("xhigh"), Duration::from_secs(180));
+        assert_eq!(stream_idle_timeout("max"), Duration::from_secs(180));
+    }
+
+    #[test]
+    fn http_overflow_requires_413_or_context_length_client_error() {
+        assert!(http_error_is_context_overflow(413, "anything"));
+        assert!(http_error_is_context_overflow(
+            400,
+            r#"{"error":{"code":"context_length_exceeded"}}"#
+        ));
+        assert!(http_error_is_context_overflow(
+            400,
+            "This model's maximum context length is 272000 tokens"
+        ));
+        // The misclassification this guards against: Go's server-side timeout
+        // wording in a 5xx body is NOT a prompt overflow.
+        assert!(!http_error_is_context_overflow(
+            504,
+            "context deadline exceeded"
+        ));
+        assert!(!http_error_is_context_overflow(
+            500,
+            "context deadline exceeded"
+        ));
+        assert!(!http_error_is_context_overflow(429, "slow down"));
+    }
+
+    #[test]
+    fn truncated_drain_drops_half_streamed_args() {
+        let pending = HashMap::from([(
+            "item_1".to_string(),
+            (
+                "shell".to_string(),
+                r#"{"command":"rm -rf /tmp/scra"#.to_string(), // cut mid-stream
+                "call_1".to_string(),
+            ),
+        )]);
+        let (out, skipped) = drain_pending_tool_calls(pending, false);
+        assert!(out.is_empty(), "half-specified call must NOT execute");
+        assert_eq!(skipped, 1);
+    }
+
+    #[test]
+    fn completed_drain_keeps_empty_args_safety_net() {
+        let pending = HashMap::from([(
+            "item_1".to_string(),
+            (
+                "todo_write".to_string(),
+                String::new(),
+                "call_1".to_string(),
+            ),
+        )]);
+        let (out, skipped) = drain_pending_tool_calls(pending, true);
+        assert_eq!(skipped, 0);
+        assert_eq!(out.len(), 1);
+        let (ids, name, args) = &out[0];
+        assert_eq!(ids, &vec!["call_1".to_string(), "item_1".to_string()]);
+        assert_eq!(name, "todo_write");
+        assert_eq!(args, &json!({}));
+    }
+
+    #[test]
+    fn truncated_drain_keeps_calls_with_complete_args() {
+        let pending = HashMap::from([(
+            "item_1".to_string(),
+            (
+                "shell".to_string(),
+                r#"{"command":"ls"}"#.to_string(),
+                String::new(), // no call_id → item_id only
+            ),
+        )]);
+        let (out, skipped) = drain_pending_tool_calls(pending, false);
+        assert_eq!(skipped, 0);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, vec!["item_1".to_string()]);
+        assert_eq!(out[0].2["command"], "ls");
+    }
+
+    #[test]
+    fn drain_ignores_nameless_buffers() {
+        let pending = HashMap::from([(
+            "item_1".to_string(),
+            (
+                String::new(),
+                r#"{"a":1}"#.to_string(),
+                "call_1".to_string(),
+            ),
+        )]);
+        let (out, skipped) = drain_pending_tool_calls(pending, true);
+        assert!(out.is_empty());
+        assert_eq!(skipped, 0);
+    }
+
+    #[test]
+    fn message_item_text_concatenates_output_and_refusal_parts() {
+        let item = json!({
+            "type": "message",
+            "content": [
+                { "type": "output_text", "text": "Hello " },
+                { "type": "annotation", "text": "ignored-kind" },
+                { "type": "output_text", "text": "world" },
+                { "type": "refusal", "refusal": " — no." }
+            ]
+        });
+        assert_eq!(message_item_text(&item), "Hello world — no.");
+        assert_eq!(message_item_text(&json!({ "type": "message" })), "");
     }
 }

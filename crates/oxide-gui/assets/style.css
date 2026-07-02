@@ -2299,12 +2299,13 @@ details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
   position: sticky; top: 6px; z-index: 3;
 }
 .row.user .bubble {
+  /* Must stay OPAQUE: the row is position:sticky, so streaming rows scroll
+     UNDERNEATH it — any alpha lets them show through as overlapping text. */
   background: color-mix(in srgb, var(--text) 5%, var(--bg));
   border: none; border-left: 2px solid var(--syn-accent);
   border-radius: 0 8px 8px 0; max-width: 100%; width: 100%;
   padding: 10px 14px; font-size: 14px;
   box-shadow: 0 2px 10px -6px rgba(0,0,0,.28);
-  backdrop-filter: blur(8px);
 }
 .app[data-theme="light"] .row.user .bubble { box-shadow: 0 2px 10px -6px rgba(20,20,20,.16); }
 
@@ -2386,7 +2387,9 @@ svg { stroke-width: 1.6; }
 .app[data-theme="light"] .diff-dels { color: #cf2d56; }
 .app[data-theme="light"] .dl.add { background: rgba(31,138,101,.12); }
 .app[data-theme="light"] .dl.del { background: rgba(207,45,86,.10); }
-.app[data-theme="light"] .row.user .bubble { background: rgba(20,20,20,.04); }
+/* Opaque equivalent of the old rgba(20,20,20,.04) wash — see the sticky note
+   on .row.user .bubble: translucency here made streaming text bleed through. */
+.app[data-theme="light"] .row.user .bubble { background: color-mix(in srgb, var(--text) 4%, var(--bg)); }
 .app[data-theme="light"] .sidebar { background: var(--sidebar); box-shadow: none; }
 .app[data-theme="light"] { --sidebar: #f4f4f5; }
 .app[data-theme="light"] .composer { box-shadow: 0 2px 14px -8px rgba(20,20,20,.18); }
@@ -2741,6 +2744,8 @@ details::details-content { overflow: clip; }
   box-shadow: 0 14px 38px rgba(0,0,0,.35); animation: menu-in .14s ease-out; }
 .app[data-theme="light"] .env-card { box-shadow: 0 14px 38px rgba(20,20,20,.12); }
 .env-card-head { display: flex; align-items: center; justify-content: space-between; padding: 0 8px 8px; color: var(--muted); font-size: 13px; }
+.env-card-title { display: inline-flex; align-items: center; gap: 6px; }
+.env-card-logo svg { width: 13px; height: 13px; }
 .env-card-gear { background: none; border: none; color: var(--faint); cursor: pointer; padding: 2px; border-radius: 6px; }
 .env-card-gear:hover { color: var(--text); }
 .env-card-gear svg { width: 14px; height: 14px; }
@@ -3098,6 +3103,22 @@ details::details-content { overflow: clip; }
   width: min(100%, 860px);
   display: grid;
   gap: 10px;
+}
+/* SpecStream: in-flight artifact skeleton (partial spec still streaming). */
+.ui-spec.streaming { opacity: .92; }
+.ui-skel {
+  display: block; height: 12px; border-radius: 6px;
+  background: color-mix(in srgb, var(--text) 9%, transparent);
+  animation: ui-skel-pulse 1.2s ease-in-out infinite;
+}
+.ui-skel.wide { width: 38%; }
+.ui-skel.line { width: 72%; }
+.ui-skel.block { height: 42px; width: 100%; border-radius: 8px; }
+.ui-table-skel-head { display: flex; gap: 12px; font-size: 12px; color: var(--muted); font-weight: 600; }
+.ui-table-skel-rows { font-size: 12px; color: var(--faint); padding-top: 4px; }
+@keyframes ui-skel-pulse { 0%, 100% { opacity: .35; } 50% { opacity: .8; } }
+@media (prefers-reduced-motion: reduce) {
+  .ui-skel { animation: none; opacity: .5; }
 }
 .ui-spec-title {
   font-size: 12px;

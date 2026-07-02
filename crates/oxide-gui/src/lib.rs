@@ -498,12 +498,16 @@ struct ActivityView {
 struct TranscriptGroup {
     activity: bool,
     indices: Vec<usize>,
-    key: usize,
+    /// First row's ChatMsg.id — stable across mid-list inserts, unlike a Vec
+    /// index. Used both as the rsx `key:` and for the act_open toggle map.
+    key: u64,
     live: bool,
 }
 
 #[derive(Clone, PartialEq)]
 struct TranscriptTurn {
+    /// First row's ChatMsg.id, for the turn's rsx `key:`.
+    key: u64,
     groups: Vec<TranscriptGroup>,
     /// The turn's Done summary is pulled OUT of the row list so it always
     /// renders as the turn's last child — never below it (Synara's model: the
@@ -590,14 +594,14 @@ fn build_transcript_turns(messages: &[ChatMsg]) -> Vec<TranscriptTurn> {
             groups.push(TranscriptGroup {
                 activity: true,
                 indices: (start..i).collect(),
-                key: start,
+                key: messages[start].id,
                 live,
             });
         } else {
             groups.push(TranscriptGroup {
                 activity: false,
                 indices: vec![i],
-                key: i,
+                key: messages[i].id,
                 live: false,
             });
             i += 1;
@@ -626,6 +630,7 @@ fn build_transcript_turns(messages: &[ChatMsg]) -> Vec<TranscriptTurn> {
             .unwrap_or(false);
         if starts_turn || turns.is_empty() {
             turns.push(TranscriptTurn {
+                key: group.key,
                 groups: vec![group],
                 done_summary: None,
             });
@@ -962,14 +967,14 @@ fn upsert_tool_input_preview(
     } else {
         buf_push_activity(
             messages,
-            ChatMsg {
-                author: Author::Activity {
+            ChatMsg::new(
+                Author::Activity {
                     running: true,
                     ok: true,
                     key: Some(call_id),
                 },
                 text,
-            },
+            ),
         );
     }
 }
@@ -1011,17 +1016,41 @@ fn activity_has_output(text: &str) -> bool {
         .unwrap_or(false)
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone)]
 struct ChatMsg {
+    /// Monotonic per-process id — the stable rsx `key:` for transcript rows, so
+    /// list diffing tracks a row through mid-list inserts (thought rows, rows
+    /// slotted above the Done note) instead of reusing DOM nodes positionally.
+    id: u64,
     author: Author,
     text: String,
 }
 
-fn ui_spec_message(spec: UiSpec) -> ChatMsg {
-    ChatMsg {
-        author: Author::UiSpec,
-        text: serde_json::to_string(&spec).unwrap_or_else(|_| "{}".to_string()),
+static NEXT_MSG_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+impl ChatMsg {
+    fn new(author: Author, text: impl Into<String>) -> Self {
+        Self {
+            id: NEXT_MSG_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            author,
+            text: text.into(),
+        }
     }
+}
+
+// `id` is identity for list keying, not content — equality stays content-only so
+// memoized views (`Message` props, dedup checks) behave exactly as before.
+impl PartialEq for ChatMsg {
+    fn eq(&self, other: &Self) -> bool {
+        self.author == other.author && self.text == other.text
+    }
+}
+
+fn ui_spec_message(spec: UiSpec) -> ChatMsg {
+    ChatMsg::new(
+        Author::UiSpec,
+        serde_json::to_string(&spec).unwrap_or_else(|_| "{}".to_string()),
+    )
 }
 
 fn parse_ui_spec_message(text: &str) -> Result<UiSpec, String> {
@@ -1029,6 +1058,120 @@ fn parse_ui_spec_message(text: &str) -> Result<UiSpec, String> {
         serde_json::from_str(text).map_err(|e| format!("ui spec parse error: {e}"))?;
     spec.validate()?;
     Ok(spec)
+}
+
+/// Row-text prefix for an in-flight `render_ui_spec` preview:
+/// `§uispec-preview\t{call_id}\t{repaired-json}`. The final `Event::UiSpec`
+/// replaces the row's text in place (same ChatMsg id → no DOM remount).
+const UI_SPEC_PREVIEW_MARK: &str = "\u{a7}uispec-preview\t";
+
+/// Best-effort parse of a truncated JSON prefix (the SpecStream idea from
+/// vercel-labs/json-render): close an open string, trim a dangling
+/// `"key":`/`,` tail, close open braces/brackets — and if that still doesn't
+/// parse, back off to the last comma and try again (bounded). `None` = keep
+/// the previous skeleton; every new delta gets a fresh chance.
+fn repair_partial_json(src: &str) -> Option<serde_json::Value> {
+    let base = src.trim();
+    if base.is_empty() {
+        return None;
+    }
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(base) {
+        return Some(v);
+    }
+    let mut cut = base.to_string();
+    for _ in 0..6 {
+        // Balance scan: what's open at the end of `cut`?
+        let mut stack: Vec<char> = Vec::new();
+        let (mut in_str, mut esc) = (false, false);
+        for c in cut.chars() {
+            if in_str {
+                if esc {
+                    esc = false;
+                } else if c == '\\' {
+                    esc = true;
+                } else if c == '"' {
+                    in_str = false;
+                }
+                continue;
+            }
+            match c {
+                '"' => in_str = true,
+                '{' => stack.push('}'),
+                '[' => stack.push(']'),
+                '}' | ']' => {
+                    stack.pop();
+                }
+                _ => {}
+            }
+        }
+        let mut fixed = cut.clone();
+        if in_str {
+            fixed.push('"');
+        }
+        // A half-written `"key":` or a trailing comma leaves invalid JSON even
+        // after closing brackets — trim those separators off first.
+        loop {
+            let t = fixed.trim_end().to_string();
+            if t.ends_with(',') || t.ends_with(':') {
+                fixed = t[..t.len() - 1].to_string();
+            } else {
+                fixed = t;
+                break;
+            }
+        }
+        for close in stack.iter().rev() {
+            fixed.push(*close);
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&fixed) {
+            return Some(v);
+        }
+        // Dangling `"key"` with no value (etc.) — back off to the last comma
+        // (approximate: a comma inside a string just costs one extra retry).
+        let i = cut.rfind(',')?;
+        cut.truncate(i);
+    }
+    None
+}
+
+/// Upsert the live skeleton row for a streaming `render_ui_spec` call. The
+/// repaired partial is stored re-serialized, so the render path always parses.
+fn upsert_ui_spec_preview(messages: &mut Vec<ChatMsg>, call_id: &str, accumulated: &str) {
+    if call_id.is_empty() {
+        return;
+    }
+    let Some(partial) = repair_partial_json(accumulated) else {
+        return; // keep the previous skeleton; the next delta retries
+    };
+    let text = format!("{UI_SPEC_PREVIEW_MARK}{call_id}\t{partial}");
+    let prefix = format!("{UI_SPEC_PREVIEW_MARK}{call_id}\t");
+    if let Some(idx) = messages
+        .iter()
+        .rposition(|m| m.author == Author::UiSpec && m.text.starts_with(&prefix))
+    {
+        messages[idx].text = text;
+    } else {
+        messages.push(ChatMsg::new(Author::UiSpec, text));
+    }
+}
+
+/// Swap the newest preview row for the validated final spec IN PLACE (stable
+/// ChatMsg id → the card upgrades without remount); no preview → plain push.
+fn finalize_ui_spec_preview(messages: &mut Vec<ChatMsg>, final_msg: ChatMsg) {
+    if let Some(idx) = messages
+        .iter()
+        .rposition(|m| m.author == Author::UiSpec && m.text.starts_with(UI_SPEC_PREVIEW_MARK))
+    {
+        messages[idx].text = final_msg.text;
+    } else {
+        messages.push(final_msg);
+    }
+}
+
+/// Remove the preview row when the call failed core-side validation — a
+/// skeleton with no final spec would linger forever.
+fn drop_ui_spec_preview(messages: &mut Vec<ChatMsg>, call_id: &str) {
+    let prefix = format!("{UI_SPEC_PREVIEW_MARK}{call_id}\t");
+    messages.retain(|m| !(m.author == Author::UiSpec && m.text.starts_with(&prefix)));
 }
 
 #[component]
@@ -1208,38 +1351,34 @@ fn visual_fixture_messages(mode: Option<VisualFixtureMode>) -> Vec<ChatMsg> {
         return Vec::new();
     }
     vec![
-        ChatMsg {
-            author: Author::User,
-            text: "Audit the Oxide GUI motion states and harden the harness parity pass."
-                .to_string(),
-        },
-        ChatMsg {
-            author: Author::Activity {
+        ChatMsg::new(
+            Author::User,
+            "Audit the Oxide GUI motion states and harden the harness parity pass.",
+        ),
+        ChatMsg::new(
+            Author::Activity {
                 running: true,
                 ok: true,
                 key: Some("visual-tool".to_string()),
             },
-            text: tool_input_preview_label(
+            tool_input_preview_label(
                 "browser_search",
                 "{\"query\":\"oxide gui visual qa cursor parity\"}",
             ),
-        },
-        ChatMsg {
-            author: Author::Activity {
+        ),
+        ChatMsg::new(
+            Author::Activity {
                 running: true,
                 ok: true,
                 key: Some("visual-command".to_string()),
             },
-            text: command_activity_label(
+            command_activity_label(
                 "cargo test -p oxide-core gui_visual_fixture_screenshot",
                 false,
             ),
-        },
+        ),
         ui_spec_message(visual_fixture_ui_spec()),
-        ChatMsg {
-            author: Author::Agent,
-            text: String::new(),
-        },
+        ChatMsg::new(Author::Agent, String::new()),
     ]
 }
 
@@ -2617,6 +2756,62 @@ mod tests {
     use super::*;
 
     #[test]
+    fn repair_partial_json_closes_truncated_spec() {
+        // Cut mid string-value.
+        let v = repair_partial_json(r#"{"spec":{"title":"Dash"#).unwrap();
+        assert_eq!(v["spec"]["title"], "Dash");
+        // Cut mid key: backs off to the last comma.
+        let v = repair_partial_json(r#"{"spec":{"title":"Dash","ro"#).unwrap();
+        assert_eq!(v["spec"]["title"], "Dash");
+        // Cut after a colon: dangling pair trimmed.
+        let v = repair_partial_json(r#"{"spec":{"title":"Dash","root":"#).unwrap();
+        assert_eq!(v["spec"]["title"], "Dash");
+        // Nested arrays/objects get closed.
+        let v = repair_partial_json(
+            r#"{"spec":{"root":{"type":"stack","children":[{"type":"text","props":{"text":"hi"#,
+        )
+        .unwrap();
+        assert_eq!(v["spec"]["root"]["children"][0]["props"]["text"], "hi");
+        // Complete JSON passes through unchanged.
+        let v = repair_partial_json(r#"{"a":1}"#).unwrap();
+        assert_eq!(v["a"], 1);
+        assert!(repair_partial_json("").is_none());
+    }
+
+    #[test]
+    fn ui_spec_preview_upserts_then_finalizes_in_place() {
+        let mut msgs: Vec<ChatMsg> = Vec::new();
+        upsert_ui_spec_preview(&mut msgs, "c1", r#"{"spec":{"title":"Da"#);
+        assert_eq!(msgs.len(), 1);
+        let first_id = msgs[0].id;
+        assert!(msgs[0].text.starts_with(UI_SPEC_PREVIEW_MARK));
+        // Next delta updates the SAME row.
+        upsert_ui_spec_preview(&mut msgs, "c1", r#"{"spec":{"title":"Dash"#);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].id, first_id);
+        assert!(msgs[0].text.contains("Dash"));
+        // Final spec replaces the text in place — id stays stable (no remount).
+        let final_msg = ChatMsg::new(Author::UiSpec, r#"{"root":{"type":"text"}}"#.to_string());
+        finalize_ui_spec_preview(&mut msgs, final_msg);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].id, first_id);
+        assert!(!msgs[0].text.starts_with(UI_SPEC_PREVIEW_MARK));
+    }
+
+    #[test]
+    fn ui_spec_preview_dropped_on_failed_call() {
+        let mut msgs: Vec<ChatMsg> = Vec::new();
+        upsert_ui_spec_preview(&mut msgs, "c1", r#"{"spec":{"title":"x"}}"#);
+        assert_eq!(msgs.len(), 1);
+        drop_ui_spec_preview(&mut msgs, "c1");
+        assert!(msgs.is_empty());
+        // Finalize with no preview → plain push.
+        let mut msgs: Vec<ChatMsg> = Vec::new();
+        finalize_ui_spec_preview(&mut msgs, ChatMsg::new(Author::UiSpec, "{}".to_string()));
+        assert_eq!(msgs.len(), 1);
+    }
+
+    #[test]
     fn active_workspace_scan_is_not_deferred() {
         let workspace = Path::new("/Volumes/Data/oxide");
 
@@ -2655,20 +2850,17 @@ mod tests {
     }
 
     fn act(text: &str) -> ChatMsg {
-        ChatMsg {
-            author: Author::Activity {
+        ChatMsg::new(
+            Author::Activity {
                 running: false,
                 ok: true,
                 key: None,
             },
-            text: text.into(),
-        }
+            text,
+        )
     }
     fn note(text: &str) -> ChatMsg {
-        ChatMsg {
-            author: Author::Note,
-            text: text.into(),
-        }
+        ChatMsg::new(Author::Note, text)
     }
 
     #[test]
@@ -2677,14 +2869,8 @@ mod tests {
         // CLI tool events surfaced after TurnFinished landed below the footer).
         let done = format!("{DONE_NOTE_MARK} · 1m");
         let msgs = vec![
-            ChatMsg {
-                author: Author::User,
-                text: "go".into(),
-            },
-            ChatMsg {
-                author: Author::Agent,
-                text: "working".into(),
-            },
+            ChatMsg::new(Author::User, "go"),
+            ChatMsg::new(Author::Agent, "working"),
             note(&done),
             act("terminal\tBash\tgit status"),
             act("eye\tRead\tlib.rs"),
@@ -3111,15 +3297,12 @@ fn load_session(path: &Path) -> Vec<ChatMsg> {
                 "ui_spec" => Author::UiSpec,
                 _ => Author::Note,
             };
-            Some(ChatMsg {
-                author,
-                text: content,
-            })
+            Some(ChatMsg::new(author, content))
         })
         .collect();
     if trimmed {
         let hidden = total - SESSION_RENDER_MESSAGE_LIMIT;
-        out.insert(0, ChatMsg { author: Author::Note, text: format!("… {hidden} earlier messages hidden (long session) — the agent still resumes the full context") });
+        out.insert(0, ChatMsg::new(Author::Note, format!("… {hidden} earlier messages hidden (long session) — the agent still resumes the full context")));
     }
     out
 }
@@ -3551,6 +3734,9 @@ fn app() -> Element {
     let env_tab_by_tab = use_signal(HashMap::<u64, String>::new);
     // Environment card: running-process dropdown (port, name, pid).
     let mut procs_list = use_signal(Vec::<(u16, String, u32)>::new);
+    // Whether the workspace's `origin` remote is GitHub — the Environment card
+    // then wears the GitHub mark. Detected once per workspace, not per frame.
+    let mut repo_is_github = use_signal(|| false);
     // Environment card menus + per-thread extras.
     let mut git_menu = use_signal(|| false);
     let mut branch_menu = use_signal(|| false);
@@ -3772,7 +3958,7 @@ fn app() -> Element {
     // Per activity-group open state (keyed by first row index). Defaults to the
     // running state but, once the user toggles, their choice sticks across the
     // streaming re-renders that would otherwise force it back open.
-    let mut act_open = use_signal(std::collections::HashMap::<usize, bool>::new);
+    let mut act_open = use_signal(std::collections::HashMap::<u64, bool>::new);
     // Tool/command activity rows are paired to their streamed updates by a stable
     // key stored ON the row (see `activity_idx`), not by a side index map — so a
     // row inserted above the "Done" note can't shift another row's pairing.
@@ -4232,6 +4418,19 @@ fn app() -> Element {
         }
     });
 
+    // Detect the repo host once per workspace for the Environment card mark.
+    use_effect(move || {
+        let ws = ui.workspace.read().clone();
+        if cfg.read().workspace.is_some() {
+            spawn(async move {
+                let url = run_cmd(&ws, "git", &["remote", "get-url", "origin"]).await;
+                repo_is_github.set(url.contains("github.com"));
+            });
+        } else {
+            repo_is_github.set(false);
+        }
+    });
+
     // Load the kanban board + recent chat sessions for the active workspace.
     use_effect(move || {
         let ws = ui.workspace.read().clone();
@@ -4545,10 +4744,7 @@ fn app() -> Element {
                             Some(last) if last.author == Author::Agent => {
                                 last.text.push_str(&chunk)
                             }
-                            _ => m.push(ChatMsg {
-                                author: Author::Agent,
-                                text: chunk,
-                            }),
+                            _ => m.push(ChatMsg::new(Author::Agent, chunk)),
                         }
                         last_paint = std::time::Instant::now();
                     }
@@ -4572,8 +4768,8 @@ fn app() -> Element {
                                 spawn_tab_engine!(aid, conf);
                             }
                             if let Some(h) = handles.get(&aid) {
-                                messages.write().push(ChatMsg { author: Author::User, text: display });
-                                messages.write().push(ChatMsg { author: Author::Agent, text: String::new() });
+                                messages.write().push(ChatMsg::new(Author::User, display));
+                                messages.write().push(ChatMsg::new(Author::Agent, String::new()));
                                 scroll_chat_bottom();
                                 streaming.set(true);
                                 // Reset the elapsed clock at send, not just at TurnStarted —
@@ -4586,8 +4782,8 @@ fn app() -> Element {
                                 let _ = h.submit(Op::UserTurn { text: eng }).await;
                             } else {
                                 // Engine failed to start — don't eat the message silently.
-                                messages.write().push(ChatMsg { author: Author::User, text: display });
-                                messages.write().push(ChatMsg { author: Author::Note, text: format!("{} engine not running — check provider/settings, or switch model to restart it", '\u{26a0}') });
+                                messages.write().push(ChatMsg::new(Author::User, display));
+                                messages.write().push(ChatMsg::new(Author::Note, format!("{} engine not running — check provider/settings, or switch model to restart it", '\u{26a0}')));
                                 scroll_chat_bottom();
                             }
                         }
@@ -4770,7 +4966,7 @@ fn app() -> Element {
                                 }
                             }
                             questions.write().retain(|(qid, _, _)| *qid != id);
-                            messages.write().push(ChatMsg { author: Author::User, text });
+                            messages.write().push(ChatMsg::new(Author::User, text));
                             scroll_chat_bottom();
                         }
                         Some(EngineCmd::Approve { id, decision }) => {
@@ -4877,7 +5073,7 @@ fn app() -> Element {
                                 Event::AgentMessageDelta { text, .. } => {
                                     match buf.last_mut() {
                                         Some(l) if l.author == Author::Agent => l.text.push_str(&text),
-                                        _ => buf.push(ChatMsg { author: Author::Agent, text }),
+                                        _ => buf.push(ChatMsg::new(Author::Agent, text)),
                                     }
                                 }
                                 Event::Info { text } => {
@@ -4896,15 +5092,15 @@ fn app() -> Element {
                                         if buf.last().map(|m| m.author == Author::Agent && m.text.is_empty()).unwrap_or(false) {
                                             buf.pop();
                                         }
-                                        buf_push_activity(buf, ChatMsg { author: Author::Activity { running: false, ok: true, key: None }, text: row });
+                                        buf_push_activity(buf, ChatMsg::new(Author::Activity { running: false, ok: true, key: None }, row));
                                     } else if is_stage_status(&text) {
                                         // live stage info — meaningless once backgrounded
                                     } else {
-                                        buf.push(ChatMsg { author: Author::Note, text });
+                                        buf.push(ChatMsg::new(Author::Note, text));
                                     }
                                 }
                                 Event::FileDiff { path, diff, checkpoint, .. } => {
-                                    buf.push(ChatMsg { author: Author::Diff(path, checkpoint), text: diff });
+                                    buf.push(ChatMsg::new(Author::Diff(path, checkpoint), diff));
                                 }
                                 Event::UiSpec { spec, .. } => {
                                     buf.push(ui_spec_message(*spec));
@@ -4922,10 +5118,7 @@ fn app() -> Element {
                                                     *ok = true;
                                                 }
                                             } else {
-                                                buf_push_activity(buf, ChatMsg {
-                                                    author: Author::Activity { running: true, ok: true, key: Some(call_id) },
-                                                    text,
-                                                });
+                                                buf_push_activity(buf, ChatMsg::new(Author::Activity { running: true, ok: true, key: Some(call_id) }, text));
                                             }
                                     }
                                 }
@@ -4946,10 +5139,7 @@ fn app() -> Element {
                                         }
                                     }
                                     Event::CommandStarted { command_id, command, background, .. } => {
-                                        buf_push_activity(buf, ChatMsg {
-                                            author: Author::Activity { running: true, ok: true, key: Some(command_id) },
-                                            text: command_activity_label(&command, background),
-                                        });
+                                        buf_push_activity(buf, ChatMsg::new(Author::Activity { running: true, ok: true, key: Some(command_id) }, command_activity_label(&command, background)));
                                     }
                                     Event::CommandOutput { command_id, chunk, .. } => {
                                         if let Some(idx) = activity_idx(buf, &command_id) {
@@ -4957,7 +5147,7 @@ fn app() -> Element {
                                         } else {
                                             let mut text = command_activity_label(&command_id, false);
                                             append_activity_output(&mut text, &chunk);
-                                            buf_push_activity(buf, ChatMsg { author: Author::Activity { running: true, ok: true, key: Some(command_id) }, text });
+                                            buf_push_activity(buf, ChatMsg::new(Author::Activity { running: true, ok: true, key: Some(command_id) }, text));
                                         }
                                     }
                                     Event::CommandFinished { command_id, ok, exit_code, .. } => {
@@ -4983,11 +5173,11 @@ fn app() -> Element {
                                 }
                                 Event::ApprovalRequested { request_id, tool, summary } => {
                                     parked_appr.entry(ev_tid).or_default().push((request_id, tool.clone(), summary));
-                                    buf.push(ChatMsg { author: Author::Note, text: format!("Waiting for approval ({tool}) - open this tab to respond") });
+                                    buf.push(ChatMsg::new(Author::Note, format!("Waiting for approval ({tool}) - open this tab to respond")));
                                 }
                                 Event::QuestionAsked { request_id, question, options } => {
                                     parked_q.entry(ev_tid).or_default().push((request_id, question.clone(), options));
-                                    buf.push(ChatMsg { author: Author::Note, text: format!("Question: {question} - open this tab to answer") });
+                                    buf.push(ChatMsg::new(Author::Note, format!("Question: {question} - open this tab to answer")));
                                 }
                                 Event::TurnFinished { .. } => {
                                     if buf.last().map(|m| m.author == Author::Agent && m.text.is_empty()).unwrap_or(false) {
@@ -4996,7 +5186,7 @@ fn app() -> Element {
                                     for c in buf.iter_mut() {
                                         if let Author::Activity { running, .. } = &mut c.author { *running = false; }
                                     }
-                                    buf.push(ChatMsg { author: Author::Note, text: DONE_NOTE_MARK.into() });
+                                    buf.push(ChatMsg::new(Author::Note, DONE_NOTE_MARK));
                                     let title = tabs.peek().iter().find(|t| t.id == ev_tid).map(|t| t.title.clone()).unwrap_or_default();
                                     if !title.is_empty() {
                                         push_toast(toasts, toast_seq, "ok", &format!("{title} — finished"));
@@ -5005,8 +5195,39 @@ fn app() -> Element {
                                     play_notification_sound(cfg, true);
                                 }
                                 Event::Error { message } if !message.starts_with("mcp '") => {
-                                    buf.push(ChatMsg { author: Author::Note, text: format!("error: {message}") });
+                                    buf.push(ChatMsg::new(Author::Note, format!("error: {message}")));
                                     push_toast(toasts, toast_seq, "err", &message.chars().take(120).collect::<String>());
+                                }
+                                // Subagent progress for a backgrounded tab: keep at least the
+                                // chronological anchor row (the cards signal is view-bound and
+                                // turn-scoped, so these events would otherwise vanish entirely).
+                                Event::SubagentStarted { worker_id, profile, task, .. } => {
+                                    let short: String = task.chars().take(80).collect();
+                                    buf_push_activity(buf, ChatMsg::new(
+                                        Author::Activity { running: true, ok: true, key: Some(format!("subagent:{worker_id}")) },
+                                        format!("spark\tSubagent\t{profile} — {short}"),
+                                    ));
+                                }
+                                Event::SubagentFinished { worker_id, profile, task, summary, ok, .. } => {
+                                    let anchor = format!("subagent:{worker_id}");
+                                    let short: String = if summary.trim().is_empty() {
+                                        task.chars().take(80).collect()
+                                    } else {
+                                        summary.chars().take(80).collect()
+                                    };
+                                    let text = format!("spark\tSubagent\t{profile} — {short}");
+                                    if let Some(idx) = activity_idx(buf, &anchor) {
+                                        buf[idx].text = text;
+                                        if let Author::Activity { running, ok: o, .. } = &mut buf[idx].author {
+                                            *running = false;
+                                            *o = ok;
+                                        }
+                                    } else {
+                                        buf_push_activity(buf, ChatMsg::new(
+                                            Author::Activity { running: false, ok, key: Some(anchor) },
+                                            text,
+                                        ));
+                                    }
                                 }
                                 _ => {}
                             }
@@ -5059,7 +5280,7 @@ fn app() -> Element {
                                     // Route through push_activity! so it lands above a trailing
                                     // "Done" note like every other activity row (never below it).
                                     let running = verb.eq_ignore_ascii_case("running");
-                                    push_activity!(ChatMsg { author: Author::Activity { running, ok: true, key: None }, text: row });
+                                    push_activity!(ChatMsg::new(Author::Activity { running, ok: true, key: None }, row));
                                     } else if text.starts_with('\u{2699}') {
                                         // CLI-driver tool activity: live shimmer + an activity
                                         // trail row in the chat (synara-style).
@@ -5102,7 +5323,7 @@ fn app() -> Element {
                                             mw.pop();
                                         }
                                     }
-                                    push_activity!(ChatMsg { author: Author::Activity { running: false, ok: true, key: None }, text: row });
+                                    push_activity!(ChatMsg::new(Author::Activity { running: false, ok: true, key: None }, row));
                                     // CLI edits compute their real diff at turn end — show the
                                     // file in the "Edited files" card NOW as a pending row
                                     // (synara-style live), replaced by the diff when it lands.
@@ -5116,14 +5337,14 @@ fn app() -> Element {
                                     // pipeline stage becomes live animated status, not a chat note
                                     status.set(text);
                                 } else {
-                                    messages.write().push(ChatMsg { author: Author::Note, text });
+                                    messages.write().push(ChatMsg::new(Author::Note, text));
                                 }
                             }
                             Event::Error { message } => {
                                 // MCP connect errors surface on the manager dots, not the chat.
                                 if !message.starts_with("mcp '") {
                                     push_toast(toasts, toast_seq, "err", &message.chars().take(120).collect::<String>());
-                                    messages.write().push(ChatMsg { author: Author::Note, text: format!("error: {message}") });
+                                    messages.write().push(ChatMsg::new(Author::Note, format!("error: {message}")));
                                     // A turn-level error means no TurnFinished may come —
                                     // unstick the composer and clear per-turn progress cards
                                     // so stale todo spinners don't survive the failed turn.
@@ -5199,10 +5420,18 @@ fn app() -> Element {
                                 });
                             }
                             Event::UiSpec { spec, .. } => {
-                                messages.write().push(ui_spec_message(*spec));
+                                finalize_ui_spec_preview(&mut messages.write(), ui_spec_message(*spec));
                                 scroll_chat_bottom_if_sticky();
                             }
                             Event::SubagentStarted { worker_id, profile, task, .. } => {
+                                // Chronological anchor IN the transcript — the detail card
+                                // lives in the fixed Subagents block below, which otherwise
+                                // leaves no trace of WHERE in the flow the worker started.
+                                let short: String = task.chars().take(80).collect();
+                                push_activity!(ChatMsg::new(
+                                    Author::Activity { running: true, ok: true, key: Some(format!("subagent:{worker_id}")) },
+                                    format!("spark\tSubagent\t{profile} — {short}"),
+                                ));
                                 subagent_cards.write().push(SubagentCard {
                                     worker_id,
                                     profile: profile.clone(),
@@ -5242,6 +5471,23 @@ fn app() -> Element {
                                 scroll_chat_bottom_if_sticky();
                             }
                             Event::SubagentFinished { worker_id, profile, task, summary, ok, .. } => {
+                                // Settle the transcript anchor row for this worker.
+                                {
+                                    let anchor = format!("subagent:{worker_id}");
+                                    let short: String = if summary.trim().is_empty() {
+                                        task.chars().take(80).collect()
+                                    } else {
+                                        summary.chars().take(80).collect()
+                                    };
+                                    let mut ms = messages.write();
+                                    if let Some(idx) = activity_idx(&ms, &anchor) {
+                                        ms[idx].text = format!("spark\tSubagent\t{profile} — {short}");
+                                        if let Author::Activity { running, ok: o, .. } = &mut ms[idx].author {
+                                            *running = false;
+                                            *o = ok;
+                                        }
+                                    }
+                                }
                                 {
                                     let mut cards = subagent_cards.write();
                                     if let Some(card) = cards.iter_mut().find(|c| c.worker_id == worker_id) {
@@ -5273,7 +5519,14 @@ fn app() -> Element {
                             Event::ToolCallDelta { call_id, tool, accumulated, .. } => {
                                 status.set(format!("Preparing {tool} input…"));
                                 let mut m = messages.write();
-                                upsert_tool_input_preview(&mut m, call_id, tool, accumulated);
+                                if tool == "render_ui_spec" {
+                                    // SpecStream: render the artifact skeleton progressively
+                                    // from the partial argument JSON instead of a generic
+                                    // "Preparing…" line; Event::UiSpec swaps in the final card.
+                                    upsert_ui_spec_preview(&mut m, &call_id, &accumulated);
+                                } else {
+                                    upsert_tool_input_preview(&mut m, call_id, tool, accumulated);
+                                }
                                 scroll_chat_bottom_if_sticky();
                             }
                             Event::ToolCallBegin { call_id, tool, args, .. } => {
@@ -5294,12 +5547,17 @@ fn app() -> Element {
                                                 }
                                             }
                                         } else {
-                                            push_activity!(ChatMsg { author: Author::Activity { running: true, ok: true, key: Some(call_id) }, text });
+                                            push_activity!(ChatMsg::new(Author::Activity { running: true, ok: true, key: Some(call_id) }, text));
                                         }
                                     }
                             }
                                 Event::ToolCallEnd { call_id, tool, output, ok, .. } => {
                                     timeline.write().push(TimelineItem { title: format!("Tool · {tool}"), sub: if ok { "done".into() } else { "failed".into() } });
+                                    // A render_ui_spec that failed core-side validation never
+                                    // gets an Event::UiSpec — drop its orphan skeleton row.
+                                    if !ok && tool == "render_ui_spec" {
+                                        drop_ui_spec_preview(&mut messages.write(), &call_id);
+                                    }
                                     // Settle the exact row this call opened — found by its key
                                     // (call_id), never by index — and attach its output. A missing
                                     // row (shell/ask_user, or merged from a backgrounded tab) is a
@@ -5344,10 +5602,10 @@ fn app() -> Element {
                                         // Insert above any trailing Done note (CLI drivers
                                         // like claude can surface a command row after the turn's
                                         // text + Done landed) so it never renders below the footer.
-                                        push_activity!(ChatMsg {
-                                            author: Author::Activity { running: true, ok: true, key: Some(command_id) },
-                                            text: command_activity_label(&command, background),
-                                        });
+                                        push_activity!(ChatMsg::new(
+                                            Author::Activity { running: true, ok: true, key: Some(command_id) },
+                                            command_activity_label(&command, background),
+                                        ));
                                     }
                                     scroll_chat_bottom_if_sticky();
                                 }
@@ -5428,7 +5686,7 @@ fn app() -> Element {
                                             te.push(real);
                                         }
                                     }
-                                    messages.write().push(ChatMsg { author: Author::Diff(path, checkpoint), text: diff });
+                                    messages.write().push(ChatMsg::new(Author::Diff(path, checkpoint), diff));
                                 }
                             }
                             Event::HookFired { hook, command, blocked } => {
@@ -5497,7 +5755,7 @@ fn app() -> Element {
                             Event::RewindDone { id, restored } => {
                                 timeline.write().push(TimelineItem { title: format!("⎌ rewound to #{id}"), sub: format!("{restored} file(s) restored") });
                                 // Confirm in the transcript too — the timeline tab is rarely open.
-                                messages.write().push(ChatMsg { author: Author::Note, text: format!("⎌ Restored {restored} file(s) (checkpoint #{id})") });
+                                messages.write().push(ChatMsg::new(Author::Note, format!("⎌ Restored {restored} file(s) (checkpoint #{id})")));
                             }
                             Event::TokensUsed { input, output, cached_input, .. } => {
                                 usage.set((input, output, cached_input));
@@ -5545,7 +5803,7 @@ fn app() -> Element {
                                     let th = thinking.peek().clone();
                                     if !th.trim().is_empty() {
                                         let secs = turn_start.peek().as_ref().map(|t| t.elapsed().as_secs()).unwrap_or(0).max(1);
-                                        let row = ChatMsg { author: Author::Note, text: format!("§thought\t{secs}\t{th}") };
+                                        let row = ChatMsg::new(Author::Note, format!("§thought\t{secs}\t{th}"));
                                         if let Some(pos) = mw.iter().rposition(|m| m.author == Author::Agent && !m.text.is_empty()) {
                                             mw.insert(pos, row);
                                         } else {
@@ -5606,7 +5864,7 @@ fn app() -> Element {
                                 // "I'll let you know when done" never silently dangles.
                                 if !bg_jobs.peek().is_empty() {
                                     let jobs = bg_jobs.peek().join(", ");
-                                    messages.write().push(ChatMsg { author: Author::Note, text: format!("Background task(s) still running: {jobs} - the result won't return automatically. Ask the agent to check the output, or check the Environment / Local Servers panel.") });
+                                    messages.write().push(ChatMsg::new(Author::Note, format!("Background task(s) still running: {jobs} - the result won't return automatically. Ask the agent to check the output, or check the Environment / Local Servers panel.")));
                                 }
                                 if let Some(start) = turn_start.write().take() {
                                     let secs = start.elapsed().as_secs();
@@ -5617,7 +5875,7 @@ fn app() -> Element {
                                         (e.len(), e.iter().map(|x| x.1).sum::<u32>(), e.iter().map(|x| x.2).sum::<u32>())
                                     };
                                     let sum = if nf > 0 { format!("{DONE_NOTE_MARK} · {dur} · {nf} file(s) +{ta} −{td}") } else { format!("{DONE_NOTE_MARK} · {dur}") };
-                                    messages.write().push(ChatMsg { author: Author::Note, text: sum });
+                                    messages.write().push(ChatMsg::new(Author::Note, sum));
                                 }
                                 // From here, late activities slot above the Done note.
                                 turn_done = true;
@@ -5631,8 +5889,8 @@ fn app() -> Element {
                                 if let Some(text) = next {
                                     if let Some(h) = handles.get(&ev_tid) {
                                         followups.write().clear();
-                                        messages.write().push(ChatMsg { author: Author::User, text: text.clone() });
-                                        messages.write().push(ChatMsg { author: Author::Agent, text: String::new() });
+                                        messages.write().push(ChatMsg::new(Author::User, text.clone()));
+                                        messages.write().push(ChatMsg::new(Author::Agent, String::new()));
                                         scroll_chat_bottom();
                                         streaming.set(true);
                                         // See the send-site above: zero the clock now so the
@@ -6569,7 +6827,14 @@ fn app() -> Element {
                             rsx! {
                                 div { class: "env-card",
                                     div { class: "env-card-head",
-                                        span { "Environment" }
+                                        span { class: "env-card-title",
+                                            if *repo_is_github.read() {
+                                                if let Some(l) = provider_logo("github") {
+                                                    span { class: "prov-logo env-card-logo", dangerous_inner_html: l }
+                                                }
+                                            }
+                                            "Environment"
+                                        }
                                         button { class: "env-card-gear", title: "Open environment", onclick: move |_| select_env_tab(env_tab, show_env, env_tab_by_tab, tabs, active_tab, "files", false), Icon { name: "settings" } }
                                     }
                                     button { class: "env-card-row", onclick: move |_| select_env_tab(env_tab, show_env, env_tab_by_tab, tabs, active_tab, "changes", false),
@@ -8057,13 +8322,14 @@ fn app() -> Element {
                                 class: if *streaming.read() { "col streaming" } else { "col" },
                                 {
                                     let last_user_idx = messages.read().iter().rposition(|m| m.author == Author::User);
+                                    let last_agent_idx = messages.read().iter().rposition(|m| m.author == Author::Agent);
                                     let turns = {
                                         let msgs = messages.read();
                                         build_transcript_turns(&msgs)
                                     };
                                     rsx! {
                                         for turn in turns.into_iter() {
-                                        div { class: "turn",
+                                        div { key: "t-{turn.key}", class: "turn",
                                         for group in turn.groups.into_iter() {
                                             {
                                                 let is_act = group.activity;
@@ -8088,7 +8354,7 @@ fn app() -> Element {
                                                     let hidden = rows.len().saturating_sub(ACT_ROW_CAP);
                                                     let shown: Vec<(String, bool, bool)> = rows.into_iter().skip(hidden).collect();
                                                     rsx! {
-                                                        details { class: "act-group", open: is_open,
+                                                        details { key: "g-{group_key}", class: "act-group", open: is_open,
                                                             summary { class: "act-group-head",
                                                                 onclick: move |e: dioxus::prelude::MouseEvent| {
                                                                     e.prevent_default();
@@ -8163,7 +8429,7 @@ fn app() -> Element {
                                                                 let expanded = expanded_user.read().contains(&idx);
                                                                 let text_cls = if long && !expanded { "user-text clamped" } else { "user-text" };
                                                                 rsx! {
-                                                                    div { class: "{row_cls}",
+                                                                    div { key: "m-{m.id}", class: "{row_cls}",
                                                                         div { class: "bubble",
                                                                             if !imgs.is_empty() {
                                                                                 div { class: "msg-imgs",
@@ -8239,14 +8505,18 @@ fn app() -> Element {
                                                                 let secs = parts.next().unwrap_or("1").to_string();
                                                                 let body = parts.next().unwrap_or("").to_string();
                                                                 rsx! {
-                                                                    details { class: "thought-row",
+                                                                    details { key: "m-{m.id}", class: "thought-row",
                                                                         summary { class: "thought-sum", "Thought for {secs}s" }
                                                                         div { class: "thought-body", "{body}" }
                                                                     }
                                                                 }
                                                             }
                                                             _ => {
-                                                                let is_live = *streaming.read() && m.author == Author::Agent && i + 1 == messages.read().len();
+                                                                // Live = the NEWEST agent bubble while streaming — not "the last
+                                                                // row": a tool/command row landing after the bubble used to flip
+                                                                // it to the cached non-live path mid-stream (one full re-render =
+                                                                // visible flicker), and hid the reasoning box while tools ran.
+                                                                let is_live = *streaming.read() && m.author == Author::Agent && Some(i) == last_agent_idx;
                                                                 let pin_snip: String = m.text.lines().find(|l| !l.trim().is_empty()).unwrap_or("").chars().take(64).collect();
                                                                 let is_agent = m.author == Author::Agent && !m.text.is_empty();
                                                                 let ws_pin = workspace.clone();
@@ -8275,7 +8545,7 @@ fn app() -> Element {
                                                                             div { class: "thinking-body", "{thinking}" }
                                                                         }
                                                                     }
-                                                                    div { id: "msg-{i}", class: "pinwrap",
+                                                                    div { key: "m-{m.id}", id: "msg-{i}", class: "pinwrap",
                                                                         Message { author: m.author.clone(), text: m.text.clone(), live: is_live }
                                                                         if is_agent && !is_live {
                                                                             div { class: "msg-side",
@@ -8551,7 +8821,7 @@ fn app() -> Element {
                                             {
                                                 let row_cls = if card.running { "subagent-row running" } else if card.ok { "subagent-row done" } else { "subagent-row fail" };
                                                 rsx! {
-                                                    div { class: "{row_cls}",
+                                                    div { key: "sa-{card.worker_id}", class: "{row_cls}",
                                                         span { class: "subagent-status",
                                                             if card.running { span { class: "syn-spinner" } }
                                                             else if card.ok { Icon { name: "check" } }
@@ -11570,19 +11840,35 @@ fn Message(author: Author, text: String, #[props(default)] live: bool) -> Elemen
             }
         }
         Author::Activity { running, ok, .. } => rsx! { ActivityRow { text, running, ok } },
-        Author::UiSpec => match parse_ui_spec_message(&text) {
-            Ok(spec) => rsx! {
-                div { class: "row agent ui-spec-row",
-                    img { class: "avatar", src: logo_uri() }
-                    UiSpecView { spec }
-                }
-            },
-            Err(e) => rsx! {
-                div { class: "row note",
-                    div { class: "note-text", "Invalid UI spec: {e}" }
-                }
-            },
-        },
+        Author::UiSpec => {
+            // In-flight SpecStream skeleton (partial args, repaired JSON) —
+            // upgraded in place to the validated card by Event::UiSpec.
+            if let Some(rest) = text.strip_prefix(UI_SPEC_PREVIEW_MARK) {
+                let partial = rest
+                    .split_once('\t')
+                    .and_then(|(_, json)| serde_json::from_str::<serde_json::Value>(json).ok())
+                    .unwrap_or(serde_json::Value::Null);
+                return rsx! {
+                    div { class: "row agent ui-spec-row",
+                        img { class: "avatar", src: logo_uri() }
+                        UiSpecPreviewView { value: partial }
+                    }
+                };
+            }
+            match parse_ui_spec_message(&text) {
+                Ok(spec) => rsx! {
+                    div { class: "row agent ui-spec-row",
+                        img { class: "avatar", src: logo_uri() }
+                        UiSpecView { spec }
+                    }
+                },
+                Err(e) => rsx! {
+                    div { class: "row note",
+                        div { class: "note-text", "Invalid UI spec: {e}" }
+                    }
+                },
+            }
+        }
         Author::Diff(..) => rsx! {},
         Author::Note => {
             if text.starts_with(DONE_NOTE_MARK) {
@@ -11985,6 +12271,166 @@ fn UiSpecView(spec: UiSpec) -> Element {
             }
             UiNodeView { node: spec.root }
         }
+    }
+}
+
+/// SpecStream skeleton: renders the REPAIRED partial `render_ui_spec` argument
+/// JSON while it streams — known node kinds get their real chrome, missing
+/// text/values get shimmer bars, unknown/half-written kinds a placeholder line.
+/// Works on raw `Value` (not `UiSpec`): partial trees can't satisfy serde's
+/// required fields, and core's strict validate() still gates the final card.
+#[component]
+fn UiSpecPreviewView(value: serde_json::Value) -> Element {
+    let spec = value.get("spec").cloned().unwrap_or(value);
+    let title = spec["title"].as_str().unwrap_or("").to_string();
+    let root = spec.get("root").cloned();
+    rsx! {
+        div { class: "ui-spec streaming",
+            if title.is_empty() {
+                div { class: "ui-spec-title", span { class: "ui-skel wide" } }
+            } else {
+                div { class: "ui-spec-title", "{title}" }
+            }
+            if let Some(root) = root {
+                UiNodePreview { node: root, depth: 0 }
+            } else {
+                span { class: "ui-skel block" }
+            }
+        }
+    }
+}
+
+#[component]
+fn UiNodePreview(node: serde_json::Value, depth: usize) -> Element {
+    // Mirror core's caps (depth 8) so a pathological partial can't blow up
+    // the render; children capped like the tool schema (24).
+    if depth >= 8 {
+        return rsx! {};
+    }
+    let children: Vec<serde_json::Value> = node["children"]
+        .as_array()
+        .map(|c| c.iter().take(24).cloned().collect())
+        .unwrap_or_default();
+    let props = &node["props"];
+    let tone = match props["tone"].as_str() {
+        Some("info") => " info",
+        Some("success") => " success",
+        Some("warning") => " warning",
+        Some("danger") => " danger",
+        _ => "",
+    };
+    match node["type"].as_str() {
+        Some("stack") => rsx! {
+            div { class: "ui-node ui-stack",
+                for child in children {
+                    UiNodePreview { node: child, depth: depth + 1 }
+                }
+            }
+        },
+        Some("row") => rsx! {
+            div { class: "ui-node ui-row-spec",
+                for child in children {
+                    UiNodePreview { node: child, depth: depth + 1 }
+                }
+            }
+        },
+        Some("card") => {
+            let title = props["title"].as_str().unwrap_or("").to_string();
+            rsx! {
+                div { class: "ui-node ui-card-spec{tone}",
+                    if !title.is_empty() {
+                        div { class: "ui-card-title", "{title}" }
+                    }
+                    for child in children {
+                        UiNodePreview { node: child, depth: depth + 1 }
+                    }
+                }
+            }
+        }
+        Some("text") => {
+            let text = props["text"]
+                .as_str()
+                .or_else(|| props["value"].as_str())
+                .unwrap_or("")
+                .to_string();
+            if text.is_empty() {
+                rsx! { span { class: "ui-skel line" } }
+            } else {
+                rsx! { div { class: "ui-node ui-text{tone}", "{text}" } }
+            }
+        }
+        Some("metric") => {
+            let label = props["label"].as_str().unwrap_or("").to_string();
+            let val = props["value"].as_str().map(str::to_string).or_else(|| {
+                props["value"]
+                    .is_number()
+                    .then(|| props["value"].to_string())
+            });
+            rsx! {
+                div { class: "ui-node ui-metric{tone}",
+                    if label.is_empty() {
+                        span { class: "ui-skel wide" }
+                    } else {
+                        div { class: "ui-metric-label", "{label}" }
+                    }
+                    if let Some(v) = val {
+                        div { class: "ui-metric-value", "{v}" }
+                    } else {
+                        span { class: "ui-skel line" }
+                    }
+                }
+            }
+        }
+        Some("table") => {
+            let cols: Vec<String> = props["columns"]
+                .as_array()
+                .map(|cs| {
+                    cs.iter()
+                        .filter_map(|c| {
+                            c["label"]
+                                .as_str()
+                                .or_else(|| c["key"].as_str())
+                                .map(str::to_string)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let n_rows = props["rows"].as_array().map(|r| r.len()).unwrap_or(0);
+            rsx! {
+                div { class: "ui-node ui-table-wrap",
+                    if cols.is_empty() {
+                        span { class: "ui-skel block" }
+                    } else {
+                        div { class: "ui-table-skel-head",
+                            for c in cols {
+                                span { class: "ui-table-skel-col", "{c}" }
+                            }
+                        }
+                        div { class: "ui-table-skel-rows",
+                            if n_rows > 0 { "{n_rows} row(s)…" } else { span { class: "ui-skel line" } }
+                        }
+                    }
+                }
+            }
+        }
+        Some("code") => rsx! {
+            div { class: "ui-node ui-code-block", span { class: "ui-skel block" } }
+        },
+        Some("alert") => {
+            let title = props["title"].as_str().unwrap_or("Notice").to_string();
+            rsx! { div { class: "ui-node ui-alert{tone}", "{title}" } }
+        }
+        Some("divider") => rsx! { div { class: "ui-node ui-divider" } },
+        Some("action") => {
+            let label = props["label"]
+                .as_str()
+                .or_else(|| props["text"].as_str())
+                .unwrap_or("Action")
+                .to_string();
+            rsx! { div { class: "ui-node ui-action ghost", "{label}" } }
+        }
+        // Half-written or unknown kind — placeholder until more JSON lands.
+        _ => rsx! { span { class: "ui-skel line" } },
     }
 }
 
@@ -12584,8 +13030,8 @@ fn ChatPane(
                 tokio::select! {
                     cmd = rx.next() => match cmd {
                         Some(PaneCmd::Submit(t)) => {
-                            messages.write().push(ChatMsg { author: Author::User, text: t.clone() });
-                            messages.write().push(ChatMsg { author: Author::Agent, text: String::new() });
+                            messages.write().push(ChatMsg::new(Author::User, t.clone()));
+                            messages.write().push(ChatMsg::new(Author::Agent, String::new()));
                             streaming.set(true);
                             let _ = handle.submit(Op::UserTurn { text: t }).await;
                         }
@@ -12597,7 +13043,7 @@ fn ChatPane(
                             let mut mm = messages.write();
                             match mm.last_mut() {
                                 Some(l) if l.author == Author::Agent => l.text.push_str(&text),
-                                _ => mm.push(ChatMsg { author: Author::Agent, text }),
+                                _ => mm.push(ChatMsg::new(Author::Agent, text)),
                             }
                         }
                         Some(Event::ReasoningDelta { text, .. }) => { thinking.write().push_str(&text); }
@@ -12615,7 +13061,7 @@ fn ChatPane(
                                         if let Author::Activity { running, ok, .. } = &mut c.author { *running = true; *ok = true; }
                                     }
                                 } else {
-                                    messages.write().push(ChatMsg { author: Author::Activity { running: true, ok: true, key: Some(call_id) }, text });
+                                    messages.write().push(ChatMsg::new(Author::Activity { running: true, ok: true, key: Some(call_id) }, text));
                                 }
                             }
                         }
@@ -12630,14 +13076,14 @@ fn ChatPane(
                                 }
                             }
                         }
-                        Some(Event::FileDiff { path, diff, checkpoint, .. }) => { messages.write().push(ChatMsg { author: Author::Diff(path, checkpoint), text: diff }); }
+                        Some(Event::FileDiff { path, diff, checkpoint, .. }) => { messages.write().push(ChatMsg::new(Author::Diff(path, checkpoint), diff)); }
                         Some(Event::UiSpec { spec, .. }) => { messages.write().push(ui_spec_message(*spec)); }
                         Some(Event::TurnStarted { .. }) => { thinking.set(String::new()); status.set("Working…".to_string()); }
                         Some(Event::TurnFinished { .. }) => { streaming.set(false); status.set(String::new()); pane_question.set(None); { let mut mm = messages.write(); for c in mm.iter_mut() { if let Author::Activity { running, .. } = &mut c.author { *running = false; } } } }
                         Some(Event::Info { text }) => { if is_stage_status(&text) { status.set(text); } }
-                        Some(Event::Error { message }) => { messages.write().push(ChatMsg { author: Author::Note, text: format!("error: {message}") }); streaming.set(false); }
+                        Some(Event::Error { message }) => { messages.write().push(ChatMsg::new(Author::Note, format!("error: {message}"))); streaming.set(false); }
                         Some(Event::QuestionAsked { question, options, .. }) => {
-                            messages.write().push(ChatMsg { author: Author::Note, text: format!("Question: {question}") });
+                            messages.write().push(ChatMsg::new(Author::Note, format!("Question: {question}")));
                             pane_question.set(Some((question, options)));
                         }
                         Some(Event::AuditLog { .. })
@@ -12663,7 +13109,7 @@ fn ChatPane(
                                 let diff = msg.text.clone();
                                 let (adds, dels) = diff_counts(&diff);
                                 rsx! {
-                                    div { class: "row diffrow",
+                                    div { key: "m-{msg.id}", class: "row diffrow",
                                         details { class: "diff-card",
                                             summary { class: "diff-head",
                                                 span { class: "diff-caret", Icon { name: "chevron" } }
@@ -12676,7 +13122,7 @@ fn ChatPane(
                                     }
                                 }
                             }
-                            _ => rsx! { Message { author: msg.author.clone(), text: msg.text.clone() } }
+                            _ => rsx! { Message { key: "m-{msg.id}", author: msg.author.clone(), text: msg.text.clone() } }
                         }
                     }
                 }
