@@ -6,7 +6,9 @@
 //! [`Op`]s and renders the [`Event`] stream, exactly like the future GUI will.
 
 use async_trait::async_trait;
-use crossterm::event::{Event as CtEvent, EventStream, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    Event as CtEvent, EventStream, KeyCode, KeyEvent, KeyModifiers, MouseEventKind,
+};
 use futures::StreamExt;
 use oxide_core::EngineHandle;
 use oxide_frontend::Frontend;
@@ -86,6 +88,9 @@ struct State {
     /// The active model's context window (from the backend), for the status bar.
     context_limit: Option<u64>,
     last_input_tokens: u64,
+    /// Rows scrolled up from the bottom (0 = follow the newest output). Clamped
+    /// to the max offset in `draw` once the wrapped height is known.
+    scroll: usize,
     quit: bool,
 }
 
@@ -193,6 +198,8 @@ impl Frontend for Tui {
         let mut terminal = ratatui::init();
         // Multi-line pastes arrive as one Paste event instead of N keystrokes.
         let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste);
+        // Mouse capture lets the wheel scroll the transcript.
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
         let mut reader = EventStream::new();
         let mut state = State {
             harness: self.harness.clone(),
@@ -207,6 +214,7 @@ impl Frontend for Tui {
         load_last_session(&self.workspace, &mut state);
 
         let res = run_loop(&mut terminal, &mut reader, &mut events, &handle, &mut state).await;
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
         let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
         ratatui::restore();
         res
@@ -288,6 +296,13 @@ async fn run_loop(
                 match term {
                     Some(Ok(CtEvent::Key(key))) => { handle_key(key, handle, state).await?; dirty = true; }
                     Some(Ok(CtEvent::Paste(s))) => { state.input.push_str(&s); dirty = true; }
+                    Some(Ok(CtEvent::Mouse(m))) => {
+                        match m.kind {
+                            MouseEventKind::ScrollUp => { state.scroll = state.scroll.saturating_add(3); dirty = true; }
+                            MouseEventKind::ScrollDown => { state.scroll = state.scroll.saturating_sub(3); dirty = true; }
+                            _ => {}
+                        }
+                    }
                     Some(Ok(CtEvent::Resize(_, _))) => { dirty = true; }
                     Some(Ok(_)) => {}
                     Some(Err(e)) => return Err(e.into()),
@@ -342,6 +357,8 @@ async fn handle_key(key: KeyEvent, handle: &EngineHandle, state: &mut State) -> 
             let text = state.input.trim().to_string();
             if !text.is_empty() {
                 state.input.clear();
+                // Snap to the bottom so the user sees their message + the reply.
+                state.scroll = 0;
                 state.push(Line::from(vec![
                     Span::styled(
                         "you   ",
@@ -354,6 +371,8 @@ async fn handle_key(key: KeyEvent, handle: &EngineHandle, state: &mut State) -> 
                 handle.submit(Op::UserTurn { text }).await?;
             }
         }
+        (_, KeyCode::PageUp) => state.scroll = state.scroll.saturating_add(10),
+        (_, KeyCode::PageDown) => state.scroll = state.scroll.saturating_sub(10),
         (_, KeyCode::Backspace) => {
             state.input.pop();
         }
@@ -713,7 +732,7 @@ fn apply_event(event: Event, state: &mut State) {
     }
 }
 
-fn draw(terminal: &mut ratatui::DefaultTerminal, state: &State) -> anyhow::Result<()> {
+fn draw(terminal: &mut ratatui::DefaultTerminal, state: &mut State) -> anyhow::Result<()> {
     terminal.draw(|frame| {
         let chunks = Layout::vertical([
             Constraint::Min(3),
@@ -738,15 +757,26 @@ fn draw(terminal: &mut ratatui::DefaultTerminal, state: &State) -> anyhow::Resul
                 Span::raw(state.streaming.clone()),
             ]));
         }
-        let visible = chunks[0].height.saturating_sub(2) as usize;
-        let start = lines.len().saturating_sub(visible);
-        let transcript = Paragraph::new(lines[start..].to_vec())
+        // Word wrap makes logical lines ≠ visual rows, so scroll by exact wrapped
+        // rows: render the whole transcript and offset it. `scroll` counts rows up
+        // from the bottom (0 = follow newest); clamp it to the real max here.
+        let inner_w = chunks[0].width.saturating_sub(2);
+        let inner_h = chunks[0].height.saturating_sub(2) as usize;
+        let para = Paragraph::new(lines).wrap(Wrap { trim: false });
+        let total = para.line_count(inner_w);
+        let max_off = total.saturating_sub(inner_h);
+        if state.scroll > max_off {
+            state.scroll = max_off;
+        }
+        let off = (max_off - state.scroll) as u16;
+        let scrolled = if state.scroll > 0 { " ↑" } else { "" };
+        let transcript = para
             .block(
                 RatBlock::default()
                     .borders(Borders::ALL)
-                    .title(format!(" Oxide · {} ", state.harness)),
+                    .title(format!(" Oxide · {}{} ", state.harness, scrolled)),
             )
-            .wrap(Wrap { trim: false });
+            .scroll((off, 0));
         frame.render_widget(transcript, chunks[0]);
 
         // Input box.

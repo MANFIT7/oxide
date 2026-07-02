@@ -13,6 +13,8 @@ oxide-frontend = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 anyhow = { workspace = true }
-ratatui = { workspace = true }
+# unstable-rendered-line-info exposes Paragraph::line_count so the transcript can
+# scroll by exact wrapped-row count (word wrap makes logical≠visual line counts).
+ratatui = { workspace = true, features = ["unstable-rendered-line-info"] }
 crossterm = { workspace = true }
 futures = { workspace = true }
