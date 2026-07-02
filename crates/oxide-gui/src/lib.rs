@@ -1181,6 +1181,11 @@ fn SlotText(text: String, #[props(default)] reverse: bool) -> Element {
         span { class: "slot-text {dir}", aria_label: "{text}",
             for (i, ch) in text.chars().enumerate() {
                 span {
+                    // Keyed by (position, char): when the value changes, only the
+                    // characters that actually differ remount → their roll
+                    // animation re-fires (odometer/textmotion style). Unchanged
+                    // characters keep their node and stay still.
+                    key: "{i}-{ch}",
                     class: "slot-char",
                     style: "--i:{i}",
                     aria_hidden: "true",
@@ -3083,6 +3088,20 @@ fn thread_json_load<T: serde::de::DeserializeOwned + Default>(
         .unwrap_or_default()
 }
 
+/// Atomic write (temp + rename): `std::fs::write` truncates first, so a crash
+/// or force-quit mid-flush leaves a torn file. For config/board files that torn
+/// state is fatal downstream (`Config::load` refuses to start on a parse error).
+pub(crate) fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
+    let tmp = path.with_extension("oxide-tmp");
+    std::fs::write(&tmp, contents)?;
+    std::fs::rename(&tmp, path).or_else(|_| {
+        // Cross-device or rename race — land the bytes directly, drop the temp.
+        let direct = std::fs::write(path, contents);
+        let _ = std::fs::remove_file(&tmp);
+        direct
+    })
+}
+
 fn thread_json_save<T: serde::Serialize>(ws: &Path, dir: &str, stem: &str, v: &T) {
     let d = ws.join(format!(".oxide/{dir}"));
     let _ = std::fs::create_dir_all(&d);
@@ -4560,6 +4579,20 @@ fn app() -> Element {
             if turn_edits.peek().iter().any(|e| e.4.is_empty() && e.3 == 0) {
                 turn_edits.write().retain(|e| !(e.4.is_empty() && e.3 == 0));
             }
+            // Subagent cards + their command logs: same guarantee as activity
+            // rows — no spinner survives the end of streaming.
+            if subagent_cards
+                .peek()
+                .iter()
+                .any(|c| c.running || c.logs.iter().any(|l| l.running))
+            {
+                for c in subagent_cards.write().iter_mut() {
+                    c.running = false;
+                    for log in c.logs.iter_mut() {
+                        log.running = false;
+                    }
+                }
+            }
         }
     });
 
@@ -4807,12 +4840,12 @@ fn app() -> Element {
                             persist.resume_path = None;
                             persist.resume = false;
                             if let Ok(s) = toml::to_string(&persist) {
-                                let _ = std::fs::write(ws.join("oxide.toml"), &s);
+                                let _ = write_atomic(&ws.join("oxide.toml"), &s);
                                 // Also persist globally so the packaged app remembers across launches.
                                 if let Some(home) = std::env::var_os("HOME") {
                                     let gdir = std::path::PathBuf::from(home).join(".config/oxide");
                                     let _ = std::fs::create_dir_all(&gdir);
-                                    let _ = std::fs::write(gdir.join("config.toml"), &s);
+                                    let _ = write_atomic(&gdir.join("config.toml"), &s);
                                 }
                             }
                             // Only wipe the transcript when switching PROJECT — a
@@ -4922,6 +4955,9 @@ fn app() -> Element {
                             // switch too, else the previous tab's subagent cards
                             // linger on the newly-viewed tab ("stuck, won't disappear").
                             subagent_cards.write().clear();
+                            // Same class of bug: `todos` is global too — without this the
+                            // previous tab's task card stays pinned on the new tab.
+                            todos.write().clear();
                             // The tab's snapshot + anything that streamed while it was
                             // backgrounded (drained from the bg buffer in one write).
                             let mut cur_msgs = tabs.peek().iter().find(|t| t.id == id).map(|t| t.messages.clone()).unwrap_or(msgs);
@@ -5009,6 +5045,10 @@ fn app() -> Element {
                             status.set(String::new());
                             todos.write().clear();
                             subagent_cards.write().clear();
+                            // The interrupted engine no longer awaits these; a stale
+                            // card clicked later re-marks the tab "Running" forever.
+                            approvals.write().clear();
+                            questions.write().clear();
                         }
                         None => break,
                       }
@@ -5353,6 +5393,10 @@ fn app() -> Element {
                                     todos.write().clear();
                                     subagent_cards.write().clear();
                                     turn_edits.write().clear();
+                                    // No TurnFinished is coming — pending approval/question
+                                    // cards reference a request the engine already abandoned.
+                                    approvals.write().clear();
+                                    questions.write().clear();
                                     {
                                         let mut m = messages.write();
                                         for c in m.iter_mut() {
@@ -5517,7 +5561,13 @@ fn app() -> Element {
                                 timeline.write().push(TimelineItem { title: format!("Approval needed · {tool}"), sub: summary });
                             }
                             Event::ToolCallDelta { call_id, tool, accumulated, .. } => {
-                                status.set(format!("Preparing {tool} input…"));
+                                // Guard like AgentMessageDelta: this fires per streamed
+                                // token of tool args — an unconditional set dirties the
+                                // whole view per delta for an unchanged label.
+                                let label = format!("Preparing {tool} input…");
+                                if status.peek().as_str() != label {
+                                    status.set(label);
+                                }
                                 let mut m = messages.write();
                                 if tool == "render_ui_spec" {
                                     // SpecStream: render the artifact skeleton progressively
@@ -5792,6 +5842,12 @@ fn app() -> Element {
                                 // don't keep spinning/over-reporting after the turn ends.
                                 for c in subagent_cards.write().iter_mut() {
                                     c.running = false;
+                                    // Command logs too: a log whose CommandFinished never
+                                    // arrived keeps its spinner AND force-opens its
+                                    // <details> (`open: log.running`) forever otherwise.
+                                    for log in c.logs.iter_mut() {
+                                        log.running = false;
+                                    }
                                 }
                                 {
                                     let mut mw = messages.write();
@@ -8719,9 +8775,12 @@ fn app() -> Element {
                                         div { class: "approval-q", "Allow " span { class: "approval-tool", "{tool}" } "?" }
                                         if !summary.is_empty() { div { class: "approval-sum", "{summary}" } }
                                         div { class: "approval-actions",
-                                            button { class: "approval-yes", onclick: move |_| { engine.send(EngineCmd::Approve { id, decision: ApprovalDecision::Approve }); }, "Approve" }
-                                            button { class: "approval-always", onclick: move |_| { engine.send(EngineCmd::Approve { id, decision: ApprovalDecision::ApproveForSession }); }, "Always" }
-                                            button { class: "approval-no", onclick: move |_| { engine.send(EngineCmd::Approve { id, decision: ApprovalDecision::Reject }); }, "Reject" }
+                                            // Remove the card optimistically: it otherwise stays
+                                            // clickable until the coroutine drains the command, and
+                                            // a double-click re-marks the tab "Running" for nothing.
+                                            button { class: "approval-yes", onclick: move |_| { approvals.write().retain(|(i, _, _)| *i != id); engine.send(EngineCmd::Approve { id, decision: ApprovalDecision::Approve }); }, "Approve" }
+                                            button { class: "approval-always", onclick: move |_| { approvals.write().retain(|(i, _, _)| *i != id); engine.send(EngineCmd::Approve { id, decision: ApprovalDecision::ApproveForSession }); }, "Always" }
+                                            button { class: "approval-no", onclick: move |_| { approvals.write().retain(|(i, _, _)| *i != id); engine.send(EngineCmd::Approve { id, decision: ApprovalDecision::Reject }); }, "Reject" }
                                         }
                                     }
                                 }
@@ -8774,7 +8833,7 @@ fn app() -> Element {
                                                                     summary { class: "edits-row",
                                                                         span { class: "edits-caret", Icon { name: "chevron" } }
                                                                         span { class: "edits-path", "{path}" }
-                                                                        span { class: "edits-rowcounts", span { class: "diff-adds", "+{a}" } " " span { class: "diff-dels", "−{d}" } }
+                                                                        span { class: "edits-rowcounts", span { class: "diff-adds", SlotText { text: format!("+{a}") } } " " span { class: "diff-dels", SlotText { text: format!("\u{2212}{d}") } } }
                                                                         if is_reverted {
                                                                             span { class: "diff-reverted slot-status icon-slot", Icon { name: "check" } SlotText { text: "Reverted".to_string(), reverse: true } }
                                                                         } else if accepted.read().contains(&cp) {
@@ -8914,9 +8973,11 @@ fn app() -> Element {
                                                     span { class: "live-changes-sub", "{subtitle}" }
                                                 }
                                                 if total_add + total_del > 0 {
+                                                    // Digits ROLL as edits land (slot/odometer style) —
+                                                    // only the changed characters animate.
                                                     span { class: "live-changes-counts",
-                                                        span { class: "diff-adds", "+{total_add}" }
-                                                        span { class: "diff-dels", "−{total_del}" }
+                                                        span { class: "diff-adds", SlotText { text: format!("+{total_add}") } }
+                                                        span { class: "diff-dels", SlotText { text: format!("\u{2212}{total_del}") } }
                                                     }
                                                 }
                                                 // No empty skeleton pill while counts are 0 — the
@@ -8942,7 +9003,7 @@ fn app() -> Element {
                                                                 if row_pending {
                                                                     span { class: "live-change-state shimmer slot-status", SlotText { text: "editing…".to_string() } }
                                                                 } else {
-                                                                    span { class: "live-change-state", span { class: "diff-adds", "+{a}" } " " span { class: "diff-dels", "−{d}" } }
+                                                                    span { class: "live-change-state", span { class: "diff-adds", SlotText { text: format!("+{a}") } } " " span { class: "diff-dels", SlotText { text: format!("\u{2212}{d}") } } }
                                                                 }
                                                             }
                                                         }
@@ -10121,6 +10182,7 @@ fn FileNode(path: PathBuf, depth: usize, is_root: bool) -> Element {
 #[component]
 fn Editor() -> Element {
     let mut ui = use_context::<Ui>();
+    let mut save_err = use_signal(|| None::<String>);
     let path = ui.open_path.read().clone();
     let Some(path) = path else {
         return rsx! {};
@@ -10190,12 +10252,22 @@ fn Editor() -> Element {
                                 let p = ui.open_path.read().clone();
                                 if let Some(p) = p {
                                     let text = ui.editor_text.read().clone();
-                                    let _ = std::fs::write(&p, text);
-                                    ui.dirty.set(false);
+                                    // A swallowed write error + cleared dirty dot would
+                                    // report success while the file was never written.
+                                    match write_atomic(&p, &text) {
+                                        Ok(()) => {
+                                            ui.dirty.set(false);
+                                            save_err.set(None);
+                                        }
+                                        Err(e) => save_err.set(Some(format!("Save failed: {e}"))),
+                                    }
                                 }
                             },
                             "Save"
                         }
+                    }
+                    if let Some(err) = save_err.read().clone() {
+                        span { class: "ed-save-err", title: "{err}", "{err}" }
                     }
                     button { class: "ed-close", onclick: move |_| ui.open_path.set(None), "Close" }
                 }
@@ -10306,7 +10378,7 @@ fn SettingsModal(
         c.workspace = Some(chosen_ws.clone());
         // Persist to <workspace>/oxide.toml.
         if let Ok(s) = toml::to_string(&c) {
-            let _ = std::fs::write(chosen_ws.join("oxide.toml"), s);
+            let _ = write_atomic(&chosen_ws.join("oxide.toml"), &s);
         }
         cfg.set(c.clone());
         let mut uiw = ui;
@@ -11823,7 +11895,13 @@ fn Message(author: Author, text: String, #[props(default)] live: bool) -> Elemen
                 // A stray placeholder left after a turn renders nothing.
                 return rsx! {};
             }
-            let copy = serde_json::to_string(&text).unwrap_or_default();
+            // The copy button only renders once settled — don't pay a full-text
+            // JSON serialize on every streaming frame for a button that isn't there.
+            let copy = if live {
+                String::new()
+            } else {
+                serde_json::to_string(&text).unwrap_or_default()
+            };
             let body_cls = if live {
                 "agent-text agent-md live"
             } else {

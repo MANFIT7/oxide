@@ -317,12 +317,22 @@ impl Config {
     /// Load defaults then overlay any discovered config files.
     pub fn load() -> Result<Self> {
         let mut cfg = Config::default();
+        // A corrupt config file (torn write, hand-edit gone wrong) must not
+        // brick startup — warn and continue with what still parses. The bad
+        // file is left in place for the user to inspect/fix.
         if let Some(user) = user_config_path() {
-            cfg.overlay_file(&user)?;
+            if let Err(e) = cfg.overlay_file(&user) {
+                eprintln!(
+                    "oxide: ignoring unreadable config {}: {e:#}",
+                    user.display()
+                );
+            }
         }
         let project = PathBuf::from("oxide.toml");
         if project.exists() {
-            cfg.overlay_file(&project)?;
+            if let Err(e) = cfg.overlay_file(&project) {
+                eprintln!("oxide: ignoring unreadable oxide.toml: {e:#}");
+            }
         }
         if cfg.import_external_mcp {
             cfg.merge_imported_mcp(import_codex_mcp_servers());

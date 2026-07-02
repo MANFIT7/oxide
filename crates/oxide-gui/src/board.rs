@@ -74,10 +74,20 @@ fn board_path(workspace: &Path) -> PathBuf {
 
 impl Board {
     pub fn load(workspace: &Path) -> Self {
-        std::fs::read_to_string(board_path(workspace))
-            .ok()
-            .and_then(|t| serde_json::from_str(&t).ok())
-            .unwrap_or_default()
+        let path = board_path(workspace);
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return Self::default();
+        };
+        match serde_json::from_str(&text) {
+            Ok(board) => board,
+            Err(_) => {
+                // Corrupt board: DON'T return an empty default silently — the
+                // next save would overwrite the file and wipe every card for
+                // good. Park the bad bytes beside it for recovery instead.
+                let _ = std::fs::rename(&path, path.with_extension("json.corrupt"));
+                Self::default()
+            }
+        }
     }
 
     pub fn save(&self, workspace: &Path) {
@@ -85,7 +95,9 @@ impl Board {
             let _ = std::fs::create_dir_all(dir);
         }
         if let Ok(s) = serde_json::to_string_pretty(self) {
-            let _ = std::fs::write(board_path(workspace), s);
+            // Atomic: a torn write here is exactly what produces the corrupt
+            // file that `load` must then rescue.
+            let _ = crate::write_atomic(&board_path(workspace), &s);
         }
     }
 

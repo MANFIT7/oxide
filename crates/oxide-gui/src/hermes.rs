@@ -18,12 +18,19 @@ pub fn read_profiles(workspace: &Path) -> anyhow::Result<Vec<HermesProfile>> {
     }
     let mut profiles = Vec::new();
     for entry in std::fs::read_dir(dir)? {
-        let path = entry?.path();
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
         if path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
             continue;
         }
-        let text = std::fs::read_to_string(path)?;
-        profiles.push(toml::from_str::<HermesProfile>(&text)?);
+        // One unreadable/incompatible profile must not blank the whole list.
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        match toml::from_str::<HermesProfile>(&text) {
+            Ok(profile) => profiles.push(profile),
+            Err(_) => continue,
+        }
     }
     profiles.sort_by(|a, b| {
         b.created_ms

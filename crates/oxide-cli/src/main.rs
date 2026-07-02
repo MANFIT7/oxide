@@ -191,7 +191,34 @@ async fn run_exec(
     handle.submit(Op::UserTurn { text: prompt }).await?;
     let mut missing_answer: Option<String> = None;
 
-    while let Some(ev) = events.recv().await {
+    // Terminal Ctrl-C is delivered to THIS process only: the CLI child runs in
+    // its own process group (deliberate — the engine group-kills it on abort),
+    // so exiting on default SIGINT would orphan a live codex/claude and every
+    // process it spawned. Catch it, interrupt the turn (which group-kills the
+    // child), then shut the engine down before returning to the shell.
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
+    loop {
+        let ev = tokio::select! {
+            _ = &mut ctrl_c => {
+                if !json_events {
+                    eprintln!("\n[interrupted] stopping the CLI child…");
+                }
+                let _ = handle.submit(Op::Interrupt).await;
+                let _ = handle.submit(Op::Shutdown).await;
+                // Bounded drain: wait for the engine to confirm exit so the
+                // child group is dead before the shell prompt returns.
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    while events.recv().await.is_some() {}
+                })
+                .await;
+                break;
+            }
+            ev = events.recv() => match ev {
+                Some(ev) => ev,
+                None => break,
+            },
+        };
         if json_events {
             println!("{}", serde_json::to_string(&ev)?);
         }
@@ -212,6 +239,9 @@ async fn run_exec(
             Event::AgentMessageDelta { text, .. } => {
                 if !json_events {
                     print!("{text}");
+                    // Piped stdout is block-buffered — without a flush the
+                    // streamed answer arrives as one late chunk.
+                    let _ = std::io::Write::flush(&mut std::io::stdout());
                 }
             }
             Event::ReasoningDelta { .. } => {}

@@ -7,7 +7,7 @@
 
 use async_trait::async_trait;
 use crossterm::event::{
-    Event as CtEvent, EventStream, KeyCode, KeyEvent, KeyModifiers, MouseEventKind,
+    Event as CtEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
 };
 use futures::StreamExt;
 use oxide_core::EngineHandle;
@@ -79,6 +79,9 @@ struct State {
     blocks: Vec<Block>,
     next_block_id: u64,
     input: String,
+    /// Caret position in `input`, in CHARS (not bytes) — the composer supports
+    /// readline/mac editing (Cmd/Option+arrows, kill words), not append-only.
+    cursor: usize,
     /// Buffer for the assistant message currently streaming in.
     streaming: String,
     status: String,
@@ -162,6 +165,38 @@ impl State {
     }
 }
 
+/// Byte offset of char index `ci` in `s` (caret math is in chars, string ops
+/// need bytes — indexing bytes directly would split UTF-8).
+fn byte_at(s: &str, ci: usize) -> usize {
+    s.char_indices().nth(ci).map(|(b, _)| b).unwrap_or(s.len())
+}
+
+/// Readline-style word jump left: skip spaces, then the word before `ci`.
+fn word_left(s: &str, ci: usize) -> usize {
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = ci.min(chars.len());
+    while i > 0 && chars[i - 1].is_whitespace() {
+        i -= 1;
+    }
+    while i > 0 && !chars[i - 1].is_whitespace() {
+        i -= 1;
+    }
+    i
+}
+
+/// Readline-style word jump right: skip spaces, then to the end of the word.
+fn word_right(s: &str, ci: usize) -> usize {
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = ci.min(chars.len());
+    while i < chars.len() && chars[i].is_whitespace() {
+        i += 1;
+    }
+    while i < chars.len() && !chars[i].is_whitespace() {
+        i += 1;
+    }
+    i
+}
+
 /// One 60fps animation step of the scroll glide: move `pos` toward `target`
 /// by 35% of the remaining distance (exponential ease-out), snapping the last
 /// sub-row step so it settles exactly. Returns true while still moving — the
@@ -219,6 +254,15 @@ impl Frontend for Tui {
         let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste);
         // Mouse capture lets the wheel scroll the transcript.
         let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
+        // Kitty keyboard protocol (where supported: Ghostty/kitty/WezTerm/iTerm2):
+        // without it macOS terminals never report the Cmd (SUPER) modifier, so
+        // Cmd+←/→/Backspace can't work. Ignored by terminals that lack it.
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::event::PushKeyboardEnhancementFlags(
+                crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+            )
+        );
         let mut reader = EventStream::new();
         let mut state = State {
             harness: self.harness.clone(),
@@ -233,6 +277,10 @@ impl Frontend for Tui {
         load_last_session(&self.workspace, &mut state);
 
         let res = run_loop(&mut terminal, &mut reader, &mut events, &handle, &mut state).await;
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::event::PopKeyboardEnhancementFlags
+        );
         let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
         let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
         ratatui::restore();
@@ -314,7 +362,12 @@ async fn run_loop(
             term = reader.next() => {
                 match term {
                     Some(Ok(CtEvent::Key(key))) => { handle_key(key, handle, state).await?; dirty = true; }
-                    Some(Ok(CtEvent::Paste(s))) => { state.input.push_str(&s); dirty = true; }
+                    Some(Ok(CtEvent::Paste(s))) => {
+                        let b = byte_at(&state.input, state.cursor);
+                        state.input.insert_str(b, &s);
+                        state.cursor += s.chars().count();
+                        dirty = true;
+                    }
                     Some(Ok(CtEvent::Mouse(m))) => {
                         // Only the TARGET moves here; the frame tick below eases the
                         // rendered position toward it, so fast flicks accumulate into
@@ -353,6 +406,10 @@ async fn run_loop(
 }
 
 async fn handle_key(key: KeyEvent, handle: &EngineHandle, state: &mut State) -> anyhow::Result<()> {
+    // With the kitty protocol active some terminals also report key releases.
+    if key.kind == KeyEventKind::Release {
+        return Ok(());
+    }
     // While a tool approval is pending, keys answer the prompt.
     if let Some(request_id) = state.pending_approval {
         let decision = match key.code {
@@ -374,16 +431,27 @@ async fn handle_key(key: KeyEvent, handle: &EngineHandle, state: &mut State) -> 
         return Ok(());
     }
 
-    match (key.modifiers, key.code) {
-        (KeyModifiers::CONTROL, KeyCode::Char('c')) => state.quit = true,
-        (_, KeyCode::Esc) => {
+    // Mac/readline composer editing. Cmd arrives as SUPER only on terminals
+    // speaking the kitty protocol; Home/End + Ctrl-A/E cover the rest.
+    let m = key.modifiers;
+    let (ctrl, alt, sup) = (
+        m.contains(KeyModifiers::CONTROL),
+        m.contains(KeyModifiers::ALT),
+        m.contains(KeyModifiers::SUPER),
+    );
+    let len = state.input.chars().count();
+    state.cursor = state.cursor.min(len);
+    match key.code {
+        KeyCode::Char('c') if ctrl => state.quit = true,
+        KeyCode::Esc => {
             handle.submit(Op::Interrupt).await?;
             state.status = "interrupt sent".into();
         }
-        (_, KeyCode::Enter) => {
+        KeyCode::Enter => {
             let text = state.input.trim().to_string();
             if !text.is_empty() {
                 state.input.clear();
+                state.cursor = 0;
                 // Snap to the bottom so the user sees their message + the reply.
                 // Instant (no glide): this is intent to see NOW, not navigation.
                 state.scroll_target = 0;
@@ -400,12 +468,76 @@ async fn handle_key(key: KeyEvent, handle: &EngineHandle, state: &mut State) -> 
                 handle.submit(Op::UserTurn { text }).await?;
             }
         }
-        (_, KeyCode::PageUp) => state.scroll_target = state.scroll_target.saturating_add(10),
-        (_, KeyCode::PageDown) => state.scroll_target = state.scroll_target.saturating_sub(10),
-        (_, KeyCode::Backspace) => {
-            state.input.pop();
+        KeyCode::PageUp => state.scroll_target = state.scroll_target.saturating_add(10),
+        KeyCode::PageDown => state.scroll_target = state.scroll_target.saturating_sub(10),
+        // ── caret movement ──
+        KeyCode::Left if sup => state.cursor = 0,
+        KeyCode::Right if sup => state.cursor = len,
+        KeyCode::Left if alt => state.cursor = word_left(&state.input, state.cursor),
+        KeyCode::Right if alt => state.cursor = word_right(&state.input, state.cursor),
+        KeyCode::Left => state.cursor = state.cursor.saturating_sub(1),
+        KeyCode::Right => state.cursor = (state.cursor + 1).min(len),
+        KeyCode::Home => state.cursor = 0,
+        KeyCode::End => state.cursor = len,
+        KeyCode::Char('a') if ctrl => state.cursor = 0,
+        KeyCode::Char('e') if ctrl => state.cursor = len,
+        // ── kill edits ──
+        KeyCode::Backspace if sup => {
+            // Cmd+Backspace: delete to line start.
+            let b = byte_at(&state.input, state.cursor);
+            state.input.replace_range(..b, "");
+            state.cursor = 0;
         }
-        (_, KeyCode::Char(c)) => state.input.push(c),
+        KeyCode::Backspace if alt => {
+            // Option+Backspace: delete the word before the caret.
+            let start = word_left(&state.input, state.cursor);
+            let (b0, b1) = (
+                byte_at(&state.input, start),
+                byte_at(&state.input, state.cursor),
+            );
+            state.input.replace_range(b0..b1, "");
+            state.cursor = start;
+        }
+        KeyCode::Char('w') if ctrl => {
+            let start = word_left(&state.input, state.cursor);
+            let (b0, b1) = (
+                byte_at(&state.input, start),
+                byte_at(&state.input, state.cursor),
+            );
+            state.input.replace_range(b0..b1, "");
+            state.cursor = start;
+        }
+        KeyCode::Char('u') if ctrl => {
+            let b = byte_at(&state.input, state.cursor);
+            state.input.replace_range(..b, "");
+            state.cursor = 0;
+        }
+        KeyCode::Char('k') if ctrl => {
+            let b = byte_at(&state.input, state.cursor);
+            state.input.truncate(b);
+        }
+        KeyCode::Backspace => {
+            if state.cursor > 0 {
+                let b0 = byte_at(&state.input, state.cursor - 1);
+                let b1 = byte_at(&state.input, state.cursor);
+                state.input.replace_range(b0..b1, "");
+                state.cursor -= 1;
+            }
+        }
+        KeyCode::Delete => {
+            if state.cursor < len {
+                let b0 = byte_at(&state.input, state.cursor);
+                let b1 = byte_at(&state.input, state.cursor + 1);
+                state.input.replace_range(b0..b1, "");
+            }
+        }
+        // Plain typing (SHIFT included); swallow Cmd/Ctrl/Alt chords so a
+        // terminal that forwards e.g. Cmd+K doesn't type a literal 'k'.
+        KeyCode::Char(c) if !ctrl && !alt && !sup => {
+            let b = byte_at(&state.input, state.cursor);
+            state.input.insert(b, c);
+            state.cursor += 1;
+        }
         _ => {}
     }
     Ok(())
@@ -812,10 +944,19 @@ fn draw(terminal: &mut ratatui::DefaultTerminal, state: &mut State) -> anyhow::R
             .scroll((off, 0));
         frame.render_widget(transcript, chunks[0]);
 
-        // Input box.
+        // Input box: keep the caret visible by h-scrolling once the text is
+        // wider than the box, and draw a real terminal cursor at the caret.
+        let inner_iw = chunks[1].width.saturating_sub(2) as usize;
+        let cur = state.cursor.min(state.input.chars().count());
+        let xoff = cur.saturating_sub(inner_iw.saturating_sub(1)) as u16;
         let input = Paragraph::new(state.input.as_str())
+            .scroll((0, xoff))
             .block(RatBlock::default().borders(Borders::ALL).title(" message "));
         frame.render_widget(input, chunks[1]);
+        frame.set_cursor_position((
+            chunks[1].x + 1 + (cur as u16).saturating_sub(xoff),
+            chunks[1].y + 1,
+        ));
 
         // Status line.
         let status = Paragraph::new(Line::from(Span::styled(
@@ -898,6 +1039,25 @@ mod tests {
         assert_eq!(state.blocks[0].status, BlockStatus::Fail);
         // output line + exit footer
         assert_eq!(state.blocks[0].body.len(), 2);
+    }
+
+    #[test]
+    fn word_jumps_and_byte_offsets_handle_unicode() {
+        let s = "halo dunia ✨ oxide";
+        // word_left from the end lands at the start of "oxide".
+        let n = s.chars().count();
+        assert_eq!(word_left(s, n), n - 5);
+        // word_left from just after "✨ " lands on the "✨" itself.
+        assert_eq!(word_left(s, n - 6), n - 7);
+        // word_right from 0 lands after "halo".
+        assert_eq!(word_right(s, 0), 4);
+        // byte_at respects multi-byte chars (✨ = 3 bytes).
+        let ci = s.chars().position(|c| c == '✨').unwrap();
+        assert_eq!(&s[byte_at(s, ci)..byte_at(s, ci + 1)], "✨");
+        // Past-the-end char index clamps to the byte length.
+        assert_eq!(byte_at(s, 999), s.len());
+        assert_eq!(word_left(s, 0), 0);
+        assert_eq!(word_right(s, 999), n);
     }
 
     #[test]

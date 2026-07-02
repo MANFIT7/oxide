@@ -296,7 +296,7 @@ def main() -> int:
         contains_all(
             css,
             [
-                ".live-changes-skeleton, .live-change-state.shimmer { animation: none;",
+                ".live-change-state.shimmer { animation: none;",
                 ".edits-row.pending .edits-rowcounts.shimmer { animation: none; }",
                 ".slot-char",
             ],

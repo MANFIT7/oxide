@@ -5505,7 +5505,16 @@ async fn hook_command(
 /// the tree sha — `git cat-file -p <sha>:<path>` then yields any file's
 /// pre-turn bytes.
 async fn git_baseline_tree(ws: &std::path::Path) -> Option<String> {
-    let idx = ws.join(format!(".oxide/tmp-index-{}", std::process::id()));
+    // PID alone is NOT unique here: two conversations in one GUI process can
+    // baseline the same workspace concurrently — sharing an index file lets
+    // one call delete/overwrite the other's mid-`write-tree` (wrong tree =
+    // wrong rewind bytes). A per-call nonce keeps each index private.
+    static IDX_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let idx = ws.join(format!(
+        ".oxide/tmp-index-{}-{}",
+        std::process::id(),
+        IDX_NONCE.fetch_add(1, Ordering::Relaxed)
+    ));
     let _ = std::fs::create_dir_all(ws.join(".oxide"));
     let add = tokio::process::Command::new("git")
         .arg("-C")

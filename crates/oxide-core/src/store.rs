@@ -218,8 +218,13 @@ impl CheckpointStore {
                         }
                     }
                     None => {
-                        // File didn't exist before; remove it on rewind.
-                        if std::fs::remove_file(&snap.path).is_ok() {
+                        // `prior=None` normally means "didn't exist before this
+                        // turn" — but it is ALSO what gets recorded when the
+                        // baseline lookup failed (absolute path, workspace that
+                        // is a subdir of the git root, …). Deleting outright
+                        // would destroy a pre-existing file in that case, so
+                        // move it aside instead of removing it.
+                        if trash_on_rewind(&snap.path).is_ok() {
                             restored += 1;
                         }
                     }
@@ -231,6 +236,32 @@ impl CheckpointStore {
         }
         restored
     }
+}
+
+/// "Delete" a rewound new-file by moving it to `.oxide/trash/` next to the
+/// nearest `.oxide` dir up the tree (same filesystem → cheap rename), falling
+/// back to a sibling `<name>.rewind-removed`. Never `remove_file`: if the
+/// checkpoint mislabeled a pre-existing file as new, the bytes must survive.
+fn trash_on_rewind(path: &std::path::Path) -> std::io::Result<()> {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "file".to_string());
+    for anc in path.ancestors().skip(1) {
+        let oxide = anc.join(".oxide");
+        if oxide.is_dir() {
+            let trash = oxide.join("trash");
+            std::fs::create_dir_all(&trash)?;
+            let mut dest = trash.join(&name);
+            let mut n = 1u32;
+            while dest.exists() {
+                dest = trash.join(format!("{name}.{n}"));
+                n += 1;
+            }
+            return std::fs::rename(path, dest);
+        }
+    }
+    std::fs::rename(path, path.with_extension("rewind-removed"))
 }
 
 #[cfg(test)]

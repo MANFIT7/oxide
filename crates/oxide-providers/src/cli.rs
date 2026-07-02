@@ -972,6 +972,12 @@ struct ClaudeLineState {
     saw_partial: bool,
     /// tool_use ids surfaced as command rows, finished by the later tool_result.
     command_ids: std::collections::HashSet<String>,
+    /// Edit/Write tool_use id → file_path. `FileChanged` must fire at the
+    /// tool_result (file ON DISK), not at tool_use (file not written yet): the
+    /// engine diffs immediately, an empty diff is suppressed, and the GUI's
+    /// "editing…" row then spins until turn end (stuck through e.g. a long
+    /// test run after the edit).
+    edit_files: HashMap<String, String>,
     /// session-map key for persisting the native session id.
     skey: String,
     /// Background-command output routing.
@@ -985,6 +991,7 @@ impl ClaudeLineState {
         Self {
             saw_partial: false,
             command_ids: std::collections::HashSet::new(),
+            edit_files: HashMap::new(),
             skey,
             bg: BgTracker::default(),
             tool_blocks: HashMap::new(),
@@ -1148,8 +1155,13 @@ fn claude_handle_line(
                                 send(sink, StreamItem::Notice(label));
                             }
                             if matches!(name, "Edit" | "Write" | "MultiEdit" | "NotebookEdit") {
-                                if let Some(p) = input["file_path"].as_str() {
-                                    send(sink, StreamItem::FileChanged(p.to_string()));
+                                if let (Some(p), Some(tid)) =
+                                    (input["file_path"].as_str(), block["id"].as_str())
+                                {
+                                    // Defer FileChanged to this call's tool_result —
+                                    // emitting here (before the write lands) makes the
+                                    // engine diff an unchanged file and drop the event.
+                                    st.edit_files.insert(tid.to_string(), p.to_string());
                                 }
                             }
                         }
@@ -1169,6 +1181,13 @@ fn claude_handle_line(
                     if let Some(rid) = block["tool_use_id"].as_str() {
                         if bg_on_tool_result(&mut st.bg, rid, &block["content"], sink) {
                             continue;
+                        }
+                        // Edit landed on disk — NOW the engine's diff is non-empty,
+                        // so FileChanged settles the GUI's "editing…" row promptly
+                        // instead of after the whole turn. Emitted for failed edits
+                        // too: an unchanged file just yields no diff (harmless).
+                        if let Some(p) = st.edit_files.remove(rid) {
+                            send(sink, StreamItem::FileChanged(p));
                         }
                     }
                     let id = match block["tool_use_id"].as_str() {
@@ -1765,6 +1784,42 @@ mod cli_driver_tests {
         assert_eq!(claude_model_arg("opus"), Some("opus"));
         assert_eq!(claude_model_arg("fable"), Some("fable"));
         assert_eq!(claude_model_arg("haiku"), Some("haiku"));
+    }
+
+    #[test]
+    fn claude_edit_file_changed_fires_at_tool_result_not_tool_use() {
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut st = ClaudeLineState::new("test-edit-defer".into());
+        let tool_use = serde_json::json!({
+            "type": "assistant",
+            "message": { "content": [{
+                "type": "tool_use", "id": "toolu_1", "name": "Edit",
+                "input": { "file_path": "/tmp/x.rs" }
+            }]}
+        });
+        claude_handle_line(&tool_use, &tx, &mut st, false);
+        while let Ok(item) = rx.try_recv() {
+            assert!(
+                !matches!(item, StreamItem::FileChanged(_)),
+                "FileChanged must not fire before the write lands — the engine \
+                 diffs immediately and an unchanged file leaves the GUI's \
+                 'editing…' row stuck until turn end"
+            );
+        }
+        let tool_result = serde_json::json!({
+            "type": "user",
+            "message": { "content": [{
+                "type": "tool_result", "tool_use_id": "toolu_1", "content": "ok"
+            }]}
+        });
+        claude_handle_line(&tool_result, &tx, &mut st, false);
+        let mut path = None;
+        while let Ok(item) = rx.try_recv() {
+            if let StreamItem::FileChanged(p) = item {
+                path = Some(p);
+            }
+        }
+        assert_eq!(path.as_deref(), Some("/tmp/x.rs"));
     }
 
     #[test]
