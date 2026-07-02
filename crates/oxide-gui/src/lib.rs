@@ -416,11 +416,20 @@ fn activity_idx(msgs: &[ChatMsg], key: &str) -> Option<usize> {
 /// orphan spinner that outlived its command until the turn-end sweep.
 fn upsert_command_started(messages: &mut Vec<ChatMsg>, command_id: String, label: String) {
     if let Some(idx) = activity_idx(messages, &command_id) {
-        messages[idx].text = label;
-        if let Author::Activity { running, ok, .. } = &mut messages[idx].author {
+        // RELOCATE to the tail, don't mutate in place: a multi-tool assistant
+        // message seeds every call's "Preparing…" row up front (block order),
+        // but execution happens later, one by one — upgrading in place leaves
+        // a RUNNING command rendered above already-settled rows. Moving the
+        // row (same ChatMsg id → keyed diff animates a move, not a remount)
+        // keeps display order == execution order: the running command is
+        // always the newest thing in the transcript, Cursor-style.
+        let mut row = messages.remove(idx);
+        row.text = label;
+        if let Author::Activity { running, ok, .. } = &mut row.author {
             *running = true;
             *ok = true;
         }
+        buf_push_activity(messages, row);
     } else {
         buf_push_activity(
             messages,
@@ -610,10 +619,20 @@ fn build_transcript_turns(messages: &[ChatMsg]) -> Vec<TranscriptTurn> {
         if matches!(messages[i].author, Author::Activity { .. }) {
             let start = i;
             let mut live = false;
+            let mut indices: Vec<usize> = Vec::new();
             while i < messages.len() {
                 match messages[i].author {
                     Author::Activity { running, .. } => {
                         live |= running;
+                        indices.push(i);
+                        i += 1;
+                    }
+                    // Diff rows render NOTHING in the transcript (they're
+                    // consolidated into the Edited-files card) — but as
+                    // non-activity rows they used to SPLIT an activity run
+                    // here, leaving ungroupable stray singles above the Done
+                    // note. Let them pass through the run invisibly.
+                    Author::Diff(..) => {
                         i += 1;
                     }
                     _ => break,
@@ -621,7 +640,7 @@ fn build_transcript_turns(messages: &[ChatMsg]) -> Vec<TranscriptTurn> {
             }
             groups.push(TranscriptGroup {
                 activity: true,
-                indices: (start..i).collect(),
+                indices,
                 key: messages[start].id,
                 live,
             });
@@ -2795,6 +2814,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn diff_rows_do_not_split_activity_groups() {
+        // FileDiff pushes invisible Author::Diff rows between activity rows;
+        // they must pass through a run instead of splitting it into stray
+        // singles that can't collapse (the "leftover tools above Done" bug).
+        let msgs = vec![
+            ChatMsg::new(Author::User, "go"),
+            act("terminal\tRun\tcargo fmt"),
+            ChatMsg::new(Author::Diff("src/lib.rs".into(), 1), "diff a".to_string()),
+            act("terminal\tRun\tgrep foo"),
+            ChatMsg::new(Author::Diff("src/x.rs".into(), 2), "diff b".to_string()),
+            act("edit\tEdit\tsrc/lib.rs"),
+        ];
+        let turns = build_transcript_turns(&msgs);
+        assert_eq!(turns.len(), 1);
+        // One user group + ONE activity group holding all three tool rows
+        // (len > 2 → renders as a collapsible act-group), diffs absorbed.
+        let acts: Vec<_> = turns[0].groups.iter().filter(|g| g.activity).collect();
+        assert_eq!(acts.len(), 1);
+        assert_eq!(acts[0].indices, vec![1, 3, 5]);
+    }
+
+    #[test]
     fn command_started_upgrades_preparing_preview_in_place() {
         // The screenshot bug: claude's command_id IS the tool_use id, so the
         // "Preparing…" preview and the command row shared a key. A blind push
@@ -2809,18 +2850,32 @@ mod tests {
         );
         assert_eq!(msgs.len(), 1);
         let preview_id = msgs[0].id;
+        // A second call's preview seeded AFTER ours (multi-tool message) plus a
+        // settled row — starting toolu_1 must move its row BELOW them.
+        msgs.push(ChatMsg::new(
+            Author::Activity {
+                running: false,
+                ok: true,
+                key: Some("toolu_0".into()),
+            },
+            "terminal\tRun\tgrep done",
+        ));
         upsert_command_started(
             &mut msgs,
             "toolu_1".into(),
             command_activity_label("git ls-files", false),
         );
-        // SAME row upgraded — no duplicate, stable ChatMsg id.
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].id, preview_id);
-        assert!(msgs[0].text.starts_with("terminal\tRun\t"));
+        // SAME row (stable ChatMsg id), no duplicate, RELOCATED to the tail so
+        // the running command renders below already-settled rows.
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs.last().unwrap().id, preview_id);
+        assert!(msgs.last().unwrap().text.starts_with("terminal\tRun\t"));
+        let msgs_first_is_settled =
+            matches!(msgs[0].author, Author::Activity { running: false, .. });
+        assert!(msgs_first_is_settled);
         // A late arg delta must NOT downgrade the started command row.
         upsert_tool_input_preview(&mut msgs, "toolu_1".into(), "Bash".into(), "{}".into());
-        assert!(msgs[0].text.starts_with("terminal\tRun\t"));
+        assert!(msgs.last().unwrap().text.starts_with("terminal\tRun\t"));
         // Settling by key now hits the one-and-only row: no orphan spinner.
         let idx = activity_idx(&msgs, "toolu_1").unwrap();
         if let Author::Activity { running, .. } = &mut msgs[idx].author {
@@ -6524,7 +6579,6 @@ fn app() -> Element {
                                         }
                                         Icon { name: "folder" }
                                         span { class: "project-name", "{pname}" }
-                                        if is_current && (*streaming.read() || !busy_tabs.read().is_empty()) { span { class: "syn-spinner", style: "margin-left:6px" } }
                                         button { class: "project-del", title: "Remove this project's chats from the list",
                                             onclick: {
                                                 let pdel = pws.clone();
@@ -6562,6 +6616,10 @@ fn app() -> Element {
                                             },
                                             Icon { name: "trash" }
                                         }
+                                        // Anchored next to the + button (not floating mid-row
+                                        // after the flexible name) so busy state reads as part
+                                        // of the header's control cluster.
+                                        if is_current && (*streaming.read() || !busy_tabs.read().is_empty()) { span { class: "syn-spinner" } }
                                         button { class: "project-add", title: "New chat here", onclick: move |e: dioxus::prelude::MouseEvent| {
                                                 e.stop_propagation();
                                                 show_board.set(false);
@@ -8922,9 +8980,9 @@ fn app() -> Element {
                                                                         } else if accepted.read().contains(&cp) {
                                                                             span { class: "diff-kept slot-status icon-slot", Icon { name: "check" } SlotText { text: "Kept".to_string() } }
                                                                         } else if cp != 0 {
-                                                                            button { class: "edits-row-keep",
-                                                                                onclick: move |e: dioxus::prelude::MouseEvent| { e.prevent_default(); e.stop_propagation(); accepted.write().insert(cp); },
-                                                                                SlotText { text: "Keep".to_string() } }
+                                                                            // Revert only — keeping is the default outcome; a
+                                                                            // dedicated Keep button was noise ("Kept" still shows
+                                                                            // when the review panel accepts a checkpoint).
                                                                             button { class: "edits-row-revert",
                                                                                 onclick: move |e: dioxus::prelude::MouseEvent| { e.prevent_default(); e.stop_propagation(); engine.send(EngineCmd::Rewind { id: cp }); reverted.write().insert(cp); },
                                                                                 SlotText { text: "Revert".to_string(), reverse: true } }

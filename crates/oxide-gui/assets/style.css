@@ -1818,7 +1818,10 @@ svg { width: 17px; height: 17px; flex-shrink: 0; }
 .activity-card.has-out { display: block; }
 .activity-sum { display: flex; align-items: center; gap: 8px; list-style: none; cursor: pointer; }
 .activity-sum::-webkit-details-marker { display: none; }
-.activity-out-n { margin-left: auto; font-size: 11px; color: var(--faint); }
+/* nowrap + no-shrink: without them the flexible command text squeezes this
+   badge to min-content and "5 lines ▾" stacks into three lines beside the row. */
+.activity-out-n { margin-left: auto; font-size: 11px; color: var(--faint); white-space: nowrap; flex-shrink: 0; }
+.activity-sum .copy-btn { flex-shrink: 0; }
 .activity-out { margin-top: 8px; padding: 9px 11px; background: var(--composer); border: 1px solid var(--border); border-radius: 8px; font-family: ui-monospace, Menlo, monospace; font-size: 11.5px; line-height: 1.55; color: var(--text); white-space: pre-wrap; word-break: break-word; max-height: 320px; overflow-y: auto; }
 details.has-out[open] .activity-out-n::after { content: " ▴"; }
 details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
@@ -3064,18 +3067,13 @@ details::details-content { overflow: clip; }
 /* Per-file Revert inside the "Edited files" card (consolidates the old
    standalone diff boxes). */
 .edits-row-revert {
-  margin-left: 6px; flex-shrink: 0;
+  /* margin-left:auto — the removed Keep button used to anchor this cluster
+     to the right; Revert carries the anchor alone now. */
+  margin-left: auto; flex-shrink: 0;
   background: transparent; border: 1px solid var(--border); color: var(--muted);
   border-radius: 6px; padding: 2px 9px; font-size: 11px; cursor: pointer; font-family: inherit;
 }
 .edits-row-revert:hover { background: rgba(224,145,58,.12); color: var(--danger); border-color: rgba(224,145,58,.4); }
-/* Keep (Accept) — completes the Cursor-style accept/reject pair on each row. */
-.edits-row-keep {
-  margin-left: auto; flex-shrink: 0;
-  background: transparent; border: 1px solid rgba(58,210,159,.35); color: #3ad29f;
-  border-radius: 6px; padding: 2px 9px; font-size: 11px; cursor: pointer; font-family: inherit;
-}
-.edits-row-keep:hover { background: rgba(58,210,159,.12); border-color: rgba(58,210,159,.55); }
 .edits-row .diff-reverted, .edits-row .diff-kept { margin-left: auto; flex-shrink: 0; }
 .diff-kept { color: var(--ok); font-size: 12px; font-weight: 600; animation: popin .25s ease; }
 /* header action group: Keep all + Undo */
