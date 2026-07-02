@@ -408,6 +408,34 @@ fn activity_idx(msgs: &[ChatMsg], key: &str) -> Option<usize> {
         .rposition(|m| matches!(&m.author, Author::Activity { key: Some(k), .. } if k == key))
 }
 
+/// Start (or upgrade) a command's activity row. The args-streaming preview
+/// (`ToolCallDelta` → "Preparing …") may already hold a row under the SAME id —
+/// for CLI drivers the command_id IS the tool_use id — so starting must
+/// UPSERT that row, never blind-push a second one: `CommandFinished` settles
+/// the newest row with the key (rposition), which left the preview row as an
+/// orphan spinner that outlived its command until the turn-end sweep.
+fn upsert_command_started(messages: &mut Vec<ChatMsg>, command_id: String, label: String) {
+    if let Some(idx) = activity_idx(messages, &command_id) {
+        messages[idx].text = label;
+        if let Author::Activity { running, ok, .. } = &mut messages[idx].author {
+            *running = true;
+            *ok = true;
+        }
+    } else {
+        buf_push_activity(
+            messages,
+            ChatMsg::new(
+                Author::Activity {
+                    running: true,
+                    ok: true,
+                    key: Some(command_id),
+                },
+                label,
+            ),
+        );
+    }
+}
+
 /// Push an activity row into a backgrounded-tab buffer, keeping it above a
 /// trailing Done note (the bg-loop equivalent of the `push_activity!` macro,
 /// so a late row never lands below the turn's summary once merged into the view).
@@ -959,6 +987,12 @@ fn upsert_tool_input_preview(
     }
     let text = tool_input_preview_label(&tool, &accumulated);
     if let Some(idx) = activity_idx(messages, &call_id) {
+        // Never downgrade: once the row was upgraded to a real command/tool
+        // label (CommandStarted shares the tool_use id), a late arg delta must
+        // not flip it back to "Preparing…".
+        if !messages[idx].text.starts_with("spark\tPreparing\t") {
+            return;
+        }
         messages[idx].text = text;
         if let Author::Activity { running, ok, .. } = &mut messages[idx].author {
             *running = true;
@@ -2759,6 +2793,54 @@ fn build_projects(current: &Path, recents: &[PathBuf]) -> Vec<ProjectGroup> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_started_upgrades_preparing_preview_in_place() {
+        // The screenshot bug: claude's command_id IS the tool_use id, so the
+        // "Preparing…" preview and the command row shared a key. A blind push
+        // made CommandFinished (rposition = newest) settle only the new row,
+        // leaving the preview as an orphan spinner until turn end.
+        let mut msgs: Vec<ChatMsg> = Vec::new();
+        upsert_tool_input_preview(
+            &mut msgs,
+            "toolu_1".into(),
+            "Bash".into(),
+            r#"{"command":"git ls-files"}"#.into(),
+        );
+        assert_eq!(msgs.len(), 1);
+        let preview_id = msgs[0].id;
+        upsert_command_started(
+            &mut msgs,
+            "toolu_1".into(),
+            command_activity_label("git ls-files", false),
+        );
+        // SAME row upgraded — no duplicate, stable ChatMsg id.
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].id, preview_id);
+        assert!(msgs[0].text.starts_with("terminal\tRun\t"));
+        // A late arg delta must NOT downgrade the started command row.
+        upsert_tool_input_preview(&mut msgs, "toolu_1".into(), "Bash".into(), "{}".into());
+        assert!(msgs[0].text.starts_with("terminal\tRun\t"));
+        // Settling by key now hits the one-and-only row: no orphan spinner.
+        let idx = activity_idx(&msgs, "toolu_1").unwrap();
+        if let Author::Activity { running, .. } = &mut msgs[idx].author {
+            *running = false;
+        }
+        assert!(!msgs
+            .iter()
+            .any(|m| matches!(m.author, Author::Activity { running: true, .. })));
+    }
+
+    #[test]
+    fn command_started_without_preview_still_pushes_row() {
+        let mut msgs: Vec<ChatMsg> = Vec::new();
+        upsert_command_started(&mut msgs, "c9".into(), command_activity_label("ls", false));
+        assert_eq!(msgs.len(), 1);
+        assert!(matches!(
+            msgs[0].author,
+            Author::Activity { running: true, .. }
+        ));
+    }
 
     #[test]
     fn repair_partial_json_closes_truncated_spec() {
@@ -5179,7 +5261,7 @@ fn app() -> Element {
                                         }
                                     }
                                     Event::CommandStarted { command_id, command, background, .. } => {
-                                        buf_push_activity(buf, ChatMsg::new(Author::Activity { running: true, ok: true, key: Some(command_id) }, command_activity_label(&command, background)));
+                                        upsert_command_started(buf, command_id, command_activity_label(&command, background));
                                     }
                                     Event::CommandOutput { command_id, chunk, .. } => {
                                         if let Some(idx) = activity_idx(buf, &command_id) {
@@ -5649,13 +5731,14 @@ fn app() -> Element {
                                             bg_jobs.write().push(command.clone());
                                         }
                                         status.set(if background { format!("Background · {command}") } else { format!("Running · {command}") });
-                                        // Insert above any trailing Done note (CLI drivers
-                                        // like claude can surface a command row after the turn's
-                                        // text + Done landed) so it never renders below the footer.
-                                        push_activity!(ChatMsg::new(
-                                            Author::Activity { running: true, ok: true, key: Some(command_id) },
+                                        // Upgrade the "Preparing…" preview row in place when one
+                                        // exists (same tool_use id); else insert above a trailing
+                                        // Done note so a late row never lands below the footer.
+                                        upsert_command_started(
+                                            &mut messages.write(),
+                                            command_id,
                                             command_activity_label(&command, background),
-                                        ));
+                                        );
                                     }
                                     scroll_chat_bottom_if_sticky();
                                 }
