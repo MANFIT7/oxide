@@ -474,20 +474,19 @@ fn spawn_bg_tailer(
 /// orphan spinner that outlived its command until the turn-end sweep.
 fn upsert_command_started(messages: &mut Vec<ChatMsg>, command_id: String, label: String) {
     if let Some(idx) = activity_idx(messages, &command_id) {
-        // RELOCATE to the tail, don't mutate in place: a multi-tool assistant
-        // message seeds every call's "Preparing…" row up front (block order),
-        // but execution happens later, one by one — upgrading in place leaves
-        // a RUNNING command rendered above already-settled rows. Moving the
-        // row (same ChatMsg id → keyed diff animates a move, not a remount)
-        // keeps display order == execution order: the running command is
-        // always the newest thing in the transcript, Cursor-style.
-        let mut row = messages.remove(idx);
-        row.text = label;
-        if let Author::Activity { running, ok, .. } = &mut row.author {
+        // Upgrade IN PLACE. Claude emits every CommandStarted of a multi-tool
+        // assistant message back-to-back at the final message line — relocating
+        // each to the tail (tried in v0.0.136) sank ALL commands below the
+        // message's interleaved text, scrambling chronology. The streamed
+        // preview rows already sit at the correct chronological positions
+        // (deltas arrive in block order); in place is the truthful order. The
+        // reversed-render symptom that motivated relocation was a keyed-diff
+        // bug in the transcript loops, fixed at the render layer instead.
+        messages[idx].text = label;
+        if let Author::Activity { running, ok, .. } = &mut messages[idx].author {
             *running = true;
             *ok = true;
         }
-        buf_push_activity(messages, row);
     } else {
         buf_push_activity(
             messages,
@@ -597,6 +596,55 @@ struct TranscriptGroup {
     /// index. Used both as the rsx `key:` and for the act_open toggle map.
     key: u64,
     live: bool,
+}
+
+/// One fully-keyed render item in a turn — the transcript renders ONE flat
+/// list of these per turn. The old nested for-loops (turn → group → row)
+/// emitted unkeyed fragment/conditional roots, so Dioxus fell back to
+/// POSITIONAL diffing of the children; combined with mid-list mutation that
+/// mapped DOM nodes to the wrong logical rows (the reversed-transcript bug,
+/// healed only by the col-{tab} remount). Flat list + one keyed root per item
+/// = real keyed reconciliation.
+enum TurnItem {
+    /// A collapsible activity group (>2 consecutive tool rows).
+    Act(TranscriptGroup),
+    /// A single message row (index into `messages`).
+    Row(usize),
+}
+
+/// A turn pre-flattened for rendering.
+struct TurnRender {
+    key: u64,
+    items: Vec<TurnItem>,
+    done_summary: Option<String>,
+}
+
+/// Flatten turns into fully-keyed render items. Diff rows are dropped here —
+/// they render nothing (consolidated into the Edited-files card), and unkeyed
+/// empties mixed into a keyed list destabilize reconciliation.
+fn flatten_turns(turns: Vec<TranscriptTurn>, messages: &[ChatMsg]) -> Vec<TurnRender> {
+    turns
+        .into_iter()
+        .map(|turn| {
+            let mut items: Vec<TurnItem> = Vec::new();
+            for group in turn.groups {
+                if group.activity && group.indices.len() > 2 {
+                    items.push(TurnItem::Act(group));
+                } else {
+                    for i in group.indices {
+                        if !matches!(messages[i].author, Author::Diff(..)) {
+                            items.push(TurnItem::Row(i));
+                        }
+                    }
+                }
+            }
+            TurnRender {
+                key: turn.key,
+                items,
+                done_summary: turn.done_summary,
+            }
+        })
+        .collect()
 }
 
 #[derive(Clone, PartialEq)]
@@ -2872,6 +2920,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn flatten_turns_yields_one_keyed_item_per_root() {
+        let msgs = vec![
+            ChatMsg::new(Author::User, "go"),
+            act("terminal\tRun\ta"),
+            act("terminal\tRun\tb"),
+            act("terminal\tRun\tc"),
+            ChatMsg::new(Author::Diff("x.rs".into(), 1), "diff".to_string()),
+            ChatMsg::new(Author::Agent, "answer"),
+        ];
+        let rturns = flatten_turns(build_transcript_turns(&msgs), &msgs);
+        assert_eq!(rturns.len(), 1);
+        let items = &rturns[0].items;
+        // user row, ONE Act group (3 activity rows), agent row — Diff dropped.
+        assert_eq!(items.len(), 3);
+        assert!(matches!(items[0], TurnItem::Row(0)));
+        assert!(matches!(&items[1], TurnItem::Act(g) if g.indices == vec![1, 2, 3]));
+        assert!(matches!(items[2], TurnItem::Row(5)));
+        // Small activity runs expand to plain rows (no collapse group).
+        let msgs2 = vec![ChatMsg::new(Author::User, "go"), act("eye\tRead\tx")];
+        let rt2 = flatten_turns(build_transcript_turns(&msgs2), &msgs2);
+        assert_eq!(rt2[0].items.len(), 2);
+        assert!(matches!(rt2[0].items[1], TurnItem::Row(1)));
+    }
+
+    #[test]
     fn diff_rows_do_not_split_activity_groups() {
         // FileDiff pushes invisible Author::Diff rows between activity rows;
         // they must pass through a run instead of splitting it into stray
@@ -2908,32 +2981,24 @@ mod tests {
         );
         assert_eq!(msgs.len(), 1);
         let preview_id = msgs[0].id;
-        // A second call's preview seeded AFTER ours (multi-tool message) plus a
-        // settled row — starting toolu_1 must move its row BELOW them.
-        msgs.push(ChatMsg::new(
-            Author::Activity {
-                running: false,
-                ok: true,
-                key: Some("toolu_0".into()),
-            },
-            "terminal\tRun\tgrep done",
-        ));
+        // Text streamed after the preview (multi-tool message interleaving) —
+        // starting toolu_1 must upgrade its row IN PLACE, preserving the
+        // chronological interleave (relocation-to-tail scrambled multi-tool
+        // messages; reverted in v0.0.138).
+        msgs.push(ChatMsg::new(Author::Agent, "text after the preview"));
         upsert_command_started(
             &mut msgs,
             "toolu_1".into(),
             command_activity_label("git ls-files", false),
         );
-        // SAME row (stable ChatMsg id), no duplicate, RELOCATED to the tail so
-        // the running command renders below already-settled rows.
+        // SAME row (stable ChatMsg id), no duplicate, SAME position.
         assert_eq!(msgs.len(), 2);
-        assert_eq!(msgs.last().unwrap().id, preview_id);
-        assert!(msgs.last().unwrap().text.starts_with("terminal\tRun\t"));
-        let msgs_first_is_settled =
-            matches!(msgs[0].author, Author::Activity { running: false, .. });
-        assert!(msgs_first_is_settled);
+        assert_eq!(msgs[0].id, preview_id);
+        assert!(msgs[0].text.starts_with("terminal\tRun\t"));
+        assert!(matches!(msgs[1].author, Author::Agent));
         // A late arg delta must NOT downgrade the started command row.
         upsert_tool_input_preview(&mut msgs, "toolu_1".into(), "Bash".into(), "{}".into());
-        assert!(msgs.last().unwrap().text.starts_with("terminal\tRun\t"));
+        assert!(msgs[0].text.starts_with("terminal\tRun\t"));
         // Settling by key now hits the one-and-only row: no orphan spinner.
         let idx = activity_idx(&msgs, "toolu_1").unwrap();
         if let Author::Activity { running, .. } = &mut msgs[idx].author {
@@ -8610,23 +8675,20 @@ fn app() -> Element {
                                 {
                                     let last_user_idx = messages.read().iter().rposition(|m| m.author == Author::User);
                                     let last_agent_idx = messages.read().iter().rposition(|m| m.author == Author::Agent);
-                                    let turns = {
+                                    let rturns = {
                                         let msgs = messages.read();
-                                        build_transcript_turns(&msgs)
+                                        flatten_turns(build_transcript_turns(&msgs), &msgs)
                                     };
                                     rsx! {
-                                        for turn in turns.into_iter() {
+                                        for turn in rturns.into_iter() {
                                         div { key: "t-{turn.key}", class: "turn",
-                                        for group in turn.groups.into_iter() {
+                                        for item in turn.items.into_iter() {
                                             {
-                                                let is_act = group.activity;
-                                                let idxs = group.indices;
-                                                let group_key = group.key;
-                                                let group_live = group.live;
-                                                rsx! {
-                                            if is_act && idxs.len() > 2 {
+                                                match item {
+                                            TurnItem::Act(group) => {
                                                 {
-                                                    let _ = group_live;
+                                                    let idxs = group.indices;
+                                                    let group_key = group.key;
                                                     let rows: Vec<(String, bool, bool)> = idxs.iter().map(|&i| {
                                                         let m = &messages.read()[i];
                                                         if let Author::Activity { running, ok, .. } = m.author { (m.text.clone(), running, ok) } else { (m.text.clone(), false, true) }
@@ -8681,13 +8743,13 @@ fn app() -> Element {
                                                         }
                                                     }
                                                 }
-                                            } else {
-                                                for i in idxs {
+                                            }
+                                            TurnItem::Row(i) => {
                                                     {
                                                         let m = messages.read()[i].clone();
                                                         match &m.author {
-                                                            // Standalone diff boxes are consolidated into the
-                                                            // "Edited files" summary card below — render nothing here.
+                                                            // Diff rows were dropped in flatten_turns; User rows and
+                                                            // the rest each render ONE keyed root.
                                                             Author::Diff(_, _) => rsx! {},
                                                             Author::User => {
                                                                 // Display text may carry pasted images after \u{2} separators —
@@ -8810,6 +8872,10 @@ fn app() -> Element {
                                                                 let ws_mark = workspace.clone();
                                                                 let snip2 = pin_snip.clone();
                                                                 rsx! {
+                                                                    // ONE keyed root per row — the thinking-box rides INSIDE it
+                                                                    // (an unkeyed conditional sibling used to bury the row key
+                                                                    // under a fragment root → positional diffing → reversal).
+                                                                    div { key: "m-{m.id}", class: "rowwrap",
                                                                     if is_live && !thinking.read().is_empty() {
                                                                         details { class: "thinking-box", open: think_open.read().unwrap_or(true),
                                                                             summary {
@@ -8832,7 +8898,7 @@ fn app() -> Element {
                                                                             div { class: "thinking-body", "{thinking}" }
                                                                         }
                                                                     }
-                                                                    div { key: "m-{m.id}", id: "msg-{i}", class: "pinwrap",
+                                                                    div { id: "msg-{i}", class: "pinwrap",
                                                                         Message { author: m.author.clone(), text: m.text.clone(), live: is_live }
                                                                         if is_agent && !is_live {
                                                                             div { class: "msg-side",
@@ -8869,7 +8935,7 @@ fn app() -> Element {
                                             }
                                         }
                                         if let Some(sum) = turn.done_summary {
-                                            div { class: "pinwrap", Message { author: Author::Note, text: sum, live: false } }
+                                            div { key: "done-{turn.key}", class: "pinwrap", Message { author: Author::Note, text: sum, live: false } }
                                         }
                                         }
                                         }

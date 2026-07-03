@@ -565,6 +565,244 @@ pub fn workspaces_opened_by_oxide() -> Vec<String> {
     })
 }
 
+/// Cross-session recall for the `session_search` tool (hermes-agent's
+/// session_search shape, LIKE-based — turso has no FTS5 yet). Content search
+/// over past transcripts: newest hit per session, each with a snippet, a ±N
+/// message window around the hit, and the session's "bookends" (how it started
+/// / how it ended) so the model sees goal + resolution without reading it all.
+pub struct RecallHit {
+    pub session_id: String,
+    pub title: String,
+    pub workspace: String,
+    pub snippet: String,
+    pub window: Vec<(String, String)>,
+    pub bookend_start: Vec<(String, String)>,
+    pub bookend_end: Vec<(String, String)>,
+}
+
+/// Roles worth showing to the model when recalling a conversation.
+const RECALL_ROLES: &str = "('user','assistant')";
+
+fn clip(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let cut: String = s.chars().take(max).collect();
+    format!("{cut}…")
+}
+
+/// ±120 chars of context around the first case-insensitive occurrence of any
+/// query word (fallback: the head of the message).
+fn snippet_around(content: &str, words: &[String]) -> String {
+    let lower = content.to_lowercase();
+    let pos = words
+        .iter()
+        .filter_map(|w| lower.find(&w.to_lowercase()))
+        .min()
+        .unwrap_or(0);
+    let start = content[..pos]
+        .char_indices()
+        .rev()
+        .take(120)
+        .last()
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    let tail: String = content[start..].chars().take(260).collect();
+    let prefix = if start > 0 { "…" } else { "" };
+    format!("{prefix}{tail}")
+}
+
+pub fn recall_search(query: &str, exclude_session: &str, limit: usize) -> Vec<RecallHit> {
+    let words: Vec<String> = query
+        .split_whitespace()
+        .take(4)
+        .map(|w| w.replace(['%', '_'], ""))
+        .filter(|w| !w.is_empty())
+        .collect();
+    if words.is_empty() {
+        return Vec::new();
+    }
+    // AND every word; LIKE is ASCII case-insensitive in SQLite.
+    let cond: Vec<String> = (0..words.len())
+        .map(|i| format!("m.content LIKE ?{}", i + 1))
+        .collect();
+    let sql = format!(
+        "SELECT m.session_id, m.seq, m.content, s.title, s.workspace
+         FROM messages m JOIN sessions s ON s.id = m.session_id
+         WHERE s.archived_at IS NULL AND m.role IN {RECALL_ROLES} AND {}
+         ORDER BY m.ts_ms DESC LIMIT 300",
+        cond.join(" AND ")
+    );
+    let params: Vec<turso::Value> = words
+        .iter()
+        .map(|w| turso::Value::Text(format!("%{w}%")))
+        .collect();
+    let rows: Vec<(String, i64, String, String, String)> = {
+        let sql = sql.clone();
+        with_db(move |db| {
+            db.query_map("recall search", &sql, params, |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+        })
+    };
+    // Newest hit per session, skipping the conversation doing the asking.
+    let mut hits: Vec<RecallHit> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (sid, seq, content, title, workspace) in rows {
+        if sid == exclude_session || !seen.insert(sid.clone()) {
+            continue;
+        }
+        let window = recall_window(&sid, seq, 3);
+        let bookend_start = recall_bookend(&sid, true, 3);
+        let bookend_end = recall_bookend(&sid, false, 3);
+        hits.push(RecallHit {
+            session_id: sid,
+            title,
+            workspace,
+            snippet: snippet_around(&content, &words),
+            window,
+            bookend_start,
+            bookend_end,
+        });
+        if hits.len() >= limit {
+            break;
+        }
+    }
+    hits
+}
+
+fn recall_window(session_id: &str, seq: i64, n: i64) -> Vec<(String, String)> {
+    let sid = session_id.to_string();
+    with_db(move |db| {
+        db.query_map(
+            "recall window",
+            &format!(
+                "SELECT role, content FROM messages
+                 WHERE session_id=?1 AND seq BETWEEN ?2 AND ?3 AND role IN {RECALL_ROLES}
+                 ORDER BY seq"
+            ),
+            turso::params![sid, seq - n, seq + n],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+    })
+}
+
+fn recall_bookend(session_id: &str, start: bool, n: i64) -> Vec<(String, String)> {
+    let sid = session_id.to_string();
+    let order = if start { "ASC" } else { "DESC" };
+    let mut rows: Vec<(String, String)> = with_db(move |db| {
+        db.query_map(
+            "recall bookend",
+            &format!(
+                "SELECT role, content FROM messages
+                 WHERE session_id=?1 AND role IN {RECALL_ROLES}
+                 ORDER BY seq {order} LIMIT ?2"
+            ),
+            turso::params![sid, n],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+    });
+    if !start {
+        rows.reverse();
+    }
+    rows
+}
+
+/// Model-facing report for the `session_search` tool. Modes by args:
+/// query → discovery; session_id → read; neither → browse recent.
+pub fn session_recall_text(
+    workspace: &Path,
+    query: &str,
+    session_id: &str,
+    current_session: &str,
+) -> String {
+    if !session_id.is_empty() {
+        let msgs = load(session_id);
+        if msgs.is_empty() {
+            return format!("session_search: no session '{session_id}' (or it is empty).");
+        }
+        let shown: Vec<&(String, String)> = if msgs.len() > 30 {
+            msgs.iter()
+                .take(20)
+                .chain(
+                    msgs.iter()
+                        .rev()
+                        .take(10)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev(),
+                )
+                .collect()
+        } else {
+            msgs.iter().collect()
+        };
+        let mut out = format!(
+            "Session {session_id} ({} of {} messages):\n",
+            shown.len(),
+            msgs.len()
+        );
+        for (role, content) in shown {
+            if role == "user" || role == "assistant" {
+                out.push_str(&format!("[{role}] {}\n", clip(content, 400)));
+            }
+        }
+        return out;
+    }
+    if query.trim().is_empty() {
+        let recent = list(workspace, 10);
+        if recent.is_empty() {
+            return "session_search: no past sessions in this workspace.".to_string();
+        }
+        let mut out = String::from(
+            "Recent sessions (pass session_id to read one, or query to search content):\n",
+        );
+        for m in recent {
+            out.push_str(&format!(
+                "- {} — \"{}\" ({} messages)\n",
+                m.id,
+                clip(&m.title, 80),
+                message_count(&m.id)
+            ));
+        }
+        return out;
+    }
+    let hits = recall_search(query, current_session, 5);
+    if hits.is_empty() {
+        return format!("session_search: nothing found for \"{query}\" in past sessions.");
+    }
+    let mut out = format!("Past sessions matching \"{query}\":\n");
+    for (i, h) in hits.iter().enumerate() {
+        out.push_str(&format!(
+            "\n{}. {} — \"{}\" (workspace {})\n   match: {}\n",
+            i + 1,
+            h.session_id,
+            clip(&h.title, 80),
+            h.workspace,
+            clip(&h.snippet, 260)
+        ));
+        if !h.window.is_empty() {
+            out.push_str("   around the match:\n");
+            for (role, content) in &h.window {
+                out.push_str(&format!("     [{role}] {}\n", clip(content, 240)));
+            }
+        }
+        if !h.bookend_start.is_empty() {
+            out.push_str("   session began:\n");
+            for (role, content) in &h.bookend_start {
+                out.push_str(&format!("     [{role}] {}\n", clip(content, 160)));
+            }
+        }
+        if !h.bookend_end.is_empty() {
+            out.push_str("   session ended:\n");
+            for (role, content) in &h.bookend_end {
+                out.push_str(&format!("     [{role}] {}\n", clip(content, 160)));
+            }
+        }
+    }
+    out.push_str("\nPass session_id to read a full session.");
+    out
+}
+
 /// Title search across ALL workspaces (palette).
 pub fn search(q: &str, limit: usize) -> Vec<SessionMeta> {
     let pat = format!("%{}%", q.replace('%', ""));
@@ -1034,6 +1272,59 @@ pub fn import_workspace(ws: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recall_snippet_centers_on_match_and_clip_respects_unicode() {
+        let content = format!(
+            "{}INTI masalahnya di sini{}",
+            "a".repeat(300),
+            "b".repeat(300)
+        );
+        let s = snippet_around(&content, &["inti".to_string()]);
+        assert!(
+            s.starts_with('…'),
+            "mid-string match gets a leading ellipsis"
+        );
+        assert!(s.contains("INTI masalahnya"));
+        assert!(s.chars().count() < 300);
+        // No match → head of the message, no panic.
+        let s = snippet_around("halo dunia", &["zzz".to_string()]);
+        assert!(s.starts_with("halo"));
+        // clip cuts on char boundaries (multi-byte safe).
+        assert_eq!(clip("héllo wörld", 5), "héllo…");
+        assert_eq!(clip("ok", 5), "ok");
+    }
+
+    #[test]
+    fn recall_search_returns_window_and_bookends_and_excludes_self() {
+        // The test worker runs on :memory:, so this never touches the real db.
+        let ws = Path::new("/tmp/oxide-recall-test");
+        let sid = format!("{}-recall-test", now_ms());
+        for (role, content) in [
+            ("user", "goal: fix the login bug"),
+            ("assistant", "investigating the auth flow"),
+            ("assistant", "the ROOT CAUSE is a token expiry off-by-one"),
+            ("user", "great, apply the fix"),
+            ("assistant", "done — fix applied and tests pass"),
+        ] {
+            append(&sid, ws, "claude", role, content);
+        }
+        let hits = recall_search("root cause expiry", "other-session", 5);
+        assert_eq!(hits.len(), 1);
+        let h = &hits[0];
+        assert_eq!(h.session_id, sid);
+        assert!(h.snippet.contains("ROOT CAUSE"));
+        assert!(h.window.iter().any(|(_, c)| c.contains("ROOT CAUSE")));
+        assert!(h.bookend_start[0].1.contains("goal"));
+        assert!(h.bookend_end.last().unwrap().1.contains("tests pass"));
+        // The conversation doing the asking is excluded from its own results.
+        assert!(recall_search("root cause expiry", &sid, 5).is_empty());
+        // Formatter smoke: discovery + read modes.
+        let txt = session_recall_text(ws, "root cause expiry", "", "other-session");
+        assert!(txt.contains("session began"));
+        let txt = session_recall_text(ws, "", &sid, "");
+        assert!(txt.contains("login bug"));
+    }
 
     #[test]
     fn imports_codex_desktop_threads_as_resumable_sessions() {

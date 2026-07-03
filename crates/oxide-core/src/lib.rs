@@ -1924,6 +1924,11 @@ impl Engine {
             .params(serde_json::json!({"type":"object","properties":{"url":{"type":"string"}},"required":["url"]})));
         tools.push(ToolSpec::new("codebase_search", "Find code relevant to a natural-language query — fast indexed retrieval (TF-IDF + symbol-aware) across the workspace. Use this FIRST to locate where something is implemented when you don't know the file; prefer it over a broad `search`. Then read only the top file(s).")
             .params(serde_json::json!({"type":"object","properties":{"query":{"type":"string"}},"required":["query"]})));
+        tools.push(ToolSpec::new("session_search", "Recall PAST Oxide conversations (other sessions). With `query`: find sessions that discussed a topic — returns a snippet, the messages around the match, and how each session began/ended. With `session_id`: read that session. With no args: list recent sessions. Use when the user references earlier work (\"like we did before\", \"the bug from last week\").")
+            .params(serde_json::json!({"type":"object","properties":{
+                "query":{"type":"string","description":"topic to find across past sessions"},
+                "session_id":{"type":"string","description":"read this specific session instead of searching"}
+            }})));
         tools.push(ToolSpec::new("todo_write", "Maintain a short task checklist for non-trivial multi-step work (>2 edits or multiple files/subsystems). Skip it for simple tasks. Call with the FULL list each time; keep exactly one task 'in_progress' and mark tasks 'completed' as you finish.")
             .params(serde_json::json!({
                 "type":"object",
@@ -5417,6 +5422,28 @@ Do NOT read it again. Proceed now: make the edits with the edit/write_file tools
                     "codebase_search: timed out (repository too large). Narrow the query or use `search`/`read_file` on a specific path.".into(),
                     false,
                 ),
+            }
+        } else if name == "session_search" {
+            let q = arguments["query"].as_str().unwrap_or("").trim().to_string();
+            let sid = arguments["session_id"]
+                .as_str()
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let ws = self.workspace.clone();
+            let cur = self
+                .session_store
+                .as_ref()
+                .map(|s| s.id.clone())
+                .unwrap_or_default();
+            // DB calls are sync (worker-thread channel) — keep them off the
+            // engine's async loop, and bound the whole recall.
+            let job =
+                tokio::task::spawn_blocking(move || db::session_recall_text(&ws, &q, &sid, &cur));
+            match tokio::time::timeout(std::time::Duration::from_secs(10), job).await {
+                Ok(Ok(text)) => (text, true),
+                Ok(Err(_)) => ("session_search: internal error".into(), false),
+                Err(_) => ("session_search: timed out".into(), false),
             }
         } else if name == "edit" {
             match &edit_error {

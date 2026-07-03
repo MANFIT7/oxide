@@ -2748,6 +2748,9 @@ details::details-content { overflow: clip; }
 .app[data-theme="light"] .env-card { box-shadow: 0 14px 38px rgba(20,20,20,.12); }
 .env-card-head { display: flex; align-items: center; justify-content: space-between; padding: 0 8px 8px; color: var(--muted); font-size: 13px; }
 .env-card-title { display: inline-flex; align-items: center; gap: 6px; }
+/* Keyed row root: purely structural (one keyed root per transcript row for
+   Dioxus reconciliation) — contents keeps layout identical to no wrapper. */
+.rowwrap { display: contents; }
 /* Watched background job: expandable chip with a live tail of its output file. */
 details.bg-chip.bg-watch { display: block; padding: 0; }
 .bg-watch-sum { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; list-style: none; padding: 3px 8px; }
