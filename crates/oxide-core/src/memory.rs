@@ -77,6 +77,114 @@ impl Memory {
         std::fs::write(self.dir.join("skills").join(format!("{safe}.md")), content)
     }
 
+    /// Mechanical curator (hermes' lifecycle, deterministic v1): skills
+    /// untouched for 45+ days move to `skills/archive/` — recoverable, never
+    /// deleted, and out of the system-prompt index. Runs at most once per
+    /// 24h (state file guard). Returns how many were archived.
+    pub fn curate(&self) -> usize {
+        const ARCHIVE_AFTER: std::time::Duration = std::time::Duration::from_secs(45 * 86_400);
+        const RUN_EVERY: std::time::Duration = std::time::Duration::from_secs(86_400);
+        let state = self.dir.join(".curator_state");
+        let ran_recently = std::fs::metadata(&state)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .map(|age| age < RUN_EVERY)
+            .unwrap_or(false);
+        if ran_recently {
+            return 0;
+        }
+        let _ = std::fs::write(&state, "");
+        let skills_dir = self.dir.join("skills");
+        let archive = skills_dir.join("archive");
+        let mut moved = 0usize;
+        if let Ok(rd) = std::fs::read_dir(&skills_dir) {
+            for entry in rd.flatten() {
+                let p = entry.path();
+                if p.extension().and_then(|x| x.to_str()) != Some("md") {
+                    continue;
+                }
+                let stale = std::fs::metadata(&p)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.elapsed().ok())
+                    .map(|age| age >= ARCHIVE_AFTER)
+                    .unwrap_or(false);
+                if !stale {
+                    continue;
+                }
+                let _ = std::fs::create_dir_all(&archive);
+                if let Some(name) = p.file_name() {
+                    if std::fs::rename(&p, archive.join(name)).is_ok() {
+                        moved += 1;
+                    }
+                }
+            }
+        }
+        moved
+    }
+
+    /// Facts as individual lines (the `- ` bullets of MEMORY.md), for the GUI
+    /// memory panel.
+    pub fn facts(&self) -> Vec<String> {
+        std::fs::read_to_string(self.dir.join("MEMORY.md"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| {
+                let t = l.trim();
+                t.strip_prefix("- ")
+                    .map(str::to_string)
+                    .or_else(|| (!t.is_empty()).then(|| t.to_string()))
+            })
+            .collect()
+    }
+
+    /// Remove one fact by its index in [`facts`] (GUI delete button).
+    pub fn remove_fact(&self, index: usize) -> std::io::Result<()> {
+        let facts = self.facts();
+        let next: String = facts
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != index)
+            .map(|(_, f)| format!("- {f}\n"))
+            .collect();
+        std::fs::write(self.dir.join("MEMORY.md"), next)
+    }
+
+    /// Move one skill to `skills/archive/` (GUI archive button).
+    pub fn archive_skill(&self, name: &str) -> std::io::Result<()> {
+        let skills = self.dir.join("skills");
+        let archive = skills.join("archive");
+        std::fs::create_dir_all(&archive)?;
+        let file = format!("{name}.md");
+        std::fs::rename(skills.join(&file), archive.join(&file))
+    }
+
+    /// Days since a skill file was last touched (freshness in the panel).
+    pub fn skill_age_days(&self, name: &str) -> Option<u64> {
+        std::fs::metadata(self.dir.join("skills").join(format!("{name}.md")))
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .map(|d| d.as_secs() / 86_400)
+    }
+
+    /// How many skills sit in `skills/archive/`.
+    pub fn archived_count(&self) -> usize {
+        std::fs::read_dir(self.dir.join("skills/archive"))
+            .map(|rd| {
+                rd.flatten()
+                    .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("md"))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// Full path of a skill file (GUI "open in editor").
+    pub fn skill_path(&self, name: &str) -> PathBuf {
+        self.dir.join("skills").join(format!("{name}.md"))
+    }
+
     /// `(name, one-line summary)` for each saved skill.
     pub fn skills(&self) -> Vec<(String, String)> {
         let mut v = Vec::new();

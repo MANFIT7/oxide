@@ -75,6 +75,10 @@ pub struct Config {
     /// Play a short notification sound when a turn finishes.
     #[serde(default = "default_true")]
     pub notification_sound: bool,
+    /// Local webhook listener port for automation triggers
+    /// (`POST 127.0.0.1:{port}/hook/{automation_id}`); None = disabled.
+    #[serde(default)]
+    pub webhook_port: Option<u16>,
     /// Notification sound volume (0.0–1.0).
     #[serde(default = "default_notify_volume")]
     pub notification_volume: f32,
@@ -297,6 +301,7 @@ impl Default for Config {
             default_tab_mode: default_tab_mode(),
             browser_headless: true,
             notification_sound: true,
+            webhook_port: None,
             notification_volume: default_notify_volume(),
             theme: default_theme(),
             accent_color: String::new(),
@@ -600,6 +605,7 @@ description = "no command or url — skipped"
         let mut cfg = Config {
             model: "gpt-custom".to_string(),
             notification_sound: false,
+            webhook_port: None,
             ..Config::default()
         };
         cfg.overlay_file(&path).unwrap();

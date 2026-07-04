@@ -119,6 +119,19 @@ impl ToolRouter {
                     .map(|s| s.chars().count())
                     .unwrap_or(0)
             ),
+            "execute_code" => {
+                let code = args["code"].as_str().unwrap_or("?");
+                let preview: String = code.lines().take(12).collect::<Vec<_>>().join("\n");
+                let more = code.lines().count().saturating_sub(12);
+                format!(
+                    "Run Python script (read-only tool RPC):\n{preview}{}",
+                    if more > 0 {
+                        format!("\n… +{more} more line(s)")
+                    } else {
+                        String::new()
+                    }
+                )
+            }
             "web_search" => format!("Search web:\n{}", args["query"].as_str().unwrap_or("?")),
             "fetch_url" => format!("Fetch URL:\n{}", args["url"].as_str().unwrap_or("?")),
             other => format!("{other} {args}"),

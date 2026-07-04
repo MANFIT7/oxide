@@ -2556,6 +2556,26 @@ fn run_automation_turn(
     trigger: &'static str,
     engine: Coroutine<EngineCmd>,
     streaming: Signal<bool>,
+    queue: Signal<Vec<String>>,
+    runs: Signal<Vec<automation::AutomationRunSpec>>,
+    status: Signal<String>,
+) {
+    run_automation_turn_with(
+        workspace, spec, trigger, None, engine, streaming, queue, runs, status,
+    );
+}
+
+/// Like [`run_automation_turn`] but with an optional webhook payload. The
+/// prompt build is async (pre-run script may execute), so the whole submit
+/// path runs inside a spawned task.
+#[allow(clippy::too_many_arguments)]
+fn run_automation_turn_with(
+    workspace: PathBuf,
+    spec: automation::AutomationSpec,
+    trigger: &'static str,
+    payload: Option<String>,
+    engine: Coroutine<EngineCmd>,
+    streaming: Signal<bool>,
     mut queue: Signal<Vec<String>>,
     mut runs: Signal<Vec<automation::AutomationRunSpec>>,
     mut status: Signal<String>,
@@ -2566,21 +2586,99 @@ fn run_automation_turn(
             if let Ok(next_runs) = automation::read_runs(&workspace) {
                 runs.set(next_runs);
             }
-            let prompt = automation::build_run_prompt(&spec);
-            let label = format!("Run automation: {}", spec.name);
-            if *streaming.read() {
-                queue.write().push(prompt);
-                status.set(format!("Queued automation: {}", spec.name));
-            } else {
-                engine.send(EngineCmd::Submit {
-                    engine: prompt,
-                    display: label,
-                });
-                status.set(format!("Started automation: {}", spec.name));
-            }
+            spawn(async move {
+                let prompt =
+                    automation::build_run_prompt_full(&workspace, &spec, payload.as_deref()).await;
+                let label = format!("Run automation: {}", spec.name);
+                if *streaming.read() {
+                    queue.write().push(prompt);
+                    status.set(format!("Queued automation: {}", spec.name));
+                } else {
+                    engine.send(EngineCmd::Submit {
+                        engine: prompt,
+                        display: label,
+                    });
+                    status.set(format!("Started automation: {}", spec.name));
+                }
+            });
         }
         Err(err) => status.set(format!("Automation failed: {err}")),
     }
+}
+
+/// Parse a minimal `POST /hook/{id}` HTTP request: returns
+/// `(automation_id, x-oxide-token header, body)`. Not a general HTTP server —
+/// just enough for localhost webhook pokes (curl, CI scripts, git hooks).
+async fn read_webhook_request(
+    sock: &mut tokio::net::TcpStream,
+) -> Option<(String, String, String)> {
+    use tokio::io::AsyncReadExt;
+    let mut raw = Vec::with_capacity(2048);
+    let mut chunk = [0u8; 4096];
+    // Read until the full header block, then until content-length is satisfied.
+    loop {
+        let n = sock.read(&mut chunk).await.ok()?;
+        if n == 0 {
+            break;
+        }
+        raw.extend_from_slice(&chunk[..n]);
+        if raw.len() > 64 * 1024 {
+            return None;
+        }
+        if let Some(head_end) = find_double_crlf(&raw) {
+            let head = String::from_utf8_lossy(&raw[..head_end]).to_string();
+            let want: usize = head
+                .lines()
+                .find_map(|l| {
+                    l.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(str::trim)
+                        .map(String::from)
+                })
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            if raw.len() >= head_end + 4 + want.min(60 * 1024) {
+                let body = String::from_utf8_lossy(&raw[head_end + 4..]).to_string();
+                let mut lines = head.lines();
+                let request = lines.next()?;
+                let mut parts = request.split_whitespace();
+                if parts.next()? != "POST" {
+                    return None;
+                }
+                let path = parts.next()?;
+                let id = path.strip_prefix("/hook/")?.trim_matches('/').to_string();
+                if id.is_empty() {
+                    return None;
+                }
+                let token = head
+                    .lines()
+                    .find_map(|l| {
+                        l.to_ascii_lowercase()
+                            .starts_with("x-oxide-token:")
+                            .then(|| l.split_once(':').map(|(_, v)| v.trim().to_string()))
+                            .flatten()
+                    })
+                    .unwrap_or_default();
+                return Some((id, token, body));
+            }
+        }
+    }
+    None
+}
+
+fn find_double_crlf(raw: &[u8]) -> Option<usize> {
+    raw.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+async fn respond_webhook(sock: &mut tokio::net::TcpStream, status: &str) {
+    use tokio::io::AsyncWriteExt;
+    let _ = sock
+        .write_all(
+            format!("HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await;
+    let _ = sock.shutdown().await;
 }
 
 fn relative_ms(value: u64) -> String {
@@ -3257,6 +3355,16 @@ fn push_action_toast(
 /// watching finished) the chime is suppressed if the window is focused — no
 /// point dinging while you're already staring at the result. Volume is
 /// user-configurable; simultaneous chimes overlap via a cloned element.
+/// hermes [SILENT] convention: an automation/agent reply that starts with
+/// `[SILENT]` means "nothing needs the user's attention" — skip toast + chime.
+fn turn_is_silent(rows: &[ChatMsg]) -> bool {
+    rows.iter()
+        .rev()
+        .find(|m| m.author == Author::Agent && !m.text.trim().is_empty())
+        .map(|m| m.text.trim_start().starts_with("[SILENT]"))
+        .unwrap_or(false)
+}
+
 fn play_notification_sound(cfg: Signal<Config>, force: bool) {
     let c = cfg.peek();
     if !c.notification_sound {
@@ -4154,6 +4262,7 @@ fn app() -> Element {
     let automation_name = use_signal(|| automation::DEFAULT_NAME.to_string());
     let automation_schedule = use_signal(|| automation::DEFAULT_SCHEDULE.to_string());
     let automation_prompt = use_signal(|| automation::DEFAULT_PROMPT.to_string());
+    let automation_script = use_signal(String::new);
     let automation_status = use_signal(|| "Automations idle".to_string());
     let automation_confirm_delete = use_signal(|| None::<String>);
     let hermes_ws = ws0.clone();
@@ -5566,12 +5675,16 @@ fn app() -> Element {
                                         if let Author::Activity { running, .. } = &mut c.author { *running = false; }
                                     }
                                     buf.push(ChatMsg::new(Author::Note, DONE_NOTE_MARK));
+                                    let silent = turn_is_silent(buf);
                                     let title = tabs.peek().iter().find(|t| t.id == ev_tid).map(|t| t.title.clone()).unwrap_or_default();
-                                    if !title.is_empty() {
+                                    if !title.is_empty() && !silent {
                                         push_toast(toasts, toast_seq, "ok", &format!("{title} — finished"));
                                     }
-                                    // Background tab done — you're looking elsewhere, always chime.
-                                    play_notification_sound(cfg, true);
+                                    // Background tab done — you're looking elsewhere, always chime
+                                    // (unless the turn declared itself [SILENT]).
+                                    if !silent {
+                                        play_notification_sound(cfg, true);
+                                    }
                                 }
                                 Event::Error { message } if !message.starts_with("mcp '") => {
                                     buf.push(ChatMsg::new(Author::Note, format!("error: {message}")));
@@ -6319,7 +6432,7 @@ fn app() -> Element {
                                 turn_done = true;
                                 // Submit the next queued message as a fresh turn.
                                 let next = { let mut q = queue.write(); if q.is_empty() { None } else { Some(q.remove(0)) } };
-                                if next.is_none() {
+                                if next.is_none() && !turn_is_silent(&messages.read()) {
                                     // Foreground turn done — only chime if the window isn't
                                     // focused (you stepped away); no ding while you're watching.
                                     play_notification_sound(cfg, false);
@@ -6521,6 +6634,65 @@ fn app() -> Element {
                     .clamp(10_000, 30_000);
             }
             tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        }
+    });
+    // Local webhook trigger: `POST 127.0.0.1:{port}/hook/{automation_id}` with
+    // header `x-oxide-token: <spec.webhook_token>` fires the automation now,
+    // injecting the request body as "Webhook payload" context. Localhost-only;
+    // enable by setting `webhook_port` in the config.
+    use_future(move || async move {
+        let Some(port) = cfg.peek().webhook_port else {
+            return;
+        };
+        let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+            Ok(l) => l,
+            Err(err) => {
+                eprintln!("webhook listener bind failed on port {port}: {err}");
+                return;
+            }
+        };
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                continue;
+            };
+            let req = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                read_webhook_request(&mut sock),
+            )
+            .await
+            .ok()
+            .flatten();
+            let Some((spec_id, token, payload)) = req else {
+                respond_webhook(&mut sock, "400 Bad Request").await;
+                continue;
+            };
+            let spec = automations.peek().iter().find(|s| s.id == spec_id).cloned();
+            let Some(spec) = spec else {
+                respond_webhook(&mut sock, "404 Not Found").await;
+                continue;
+            };
+            let expected = spec
+                .webhook_token
+                .clone()
+                .unwrap_or_else(|| automation::webhook_token_for(&spec.id, spec.created_ms));
+            if token != expected {
+                respond_webhook(&mut sock, "401 Unauthorized").await;
+                continue;
+            }
+            respond_webhook(&mut sock, "204 No Content").await;
+            if let Some(root) = cfg.peek().workspace.clone() {
+                run_automation_turn_with(
+                    root,
+                    spec,
+                    "webhook",
+                    Some(payload),
+                    engine,
+                    streaming,
+                    queue,
+                    automation_runs,
+                    automation_status,
+                );
+            }
         }
     });
     // Effort is shown by its own pill — keep the model label clean.
@@ -9489,6 +9661,7 @@ fn app() -> Element {
                     automation_name,
                     automation_schedule,
                     automation_prompt,
+                    automation_script,
                     automation_status,
                     automation_confirm_delete,
                     hermes_profiles,
@@ -10726,6 +10899,7 @@ fn SettingsModal(
     mut automation_name: Signal<String>,
     mut automation_schedule: Signal<String>,
     mut automation_prompt: Signal<String>,
+    mut automation_script: Signal<String>,
     mut automation_status: Signal<String>,
     mut automation_confirm_delete: Signal<Option<String>>,
     mut hermes_profiles: Signal<Vec<hermes::HermesProfile>>,
@@ -10814,6 +10988,7 @@ fn SettingsModal(
     };
 
     let mut settings_tab = use_signal(|| initial_tab.clone());
+    let mut memory_refresh = use_signal(|| 0u64);
     rsx! {
         div { class: "modal-overlay", onclick: move |_| on_close.call(()),
             div { class: "modal settings-modal", onclick: move |e| e.stop_propagation(),
@@ -10822,7 +10997,7 @@ fn SettingsModal(
                     button { class: "term-x", onclick: move |_| on_close.call(()), Icon { name: "x" } }
                 }
                 div { class: "settings-tabs",
-                    for (key, label) in [("model", "Model"), ("access", "Access"), ("agents", "Agents"), ("hermes", "Hermes"), ("automations", "Automations"), ("sessions", "Sessions"), ("updates", "Updates")] {
+                    for (key, label) in [("model", "Model"), ("access", "Access"), ("agents", "Agents"), ("hermes", "Hermes"), ("automations", "Automations"), ("memory", "Memory"), ("sessions", "Sessions"), ("updates", "Updates")] {
                         button { class: if settings_tab.read().as_str() == key { "settings-tab active" } else { "settings-tab" },
                             onclick: move |_| settings_tab.set(key.to_string()), "{label}" }
                     }
@@ -11182,6 +11357,89 @@ fn SettingsModal(
                         }
                     }
                   }
+                  if settings_tab.read().as_str() == "memory" {
+                    {
+                        let _ = memory_refresh.read();
+                        let mem = oxide_core::memory::Memory::new(&workspace_of(&cfg.read()));
+                        let facts = mem.facts();
+                        let skills: Vec<(String, String, Option<u64>)> = mem
+                            .skills()
+                            .into_iter()
+                            .map(|(name, summary)| {
+                                let age = mem.skill_age_days(&name);
+                                (name, summary, age)
+                            })
+                            .collect();
+                        let archived = mem.archived_count();
+                        rsx! {
+                            div { class: "field cgpt-field",
+                                span { class: "field-label", "Agent memory" }
+                                span { class: "settings-hint",
+                                    "What the agent has learned in this workspace (.oxide/memory): {facts.len()} fact(s), {skills.len()} skill(s), {archived} archived. Skills untouched for 45+ days are archived automatically."
+                                }
+                            }
+                            div { class: "field",
+                                span { class: "field-label", "Remembered facts" }
+                                if facts.is_empty() {
+                                    div { class: "archived-empty", "No facts remembered yet — the agent saves them with the remember tool." }
+                                } else {
+                                    div { class: "archived-list",
+                                        for (i, fact) in facts.iter().cloned().enumerate() {
+                                            div { class: "archived-row", key: "fact-{i}",
+                                                span { class: "archived-title", title: "{fact}", "{fact}" }
+                                                button { class: "archived-del", onclick: move |_| {
+                                                    let mem = oxide_core::memory::Memory::new(&workspace_of(&cfg.read()));
+                                                    let _ = mem.remove_fact(i);
+                                                    memory_refresh.set(memory_refresh() + 1);
+                                                }, "Forget" }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            div { class: "field",
+                                span { class: "field-label", "Learned skills" }
+                                if skills.is_empty() {
+                                    div { class: "archived-empty", "No skills yet — ask the agent to /learn from finished work." }
+                                } else {
+                                    div { class: "archived-list",
+                                        for (name, summary, age) in skills.iter().cloned() {
+                                            {
+                                                let age_label = age.map(|d| if d == 0 { "today".to_string() } else { format!("{d}d ago") }).unwrap_or_default();
+                                                let name_open = name.clone();
+                                                let name_arch = name.clone();
+                                                rsx! {
+                                                    div { class: "archived-folder", key: "skill-{name}",
+                                                        div { class: "archived-folder-head", title: "{summary}",
+                                                            Icon { name: "brain" }
+                                                            span { class: "archived-folder-name", "{name}" }
+                                                            span { class: "archived-count", "{age_label}" }
+                                                        }
+                                                        div { class: "archived-row",
+                                                            span { class: "archived-title", "{summary}" }
+                                                            button { class: "archived-restore", onclick: move |_| {
+                                                                let mem = oxide_core::memory::Memory::new(&workspace_of(&cfg.read()));
+                                                                let path = mem.skill_path(&name_open);
+                                                                let mut uiw = ui;
+                                                                uiw.open_path.set(Some(path));
+                                                                on_close.call(());
+                                                            }, "Open" }
+                                                            button { class: "archived-del", onclick: move |_| {
+                                                                let mem = oxide_core::memory::Memory::new(&workspace_of(&cfg.read()));
+                                                                let _ = mem.archive_skill(&name_arch);
+                                                                memory_refresh.set(memory_refresh() + 1);
+                                                            }, "Archive" }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                  }
                   if settings_tab.read().as_str() == "sessions" {
                     div { class: "field",
                         span { class: "field-label", "Archived sessions" }
@@ -11284,6 +11542,16 @@ fn SettingsModal(
                                 oninput: move |e| automation_prompt.set(e.value())
                             }
                         }
+                        label { class: "field",
+                            span { class: "field-label", "Pre-run script (optional)" }
+                            span { class: "settings-hint", "Shell script run before each trigger; its stdout is injected into the prompt as context." }
+                            textarea {
+                                class: "field-input",
+                                rows: "3",
+                                value: "{automation_script}",
+                                oninput: move |e| automation_script.set(e.value())
+                            }
+                        }
                         div { class: "field-folder",
                             span { class: "folder-path", "{automation_status}" }
                             button { class: "ed-save", onclick: move |_| {
@@ -11299,7 +11567,11 @@ fn SettingsModal(
                                     automation_status.set("Schedule must be FREQ=MINUTELY|HOURLY|DAILY;INTERVAL=N".to_string());
                                     return;
                                 }
-                                let spec = automation::new_spec(&name, &schedule, &prompt, automation::now_ms());
+                                let mut spec = automation::new_spec(&name, &schedule, &prompt, automation::now_ms());
+                                let script = automation_script.read().trim().to_string();
+                                if !script.is_empty() {
+                                    spec.script = Some(script);
+                                }
                                 match automation::write_spec(&root, &spec) {
                                     Ok(()) => {
                                         automations.set(automation::read_specs(&root).unwrap_or_default());
@@ -11337,6 +11609,19 @@ fn SettingsModal(
                                                 }
                                                 div { class: "archived-row",
                                                     span { class: "archived-title", title: "{spec.schedule}", "{spec.schedule} · {latest}" }
+                                                    if let Some(port) = cfg.read().webhook_port {
+                                                        {
+                                                            let token = spec.webhook_token.clone().unwrap_or_else(|| automation::webhook_token_for(&spec.id, spec.created_ms));
+                                                            let curl = format!("curl -s -X POST -H 'x-oxide-token: {token}' --data @- http://127.0.0.1:{port}/hook/{}", spec.id);
+                                                            rsx! {
+                                                                button { class: "archived-restore", title: "{curl}", onclick: move |_| {
+                                                                    let c = serde_json::to_string(&curl).unwrap_or_default();
+                                                                    spawn(async move { let _ = document::eval(&format!("navigator.clipboard.writeText({c})")).await; });
+                                                                    automation_status.set("Webhook curl copied".to_string());
+                                                                }, "Webhook" }
+                                                            }
+                                                        }
+                                                    }
                                                     button { class: "archived-restore", onclick: move |_| {
                                                         let root = workspace_of(&cfg.read());
                                                         run_automation_turn(

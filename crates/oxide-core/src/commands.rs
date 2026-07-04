@@ -50,6 +50,26 @@ Do the smallest useful setup pass:\n\
 5. Finish by summarizing what changed and which verification command you ran.{focus}"
             ))
         }
+        // hermes `/learn`: turn what just happened (or a named source) into a
+        // durable skill. No separate distillation engine — ONE prompt that
+        // makes the live agent gather + author via its own tools.
+        "learn" => {
+            let focus = args.trim();
+            let target = if focus.is_empty() {
+                "the work done earlier in THIS conversation".to_string()
+            } else {
+                format!("this subject/source: {focus}")
+            };
+            Some(format!(
+                "Distill a reusable SKILL from {target}.\n\n\
+Authoring standard (follow strictly):\n\
+1. Identify ONE reusable multi-step procedure that would genuinely save time next occurrence. If nothing qualifies, say so and STOP — do not invent a skill.\n\
+2. If a source was named, read it first with your tools (read_file / fetch_url / search).\n\
+3. Write the skill with `save_skill`: kebab-case name; body = markdown with a one-line summary FIRST (it becomes the index entry), then Steps (imperative, concrete commands/paths), then Gotchas.\n\
+4. Keep it under ~60 lines. Durable knowledge only — no session-specific values (dates, ids, temporary paths).\n\
+5. Finish by showing the skill name + its one-line summary."
+            ))
+        }
         _ => None,
     }
 }

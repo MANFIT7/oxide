@@ -17,6 +17,25 @@ pub struct AutomationSpec {
     pub schedule: String,
     pub prompt: String,
     pub created_ms: u64,
+    /// Optional pre-run shell script (hermes: "mechanical work in the script,
+    /// reasoning in the agent") — its stdout is injected into the run prompt.
+    #[serde(default)]
+    pub script: Option<String>,
+    /// Shared secret for the local webhook trigger (`POST /hook/{id}` with
+    /// header `x-oxide-token`). Set on creation; None on legacy specs.
+    #[serde(default)]
+    pub webhook_token: Option<String>,
+}
+
+/// Deterministic webhook token (not cryptographic — the listener binds to
+/// 127.0.0.1 only; this guards against accidental cross-automation firing).
+pub fn webhook_token_for(id: &str, created_ms: u64) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut a = std::collections::hash_map::DefaultHasher::new();
+    (id, created_ms, "oxide-webhook-a").hash(&mut a);
+    let mut b = std::collections::hash_map::DefaultHasher::new();
+    (created_ms, id, "oxide-webhook-b").hash(&mut b);
+    format!("{:016x}{:016x}", a.finish(), b.finish())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,6 +58,11 @@ pub fn new_spec(name: &str, schedule: &str, prompt: &str, created_ms: u64) -> Au
         schedule: schedule.trim().to_string(),
         prompt: prompt.trim().to_string(),
         created_ms,
+        script: None,
+        webhook_token: Some(webhook_token_for(
+            &id_from_name(name, created_ms),
+            created_ms,
+        )),
     }
 }
 
@@ -126,9 +150,57 @@ pub fn with_toggled_status(spec: &AutomationSpec) -> AutomationSpec {
 
 pub fn build_run_prompt(spec: &AutomationSpec) -> String {
     format!(
-        "Run automation now\n\nName: {}\nKind: {}\nSchedule: {}\nStatus: {}\n\nAutomation prompt:\n{}",
+        "Run automation now\n\nName: {}\nKind: {}\nSchedule: {}\nStatus: {}\n\nAutomation prompt:\n{}\n\nDelivery rule: if this run produced NOTHING that needs the user's attention (no changes, nothing actionable), START your final reply with [SILENT].",
         spec.name, spec.kind, spec.schedule, spec.status, spec.prompt
     )
+}
+
+/// Full run prompt: pre-run script output (if configured) + webhook payload
+/// (if this run was webhook-triggered) appended to [`build_run_prompt`].
+pub async fn build_run_prompt_full(
+    workspace: &Path,
+    spec: &AutomationSpec,
+    payload: Option<&str>,
+) -> String {
+    let mut prompt = build_run_prompt(spec);
+    if let Some(script) = spec
+        .script
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            tokio::process::Command::new("sh")
+                .arg("-c")
+                .arg(script)
+                .current_dir(workspace)
+                .output(),
+        )
+        .await;
+        let text = match out {
+            Ok(Ok(o)) => {
+                let mut t = String::from_utf8_lossy(&o.stdout).to_string();
+                if !o.status.success() {
+                    t.push_str(&format!(
+                        "\n[script exited {}] {}",
+                        o.status.code().unwrap_or(-1),
+                        String::from_utf8_lossy(&o.stderr)
+                    ));
+                }
+                t
+            }
+            Ok(Err(e)) => format!("[script failed to run: {e}]"),
+            Err(_) => "[script timed out after 60s]".to_string(),
+        };
+        let text: String = text.chars().take(8_000).collect();
+        prompt.push_str(&format!("\n\nPre-run script output:\n{text}"));
+    }
+    if let Some(body) = payload.filter(|b| !b.trim().is_empty()) {
+        let body: String = body.chars().take(4_000).collect();
+        prompt.push_str(&format!("\n\nWebhook payload:\n{body}"));
+    }
+    prompt
 }
 
 pub fn run_from_spec(
@@ -496,6 +568,8 @@ mod tests {
             schedule: "FREQ=DAILY;INTERVAL=1".to_string(),
             prompt: "Review the workspace".to_string(),
             created_ms: 10,
+            script: None,
+            webhook_token: None,
         }
     }
 
@@ -579,6 +653,8 @@ mod tests {
             schedule: "FREQ=MINUTELY;INTERVAL=5".to_string(),
             prompt: "Review the workspace".to_string(),
             created_ms: 1_000,
+            script: None,
+            webhook_token: None,
         };
         let recent_run = AutomationRunSpec {
             id: "daily-review-10000".to_string(),
@@ -606,6 +682,8 @@ mod tests {
             schedule: "FREQ=MINUTELY;INTERVAL=1".to_string(),
             prompt: "Review the workspace".to_string(),
             created_ms: 1,
+            script: None,
+            webhook_token: None,
         };
 
         assert!(!is_due(&spec, &[], 120_000));

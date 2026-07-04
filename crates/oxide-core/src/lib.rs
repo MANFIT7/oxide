@@ -22,7 +22,8 @@ pub mod db;
 mod embed;
 mod hooks;
 mod index;
-mod memory;
+pub mod memory;
+mod ptc;
 mod sandbox;
 mod store;
 mod tools;
@@ -909,6 +910,61 @@ fn mcp_pool_key(server: &McpServerConfig) -> String {
 /// stripped from the model-visible array and replaced by three tiny bridge
 /// tools. The full specs stay registered with the router, so a bridged call
 /// still hits the normal approval/sandbox chokepoint.
+/// hermes verify-on-stop: is this shell command a VERIFICATION (test / lint /
+/// typecheck / build) whose passing exit is evidence the edits work?
+fn is_verification_command(cmd: &str) -> bool {
+    let c = cmd.to_ascii_lowercase();
+    [
+        "cargo test",
+        "cargo check",
+        "cargo clippy",
+        "cargo build",
+        "pytest",
+        "npm test",
+        "npm run test",
+        "yarn test",
+        "pnpm test",
+        "go test",
+        "go vet",
+        "go build",
+        "tsc",
+        "eslint",
+        "ruff",
+        "mypy",
+        "flake8",
+        "vitest",
+        "jest",
+        "make test",
+        "make check",
+        "mix test",
+        "rspec",
+        "phpunit",
+        "gradle test",
+        "mvn test",
+        "swift test",
+    ]
+    .iter()
+    .any(|p| c.contains(p))
+        || c.contains(" lint")
+        || c.starts_with("lint")
+}
+
+/// Do these edited paths include CODE (vs docs/config prose)? Doc-only edits
+/// must never trigger the verify-on-stop nudge.
+fn edits_touch_code(paths: &[String]) -> bool {
+    paths.iter().any(|p| {
+        let lower = p.to_ascii_lowercase();
+        !(lower.ends_with(".md")
+            || lower.ends_with(".txt")
+            || lower.ends_with(".rst")
+            || lower.ends_with(".adoc")
+            || lower.ends_with("license")
+            || lower.ends_with(".license")
+            || lower.ends_with(".svg")
+            || lower.ends_with(".png"))
+    })
+}
+
 /// The detached reviewer call behind [`Engine::maybe_self_review`]. Restricted
 /// toolset — the model can ONLY `remember`/`save_skill`; its text output is
 /// discarded, tool calls are applied directly to the memory store.
@@ -1391,6 +1447,12 @@ pub fn spawn(config: Config) -> anyhow::Result<(EngineHandle, mpsc::Receiver<Eve
         mcp_tools: Vec::new(),
         deferred_tools: Vec::new(),
         turns_since_review: 0,
+        turn_verify_passed: false,
+        pending_verify_cmds: std::collections::HashSet::new(),
+        bg_done_tx: None,
+        bg_spawn_tx: None,
+        bg_tasks_running: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        bg_task_seq: 0,
         mcp_instructions: Vec::new(),
         required_mcp_unavailable: false,
         browser: None,
@@ -1698,6 +1760,22 @@ struct Engine {
     deferred_tools: Vec<ToolSpec>,
     /// Completed turns since the last background self-review fork.
     turns_since_review: u32,
+    /// hermes verify-on-stop evidence: a verification command (test/lint/
+    /// build) ran AND passed during the current turn.
+    turn_verify_passed: bool,
+    /// CLI-driver command ids whose command text classified as verification —
+    /// resolved to evidence when their CommandFinished arrives ok.
+    pending_verify_cmds: std::collections::HashSet<String>,
+    /// Completion channel for background delegated subagents; results are
+    /// drained ONLY while the engine is idle and re-enter as a fresh turn
+    /// (hermes' completion-queue — never spliced into an in-flight turn).
+    bg_done_tx: Option<mpsc::UnboundedSender<String>>,
+    /// Dispatcher channel that actually spawns background delegations.
+    bg_spawn_tx: Option<mpsc::UnboundedSender<BgDelegation>>,
+    /// Live background subagents (capacity gate: max 3, reject not queue).
+    bg_tasks_running: Arc<std::sync::atomic::AtomicUsize>,
+    /// Monotonic handle counter for background delegations.
+    bg_task_seq: u64,
     /// Server-level MCP instructions returned during initialize.
     mcp_instructions: Vec<(String, String)>,
     /// True when a configured required MCP server failed to connect.
@@ -1729,6 +1807,21 @@ struct Engine {
     event_tx: mpsc::Sender<Event>,
     /// Multi-subscriber fan-out + replay log, mirrored by every `emit`.
     bus: Arc<EventBus>,
+}
+
+/// A background delegation, shipped from handle_tool_call to the dispatcher
+/// task via channel. Indirection is deliberate: spawning the worker future
+/// directly inside handle_tool_call creates a recursive Send-inference cycle
+/// (the worker itself runs handle_tool_call).
+struct BgDelegation {
+    worker: Box<Engine>,
+    system: String,
+    task: String,
+    worker_id: String,
+    profile: WorkerProfile,
+    handle: String,
+    done_tx: mpsc::UnboundedSender<String>,
+    counter: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 #[derive(Clone)]
@@ -2180,6 +2273,15 @@ impl Engine {
                 "query":{"type":"string","description":"topic to find across past sessions"},
                 "session_id":{"type":"string","description":"read this specific session instead of searching"}
             }})));
+        tools.push(ToolSpec::new("delegate_task", "Delegate a SELF-CONTAINED subtask (research, review, exploration) to a background subagent and keep working. Returns a handle immediately; the result re-enters the conversation automatically once you are idle. Use for work that doesn't block your current step. Max 3 concurrent.")
+            .params(serde_json::json!({"type":"object","properties":{
+                "task":{"type":"string","description":"complete, standalone instructions for the subagent"},
+                "profile":{"type":"string","enum":["explorer","reviewer","tester","implementer"],"description":"subagent specialization (default chosen from the task)"}
+            },"required":["task"]})));
+        tools.push(ToolSpec::new("execute_code", "Run a Python 3 script that calls tools PROGRAMMATICALLY — for loops/batches over many reads or searches without a model round-trip per call (e.g. read 30 files and count matches). Inside the script call oxide_call('read_file', {'path': ...}) or oxide_call('search', {'query': ...}); both are read-only and workspace-sandboxed. ONLY stdout returns (print what you need), capped at 50KB; max 50 tool calls; 5 minute timeout. Not for editing files or running shell commands — use edit/shell for that.")
+            .params(serde_json::json!({"type":"object","properties":{
+                "code":{"type":"string","description":"Python 3 source; oxide_call(name, args) is predefined"}
+            },"required":["code"]})).mutating(true));
         tools.push(ToolSpec::new("todo_write", "Maintain a short task checklist for non-trivial multi-step work (>2 edits or multiple files/subsystems). Skip it for simple tasks. Call with the FULL list each time; keep exactly one task 'in_progress' and mark tasks 'completed' as you finish.")
             .params(serde_json::json!({
                 "type":"object",
@@ -2959,99 +3061,164 @@ Rules:
         }
         self.connect_mcp_servers().await;
 
-        while let Some(op) = op_rx.recv().await {
-            match op {
-                Op::UserTurn { text } => {
-                    // Capture the id this turn will use (run_turn reads self.next_turn
-                    // then increments) so a panic anywhere in run_turn's deep call tree
-                    // still emits a matching TurnFinished. The engine task is spawned
-                    // bare with no JoinHandle awaited, so an unguarded unwind would kill
-                    // it silently: the spinner streams forever AND every later prompt on
-                    // this tab is dead (op_rx dropped). catch_unwind keeps run() alive;
-                    // the next turn self-heals via sanitize_tool_pairs.
-                    let turn = TurnId(self.next_turn);
-                    if std::panic::AssertUnwindSafe(self.run_turn(text, &mut op_rx))
-                        .catch_unwind()
-                        .await
-                        .is_err()
-                    {
-                        self.emit(Event::Error {
-                            message: "internal error during turn (session still alive — retry)"
-                                .into(),
+        // Skill curator (mechanical, at most once per 24h): stale skills move
+        // to archive/ so the system-prompt index only carries live knowledge.
+        {
+            let ws = self.workspace.clone();
+            tokio::task::spawn_blocking(move || {
+                let moved = memory::Memory::new(&ws).curate();
+                if moved > 0 {
+                    tracing::info!(moved, "skill curator archived stale skills");
+                }
+            });
+        }
+
+        // Background-delegation completions re-enter HERE, between turns only.
+        let (bg_tx, mut bg_rx) = mpsc::unbounded_channel::<String>();
+        self.bg_done_tx = Some(bg_tx);
+        // Dispatcher: receives delegation requests from handle_tool_call and
+        // runs the worker — spawned OUT HERE so the worker future is never
+        // nested inside handle_tool_call's own future (Send-inference cycle).
+        let (spawn_tx, mut spawn_rx) = mpsc::unbounded_channel::<BgDelegation>();
+        self.bg_spawn_tx = Some(spawn_tx);
+        tokio::spawn(async move {
+            while let Some(d) = spawn_rx.recv().await {
+                tokio::spawn(async move {
+                    let BgDelegation {
+                        mut worker,
+                        system,
+                        task,
+                        worker_id,
+                        profile,
+                        handle,
+                        done_tx,
+                        counter,
+                    } = d;
+                    // Dummy op channel: background subagents aren't steerable.
+                    let (_op_tx, mut op_rx2) = mpsc::channel::<Op>(8);
+                    let (out, interrupted) = worker
+                        .stream_agentic_collect(
+                            &system,
+                            &task,
+                            TurnId(0),
+                            &worker_id,
+                            profile,
+                            &mut op_rx2,
+                            None,
+                        )
+                        .await;
+                    counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    let status = if interrupted {
+                        "was interrupted"
+                    } else {
+                        "finished"
+                    };
+                    let _ = done_tx.send(format!(
+                        "<system-reminder>\nBackground subagent {handle} {status}.\nTask: {task}\nResult:\n{out}\n\nIncorporate this into the ongoing work; tell the user anything important from it.\n</system-reminder>"
+                    ));
+                });
+            }
+        });
+
+        loop {
+            let op = tokio::select! {
+                op = op_rx.recv() => match op { Some(op) => op, None => break },
+                Some(done) = bg_rx.recv() => Op::UserTurn { text: done },
+            };
+            {
+                match op {
+                    Op::UserTurn { text } => {
+                        // Capture the id this turn will use (run_turn reads self.next_turn
+                        // then increments) so a panic anywhere in run_turn's deep call tree
+                        // still emits a matching TurnFinished. The engine task is spawned
+                        // bare with no JoinHandle awaited, so an unguarded unwind would kill
+                        // it silently: the spinner streams forever AND every later prompt on
+                        // this tab is dead (op_rx dropped). catch_unwind keeps run() alive;
+                        // the next turn self-heals via sanitize_tool_pairs.
+                        let turn = TurnId(self.next_turn);
+                        if std::panic::AssertUnwindSafe(self.run_turn(text, &mut op_rx))
+                            .catch_unwind()
+                            .await
+                            .is_err()
+                        {
+                            self.emit(Event::Error {
+                                message: "internal error during turn (session still alive — retry)"
+                                    .into(),
+                            })
+                            .await;
+                            self.note_db_error_once().await;
+                            self.emit(Event::TurnFinished { turn }).await;
+                        } else {
+                            // hermes-style background self-improvement: every few
+                            // turns a detached reviewer distills durable facts/
+                            // skills from the conversation (engine-loop providers
+                            // only — CLI agents run their own memory nudges).
+                            self.maybe_self_review();
+                        }
+                    }
+                    Op::SetHarness { id } => self.set_harness(id).await,
+                    Op::Interrupt => {
+                        // No turn in flight here; nothing to interrupt.
+                        self.emit(Event::Info {
+                            text: "nothing to interrupt".into(),
                         })
                         .await;
-                        self.note_db_error_once().await;
-                        self.emit(Event::TurnFinished { turn }).await;
-                    } else {
-                        // hermes-style background self-improvement: every few
-                        // turns a detached reviewer distills durable facts/
-                        // skills from the conversation (engine-loop providers
-                        // only — CLI agents run their own memory nudges).
-                        self.maybe_self_review();
                     }
-                }
-                Op::SetHarness { id } => self.set_harness(id).await,
-                Op::Interrupt => {
-                    // No turn in flight here; nothing to interrupt.
-                    self.emit(Event::Info {
-                        text: "nothing to interrupt".into(),
-                    })
-                    .await;
-                }
-                Op::SubagentControl { worker_id, .. } => {
-                    self.emit(Event::Info {
-                        text: format!("no live sub-agent worker '{worker_id}'"),
-                    })
-                    .await;
-                }
-                Op::ApprovalResponse { .. } => { /* handled inline during a turn */ }
-                Op::QuestionAnswer { .. } => { /* handled inline during a turn */ }
-                Op::Rewind { checkpoint_id } => {
-                    let restored = self.rewind_checkpoint(checkpoint_id).await;
-                    self.emit(Event::RewindDone {
-                        id: checkpoint_id,
-                        restored,
-                    })
-                    .await;
-                }
-                Op::SetHistory { msgs } => {
-                    self.session = msgs
-                        .iter()
-                        .map(|(r, c)| Message::new(role_from_str(r), c.clone()))
-                        .collect();
-                    if let Some(store) = &self.session_store {
-                        store.set_runtime_config(
-                            &self.config.provider,
-                            &self.config.model,
-                            &self.config.harness,
-                            &self.config.reasoning_effort,
-                        );
-                        let meta = format!("provider={}", self.config.provider);
-                        let mut full: Vec<(String, String)> = vec![("meta".into(), meta)];
-                        full.extend(msgs.iter().cloned());
-                        let _ = store.rewrite(&full);
+                    Op::SubagentControl { worker_id, .. } => {
+                        self.emit(Event::Info {
+                            text: format!("no live sub-agent worker '{worker_id}'"),
+                        })
+                        .await;
                     }
-                    self.emit(Event::Info {
-                        text: "history trimmed".into(),
-                    })
-                    .await;
-                }
-                Op::Shutdown => {
-                    // Kill this conversation's warm persistent-claude child (if
-                    // any) — the static registry outlives the engine otherwise
-                    // (Synara's equivalent: query.close() on session stop).
-                    if self.config.provider == "claude" {
-                        let conv = self
-                            .session_store
-                            .as_ref()
-                            .map(|s| s.id.clone())
-                            .unwrap_or_default();
-                        oxide_providers::claude_persistent_close(
-                            &conv,
-                            &self.workspace.display().to_string(),
-                        );
+                    Op::ApprovalResponse { .. } => { /* handled inline during a turn */ }
+                    Op::QuestionAnswer { .. } => { /* handled inline during a turn */ }
+                    Op::Rewind { checkpoint_id } => {
+                        let restored = self.rewind_checkpoint(checkpoint_id).await;
+                        self.emit(Event::RewindDone {
+                            id: checkpoint_id,
+                            restored,
+                        })
+                        .await;
                     }
-                    break;
+                    Op::SetHistory { msgs } => {
+                        self.session = msgs
+                            .iter()
+                            .map(|(r, c)| Message::new(role_from_str(r), c.clone()))
+                            .collect();
+                        if let Some(store) = &self.session_store {
+                            store.set_runtime_config(
+                                &self.config.provider,
+                                &self.config.model,
+                                &self.config.harness,
+                                &self.config.reasoning_effort,
+                            );
+                            let meta = format!("provider={}", self.config.provider);
+                            let mut full: Vec<(String, String)> = vec![("meta".into(), meta)];
+                            full.extend(msgs.iter().cloned());
+                            let _ = store.rewrite(&full);
+                        }
+                        self.emit(Event::Info {
+                            text: "history trimmed".into(),
+                        })
+                        .await;
+                    }
+                    Op::Shutdown => {
+                        // Kill this conversation's warm persistent-claude child (if
+                        // any) — the static registry outlives the engine otherwise
+                        // (Synara's equivalent: query.close() on session stop).
+                        if self.config.provider == "claude" {
+                            let conv = self
+                                .session_store
+                                .as_ref()
+                                .map(|s| s.id.clone())
+                                .unwrap_or_default();
+                            oxide_providers::claude_persistent_close(
+                                &conv,
+                                &self.workspace.display().to_string(),
+                            );
+                        }
+                        break;
+                    }
                 }
             }
         }
@@ -3768,6 +3935,12 @@ Reply with text only: summarize what you changed, what you verified, and what re
             mcp_tools: self.mcp_tools.clone(),
             deferred_tools: Vec::new(),
             turns_since_review: 0,
+            turn_verify_passed: false,
+            pending_verify_cmds: std::collections::HashSet::new(),
+            bg_done_tx: None,
+            bg_spawn_tx: None,
+            bg_tasks_running: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            bg_task_seq: 0,
             mcp_instructions: self.mcp_instructions.clone(),
             required_mcp_unavailable: self.required_mcp_unavailable,
             browser: None,
@@ -4465,6 +4638,7 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
         );
         let mut nudges = 0u8;
         let mut memory_nudged = false;
+        let mut verify_evidence_nudged = false;
         // True once ANY tool call fires in this turn — used to decide whether
         // the nudge makes sense for API providers. For a pure text turn the
         // nudge produces a visible second reply rather than driving more work.
@@ -4483,6 +4657,8 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
         self.turn_edited = false;
         self.turn_reads.clear();
         self.turn_edit_paths.clear();
+        self.turn_verify_passed = false;
+        self.pending_verify_cmds.clear();
         self.last_tool_sig.clear();
         self.last_tool_reps = 0;
         loop {
@@ -4593,9 +4769,13 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                                     self.emit(Event::Info { text }).await;
                                 }
                                 Some(StreamItem::CommandStarted { id, command, cwd, background }) => {
+                                    // Verification evidence: resolved at CommandFinished.
+                                    if is_verification_command(&command) {
+                                        self.pending_verify_cmds.insert(id.clone());
+                                    }
                                     self.emit(Event::CommandStarted {
                                         turn,
-                                        command_id: id,
+                                        command_id: id.clone(),
                                         worker_id: None,
                                         command,
                                         cwd: if cwd.is_empty() { self.workspace.display().to_string() } else { cwd },
@@ -4615,6 +4795,9 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                                     }).await;
                                 }
                                 Some(StreamItem::CommandFinished { id, ok, exit_code, duration_ms }) => {
+                                    if ok && self.pending_verify_cmds.remove(&id) {
+                                        self.turn_verify_passed = true;
+                                    }
                                     self.emit(Event::CommandFinished {
                                         turn,
                                         command_id: id,
@@ -4865,6 +5048,30 @@ then stop. Apply fixes with edit/write_file — do not just explain.\n\n{report}
                         )));
                         continue;
                     }
+                    // Reaching here = the auto-verify ran clean: that IS evidence.
+                    self.turn_verify_passed = true;
+                }
+                // hermes verify-on-stop: code was edited but NO verification
+                // command ran and passed this turn — demand evidence (or an
+                // explicit blocker) exactly once before letting the turn end.
+                if !verify_evidence_nudged
+                    && self.turn_edited
+                    && !self.turn_verify_passed
+                    && edits_touch_code(&self.turn_edit_paths)
+                {
+                    verify_evidence_nudged = true;
+                    let hint = if self.config.verify_command.trim().is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            " The project's verify command: `{}`.",
+                            self.config.verify_command.trim()
+                        )
+                    };
+                    self.session.push(Message::new(Role::User, format!(
+                        "<system-reminder>\nYou edited code this turn but no verification command (tests/lint/typecheck) ran and passed. Run the appropriate check NOW with `shell` and fix what breaks.{hint} If verification is genuinely impossible here, state the blocker explicitly — then stop.\n</system-reminder>"
+                    )));
+                    continue;
                 }
                 // Self-improvement loop (hermes-style): after a substantial turn,
                 // nudge ONCE to persist durable learnings before finishing.
@@ -5728,6 +5935,82 @@ Do NOT read it again. Proceed now: make the edits with the edit/write_file tools
                     false,
                 ),
             }
+        } else if name == "delegate_task" {
+            let task = arguments["task"].as_str().unwrap_or("").trim().to_string();
+            if task.is_empty() {
+                ("delegate_task: 'task' is required".to_string(), false)
+            } else if self
+                .bg_tasks_running
+                .load(std::sync::atomic::Ordering::SeqCst)
+                >= 3
+            {
+                (
+                    "delegate_task: 3 background subagents already running — finish or wait for one before delegating more.".to_string(),
+                    false,
+                )
+            } else {
+                match (
+                    self.subagent_worker_engine(),
+                    self.bg_done_tx.clone(),
+                    self.bg_spawn_tx.clone(),
+                ) {
+                    (Ok(worker), Some(done_tx), Some(spawn_tx)) => {
+                        self.bg_task_seq += 1;
+                        let handle = format!("bg-{}", self.bg_task_seq);
+                        let profile = match arguments["profile"].as_str() {
+                            Some(p) if !p.is_empty() => subagent_profile_for(
+                                &format!("{p}: {task}"),
+                                &self.config.provider,
+                                &self.config.reasoning_effort,
+                            ),
+                            _ => subagent_profile_for(
+                                &task,
+                                &self.config.provider,
+                                &self.config.reasoning_effort,
+                            ),
+                        };
+                        let system = format!(
+                            "You are a BACKGROUND subagent ({}). Complete exactly this task and report a compact, self-contained result — the parent agent reads it later with no other context.",
+                            profile.id
+                        );
+                        let counter = self.bg_tasks_running.clone();
+                        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let sent = spawn_tx
+                            .send(BgDelegation {
+                                worker: Box::new(worker),
+                                system,
+                                task: task.clone(),
+                                worker_id: format!("bgtask-{handle}"),
+                                profile,
+                                handle: handle.clone(),
+                                done_tx,
+                                counter: counter.clone(),
+                            })
+                            .is_ok();
+                        if sent {
+                            (
+                                format!("delegate_task: {handle} started in the background — its result will re-enter the conversation automatically."),
+                                true,
+                            )
+                        } else {
+                            counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                            ("delegate_task: dispatcher unavailable".to_string(), false)
+                        }
+                    }
+                    (Err(e), _, _) => (format!("delegate_task: worker init failed: {e}"), false),
+                    _ => (
+                        "delegate_task: engine not ready for background delegation".to_string(),
+                        false,
+                    ),
+                }
+            }
+        } else if name == "execute_code" {
+            let code = arguments["code"].as_str().unwrap_or("").to_string();
+            if code.trim().is_empty() {
+                ("execute_code: 'code' is required".to_string(), false)
+            } else {
+                ptc::run(&self.workspace, self.config.sandbox, &code).await
+            }
         } else if name == "session_search" {
             let q = arguments["query"].as_str().unwrap_or("").trim().to_string();
             let sid = arguments["session_id"]
@@ -5772,6 +6055,15 @@ Do NOT read it again. Proceed now: make the edits with the edit/write_file tools
         } else {
             router.execute(&name, &arguments).await
         };
+        // hermes verify-on-stop evidence: a passing test/lint/build via the
+        // engine's own shell tool proves the edits were verified this turn.
+        if ok && name == "shell" {
+            if let Some(c) = arguments.get("command").and_then(|v| v.as_str()) {
+                if is_verification_command(c) {
+                    self.turn_verify_passed = true;
+                }
+            }
+        }
         // Remember reads so `edit` can require a prior read of the file.
         if ok && name == "read_file" {
             if let Some(p) = arguments.get("path").and_then(|v| v.as_str()) {
@@ -6344,6 +6636,28 @@ attributes:
             ),
             vec!["supabase|59e4938976c99701".to_string()]
         );
+    }
+
+    #[test]
+    fn verification_command_classifier_and_code_filter() {
+        assert!(crate::is_verification_command("cargo test -p oxide-core"));
+        assert!(crate::is_verification_command(
+            "export PATH=x && cargo clippy --workspace"
+        ));
+        assert!(crate::is_verification_command(
+            "npm run test -- --watch=false"
+        ));
+        assert!(crate::is_verification_command("ruff check ."));
+        assert!(!crate::is_verification_command("git status"));
+        assert!(!crate::is_verification_command("ls -la"));
+        assert!(crate::edits_touch_code(&[
+            "src/lib.rs".into(),
+            "README.md".into()
+        ]));
+        assert!(!crate::edits_touch_code(&[
+            "README.md".into(),
+            "docs/x.txt".into()
+        ]));
     }
 
     #[test]
