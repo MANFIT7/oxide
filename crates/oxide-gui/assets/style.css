@@ -3737,3 +3737,10 @@ details.bg-chip.bg-watch[open] { max-width: 100%; flex-basis: 100%; border-radiu
 @media (prefers-reduced-motion: reduce) {
   .agent-md.live { -webkit-mask-image: none; mask-image: none; }
 }
+
+/* Streaming terminal: stop button tints danger while a command runs. */
+.term-tab.stop { color: var(--danger, #e5534b); }
+.term-tab.stop:hover { color: #ff6b62; }
+
+/* Terminal prompt chevron points right like a shell ">" (default svg points down). */
+.term-prompt svg { transform: rotate(-90deg); }

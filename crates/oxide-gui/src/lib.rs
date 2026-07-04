@@ -3616,6 +3616,17 @@ fn open_session_tab(
     path: PathBuf,
     title: String,
 ) {
+    // Already open in some tab? Switch to it — never a duplicate tab.
+    if let Some(idx) = tabs
+        .peek()
+        .iter()
+        .position(|t| t.session.as_deref() == Some(path.as_path()))
+    {
+        if idx != *active_tab.peek() {
+            switch_tab(tabs, active_tab, messages, cfg, engine, idx);
+        }
+        return;
+    }
     let loaded = load_session(&path);
     let session_runtime = |meta: Option<&oxide_core::db::SessionMeta>, base: &Config| {
         let provider = meta
@@ -3646,7 +3657,30 @@ fn open_session_tab(
             .get(cur)
             .map(|t| busy_tabs.peek().contains(&t.id))
             .unwrap_or(false);
-        if cur_busy {
+        // A TUI/terminal tab renders a PTY, not a chat transcript — replacing
+        // its data would "open" the session invisibly. Open a NEW gui tab.
+        let cur_non_gui = tabs
+            .peek()
+            .get(cur)
+            .map(|t| t.mode != "gui")
+            .unwrap_or(false);
+        // Never clobber a tab that already holds a DIFFERENT conversation:
+        // a sidebar click on another session opens a new tab. In-place reuse
+        // is only for the tab already showing this session (refresh) or a
+        // pristine "New chat" tab (no session, no messages).
+        let cur_same_session = tabs
+            .peek()
+            .get(cur)
+            .and_then(|t| t.session.clone())
+            .as_deref()
+            == Some(path.as_path());
+        let cur_has_other_content = !cur_same_session
+            && tabs
+                .peek()
+                .get(cur)
+                .map(|t| t.session.is_some() || !t.messages.is_empty())
+                .unwrap_or(false);
+        if cur_busy || cur_non_gui || cur_has_other_content {
             // Save the live transcript into the busy tab before leaving it.
             if let Some(t) = tabs.write().get_mut(cur) {
                 t.messages = messages.peek().clone();
@@ -4232,6 +4266,8 @@ fn app() -> Element {
     let mut recap_text = use_signal(String::new);
     // Multi-terminal model: (id, title, lines).
     let mut terms = use_signal(|| vec![(1u64, "zsh 1".to_string(), Vec::<String>::new())]);
+    // term id → live child pid (streaming runner) for the stop button.
+    let mut term_pids = use_signal(HashMap::<u64, u32>::new);
     let mut term_sel = use_signal(|| 0usize);
     let mut term_seq = use_signal(|| 1u64);
     let mut show_settings = use_signal(|| false);
@@ -6852,41 +6888,80 @@ fn app() -> Element {
     ];
 
     // Run a terminal command in the workspace.
+    // Streaming runner: long-lived commands (dev servers, watchers) paint
+    // output line-by-line instead of hanging forever on `.output().await`,
+    // and stay killable via the per-terminal stop button (pid registry).
     let mut run_term = move || {
         let cmd = term_input.read().trim().to_string();
         if cmd.is_empty() {
             return;
         }
         term_input.set(String::new());
-        {
+        let term_id = {
             let sel = *term_sel.peek();
-            if let Some(t) = terms.write().get_mut(sel) {
-                t.2.push(format!("$ {cmd}"));
-            }
-        }
+            let mut tv = terms.write();
+            let Some(t) = tv.get_mut(sel) else { return };
+            t.2.push(format!("$ {cmd}"));
+            t.0
+        };
         let ws = ui.workspace.read().clone();
         spawn(async move {
-            let out = tokio::process::Command::new("/bin/sh")
+            use tokio::io::{AsyncBufReadExt, BufReader};
+            const TERM_LINE_CAP: usize = 800;
+            let mut push = move |line: String| {
+                let mut tv = terms.write();
+                if let Some(t) = tv.iter_mut().find(|t| t.0 == term_id) {
+                    t.2.push(line);
+                    let extra = t.2.len().saturating_sub(TERM_LINE_CAP);
+                    if extra > 0 {
+                        t.2.drain(..extra);
+                    }
+                }
+            };
+            let child = tokio::process::Command::new("/bin/sh")
                 .arg("-c")
                 .arg(&cmd)
                 .current_dir(&ws)
-                .output()
-                .await;
-            let text = match out {
-                Ok(o) => {
-                    let mut s = String::from_utf8_lossy(&o.stdout).to_string();
-                    s.push_str(&String::from_utf8_lossy(&o.stderr));
-                    if s.trim().is_empty() {
-                        format!("(exit {})", o.status.code().unwrap_or(-1))
-                    } else {
-                        s
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn();
+            let mut child = match child {
+                Ok(c) => c,
+                Err(e) => {
+                    push(format!("error: {e}"));
+                    return;
+                }
+            };
+            if let Some(pid) = child.id() {
+                term_pids.write().insert(term_id, pid);
+            }
+            // Signals are thread-local — merge both pipes in THIS dioxus task
+            // (no tokio::spawn) with a select loop until both hit EOF.
+            let mut out_lines = child.stdout.take().map(|r| BufReader::new(r).lines());
+            let mut err_lines = child.stderr.take().map(|r| BufReader::new(r).lines());
+            while out_lines.is_some() || err_lines.is_some() {
+                tokio::select! {
+                    line = async { out_lines.as_mut().expect("guarded").next_line().await }, if out_lines.is_some() => {
+                        match line {
+                            Ok(Some(l)) => push(l),
+                            _ => out_lines = None,
+                        }
+                    }
+                    line = async { err_lines.as_mut().expect("guarded").next_line().await }, if err_lines.is_some() => {
+                        match line {
+                            Ok(Some(l)) => push(l),
+                            _ => err_lines = None,
+                        }
                     }
                 }
-                Err(e) => format!("error: {e}"),
-            };
-            let sel = *term_sel.peek();
-            if let Some(t) = terms.write().get_mut(sel) {
-                t.2.push(text);
+            }
+            let status = child.wait().await;
+            term_pids.write().remove(&term_id);
+            match status {
+                Ok(st) if !st.success() => push(format!("(exit {})", st.code().unwrap_or(-1))),
+                Err(e) => push(format!("error: {e}")),
+                _ => {}
             }
         });
     };
@@ -8876,6 +8951,18 @@ fn app() -> Element {
                                                 let n = terms.read().len(); term_sel.set(n - 1);
                                             }, Icon { name: "plus" } }
                                             button { class: "term-tab add", title: "Clear output", onclick: move |_| { let sel = *term_sel.read(); if let Some(t) = terms.write().get_mut(sel) { t.2.clear(); } }, Icon { name: "backspace" } }
+                                            {
+                                                let sel_id = terms.read().get(*term_sel.read()).map(|t| t.0);
+                                                let live_pid = sel_id.and_then(|id| term_pids.read().get(&id).copied());
+                                                rsx! {
+                                                    if let Some(pid) = live_pid {
+                                                        button { class: "term-tab add stop", title: "Stop the running command",
+                                                            onclick: move |_| {
+                                                                let _ = std::process::Command::new("kill").arg("-TERM").arg(pid.to_string()).spawn();
+                                                            }, Icon { name: "stop" } }
+                                                    }
+                                                }
+                                            }
                                             button { class: "term-tab add", title: "Native GPU terminal (Metal · oxide-term)", onclick: move |_| {
                                                 if !launch_native_terminal() {
                                                     let sel = *term_sel.read();
@@ -8913,7 +9000,7 @@ fn app() -> Element {
                     for t in tabs.read().iter().filter(|t| t.mode == "tui") {
                         div {
                             key: "tuihost-{t.id}",
-                            class: if active_is_tui && t.id == active_tab_id {
+                            class: if active_is_tui && t.id == active_tab_id && !editor_open {
                                 "tui-host-live"
                             } else {
                                 "tui-host-off"
@@ -9032,6 +9119,11 @@ fn app() -> Element {
                                 }
                             }
                         }
+                    } else if editor_open {
+                        // Editor outranks the TUI view: opening a file from the Files
+                        // panel must show it even when a terminal tab is active (the
+                        // PTY stays mounted, just hidden).
+                        Editor {}
                     } else if active_is_tui {
                         // The active terminal is rendered by the persistent TUI layer
                         // above (kept mounted across tab switches); nothing here.
@@ -9057,8 +9149,6 @@ fn app() -> Element {
                                 }
                             }
                         }
-                    } else if editor_open {
-                        Editor {}
                     } else if is_empty {
                         div { class: "hero",
                             h1 { class: "hero-title", "What should we build in {project}?" }
