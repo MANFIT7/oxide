@@ -1440,9 +1440,9 @@ pub fn spawn(config: Config) -> anyhow::Result<(EngineHandle, mpsc::Receiver<Eve
         next_turn: 1,
         next_approval: Arc::new(AtomicU64::new(1)),
         session_approved: HashSet::new(),
+        checkpoints: Arc::new(Mutex::new(CheckpointStore::load(&workspace))),
         workspace,
         session_store,
-        checkpoints: Arc::new(Mutex::new(CheckpointStore::default())),
         mcp_clients: Vec::new(),
         mcp_tools: Vec::new(),
         deferred_tools: Vec::new(),
@@ -1822,6 +1822,9 @@ struct BgDelegation {
     handle: String,
     done_tx: mpsc::UnboundedSender<String>,
     counter: Arc<std::sync::atomic::AtomicUsize>,
+    /// `/btw` side questions: deliver the answer straight to the frontend as
+    /// a note (question included) instead of re-entering the model loop.
+    notify: Option<mpsc::Sender<Event>>,
 }
 
 #[derive(Clone)]
@@ -3093,6 +3096,7 @@ Rules:
                         handle,
                         done_tx,
                         counter,
+                        notify,
                     } = d;
                     // Dummy op channel: background subagents aren't steerable.
                     let (_op_tx, mut op_rx2) = mpsc::channel::<Op>(8);
@@ -3113,9 +3117,19 @@ Rules:
                     } else {
                         "finished"
                     };
-                    let _ = done_tx.send(format!(
-                        "<system-reminder>\nBackground subagent {handle} {status}.\nTask: {task}\nResult:\n{out}\n\nIncorporate this into the ongoing work; tell the user anything important from it.\n</system-reminder>"
-                    ));
+                    if let Some(events) = notify {
+                        // /btw: the answer goes straight to the user as a note —
+                        // never re-enters the model loop.
+                        let _ = events
+                            .send(Event::Info {
+                                text: format!("\u{1f4ac} btw \u{b7} {task}\n\n{out}"),
+                            })
+                            .await;
+                    } else {
+                        let _ = done_tx.send(format!(
+                            "<system-reminder>\nBackground subagent {handle} {status}.\nTask: {task}\nResult:\n{out}\n\nIncorporate this into the ongoing work; tell the user anything important from it.\n</system-reminder>"
+                        ));
+                    }
                 });
             }
         });
@@ -3128,6 +3142,20 @@ Rules:
             {
                 match op {
                     Op::UserTurn { text } => {
+                        if self.maybe_side_question(&text) {
+                            self.emit(Event::Info {
+                                text: "\u{1f4ac} btw \u{b7} answering on the side\u{2026}".into(),
+                            })
+                            .await;
+                            continue;
+                        }
+                        if self.maybe_best_of(&text) {
+                            self.emit(Event::Info {
+                                text: "\u{1f3c6} best-of panel running \u{2014} parallel candidates + judge\u{2026}".into(),
+                            })
+                            .await;
+                            continue;
+                        }
                         // Capture the id this turn will use (run_turn reads self.next_turn
                         // then increments) so a panic anywhere in run_turn's deep call tree
                         // still emits a matching TurnFinished. The engine task is spawned
@@ -3914,6 +3942,165 @@ Reply with text only: summarize what you changed, what you verified, and what re
         .await;
 
         (out, interrupted)
+    }
+
+    /// Cursor `/btw`: answer a SIDE question in a detached read-only worker
+    /// while the main task keeps running untouched. The answer returns as a
+    /// transcript note (never re-enters the model loop). True = consumed.
+    fn maybe_side_question(&mut self, text: &str) -> bool {
+        let Some(q) = text.trim().strip_prefix("/btw") else {
+            return false;
+        };
+        let q = q.trim().to_string();
+        if q.is_empty() {
+            return true;
+        }
+        let (worker, done_tx, spawn_tx) = match (
+            self.subagent_worker_engine(),
+            self.bg_done_tx.clone(),
+            self.bg_spawn_tx.clone(),
+        ) {
+            (Ok(w), Some(d), Some(sp)) => (w, d, sp),
+            _ => return false,
+        };
+        self.bg_task_seq += 1;
+        let handle = format!("btw-{}", self.bg_task_seq);
+        let profile = subagent_profile_for(
+            &format!("explorer: {q}"),
+            &self.config.provider,
+            &self.config.reasoning_effort,
+        );
+        let system = "You answer ONE side question from the user while the main agent keeps working. \
+Answer directly and concisely (a few sentences; read files only when truly needed). Do NOT edit anything."
+            .to_string();
+        let counter = self.bg_tasks_running.clone();
+        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let sent = spawn_tx
+            .send(BgDelegation {
+                worker: Box::new(worker),
+                system,
+                task: q,
+                worker_id: format!("bgtask-{handle}"),
+                profile,
+                handle,
+                done_tx,
+                counter: counter.clone(),
+                notify: Some(self.event_tx.clone()),
+            })
+            .is_ok();
+        if !sent {
+            counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        sent
+    }
+
+    /// Cursor `/best-of-n` (MoA-lite): run the same task through N parallel
+    /// read-only workers with DIFFERENT lenses, then a judge picks the best
+    /// answer and synthesizes. Result returns as a transcript note. Detached —
+    /// spawned from the main loop (never inside handle_tool_call: Send-cycle).
+    fn maybe_best_of(&mut self, text: &str) -> bool {
+        let Some(rest) = text.trim().strip_prefix("/bestof") else {
+            return false;
+        };
+        let rest = rest.trim();
+        let (n, task) = match rest.split_once(char::is_whitespace) {
+            Some((num, t)) if num.chars().all(|c| c.is_ascii_digit()) && !num.is_empty() => (
+                num.parse::<usize>().unwrap_or(3).clamp(2, 4),
+                t.trim().to_string(),
+            ),
+            _ => (3usize, rest.to_string()),
+        };
+        if task.is_empty() {
+            return true;
+        }
+        const LENSES: [&str; 4] = [
+            "simplest-correct-answer-first",
+            "risk-and-edge-cases-first",
+            "performance-and-scalability-first",
+            "developer-experience-first",
+        ];
+        let mut workers = Vec::new();
+        for lens in LENSES.iter().take(n) {
+            match self.subagent_worker_engine() {
+                Ok(w) => workers.push((w, lens.to_string())),
+                Err(_) => return false,
+            }
+        }
+        let Ok(judge) = self.subagent_worker_engine() else {
+            return false;
+        };
+        let profile = subagent_profile_for(
+            &format!("explorer: {task}"),
+            &self.config.provider,
+            &self.config.reasoning_effort,
+        );
+        let judge_profile = subagent_profile_for(
+            &format!("reviewer: {task}"),
+            &self.config.provider,
+            &self.config.reasoning_effort,
+        );
+        let events = self.event_tx.clone();
+        self.bg_task_seq += 1;
+        let seq = self.bg_task_seq;
+        let counter = self.bg_tasks_running.clone();
+        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        tokio::spawn(async move {
+            let futs: Vec<_> = workers
+                .into_iter()
+                .enumerate()
+                .map(|(i, (mut w, lens))| {
+                    let task = task.clone();
+                    let profile = profile.clone();
+                    async move {
+                        let system = format!(
+                            "You are candidate {i} in a best-of-N panel. Approach the task with the lens: {lens}. \
+Produce a compact, self-contained answer (read files only when needed; do NOT edit anything)."
+                        );
+                        let (_tx, mut rx) = mpsc::channel::<Op>(8);
+                        let (out, _) = w
+                            .stream_agentic_collect(
+                                &system,
+                                &task,
+                                TurnId(0),
+                                &format!("bestof-{seq}-{i}"),
+                                profile,
+                                &mut rx,
+                                None,
+                            )
+                            .await;
+                        (lens, out)
+                    }
+                })
+                .collect();
+            let results = futures::future::join_all(futs).await;
+            let mut candidates = String::new();
+            for (i, (lens, out)) in results.iter().enumerate() {
+                candidates.push_str(&format!("\n--- Candidate {i} (lens: {lens}) ---\n{out}\n"));
+            }
+            let judge_task = format!(
+                "Task given to all candidates:\n{task}\n{candidates}\n\nJudge: pick the BEST candidate (say which and why in 1-2 sentences), then present the winning answer, improved with the best ideas from the others."
+            );
+            let mut judge = judge;
+            let (_tx, mut rx) = mpsc::channel::<Op>(8);
+            let (verdict, _) = judge
+                .stream_agentic_collect(
+                    "You are the judge of a best-of-N panel. Be decisive and concise.",
+                    &judge_task,
+                    TurnId(0),
+                    &format!("bestof-{seq}-judge"),
+                    judge_profile,
+                    &mut rx,
+                    None,
+                )
+                .await;
+            counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = events
+                .send(Event::Info {
+                    text: format!("\u{1f3c6} best-of-{n} \u{b7} {task}\n\n{verdict}"),
+                })
+                .await;
+        });
+        true
     }
 
     fn subagent_worker_engine(&self) -> anyhow::Result<Self> {
@@ -4847,6 +5034,10 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                             // Steering: a message sent mid-turn is injected into the
                             // conversation; the next agentic round picks it up.
                             Some(Op::UserTurn { text }) => {
+                                if self.maybe_side_question(&text) {
+                                    self.emit(Event::Info { text: "\u{1f4ac} btw \u{b7} answering on the side\u{2026}".to_string() }).await;
+                                    continue;
+                                }
                                 if let Some(store) = &self.session_store {
                                     let _ = store.append("user", &text);
                                 }
@@ -5985,6 +6176,7 @@ Do NOT read it again. Proceed now: make the edits with the edit/write_file tools
                                 handle: handle.clone(),
                                 done_tx,
                                 counter: counter.clone(),
+                                notify: None,
                             })
                             .is_ok();
                         if sent {

@@ -416,16 +416,22 @@ fn activity_idx(msgs: &[ChatMsg], key: &str) -> Option<usize> {
 fn spawn_bg_tailer(
     bg_watch: Signal<Vec<(String, String, String)>>,
     mut bg_tails: Signal<std::collections::HashMap<String, String>>,
+    mut bg_settled: Signal<std::collections::HashSet<String>>,
     id: String,
     path: String,
 ) {
     spawn(async move {
         use tokio::io::{AsyncReadExt, AsyncSeekExt};
         let mut pos: u64 = 0;
+        // Quiescence heuristic: there is no exit signal for these jobs (the
+        // process belongs to the CLI driver), so ~20s without file growth is
+        // treated as "settled". Growth flips it back to running.
+        let mut last_growth = std::time::Instant::now();
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
             if !bg_watch.peek().iter().any(|j| j.0 == id) {
                 bg_tails.write().remove(&id);
+                bg_settled.write().remove(&id);
                 break;
             }
             let Ok(meta) = tokio::fs::metadata(&path).await else {
@@ -436,7 +442,16 @@ fn spawn_bg_tailer(
                 pos = 0; // truncated/rotated — re-read from the top
             }
             if len == pos {
+                if last_growth.elapsed() > std::time::Duration::from_secs(20)
+                    && !bg_settled.peek().contains(&id)
+                {
+                    bg_settled.write().insert(id.clone());
+                }
                 continue;
+            }
+            last_growth = std::time::Instant::now();
+            if bg_settled.peek().contains(&id) {
+                bg_settled.write().remove(&id);
             }
             let Ok(mut f) = tokio::fs::File::open(&path).await else {
                 continue;
@@ -2361,7 +2376,10 @@ why it's wrong, and the concrete fix. If the diff is clean, say so plainly.{}\n\
     };
     attachments.write().clear();
     text_attachments.write().clear();
-    if !steer && *streaming.read() {
+    // `/btw` side questions bypass the queue: the engine answers them in a
+    // detached worker while the running turn continues untouched.
+    let is_btw = text.trim_start().starts_with("/btw");
+    if !steer && !is_btw && *streaming.read() {
         queue.write().push(text);
     } else {
         engine.send(EngineCmd::Submit {
@@ -2679,6 +2697,22 @@ async fn respond_webhook(sock: &mut tokio::net::TcpStream, status: &str) {
         )
         .await;
     let _ = sock.shutdown().await;
+}
+
+/// Persisted split layout: (panes, tile tree, next id) at .oxide/gui-layout.json.
+type SplitState = (Vec<(u64, String, String, String)>, Tile, u64);
+
+fn load_split_layout(ws: &Path) -> Option<SplitState> {
+    let raw = std::fs::read_to_string(ws.join(".oxide/gui-layout.json")).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+fn save_split_layout(ws: &Path, panes: &[(u64, String, String, String)], layout: &Tile, next: u64) {
+    let state: SplitState = (panes.to_vec(), layout.clone(), next);
+    if let Ok(json) = serde_json::to_string(&state) {
+        let _ = std::fs::create_dir_all(ws.join(".oxide"));
+        let _ = write_atomic(&ws.join(".oxide/gui-layout.json"), &json);
+    }
 }
 
 fn relative_ms(value: u64) -> String {
@@ -4240,16 +4274,39 @@ fn app() -> Element {
     let mut design_sel = use_signal(|| Option::<serde_json::Value>::None);
     let mut design_edits = use_signal(Vec::<(String, String, String)>::new);
     let mut design_note = use_signal(String::new);
+    // Cursor 3.1 tiled-layout persistence: panes + tree survive restarts.
+    let saved_split = use_hook(|| load_split_layout(&ws0));
     let split_panes = use_signal(|| {
-        vec![(
-            0u64,
-            "gui".to_string(),
-            cfg.read().provider.clone(),
-            cfg.read().model.clone(),
-        )]
+        saved_split
+            .as_ref()
+            .map(|s| s.0.clone())
+            .unwrap_or_else(|| {
+                vec![(
+                    0u64,
+                    "gui".to_string(),
+                    cfg.read().provider.clone(),
+                    cfg.read().model.clone(),
+                )]
+            })
     });
-    let split_layout = use_signal(|| Tile::Leaf(0));
-    let split_next_id = use_signal(|| 1u64);
+    let split_layout = use_signal(|| {
+        saved_split
+            .as_ref()
+            .map(|s| s.1.clone())
+            .unwrap_or(Tile::Leaf(0))
+    });
+    let split_next_id = use_signal(|| saved_split.as_ref().map(|s| s.2).unwrap_or(1u64));
+    // Full-screen pane (Cursor 3.4 Cmd+Shift+M): render one leaf maximized.
+    let mut split_maximized = use_signal(|| None::<u64>);
+    {
+        let ws_save = ws0.clone();
+        use_effect(move || {
+            let panes = split_panes.read().clone();
+            let layout = split_layout.read().clone();
+            let next = *split_next_id.read();
+            save_split_layout(&ws_save, &panes, &layout, next);
+        });
+    }
     let split_drag = use_signal(|| None::<u64>);
     let split_rects = use_signal(std::collections::HashMap::<u64, (f64, f64, f64, f64)>::new);
     let mut show_board = use_signal(|| false);
@@ -4382,12 +4439,21 @@ fn app() -> Element {
     // the job's process belongs to the CLI driver and outlives the turn — the
     // GUI keeps reading its output file so the result stays visible instead of
     // dead-ending at "result won't return automatically". Dismiss to stop.
+    // Split vs unified diff rendering in the changes panel (Cursor 2.x).
+    let mut diff_split = use_signal(|| false);
     let bg_watch = use_signal(Vec::<(String, String, String)>::new);
     let bg_tails = use_signal(std::collections::HashMap::<String, String>::new);
+    // Jobs whose output file stopped growing (~20s quiet) — shown as settled
+    // (green dot, no spinner); self-corrects if the file grows again.
+    let bg_settled = use_signal(std::collections::HashSet::<String>::new);
     // Tab ids whose engine is mid-turn. Engines are per-tab: leaving a tab no
     // longer kills its turn — this drives the sidebar spinners + view state.
     let mut busy_tabs = use_signal(HashSet::<u64>::new);
     let mut tab_statuses = use_signal(HashMap::<u64, TabStatus>::new);
+    // Cursor-grade sidebar: live verb per busy tab ("Writing…", "Running …")
+    // and unread markers for backgrounded tabs that finished a turn.
+    let mut tab_verbs = use_signal(HashMap::<u64, String>::new);
+    let mut unread_tabs = use_signal(HashSet::<u64>::new);
     let mut questions = use_signal(Vec::<(u64, String, Vec<String>)>::new);
     let mut q_answer = use_signal(String::new);
     let mut reverted = use_signal(HashSet::<u64>::new);
@@ -4433,6 +4499,14 @@ fn app() -> Element {
             }
         }
     });
+    // Cursor-grade status: seconds-mark of the last engine event (drives the
+    // "Taking longer than expected" swap), when the model started reasoning +
+    // how long it reasoned ("Thought for Xs"), and when the current tool
+    // started (live per-tool timer on the running activity row).
+    let mut last_ev_s = use_signal(|| 0u64);
+    let mut think_started = use_signal(|| None::<std::time::Instant>);
+    let mut think_secs = use_signal(|| 0u64);
+    let mut tool_start = use_signal(|| None::<std::time::Instant>);
 
     // File/editor signals, shared with tree/editor via context.
     let ws_sig = use_signal(|| ws0.clone());
@@ -5552,6 +5626,30 @@ fn app() -> Element {
                         // Events from a BACKGROUND tab go to its buffered transcript;
                         // only the view-bound tab writes to the live view below.
                         if ev_tid != view_tab {
+                            // Sidebar live verb + unread bookkeeping (guarded writes — a
+                            // token stream must not re-render the sidebar per chunk).
+                            if matches!(ev, Event::TurnFinished { .. }) {
+                                tab_verbs.write().remove(&ev_tid);
+                                unread_tabs.write().insert(ev_tid);
+                            } else {
+                                let verb = match &ev {
+                                    Event::AgentMessageDelta { .. } => Some("Writing…".to_string()),
+                                    Event::ReasoningDelta { .. } => Some("Thinking…".to_string()),
+                                    Event::CommandStarted { command, .. } => {
+                                        Some(format!("Running {}", command.chars().take(24).collect::<String>()))
+                                    }
+                                    Event::Info { text } => text
+                                        .strip_prefix('\u{2699}')
+                                        .map(|l| l.trim().chars().take(30).collect::<String>()),
+                                    _ => None,
+                                };
+                                if let Some(v) = verb {
+                                    let changed = tab_verbs.peek().get(&ev_tid) != Some(&v);
+                                    if changed {
+                                        tab_verbs.write().insert(ev_tid, v);
+                                    }
+                                }
+                            }
                             // Append to the plain bg buffer — NO `tabs` signal write, so a
                             // backgrounded tab's token stream never re-schedules the UI.
                             let buf = bg_buffers.entry(ev_tid).or_default();
@@ -5696,7 +5794,7 @@ fn app() -> Element {
                                     if !bg_watch.peek().iter().any(|j| j.0 == command_id) {
                                         let mut bw = bg_watch;
                                         bw.write().push((command_id.clone(), command, path.clone()));
-                                        spawn_bg_tailer(bg_watch, bg_tails, command_id, path);
+                                        spawn_bg_tailer(bg_watch, bg_tails, bg_settled, command_id, path);
                                     }
                                 }
                                 // Subagent progress for a backgrounded tab: keep at least the
@@ -5739,6 +5837,22 @@ fn app() -> Element {
                         if !matches!(ev, Event::AgentMessageDelta { .. }) {
                             flush_agent!();
                         }
+                        // Liveness + tool-timer bookkeeping (any event = engine alive;
+                        // tool rows time from their start event to the next signal).
+                        last_ev_s.set(*elapsed_s.peek());
+                        match &ev {
+                            Event::CommandStarted { .. } => tool_start.set(Some(std::time::Instant::now())),
+                            Event::Info { text, .. } if text.starts_with('⚙') => {
+                                tool_start.set(Some(std::time::Instant::now()))
+                            }
+                            Event::CommandFinished { .. } | Event::TurnFinished { .. } => tool_start.set(None),
+                            Event::AgentMessageDelta { .. } | Event::ReasoningDelta { .. }
+                                if tool_start.peek().is_some() =>
+                            {
+                                tool_start.set(None);
+                            }
+                            _ => {}
+                        }
                         match ev {
                             Event::AgentMessageDelta { text, .. } => {
                                 if status.peek().as_str() != "Writing…" {
@@ -5753,7 +5867,13 @@ fn app() -> Element {
                                 }
                             }
                             Event::ReasoningDelta { text, .. } => {
+                                if thinking.peek().is_empty() {
+                                    think_started.set(Some(std::time::Instant::now()));
+                                }
                                 thinking.write().push_str(&text);
+                                if let Some(t) = *think_started.peek() {
+                                    think_secs.set(t.elapsed().as_secs());
+                                }
                                 if status.peek().as_str() != "Thinking…" {
                                     status.set("Thinking…".to_string());
                                 }
@@ -6192,7 +6312,7 @@ fn app() -> Element {
                                 if !bg_watch.peek().iter().any(|j| j.0 == command_id) {
                                     let mut bw = bg_watch;
                                     bw.write().push((command_id.clone(), command, path.clone()));
-                                    spawn_bg_tailer(bg_watch, bg_tails, command_id, path);
+                                    spawn_bg_tailer(bg_watch, bg_tails, bg_settled, command_id, path);
                                 }
                             }
                             Event::FileDiff { path, diff, checkpoint, .. } => {
@@ -7066,7 +7186,7 @@ fn app() -> Element {
                                                 let ttl_dc = ttl.clone();
                                                 rsx! {
                                                     div { key: "tab{id}", class: if is_active { "thread active" } else { "thread" },
-                                                        onclick: move |_| { show_board.set(false); switch_tab(tabs, active_tab, messages, cfg, engine, i); },
+                                                        onclick: move |_| { unread_tabs.write().remove(&id); show_board.set(false); switch_tab(tabs, active_tab, messages, cfg, engine, i); },
                                                         ondoubleclick: move |_| { rename_text.set(ttl_dc.clone()); renaming_tab.set(Some(id)); },
                                                         span { class: "sess-branch", Icon { name: "branch" } }
                                                         if busy { span { class: "syn-spinner" } }
@@ -7083,6 +7203,14 @@ fn app() -> Element {
                                                             }
                                                         } else {
                                                             span { class: "thread-title", title: "{ttl}", "{ttl}" }
+                                                        }
+                                                        if busy && !is_active {
+                                                            if let Some(v) = tab_verbs.read().get(&id) {
+                                                                span { class: "tab-verb", title: "{v}", "{v}" }
+                                                            }
+                                                        }
+                                                        if !busy && unread_tabs.read().contains(&id) {
+                                                            span { class: "unread-dot", title: "Finished while backgrounded" }
                                                         }
                                                         if tab_status.is_some() {
                                                             span {
@@ -7791,6 +7919,10 @@ fn app() -> Element {
                                             div { class: "changes-head",
                                                 span { class: "changes-branch", Icon { name: "branch" } "{branch}" }
                                                 span { class: "changes-stats", "{n} files " span { class: "diff-adds countup plus", style: "--n:{ta}" } " " span { class: "diff-dels countup minus", style: "--n:{td}" } }
+                                                button { class: if *diff_split.read() { "git-act active" } else { "git-act" },
+                                                    title: "Toggle split / unified diff view",
+                                                    onclick: move |_| { let v = *diff_split.read(); diff_split.set(!v); },
+                                                    if *diff_split.read() { "Unified" } else { "Split" } }
                                                 button { class: "git-act", onclick: move |_| {
                                                     let ws = ws_cp.clone();
                                                     let msg = { let m = commit_msg.peek().trim().to_string(); if m.is_empty() { "wip: changes from Oxide".to_string() } else { m } };
@@ -7816,16 +7948,39 @@ fn app() -> Element {
                                                 }
                                                 button { class: "term-x", onclick: move |_| show_env.set(false), Icon { name: "x" } }
                                             }
+                                            // Cursor 2.1: clicking a file jumps to its diff below.
+                                            if files.len() > 1 {
+                                                div { class: "changes-jump",
+                                                    for (ji, (jpath, _, _, _)) in files.iter().enumerate() {
+                                                        {
+                                                            let base = std::path::Path::new(jpath.as_str())
+                                                                .file_name().map(|n| n.to_string_lossy().to_string())
+                                                                .unwrap_or_else(|| jpath.clone());
+                                                            rsx! {
+                                                                button { class: "changes-jump-chip", title: "{jpath}",
+                                                                    onclick: move |_| {
+                                                                        let js = format!(
+                                                                            "const el=document.getElementById('chfile-{ji}'); if(el){{ el.setAttribute('open',''); el.scrollIntoView({{behavior:'smooth',block:'start'}}); }}"
+                                                                        );
+                                                                        spawn(async move { let _ = document::eval(&js).await; });
+                                                                    },
+                                                                    "{base}"
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
                                             div { class: "changes-list",
                                                 if files.is_empty() { div { class: "insp-empty", "Working tree clean." } }
-                                                for (path, a, d, diff) in files {
-                                                    details { class: "changes-file",
+                                                for (fi, (path, a, d, diff)) in files.clone().into_iter().enumerate() {
+                                                    details { id: "chfile-{fi}", class: "changes-file",
                                                         summary { class: "changes-file-head",
                                                             span { class: "edits-caret", Icon { name: "chevron" } }
                                                             span { class: "changes-path", "{path}" }
                                                             span { class: "diff-adds", "+{a}" } span { class: "diff-dels", "−{d}" }
                                                         }
-                                                        HunkedDiff { ws: workspace.clone(), path: path.clone(), diff }
+                                                        HunkedDiff { ws: workspace.clone(), path: path.clone(), diff, split: *diff_split.read() }
                                                     }
                                                 }
                                             }
@@ -8773,7 +8928,10 @@ fn app() -> Element {
                     }
                     if *show_split.read() && cfg.read().workspace.is_some() {
                         SplitView {
-                            node: split_layout.read().clone(),
+                            node: match *split_maximized.read() {
+                                Some(pid) => Tile::Leaf(pid),
+                                None => split_layout.read().clone(),
+                            },
                             workspace: workspace.clone(),
                             panes: split_panes,
                             layout: split_layout,
@@ -8965,8 +9123,20 @@ fn app() -> Element {
                                                     // of (animating) rows lags hard. The header shows live progress;
                                                     // the user expands for detail. And cap rendered rows to the most
                                                     // recent so expanding a huge group stays light.
-                                                    let is_open = act_open.read().get(&group_key).copied().unwrap_or(false);
+                                                    let tool_detail = cfg.read().tool_detail.clone();
+                                                    let is_open = act_open
+                                                        .read()
+                                                        .get(&group_key)
+                                                        .copied()
+                                                        .unwrap_or(tool_detail == "detailed");
                                                     const ACT_ROW_CAP: usize = 12;
+                                                    // Compact density: settled-ok rows collapse into the header;
+                                                    // running and failed rows always stay visible.
+                                                    let rows: Vec<(String, bool, bool)> = if tool_detail == "compact" {
+                                                        rows.into_iter().filter(|(_, r, o)| *r || !*o).collect()
+                                                    } else {
+                                                        rows
+                                                    };
                                                     let hidden = rows.len().saturating_sub(ACT_ROW_CAP);
                                                     let shown: Vec<(String, bool, bool)> = rows.into_iter().skip(hidden).collect();
                                                     rsx! {
@@ -9001,9 +9171,11 @@ fn app() -> Element {
                                                                                     == want
                                                                             })
                                                                             .fold((0u32, 0u32), |(a, d), e| (a + e.1, d + e.2));
-                                                                        rsx! { EditActivityRow { text: t, running: r, ok: o, count, adds, dels } }
+                                                                        let secs = if r { tool_start.read().as_ref().map(|ts| ts.elapsed().as_secs()).unwrap_or(0) } else { 0 };
+                                                                        rsx! { EditActivityRow { text: t, running: r, ok: o, count, adds, dels, secs } }
                                                                     } else {
-                                                                        rsx! { ActivityRow { text: t, running: r, ok: o } }
+                                                                        let secs = if r { tool_start.read().as_ref().map(|ts| ts.elapsed().as_secs()).unwrap_or(0) } else { 0 };
+                                                                        rsx! { ActivityRow { text: t, running: r, ok: o, secs, auto_open: tool_detail == "detailed" } }
                                                                     }
                                                                 }
                                                             }
@@ -9154,7 +9326,7 @@ fn app() -> Element {
                                                                                 },
                                                                                 span { class: "thinking-glow", "Reasoning" }
                                                                                 {
-                                                                                    let el = *elapsed_s.read();
+                                                                                    let el = *think_secs.read();
                                                                                     if el >= 1 {
                                                                                         rsx! { span { class: "thinking-secs", "{el}s" } }
                                                                                     } else {
@@ -9166,7 +9338,13 @@ fn app() -> Element {
                                                                         }
                                                                     }
                                                                     div { id: "msg-{i}", class: "pinwrap",
-                                                                        Message { author: m.author.clone(), text: m.text.clone(), live: is_live }
+                                                                        Message {
+                                                                            author: m.author.clone(),
+                                                                            text: m.text.clone(),
+                                                                            live: is_live,
+                                                                            tool_secs: tool_start.read().as_ref().map(|t| t.elapsed().as_secs()).unwrap_or(0),
+                                                                            compact_tools: cfg.read().tool_detail == "compact",
+                                                                        }
                                                                         if is_agent && !is_live {
                                                                             div { class: "msg-side",
                                                                                 button { class: "msg-pin", title: "Pin message",
@@ -9225,7 +9403,7 @@ fn app() -> Element {
                                                     if live {
                                                         span { class: "thinking-glow", "Reasoning" }
                                                         {
-                                                            let el = *elapsed_s.read();
+                                                            let el = *think_secs.read();
                                                             if el >= 1 {
                                                                 rsx! { span { class: "thinking-secs", "{el}s" } }
                                                             } else {
@@ -9233,7 +9411,14 @@ fn app() -> Element {
                                                             }
                                                         }
                                                     } else {
-                                                        "Reasoning"
+                                                        {
+                                                            let t = *think_secs.read();
+                                                            if t >= 1 {
+                                                                rsx! { "Thought for {t}s" }
+                                                            } else {
+                                                                rsx! { "Reasoning" }
+                                                            }
+                                                        }
                                                     }
                                                 }
                                                 div { class: "thinking-body", "{thinking}" }
@@ -9247,11 +9432,19 @@ fn app() -> Element {
                                     // momentarily emptied between events, restarting the spinner's
                                     // CSS animation each time (it looked frozen/stuck). A stable
                                     // key + always-mounted pill lets the spin run continuously.
-                                    StatusPill { text: status.read().clone(), elapsed_s: *elapsed_s.read() }
+                                    StatusPill {
+                                        text: status.read().clone(),
+                                        elapsed_s: *elapsed_s.read(),
+                                        stalled_s: elapsed_s.read().saturating_sub(*last_ev_s.read()),
+                                    }
                                 }
                                 if !bg_jobs.read().is_empty() || !bg_watch.read().is_empty() {
+                                    {
+                                        let all_settled = bg_jobs.read().is_empty()
+                                            && bg_watch.read().iter().all(|j| bg_settled.read().contains(&j.0));
+                                        rsx! {
                                     div { class: "bg-bar",
-                                        span { class: "bg-orbit" }
+                                        span { class: if all_settled { "bg-orbit settled" } else { "bg-orbit" } }
                                         span { class: "bg-label", "Background" }
                                         // Watched jobs: their output FILE is tailed across turns,
                                         // so the result stays readable here — expand for the tail.
@@ -9260,10 +9453,12 @@ fn app() -> Element {
                                                 let tail = bg_tails.read().get(&id).cloned().unwrap_or_default();
                                                 let short: String = command.chars().take(60).collect();
                                                 let did = id.clone();
+                                                let settled = bg_settled.read().contains(&id);
                                                 rsx! {
                                                     details { key: "bgw-{id}", class: "bg-chip bg-watch",
-                                                        summary { class: "bg-watch-sum", title: "{command}",
-                                                            span { class: "bg-dot" }
+                                                        summary { class: "bg-watch-sum",
+                                                            title: if settled { "No new output for ~20s — likely finished. Expand for the tail; ✕ to dismiss." } else { "{command}" },
+                                                            span { class: if settled { "bg-dot settled" } else { "bg-dot" } }
                                                             span { class: "bg-chip-text", "{short}" }
                                                             button { class: "bg-x", title: "Stop watching",
                                                                 onclick: move |e: dioxus::prelude::MouseEvent| {
@@ -9294,6 +9489,8 @@ fn app() -> Element {
                                             }
                                         }
                                     }
+                                        }
+                                    }
                                 }
                                 if !queue.read().is_empty() {
                                     div { class: "queue-bar",
@@ -9317,6 +9514,14 @@ fn app() -> Element {
                                                         },
                                                         span { class: "queue-index", "{qi + 1}" }
                                                         "{preview}"
+                                                        if qi > 0 {
+                                                            button { class: "queue-steer", title: "Move up in the queue",
+                                                                onclick: move |e: dioxus::prelude::MouseEvent| {
+                                                                    e.stop_propagation();
+                                                                    let mut qv = queue.write();
+                                                                    if qi > 0 && qi < qv.len() { qv.swap(qi, qi - 1); }
+                                                                }, Icon { name: "arrow-up" } }
+                                                        }
                                                         button { class: "queue-steer", title: "Steer now — inject into the running turn instead of waiting",
                                                             onclick: move |e: dioxus::prelude::MouseEvent| {
                                                                 e.stop_propagation();
@@ -9800,6 +10005,18 @@ fn app() -> Element {
                             "Theme: Dark" => set_theme(cfg, "dark"),
                             "Theme: System" => set_theme(cfg, "system"),
                             "Toggle density" => toggle_density(cfg),
+                            "Maximize pane" => {
+                                let cur = *split_maximized.read();
+                                if cur.is_some() {
+                                    split_maximized.set(None);
+                                } else {
+                                    let mut leaves = Vec::new();
+                                    tile_leaves(&split_layout.read(), &mut leaves);
+                                    if leaves.len() > 1 {
+                                        split_maximized.set(leaves.first().copied());
+                                    }
+                                }
+                            },
                             _ => {}
                         }
                     };
@@ -9809,6 +10026,7 @@ fn app() -> Element {
                         ("plugins", "Files panel"), ("terminal", "Terminal"), ("settings", "Settings…"),
                         ("spark", "Theme: Light"), ("target", "Theme: Dark"), ("settings", "Theme: System"),
                         ("list", "Toggle density"),
+                        ("split-right", "Maximize pane"),
                     ];
                     let q = palette_query.read().to_lowercase();
                     let filtered: Vec<(&str, &str)> = actions.into_iter().filter(|(_, l)| q.is_empty() || l.to_lowercase().contains(&q)).collect();
@@ -10131,6 +10349,7 @@ fn switch_tab(
         // t.session was bound from Event::SessionPath when this tab's engine
         // opened its file — no newest-file guessing (that mixes tabs up).
     }
+    let cur_id = tabs.read().get(cur).map(|t| t.id).unwrap_or(0);
     let t = tabs.read()[idx].clone();
     active_tab.set(idx);
     let mut c = cfg.read().clone();
@@ -10140,12 +10359,20 @@ fn switch_tab(
     c.reasoning_effort = t.reasoning_effort.clone();
     c.resume_path = t.session.clone();
     cfg.set(c.clone());
+    let new_id = t.id;
     engine.send(EngineCmd::SwitchTab {
         id: t.id,
         conf: c,
         msgs: t.messages.clone(),
     });
-    scroll_chat_bottom();
+    // Cursor pain-point done right: restore the tab's last scroll position;
+    // brand-new tabs (no saved position) land at the bottom as before.
+    spawn(async move {
+        let js = format!(
+            "const s=document.querySelector('.scroll'); window.__oxscrollpos=window.__oxscrollpos||{{}}; if(s) window.__oxscrollpos[{cur_id}]=s.scrollTop;              for (const delay of [40, 140]) setTimeout(()=>requestAnimationFrame(()=>{{ const s2=document.querySelector('.scroll'); if(!s2) return;              const p=window.__oxscrollpos[{new_id}];              if (p===undefined) {{ s2.scrollTo({{top:s2.scrollHeight, behavior:'auto'}}); window.__oxstick=true; }}              else {{ s2.scrollTo({{top:p, behavior:'auto'}}); const d=s2.scrollHeight-s2.scrollTop-s2.clientHeight; window.__oxstick = d<8; }} }}),delay);"
+        );
+        let _ = dioxus::document::eval(&js).await;
+    });
 }
 
 /// Open a fresh agent tab for `provider` and make it active.
@@ -10938,6 +11165,7 @@ fn SettingsModal(
     let mut tab_mode = use_signal(|| base.default_tab_mode.clone());
     let mut browser_headless = use_signal(|| base.browser_headless);
     let mut notification_sound = use_signal(|| base.notification_sound);
+    let mut tool_detail_sel = use_signal(|| base.tool_detail.clone());
     let mut notification_volume = use_signal(|| base.notification_volume);
     // Archived-sessions manager: bump to re-query the list; confirm holds the
     // id awaiting a second click before a permanent delete.
@@ -10964,6 +11192,7 @@ fn SettingsModal(
         c.default_tab_mode = tab_mode.read().clone();
         c.browser_headless = *browser_headless.read();
         c.notification_sound = *notification_sound.read();
+        c.tool_detail = tool_detail_sel.read().clone();
         c.notification_volume = *notification_volume.read();
         c.approval_policy = if *bypass.read() {
             ApprovalPolicy::Never
@@ -11196,6 +11425,18 @@ fn SettingsModal(
                                         let _ = dioxus::document::eval(&js).join::<bool>().await;
                                     });
                                 },
+                            }
+                        }
+                    }
+                    div { class: "field",
+                        span { class: "field-label", "Tool-call detail (Cursor-style density)" }
+                        div { class: "seg-row",
+                            for (val, lbl) in [("compact", "Compact"), ("balanced", "Balanced"), ("detailed", "Detailed")] {
+                                button {
+                                    class: if tool_detail_sel.read().as_str() == val { "seg-btn active" } else { "seg-btn" },
+                                    onclick: move |_| tool_detail_sel.set(val.to_string()),
+                                    "{lbl}"
+                                }
                             }
                         }
                     }
@@ -12543,8 +12784,16 @@ fn ToolNote(text: String) -> Element {
 }
 
 #[component]
-fn StatusPill(text: String, #[props(default)] elapsed_s: u64) -> Element {
-    let label = if text.is_empty() {
+fn StatusPill(
+    text: String,
+    #[props(default)] elapsed_s: u64,
+    #[props(default)] stalled_s: u64,
+) -> Element {
+    // Cursor-style honesty: no engine event for 45s+ — say so instead of
+    // letting a stale verb ("Writing…") sit there looking hung.
+    let label = if stalled_s >= 45 {
+        "Taking longer than expected…".to_string()
+    } else if text.is_empty() {
         "Working…".to_string()
     } else {
         text
@@ -12582,7 +12831,13 @@ fn StatusPill(text: String, #[props(default)] elapsed_s: u64) -> Element {
 }
 
 #[component]
-fn Message(author: Author, text: String, #[props(default)] live: bool) -> Element {
+fn Message(
+    author: Author,
+    text: String,
+    #[props(default)] live: bool,
+    #[props(default)] tool_secs: u64,
+    #[props(default)] compact_tools: bool,
+) -> Element {
     match author {
         Author::User => {
             let segs = user_segments(&text);
@@ -12604,7 +12859,7 @@ fn Message(author: Author, text: String, #[props(default)] live: bool) -> Elemen
                     return rsx! {
                         div { class: "row agent agent-waiting",
                             img { class: "avatar", src: logo_uri() }
-                            div { class: "typing", span {}, span {}, span {} }
+                            div { class: "typing", span { class: "typing-shimmer", "Thinking\u{2026}" } }
                         }
                     };
                 }
@@ -12633,7 +12888,12 @@ fn Message(author: Author, text: String, #[props(default)] live: bool) -> Elemen
                 }
             }
         }
-        Author::Activity { running, ok, .. } => rsx! { ActivityRow { text, running, ok } },
+        Author::Activity { running, ok, .. } => {
+            if compact_tools && !running && ok {
+                return rsx! {};
+            }
+            rsx! { ActivityRow { text, running, ok, secs: if running { tool_secs } else { 0 } } }
+        }
         Author::UiSpec => {
             // In-flight SpecStream skeleton (partial args, repaired JSON) —
             // upgraded in place to the validated card by Event::UiSpec.
@@ -12957,7 +13217,7 @@ enum PaneCmd {
 }
 
 /// A tiling layout node: a leaf pane (by id) or a split of two nodes.
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 enum Tile {
     Leaf(u64),
     Split {
@@ -13390,7 +13650,13 @@ fn ui_value_display(value: Option<&serde_json::Value>) -> String {
 }
 
 #[component]
-fn ActivityRow(text: String, running: bool, ok: bool) -> Element {
+fn ActivityRow(
+    text: String,
+    running: bool,
+    ok: bool,
+    #[props(default)] secs: u64,
+    #[props(default)] auto_open: bool,
+) -> Element {
     let view = activity_view(&text);
     let state = if running {
         "running"
@@ -13413,11 +13679,12 @@ fn ActivityRow(text: String, running: bool, ok: bool) -> Element {
                     if running { span { class: "activity-spin" } }
                     else if ok { span { class: "activity-ic ok", Icon { name: "check" } } }
                     else { span { class: "activity-ic fail", Icon { name: "x" } } }
+                    if running && secs >= 2 { span { class: "activity-secs", "{secs}s" } }
                     span { class: "activity-verb", "{view.verb}" }
                     if !view.detail.is_empty() { span { class: "activity-text", "{view.detail}" } }
                 }
             } else {
-                details { class: "{cls} has-out",
+                details { class: "{cls} has-out", open: auto_open,
                     summary { class: "activity-sum",
                         span { class: "activity-tic", Icon { name: icon_static(&view.icon) } }
                         if ok { span { class: "activity-ic ok", Icon { name: "check" } } } else { span { class: "activity-ic fail", Icon { name: "x" } } }
@@ -13456,6 +13723,7 @@ fn EditActivityRow(
     count: usize,
     adds: u32,
     dels: u32,
+    #[props(default)] secs: u64,
 ) -> Element {
     let view = activity_view(&text);
     let state = if running {
@@ -13473,6 +13741,7 @@ fn EditActivityRow(
                 if running { span { class: "activity-spin" } }
                 else if ok { span { class: "activity-ic ok", Icon { name: "check" } } }
                 else { span { class: "activity-ic fail", Icon { name: "x" } } }
+                if running && secs >= 2 { span { class: "activity-secs", "{secs}s" } }
                 span { class: "activity-verb", "{view.verb}" }
                 if !view.detail.is_empty() { span { class: "activity-text", "{view.detail}" } }
                 if count > 1 { span { class: "activity-count", "×{count}" } }
@@ -14075,7 +14344,7 @@ fn revert_hunk(ws: &Path, path: &str, lines: &[String]) -> bool {
 }
 
 #[component]
-fn HunkedDiff(ws: PathBuf, path: String, diff: String) -> Element {
+fn HunkedDiff(ws: PathBuf, path: String, diff: String, #[props(default)] split: bool) -> Element {
     let hunks = split_hunks(&diff);
     let mut reverted = use_signal(std::collections::HashSet::<usize>::new);
     rsx! {
@@ -14097,8 +14366,44 @@ fn HunkedDiff(ws: PathBuf, path: String, diff: String) -> Element {
                                         onclick: move |_| { if revert_hunk(&ws2, &path2, &lines2) { reverted.write().insert(hi); } }, "Revert hunk" }
                                 }
                             }
-                            {
+                            if split {
+                                // Side-by-side (Cursor split view): old on the left,
+                                // new on the right; pairs share a row.
+                                {
+                                    let mut prs: Vec<(String, String, &'static str)> = Vec::new();
+                                    let mut i = 0;
+                                    while i < lines.len() {
+                                        let l = &lines[i];
+                                        if l.starts_with('-') && i + 1 < lines.len() && lines[i + 1].starts_with('+') {
+                                            let (oh, nh) = word_diff(&l[1..], &lines[i + 1][1..]);
+                                            prs.push((oh, nh, "pair"));
+                                            i += 2;
+                                            continue;
+                                        }
+                                        if let Some(rest) = l.strip_prefix('-') {
+                                            prs.push((esc(rest), String::new(), "delonly"));
+                                        } else if let Some(rest) = l.strip_prefix('+') {
+                                            prs.push((String::new(), esc(rest), "addonly"));
+                                        } else {
+                                            let t = esc(l.strip_prefix(' ').unwrap_or(l));
+                                            prs.push((t.clone(), t, "ctx"));
+                                        }
+                                        i += 1;
+                                    }
+                                    rsx! {
+                                        div { class: "diff-split",
+                                            for (lh, rh, kind) in prs {
+                                                div { class: "ds-row {kind}",
+                                                    pre { class: "ds-cell left", dangerous_inner_html: "{lh}" }
+                                                    pre { class: "ds-cell right", dangerous_inner_html: "{rh}" }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
                                 // Pair consecutive -/+ lines for word-level highlights.
+                                {
                                 let mut rows: Vec<(&'static str, String)> = Vec::new();
                                 let mut i = 0;
                                 while i < lines.len() {
@@ -14120,6 +14425,7 @@ fn HunkedDiff(ws: PathBuf, path: String, diff: String) -> Element {
                                             div { class: "{cls}", dangerous_inner_html: "{html}" }
                                         }
                                     }
+                                }
                                 }
                             }
                         }

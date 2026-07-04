@@ -91,6 +91,10 @@ pub struct Config {
     /// UI density: "comfortable" or "compact".
     #[serde(default = "default_density")]
     pub density: String,
+    /// Tool-call trace density in the transcript: "compact" (hide settled
+    /// rows), "balanced" (default), or "detailed" (auto-expand outputs).
+    #[serde(default = "default_tool_detail")]
+    pub tool_detail: String,
     /// Pinned session file paths (shown in a top "Pinned" section).
     #[serde(default)]
     pub pinned_sessions: Vec<String>,
@@ -149,6 +153,9 @@ fn default_github_repo() -> String {
 }
 fn default_density() -> String {
     "comfortable".to_string()
+}
+fn default_tool_detail() -> String {
+    "balanced".to_string()
 }
 fn default_theme() -> String {
     "dark".to_string()
@@ -306,6 +313,7 @@ impl Default for Config {
             theme: default_theme(),
             accent_color: String::new(),
             density: default_density(),
+            tool_detail: default_tool_detail(),
             pinned_sessions: Vec::new(),
             auto_verify: true,
             verify_command: String::new(),

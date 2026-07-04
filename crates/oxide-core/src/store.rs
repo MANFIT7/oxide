@@ -162,43 +162,126 @@ struct Checkpoint {
     files: Vec<FileSnapshot>,
 }
 
-/// In-memory checkpoint log enabling rewind of file writes within a session.
+/// Checkpoint log enabling rewind of file writes. Mirrored to
+/// `.oxide/checkpoints/<id>/` so rewind survives an app restart (Cursor-style
+/// durable checkpoints); in-memory only when constructed via `default()`.
 #[derive(Default)]
 pub struct CheckpointStore {
     next_id: u64,
     checkpoints: Vec<Checkpoint>,
+    dir: Option<PathBuf>,
 }
 
 impl CheckpointStore {
+    /// Load persisted checkpoints from `.oxide/checkpoints/` (newest ~50 kept;
+    /// older ones are pruned — a rewind that far back crosses too many turns
+    /// to be meaningful).
+    pub fn load(workspace: &Path) -> Self {
+        const KEEP: usize = 50;
+        let dir = workspace.join(".oxide/checkpoints");
+        let mut ids: Vec<u64> = std::fs::read_dir(&dir)
+            .map(|rd| {
+                rd.flatten()
+                    .filter_map(|e| e.file_name().to_string_lossy().parse::<u64>().ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        ids.sort_unstable();
+        while ids.len() > KEEP {
+            let old = ids.remove(0);
+            let _ = std::fs::remove_dir_all(dir.join(old.to_string()));
+        }
+        let mut checkpoints = Vec::new();
+        for id in &ids {
+            let cp_dir = dir.join(id.to_string());
+            let Ok(meta) = std::fs::read_to_string(cp_dir.join("meta.json")) else {
+                continue;
+            };
+            let Ok(meta) = serde_json::from_str::<serde_json::Value>(&meta) else {
+                continue;
+            };
+            let mut files = Vec::new();
+            for (fi, f) in meta["files"].as_array().into_iter().flatten().enumerate() {
+                let Some(path) = f["path"].as_str() else {
+                    continue;
+                };
+                let existed = f["existed"].as_bool().unwrap_or(false);
+                let prior = if existed {
+                    std::fs::read(cp_dir.join(format!("file-{fi}.bin"))).ok()
+                } else {
+                    None
+                };
+                files.push(FileSnapshot {
+                    path: PathBuf::from(path),
+                    prior,
+                });
+            }
+            if !files.is_empty() {
+                checkpoints.push(Checkpoint { id: *id, files });
+            }
+        }
+        Self {
+            next_id: ids.last().copied().unwrap_or(0),
+            checkpoints,
+            dir: Some(dir),
+        }
+    }
+
+    /// Mirror one checkpoint to disk (best-effort — rewind still works from
+    /// memory if the write fails).
+    fn persist(&self, cp: &Checkpoint) {
+        let Some(dir) = &self.dir else { return };
+        let cp_dir = dir.join(cp.id.to_string());
+        if std::fs::create_dir_all(&cp_dir).is_err() {
+            return;
+        }
+        let files: Vec<serde_json::Value> = cp
+            .files
+            .iter()
+            .map(|f| {
+                serde_json::json!({
+                    "path": f.path.display().to_string(),
+                    "existed": f.prior.is_some(),
+                })
+            })
+            .collect();
+        let meta = serde_json::json!({ "id": cp.id, "files": files });
+        let _ = std::fs::write(cp_dir.join("meta.json"), meta.to_string());
+        for (fi, f) in cp.files.iter().enumerate() {
+            if let Some(bytes) = &f.prior {
+                let _ = std::fs::write(cp_dir.join(format!("file-{fi}.bin")), bytes);
+            }
+        }
+    }
+
+    fn unpersist(&self, id: u64) {
+        if let Some(dir) = &self.dir {
+            let _ = std::fs::remove_dir_all(dir.join(id.to_string()));
+        }
+    }
+
     /// Snapshot with EXPLICIT prior bytes (e.g. reconstructed from a git
     /// baseline for CLI-driver edits, where the file is already modified).
     pub fn snapshot_with(&mut self, path: &Path, prior: Option<Vec<u8>>) -> u64 {
         self.next_id += 1;
         let id = self.next_id;
-        self.checkpoints.push(Checkpoint {
+        let cp = Checkpoint {
             id,
             files: vec![FileSnapshot {
                 path: path.to_path_buf(),
                 prior,
             }],
-        });
+        };
+        self.persist(&cp);
+        self.checkpoints.push(cp);
         id
     }
 
     /// Snapshot `path`'s current bytes (capturing absence) under a new checkpoint.
     /// Returns the checkpoint id to surface to the frontend.
     pub fn snapshot(&mut self, path: &Path) -> u64 {
-        self.next_id += 1;
-        let id = self.next_id;
         let prior = std::fs::read(path).ok();
-        self.checkpoints.push(Checkpoint {
-            id,
-            files: vec![FileSnapshot {
-                path: path.to_path_buf(),
-                prior,
-            }],
-        });
-        id
+        self.snapshot_with(path, prior)
     }
 
     /// Restore the workspace to checkpoint `id`, undoing it and every checkpoint
@@ -210,6 +293,7 @@ impl CheckpointStore {
                 break;
             }
             let cp = self.checkpoints.pop().unwrap();
+            self.unpersist(cp.id);
             for snap in cp.files {
                 match snap.prior {
                     Some(bytes) => {
@@ -267,6 +351,26 @@ fn trash_on_rewind(path: &std::path::Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checkpoints_persist_across_reload() {
+        let ws = std::env::temp_dir().join(format!("oxide-cp-reload-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(&ws).unwrap();
+        let target = ws.join("code.txt");
+        std::fs::write(&target, "v1").unwrap();
+        let id = {
+            let mut cps = CheckpointStore::load(&ws);
+            let id = cps.snapshot(&target);
+            std::fs::write(&target, "v2").unwrap();
+            id
+        };
+        // Fresh process simulation: reload from disk, then rewind.
+        let mut cps = CheckpointStore::load(&ws);
+        assert_eq!(cps.rewind(id), 1);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "v1");
+        std::fs::remove_dir_all(&ws).ok();
+    }
 
     #[test]
     fn session_append_and_load_roundtrips() {
