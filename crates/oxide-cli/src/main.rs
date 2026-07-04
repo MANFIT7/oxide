@@ -55,6 +55,9 @@ enum Command {
     },
     /// Launch the Rust-native desktop command center.
     Gui,
+    /// Serve Oxide tools (session_search) over MCP stdio — lets external
+    /// agents (Claude Code via OXIDE_MCP_BRIDGE) recall past Oxide sessions.
+    McpServe,
     /// Inspect available harnesses.
     Harness {
         #[command(subcommand)]
@@ -120,6 +123,12 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
+    // MCP server mode: pure stdio JSON-RPC, no engine/config needed — and it
+    // must not print anything but protocol frames to stdout.
+    if matches!(cli.command, Some(Command::McpServe)) {
+        return run_mcp_serve();
+    }
+
     let mut config = Config::load()?;
     if let Some(h) = cli.harness {
         config.harness = h;
@@ -157,6 +166,8 @@ fn main() -> Result<()> {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(async move {
                 match other {
+                    // Handled before config load; unreachable here.
+                    Command::McpServe => Ok(()),
                     Command::Tui => run_tui(config).await,
                     Command::Exec {
                         prompt,
@@ -174,6 +185,82 @@ fn main() -> Result<()> {
             })
         }
     }
+}
+
+/// Minimal MCP server over stdio (JSON-RPC 2.0): exposes Oxide's cross-session
+/// recall to external agents. Claude Code connects to it when the claude
+/// driver is launched with `OXIDE_MCP_BRIDGE=<path-to-oxide-binary>`.
+fn run_mcp_serve() -> Result<()> {
+    use std::io::{BufRead, Write};
+    let stdin = std::io::stdin();
+    let mut out = std::io::stdout();
+    let ws = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let tools = serde_json::json!([{
+        "name": "session_search",
+        "description": "Recall PAST Oxide conversations in this workspace's session database. query: find sessions on a topic (snippet + surrounding messages + how each session began/ended). session_id: read that session. No args: list recent sessions.",
+        "inputSchema": {"type":"object","properties":{
+            "query":{"type":"string"},
+            "session_id":{"type":"string"}
+        }}
+    }]);
+    for line in stdin.lock().lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(req) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let id = req.get("id").cloned();
+        let method = req["method"].as_str().unwrap_or("");
+        let result = match method {
+            "initialize" => Some(serde_json::json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "oxide", "version": env!("CARGO_PKG_VERSION")}
+            })),
+            "tools/list" => Some(serde_json::json!({"tools": tools})),
+            "tools/call" => {
+                let name = req["params"]["name"].as_str().unwrap_or("");
+                let args = &req["params"]["arguments"];
+                let text = match name {
+                    // Read-only path: the running Oxide app holds turso's
+                    // exclusive lock on the db file; rusqlite reads beside it.
+                    "session_search" => oxide_core::db::session_recall_text_readonly(
+                        &ws,
+                        args["query"].as_str().unwrap_or(""),
+                        args["session_id"].as_str().unwrap_or(""),
+                    ),
+                    other => format!("unknown tool '{other}'"),
+                };
+                Some(serde_json::json!({
+                    "content": [{"type": "text", "text": text}],
+                    "isError": false
+                }))
+            }
+            "ping" => Some(serde_json::json!({})),
+            // Notifications (no id) need no response; unknown REQUESTS get a
+            // JSON-RPC method-not-found error so the client doesn't hang.
+            _ => None,
+        };
+        match (id, result) {
+            (Some(id), Some(result)) => {
+                let msg = serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result});
+                writeln!(out, "{msg}")?;
+                out.flush()?;
+            }
+            (Some(id), None) if !method.starts_with("notifications/") => {
+                let msg = serde_json::json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "error": {"code": -32601, "message": format!("method not found: {method}")}
+                });
+                writeln!(out, "{msg}")?;
+                out.flush()?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// Headless single-turn runner: submit one prompt, print every event, optionally

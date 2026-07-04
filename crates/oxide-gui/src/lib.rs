@@ -466,6 +466,27 @@ fn spawn_bg_tailer(
     });
 }
 
+/// Upgrade the newest streamed "Preparing {verb} · {args}" preview row into the
+/// tool's settled activity row (in place, key preserved). Non-command tools
+/// (Edit/Read/Grep…) have no CommandStarted to retire their preview — without
+/// this the preview spins beside the real row for the whole turn.
+fn upgrade_preparing_row(rows: &mut [ChatMsg], verb: &str, row: &str) -> bool {
+    let prefix = format!("spark\tPreparing\t{verb}");
+    match rows.iter().rposition(|m| {
+        matches!(&m.author, Author::Activity { key: Some(_), .. }) && m.text.starts_with(&prefix)
+    }) {
+        Some(idx) => {
+            rows[idx].text = row.to_string();
+            if let Author::Activity { running, ok, .. } = &mut rows[idx].author {
+                *running = false;
+                *ok = true;
+            }
+            true
+        }
+        None => false,
+    }
+}
+
 /// Start (or upgrade) a command's activity row. The args-streaming preview
 /// (`ToolCallDelta` → "Preparing …") may already hold a row under the SAME id —
 /// for CLI drivers the command_id IS the tool_use id — so starting must
@@ -3010,6 +3031,43 @@ mod tests {
     }
 
     #[test]
+    fn preparing_preview_upgrades_for_non_command_tools() {
+        // Edit/Read/Grep have no CommandStarted — the ⚙ notice must retire the
+        // streamed preview row in place instead of leaving it spinning.
+        let mut msgs: Vec<ChatMsg> = Vec::new();
+        upsert_tool_input_preview(
+            &mut msgs,
+            "toolu_9".into(),
+            "Edit".into(),
+            r#"{"file_path":"/x.rs"}"#.into(),
+        );
+        assert_eq!(msgs.len(), 1);
+        let id = msgs[0].id;
+        assert!(upgrade_preparing_row(
+            &mut msgs,
+            "Edit",
+            "edit\tEdit\t/x.rs"
+        ));
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].id, id);
+        assert_eq!(msgs[0].text, "edit\tEdit\t/x.rs");
+        assert!(matches!(
+            msgs[0].author,
+            Author::Activity {
+                running: false,
+                ok: true,
+                ..
+            }
+        ));
+        // Different tool name → no match, caller pushes a fresh row.
+        assert!(!upgrade_preparing_row(
+            &mut msgs,
+            "Read",
+            "eye\tRead\t/y.rs"
+        ));
+    }
+
+    #[test]
     fn command_started_without_preview_still_pushes_row() {
         let mut msgs: Vec<ChatMsg> = Vec::new();
         upsert_command_started(&mut msgs, "c9".into(), command_activity_label("ls", false));
@@ -4574,7 +4632,12 @@ fn app() -> Element {
                 };
                 const upd = () => {
                   const d = bottomDistance();
-                  window.__oxstick = d < 160;
+                  // RE-ARM only at the true bottom. Stickiness must never be
+                  // derived from distance alone: during a stream the snap runs
+                  // per frame, so a distance threshold re-captured the user
+                  // before their upward gesture could ever escape (the
+                  // "can't scroll up while running" trap).
+                  if (d < 8) window.__oxstick = true;
                   const b = s.querySelector('.jump-bottom');
                   if (b) b.classList.toggle('show', d > 300);
                 };
@@ -4609,16 +4672,23 @@ fn app() -> Element {
                   if (ignoreScroll) return;
                   upd();
                 }, { passive: true });
-                // Wheel/touch/key scrolls are the user's intent to inspect history.
-                // Do not let incoming streaming tokens pull them back down until
-                // they return near the bottom or press the jump button.
-                const userScrollIntent = () => {
-                  if (bottomDistance() > 80) window.__oxstick = false;
-                };
-                s.addEventListener('wheel', userScrollIntent, { passive: true });
-                s.addEventListener('touchmove', userScrollIntent, { passive: true });
+                // UPWARD intent unsticks IMMEDIATELY — direction, not distance.
+                // (The old `distance > 80` guard was unreachable mid-stream:
+                // per-frame snaps reset the distance before a gesture crossed it.)
+                s.addEventListener('wheel', (ev) => {
+                  if (ev.deltaY < 0) window.__oxstick = false;
+                }, { passive: true });
+                let touchY = 0;
+                s.addEventListener('touchstart', (ev) => {
+                  touchY = ev.touches[0] ? ev.touches[0].clientY : 0;
+                }, { passive: true });
+                s.addEventListener('touchmove', (ev) => {
+                  const y = ev.touches[0] ? ev.touches[0].clientY : 0;
+                  if (y > touchY + 4) window.__oxstick = false; // finger down = scroll up
+                  touchY = y;
+                }, { passive: true });
                 s.addEventListener('keydown', (ev) => {
-                  if (['PageUp', 'ArrowUp', 'Home', ' '].includes(ev.key)) userScrollIntent();
+                  if (['PageUp', 'ArrowUp', 'Home'].includes(ev.key)) window.__oxstick = false;
                 }, { passive: true });
                 inner = new MutationObserver(stick);
                 inner.observe(s, { childList: true, subtree: true, characterData: true });
@@ -5399,7 +5469,9 @@ fn app() -> Element {
                                         if buf.last().map(|m| m.author == Author::Agent && m.text.is_empty()).unwrap_or(false) {
                                             buf.pop();
                                         }
-                                        buf_push_activity(buf, ChatMsg::new(Author::Activity { running: false, ok: true, key: None }, row));
+                                        if !upgrade_preparing_row(buf, verb, &row) {
+                                            buf_push_activity(buf, ChatMsg::new(Author::Activity { running: false, ok: true, key: None }, row));
+                                        }
                                     } else if is_stage_status(&text) {
                                         // live stage info — meaningless once backgrounded
                                     } else {
@@ -5639,13 +5711,26 @@ fn app() -> Element {
                                             mw.pop();
                                         }
                                     }
-                                    push_activity!(ChatMsg::new(Author::Activity { running: false, ok: true, key: None }, row));
+                                    let upgraded = upgrade_preparing_row(&mut messages.write(), verb, &row);
+                                    if !upgraded {
+                                        push_activity!(ChatMsg::new(Author::Activity { running: false, ok: true, key: None }, row));
+                                    }
                                     // CLI edits compute their real diff at turn end — show the
                                     // file in the "Edited files" card NOW as a pending row
                                     // (synara-style live), replaced by the diff when it lands.
                                     if matches!(verb.to_ascii_lowercase().as_str(), "edit" | "editing" | "write" | "multiedit" | "notebookedit") && !detail.is_empty() {
-                                        let p = detail.split_whitespace().next().unwrap_or("").to_string();
-                                        if !p.is_empty() && !turn_edits.peek().iter().any(|e| e.0 == p) {
+                                        // Normalize to workspace-relative: the notice carries the
+                                        // tool's ABSOLUTE path while FileDiff settles with the
+                                        // git-relative one — the mismatch left an absolute
+                                        // "editing…" twin that never settled.
+                                        let raw = detail.split_whitespace().next().unwrap_or("").to_string();
+                                        let ws_prefix = format!("{}/", cur_ws.display());
+                                        let p = raw.strip_prefix(&ws_prefix).unwrap_or(&raw).to_string();
+                                        let pb = p.rsplit('/').next().unwrap_or(&p).to_string();
+                                        let dup = turn_edits.peek().iter().any(|e| {
+                                            e.0 == p || e.0.rsplit('/').next().unwrap_or(&e.0) == pb
+                                        });
+                                        if !p.is_empty() && !dup {
                                             turn_edits.write().push((p, 0, 0, 0, String::new()));
                                         }
                                     }
@@ -6020,6 +6105,10 @@ fn app() -> Element {
                                         } else {
                                             te.push(real);
                                         }
+                                        // The settled row absorbs the file — any leftover pending
+                                        // twin (absolute-path duplicate from a re-edit notice)
+                                        // must not keep an orphan "editing…" spinner.
+                                        te.retain(|e| !(e.4.is_empty() && e.3 == 0 && base(&e.0) == nb));
                                     }
                                     messages.write().push(ChatMsg::new(Author::Diff(path, checkpoint), diff));
                                 }
@@ -7285,10 +7374,14 @@ fn app() -> Element {
                                                 button { class: "env-proc as-btn", onclick: move |_| {
                                                         git_menu.set(false);
                                                         let ws = ui.workspace.peek().clone();
+                                                        // Use the Changes panel's commit-message draft when
+                                                        // present; the hardcoded label is only the fallback.
+                                                        let msg = { let m = commit_msg.peek().trim().to_string(); if m.is_empty() { "wip: changes from Oxide".to_string() } else { m } };
                                                         spawn(async move {
                                                             let _ = run_cmd(&ws, "git", &["add", "-A"]).await;
-                                                            let r = run_cmd(&ws, "git", &["commit", "-m", "wip: changes from Oxide"]).await;
+                                                            let r = run_cmd(&ws, "git", &["commit", "-m", &msg]).await;
                                                             let ok = !r.contains("error") && !r.contains("fatal");
+                                                            if ok { commit_msg.set(String::new()); }
                                                             push_toast(toasts, toast_seq, if ok { "ok" } else { "err" }, if ok { "Committed" } else { "Commit failed" });
                                                             changed_files.set(load_changed_files(&ws).await);
                                                         });
@@ -7528,10 +7621,12 @@ fn app() -> Element {
                                                 span { class: "changes-stats", "{n} files " span { class: "diff-adds countup plus", style: "--n:{ta}" } " " span { class: "diff-dels countup minus", style: "--n:{td}" } }
                                                 button { class: "git-act", onclick: move |_| {
                                                     let ws = ws_cp.clone();
+                                                    let msg = { let m = commit_msg.peek().trim().to_string(); if m.is_empty() { "wip: changes from Oxide".to_string() } else { m } };
                                                     spawn(async move {
                                                         let _ = run_cmd(&ws, "git", &["add", "-A"]).await;
-                                                        let r = run_cmd(&ws, "git", &["commit", "-m", "wip: changes from Oxide"]).await;
+                                                        let r = run_cmd(&ws, "git", &["commit", "-m", &msg]).await;
                                                         let ok = !r.contains("error") && !r.contains("fatal");
+                                                        if ok { commit_msg.set(String::new()); }
                                                         push_toast(toasts, toast_seq, if ok { "ok" } else { "err" }, if ok { "Changes committed" } else { "Commit failed" });
                                                         changed_files.set(load_changed_files(&ws).await);
                                                     });
@@ -8662,7 +8757,7 @@ fn app() -> Element {
                         div { class: if *streaming.read() { "scroll" } else { "scroll smooth" },
                             div { class: "jump-anchor",
                                 button { class: "jump-bottom", title: "Scroll to bottom",
-                                    onclick: move |_| { spawn(async move { let _ = dioxus::document::eval("const s=document.querySelector('.scroll'); if(s) s.scrollTo({top:s.scrollHeight, behavior:'smooth'});").await; }); },
+                                    onclick: move |_| { spawn(async move { let _ = dioxus::document::eval("window.__oxstick = true; const s=document.querySelector('.scroll'); if(s) s.scrollTo({top:s.scrollHeight, behavior:'smooth'});").await; }); },
                                     Icon { name: "arrow-down" }
                                 }
                             }
@@ -12107,8 +12202,14 @@ fn Composer(
                                         let ws = ws_branch.clone();
                                         rsx! {
                                             button { class: "menu-item", onclick: move |_| {
-                                                let _ = std::process::Command::new("git").args(["switch", &bb]).current_dir(&ws).output();
+                                                // Async — a sync .output() here blocked the UI thread
+                                                // for the whole checkout on big repos.
                                                 show_branch.set(false);
+                                                let ws2 = ws.clone();
+                                                let bb2 = bb.clone();
+                                                spawn(async move {
+                                                    let _ = run_cmd(&ws2, "git", &["switch", &bb2]).await;
+                                                });
                                             },
                                                 Icon { name: "branch" } span { class: "menu-name", "{b}" }
                                             }

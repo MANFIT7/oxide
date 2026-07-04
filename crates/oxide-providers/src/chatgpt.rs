@@ -974,6 +974,7 @@ async fn send_response_usage(
 ) -> bool {
     let usage = &response["usage"];
     sink.send(StreamItem::Usage {
+        cost_usd: None,
         input: usage["input_tokens"].as_u64().unwrap_or(0),
         output: usage["output_tokens"].as_u64().unwrap_or(0),
         context_window: Some(model_context_window(model)),

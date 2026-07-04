@@ -121,6 +121,7 @@ impl LocalDb {
     fn execute_batch(&mut self, op: &str, sql: &str) {
         if let Err(err) = self.try_execute_batch(sql) {
             tracing::warn!(operation = op, error = %err, "Turso database operation failed");
+            note_db_error(&err);
         }
     }
 
@@ -130,6 +131,7 @@ impl LocalDb {
     {
         if let Err(err) = self.rt.block_on(self.conn.execute(sql, params)) {
             tracing::warn!(operation = op, error = %err, "Turso database operation failed");
+            note_db_error(&err);
         }
     }
 
@@ -150,6 +152,7 @@ impl LocalDb {
             Ok(out) => out,
             Err(err) => {
                 tracing::warn!(operation = op, error = %err, "Turso database query failed");
+                note_db_error(&err);
                 Vec::new()
             }
         }
@@ -188,7 +191,9 @@ fn worker() -> &'static DbWorker {
                     })
                     .expect("Turso in-memory database");
                 for job in rx {
-                    job(&mut db);
+                    // A panicking job must not kill the worker — a dead worker
+                    // used to cascade into panics on every later db call.
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(&mut db)));
                 }
             })
             .expect("spawn Turso database worker");
@@ -198,17 +203,49 @@ fn worker() -> &'static DbWorker {
 
 fn with_db<T, F>(f: F) -> T
 where
-    T: Send + 'static,
+    T: Default + Send + 'static,
     F: FnOnce(&mut LocalDb) -> T + Send + 'static,
 {
+    // NEVER panic the caller: with_db runs on UI/async threads for EVERY db
+    // operation — if the worker thread ever died, the old `.expect()`s here
+    // turned one dead worker into a panic on every later call (a persistence
+    // failure escalating into an app crash). Degrade to T::default + a warn;
+    // every call site returns Vec/Option/()/counters where default is safe.
     let (tx, rx) = mpsc::sync_channel(1);
-    worker()
+    if worker()
         .tx
         .send(Box::new(move |db| {
             let _ = tx.send(f(db));
         }))
-        .expect("send Turso database job");
-    rx.recv().expect("receive Turso database job result")
+        .is_err()
+    {
+        tracing::warn!("Turso database worker unavailable (send failed)");
+        return T::default();
+    }
+    match rx.recv() {
+        Ok(v) => v,
+        Err(_) => {
+            tracing::warn!("Turso database worker died mid-job");
+            T::default()
+        }
+    }
+}
+
+/// Last database write/query failure, for user-visible surfacing. The db layer
+/// deliberately degrades (warn + empty result) instead of erroring — but a
+/// silently failing session db means messages vanish; the engine drains this
+/// once per turn and tells the user.
+static LAST_DB_ERROR: Mutex<Option<String>> = Mutex::new(None);
+
+fn note_db_error(err: impl std::fmt::Display) {
+    if let Ok(mut g) = LAST_DB_ERROR.lock() {
+        *g = Some(err.to_string());
+    }
+}
+
+/// Take (and clear) the most recent db failure, if any.
+pub fn take_db_error() -> Option<String> {
+    LAST_DB_ERROR.lock().ok().and_then(|mut g| g.take())
 }
 
 fn now_ms() -> i64 {
@@ -798,6 +835,157 @@ pub fn session_recall_text(
                 out.push_str(&format!("     [{role}] {}\n", clip(content, 160)));
             }
         }
+    }
+    out.push_str("\nPass session_id to read a full session.");
+    out
+}
+
+/// Open the session db for an OUT-OF-PROCESS reader. Turso's lock is
+/// EXCLUSIVE — while the Oxide app runs, even read-only sqlite opens/queries
+/// hit "database is locked" (verified live). So: probe a direct read-only
+/// open first (works when the app is closed); on lock, byte-copy
+/// `oxide.db{,-wal,-shm}` to a temp snapshot (advisory locks don't block byte
+/// reads) and read the copy. Refreshed when older than 15s.
+fn open_recall_conn() -> Result<SqliteConnection, String> {
+    let probe = |p: &Path| -> Result<SqliteConnection, String> {
+        let conn = SqliteConnection::open_with_flags(
+            p,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|e| e.to_string())?;
+        // A locked db opens fine but fails on the first query — probe now so
+        // a lock is never silently reported as "no sessions".
+        conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get::<_, i64>(0))
+            .map_err(|e| e.to_string())?;
+        Ok(conn)
+    };
+    let src = db_path();
+    if let Ok(c) = probe(&src) {
+        return Ok(c);
+    }
+    // Locked by the running app — snapshot-copy and read the copy.
+    let dir = std::env::temp_dir().join("oxide-recall-snapshot");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let dst = dir.join("oxide.db");
+    let fresh = dst
+        .metadata()
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .map(|age| age.as_secs() < 15)
+        .unwrap_or(false);
+    if !fresh {
+        std::fs::copy(&src, &dst).map_err(|e| format!("snapshot copy: {e}"))?;
+        for ext in ["-wal", "-shm"] {
+            let s = PathBuf::from(format!("{}{ext}", src.display()));
+            let d = dir.join(format!("oxide.db{ext}"));
+            if s.exists() {
+                let _ = std::fs::copy(&s, &d);
+            } else {
+                let _ = std::fs::remove_file(&d);
+            }
+        }
+    }
+    // The copy needs write access once to recover/checkpoint the copied WAL.
+    let conn = SqliteConnection::open(&dst).map_err(|e| e.to_string())?;
+    conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get::<_, i64>(0))
+        .map_err(|e| format!("snapshot read: {e}"))?;
+    Ok(conn)
+}
+
+/// Read-only recall for OUT-OF-PROCESS callers (`oxide mcp-serve`) — see
+/// [`open_recall_conn`] for the locking story.
+pub fn session_recall_text_readonly(workspace: &Path, query: &str, session_id: &str) -> String {
+    let conn = match open_recall_conn() {
+        Ok(c) => c,
+        Err(e) => return format!("session_search: cannot open session db read-only: {e}"),
+    };
+    let q1 = |sql: &str, params: &[&dyn rusqlite::ToSql]| -> Vec<(String, String)> {
+        conn.prepare(sql)
+            .and_then(|mut st| {
+                st.query_map(params, |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })
+                .map(|rows| rows.flatten().collect())
+            })
+            .unwrap_or_default()
+    };
+    if !session_id.is_empty() {
+        let msgs = q1(
+            "SELECT role, content FROM messages WHERE session_id=?1 AND role IN ('user','assistant') ORDER BY seq",
+            &[&session_id],
+        );
+        if msgs.is_empty() {
+            return format!("session_search: no session '{session_id}' (or it is empty).");
+        }
+        let mut out = format!("Session {session_id} ({} messages):\n", msgs.len());
+        for (role, content) in msgs.iter().take(20) {
+            out.push_str(&format!("[{role}] {}\n", clip(content, 400)));
+        }
+        return out;
+    }
+    if query.trim().is_empty() {
+        let ws = workspace.display().to_string();
+        let recent = q1(
+            "SELECT id, title FROM sessions WHERE archived_at IS NULL AND workspace=?1 ORDER BY updated_ms DESC LIMIT 10",
+            &[&ws],
+        );
+        if recent.is_empty() {
+            return "session_search: no past sessions in this workspace.".to_string();
+        }
+        let mut out = String::from("Recent sessions (pass session_id to read one):\n");
+        for (id, title) in recent {
+            out.push_str(&format!("- {} — \"{}\"\n", id, clip(&title, 80)));
+        }
+        return out;
+    }
+    let words: Vec<String> = query
+        .split_whitespace()
+        .take(4)
+        .map(|w| w.replace(['%', '_'], ""))
+        .filter(|w| !w.is_empty())
+        .collect();
+    if words.is_empty() {
+        return "session_search: empty query.".to_string();
+    }
+    let cond: Vec<String> = (0..words.len())
+        .map(|i| format!("m.content LIKE ?{}", i + 1))
+        .collect();
+    let sql = format!(
+        "SELECT m.session_id, m.content, s.title FROM messages m JOIN sessions s ON s.id=m.session_id
+         WHERE s.archived_at IS NULL AND m.role IN ('user','assistant') AND {}
+         ORDER BY m.ts_ms DESC LIMIT 300",
+        cond.join(" AND ")
+    );
+    let pats: Vec<String> = words.iter().map(|w| format!("%{w}%")).collect();
+    let rows: Vec<(String, String, String)> = conn
+        .prepare(&sql)
+        .and_then(|mut st| {
+            st.query_map(rusqlite::params_from_iter(pats.iter()), |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .map(|rows| rows.flatten().collect())
+        })
+        .unwrap_or_default();
+    let mut out = format!("Past sessions matching \"{query}\":\n");
+    let mut seen = std::collections::HashSet::new();
+    let mut n = 0;
+    for (sid, content, title) in rows {
+        if !seen.insert(sid.clone()) {
+            continue;
+        }
+        n += 1;
+        out.push_str(&format!(
+            "{n}. {sid} — \"{}\"\n   match: {}\n",
+            clip(&title, 80),
+            clip(&snippet_around(&content, &words), 260)
+        ));
+        if n >= 5 {
+            break;
+        }
+    }
+    if n == 0 {
+        return format!("session_search: nothing found for \"{query}\" in past sessions.");
     }
     out.push_str("\nPass session_id to read a full session.");
     out

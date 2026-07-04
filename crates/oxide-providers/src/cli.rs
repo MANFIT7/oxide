@@ -729,6 +729,7 @@ impl Provider for CodexCliProvider {
                         send(
                             sink,
                             StreamItem::Usage {
+                                cost_usd: None,
                                 input: u["input_tokens"].as_u64().unwrap_or(0),
                                 output: u["output_tokens"].as_u64().unwrap_or(0),
                                 // codex doesn't report the window here; default 272k.
@@ -1253,6 +1254,8 @@ fn claude_handle_line(
                     context_window: window,
                     cached_input: u["cached_input_tokens"].as_u64().unwrap_or(0),
                     reasoning_output: u["reasoning_output_tokens"].as_u64().unwrap_or(0),
+                    // The result event reports the turn's real dollar cost.
+                    cost_usd: v["total_cost_usd"].as_f64(),
                 },
             );
         }
@@ -1279,6 +1282,70 @@ struct PersistentChild {
     last_used: std::time::Instant,
     /// Shared with the SteerHandle: true only while a turn is being read.
     turn_active: Arc<AtomicBool>,
+    /// Lines the idle-drain reader pulled while NO turn was in flight (late
+    /// events after a `result`, future push-style notifications). Bounded;
+    /// processed at the start of the next turn so nothing is lost — and the OS
+    /// pipe can never fill and block the child while nobody is reading.
+    pending_lines: Vec<String>,
+}
+
+/// Cap for idle-drained lines kept for the next turn (oldest dropped first).
+const IDLE_PENDING_CAP: usize = 400;
+
+/// Between turns nobody used to read the child's stdout — anything it wrote
+/// (late post-`result` events; future Monitor/ScheduleWakeup-style pushes)
+/// piled into the ~64KB OS pipe, and a chatty child would BLOCK on write.
+/// This task polls while idle: it try_locks the entry (a held lock = turn in
+/// flight → back off) and drains whatever is buffered into `pending_lines`.
+fn spawn_idle_drain(key: String, entry: Arc<tokio::sync::Mutex<PersistentChild>>) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            // Stop when the child was removed/replaced in the registry.
+            let current = persistent_map()
+                .lock()
+                .ok()
+                .and_then(|m| m.get(&key).cloned());
+            match current {
+                Some(cur) if Arc::ptr_eq(&cur, &entry) => {}
+                _ => break,
+            }
+            let Ok(mut guard) = entry.try_lock() else {
+                continue; // turn in flight — its loop owns the reader
+            };
+            if guard.turn_active.load(Ordering::SeqCst) {
+                continue;
+            }
+            // Drain whatever is already buffered; 30ms of quiet = done for now.
+            loop {
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(30),
+                    guard.reader.next_line(),
+                )
+                .await
+                {
+                    Ok(Ok(Some(line))) => {
+                        let line = line.trim().to_string();
+                        if line.is_empty() {
+                            continue;
+                        }
+                        if guard.pending_lines.len() >= IDLE_PENDING_CAP {
+                            guard.pending_lines.remove(0);
+                        }
+                        guard.pending_lines.push(line);
+                    }
+                    // EOF/read error: child died while idle — let the registry
+                    // entry be respawned lazily by the next turn.
+                    Ok(Ok(None)) | Ok(Err(_)) => {
+                        drop(guard);
+                        remove_persistent(&key);
+                        return;
+                    }
+                    Err(_) => break, // quiet — nothing more buffered
+                }
+            }
+        }
+    });
 }
 
 #[allow(clippy::type_complexity)]
@@ -1505,6 +1572,7 @@ fn spawn_persistent(
         model: model.to_string(),
         last_used: std::time::Instant::now(),
         turn_active: turn_active.clone(),
+        pending_lines: Vec::new(),
     }));
     if let Ok(mut m) = persistent_map().lock() {
         m.insert(key.to_string(), entry.clone());
@@ -1520,6 +1588,7 @@ fn spawn_persistent(
         );
     }
     ensure_persistent_reaper();
+    spawn_idle_drain(key.to_string(), entry.clone());
     Ok(entry)
 }
 
@@ -1603,6 +1672,15 @@ impl Provider for ClaudePersistentProvider {
         let mut guard = entry.lock().await;
         // Fresh turn: clear any stale interrupt flag from a boundary-race steer.
         guard.interrupt.store(false, Ordering::SeqCst);
+        // Replay anything the idle-drain reader collected between turns (late
+        // post-result events, push-style notifications) BEFORE this turn's
+        // content, in order. A stray duplicate `result` here must not end the
+        // new turn — its return value is deliberately ignored.
+        for line in std::mem::take(&mut guard.pending_lines) {
+            if let Ok(v) = serde_json::from_str::<Value>(&line) {
+                let _ = claude_handle_line(&v, &sink, &mut st, true);
+            }
+        }
         // Model changed since spawn (e.g. GUI Reconfigure) → switch the live
         // process with a control message instead of respawning, keeping context.
         let want_model = claude_model_arg(&req.model).unwrap_or("");
@@ -1807,6 +1885,20 @@ fn claude_tuning_args(req: &TurnRequest) -> Vec<String> {
     {
         a.push("--max-budget-usd".to_string());
         a.push(b);
+    }
+    // Opt-in MCP bridge: expose Oxide's session_search to the claude agent.
+    // The env value is the PATH to the `oxide` CLI binary (deliberately not
+    // auto-derived — the GUI binary is a different executable, and a wrong
+    // spawn would add silent noise to every session).
+    if let Some(bin) = std::env::var("OXIDE_MCP_BRIDGE")
+        .ok()
+        .filter(|s| !s.trim().is_empty() && s != "0")
+    {
+        let cfg = serde_json::json!({
+            "mcpServers": { "oxide": { "command": bin, "args": ["mcp-serve"] } }
+        });
+        a.push("--mcp-config".to_string());
+        a.push(cfg.to_string());
     }
     // Harness persona/policy appended to Claude Code's own base prompt (opt-in).
     if let Some(extra) = req

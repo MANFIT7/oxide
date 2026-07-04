@@ -235,6 +235,9 @@ pub enum Event {
         turn: TurnId,
         input: u64,
         output: u64,
+        /// USD cost of the turn when the backend reports it (claude CLI).
+        #[serde(default)]
+        cost_usd: Option<f64>,
         /// Of `input`, tokens served from the prompt cache (0 if unreported).
         #[serde(default)]
         cached_input: u64,

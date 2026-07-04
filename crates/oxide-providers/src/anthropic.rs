@@ -235,6 +235,7 @@ impl Provider for AnthropicProvider {
                     let output = data["usage"]["output_tokens"].as_u64().unwrap_or(0);
                     let _ = sink
                         .send(StreamItem::Usage {
+                            cost_usd: None,
                             input: input_tokens,
                             output,
                             context_window: None,

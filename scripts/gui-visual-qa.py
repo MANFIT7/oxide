@@ -362,7 +362,11 @@ def main() -> int:
                 "bottomDistance",
                 "hasSelection",
                 "typingTarget",
-                "userScrollIntent",
+                # Direction-based unstick: an upward wheel releases the follow
+                # IMMEDIATELY (a distance threshold was unreachable mid-stream).
+                "ev.deltaY < 0",
+                # Re-arm only at the true bottom, never by proximity.
+                "if (d < 8) window.__oxstick = true;",
                 "requestAnimationFrame(() =>",
                 "window.__oxstick !== false",
             ],

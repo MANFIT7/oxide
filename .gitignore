@@ -1,4 +1,6 @@
-/target
+# `target/` (unanchored) also catches nested crates/*/target from a cargo run
+# with cwd inside a crate — the anchored `/target` let those leak into status.
+target/
 **/*.rs.bk
 Cargo.lock.bak
 .DS_Store
@@ -18,6 +20,11 @@ Cargo.lock.bak
 .oxide/trash/
 **/.oxide/trash/
 oxide-macos-arm64
+# Release artifacts are built + attached by CI (release.yml) — never tracked.
+# A 12MB gz committed 78× is what ballooned .git to 1GB.
+oxide-macos-arm64.gz
+oxide-macos-arm64.gz.sha256
+.tmp/
 **/.oxide/worktrees/
 **/.oxide/screenshots/
 **/.oxide/board.json

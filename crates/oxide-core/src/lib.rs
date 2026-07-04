@@ -904,6 +904,182 @@ fn mcp_pool_key(server: &McpServerConfig) -> String {
     key.join("\u{1e}")
 }
 
+/// hermes-style progressive tool disclosure: when the DEFERRABLE (MCP) tool
+/// schemas would eat too much of the context on every request, they are
+/// stripped from the model-visible array and replaced by three tiny bridge
+/// tools. The full specs stay registered with the router, so a bridged call
+/// still hits the normal approval/sandbox chokepoint.
+/// The detached reviewer call behind [`Engine::maybe_self_review`]. Restricted
+/// toolset — the model can ONLY `remember`/`save_skill`; its text output is
+/// discarded, tool calls are applied directly to the memory store.
+async fn self_review_task(
+    provider_id: String,
+    model: String,
+    workspace: std::path::PathBuf,
+    digest: String,
+) {
+    use oxide_providers::{Message, Role, StreamItem, TurnRequest};
+    let provider = oxide_providers::build(&provider_id);
+    let tools = vec![
+        ToolSpec::new("remember", "Save ONE durable user preference or project fact.")
+            .params(serde_json::json!({"type":"object","properties":{"text":{"type":"string"}},"required":["text"]})),
+        ToolSpec::new("save_skill", "Save ONE reusable multi-step procedure as markdown.")
+            .params(serde_json::json!({"type":"object","properties":{
+                "name":{"type":"string"},"content":{"type":"string"}
+            },"required":["name","content"]})),
+    ];
+    let req = TurnRequest {
+        model,
+        reasoning_effort: "low".to_string(),
+        temperature: 0.2,
+        messages: vec![
+            Message::new(
+                Role::System,
+                "You are Oxide's background self-improvement reviewer. Read the conversation \
+                 digest. ONLY if it contains a durable user preference/project fact, call \
+                 `remember`; ONLY if it contains a reusable multi-step procedure worth \
+                 repeating in future sessions, call `save_skill` (concise markdown). At most \
+                 2 calls total. Most digests contain NOTHING durable — then reply exactly \
+                 'nothing'. Never echo the digest.",
+            ),
+            Message::new(Role::User, digest),
+        ],
+        tools,
+        cwd: workspace.display().to_string(),
+        conversation_id: String::new(),
+        cli_resume: None,
+        system_append: None,
+        claude_agents: None,
+    };
+    let (tx, mut rx) = mpsc::channel(64);
+    let worker = tokio::spawn(async move {
+        let _ = provider.stream(req, tx).await;
+    });
+    let mem = memory::Memory::new(&workspace);
+    let mut applied = 0u8;
+    while let Some(item) = rx.recv().await {
+        if applied >= 2 {
+            continue; // drain silently; cap writes
+        }
+        if let StreamItem::ToolCall {
+            name, arguments, ..
+        } = item
+        {
+            match name.as_str() {
+                "remember" => {
+                    if let Some(t) = arguments["text"].as_str() {
+                        let _ = mem.remember(t);
+                        applied += 1;
+                    }
+                }
+                "save_skill" => {
+                    if let (Some(n), Some(c)) =
+                        (arguments["name"].as_str(), arguments["content"].as_str())
+                    {
+                        let _ = mem.save_skill(n, c);
+                        applied += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let _ = worker.await;
+    if applied > 0 {
+        tracing::info!(applied, "self-review saved durable knowledge");
+    }
+}
+
+fn deferrable_schema_chars(tools: &[ToolSpec]) -> usize {
+    tools
+        .iter()
+        .map(|t| {
+            t.name.len()
+                + t.description.len()
+                + serde_json::to_string(&t.parameters)
+                    .map(|s| s.len())
+                    .unwrap_or(0)
+        })
+        .sum()
+}
+
+fn tool_bridge_specs() -> Vec<ToolSpec> {
+    vec![
+        ToolSpec::new(
+            "tool_search",
+            "Find available EXTERNAL (MCP) tools by keyword. Their full schemas are deferred to keep context small — search first, then `tool_describe`, then `tool_call`.",
+        )
+        .params(serde_json::json!({"type":"object","properties":{"query":{"type":"string"}},"required":["query"]})),
+        ToolSpec::new(
+            "tool_describe",
+            "Get the full JSON schema of a deferred external tool by exact name (from tool_search).",
+        )
+        .params(serde_json::json!({"type":"object","properties":{"name":{"type":"string"}},"required":["name"]})),
+        ToolSpec::new(
+            "tool_call",
+            "Invoke a deferred external tool by exact name with its arguments object. Permissions apply exactly as if called directly.",
+        )
+        .mutating(true)
+        .params(serde_json::json!({"type":"object","properties":{
+            "name":{"type":"string"},
+            "arguments":{"type":"object"}
+        },"required":["name"]})),
+    ]
+}
+
+/// Keyword search over deferred tools (name > description weighting).
+fn search_deferred(deferred: &[ToolSpec], query: &str) -> String {
+    if deferred.is_empty() {
+        return "tool_search: no tools are deferred right now — every available tool is already in your tool list.".to_string();
+    }
+    let words: Vec<String> = query
+        .split_whitespace()
+        .map(|w| w.to_ascii_lowercase())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let mut scored: Vec<(i32, &ToolSpec)> = deferred
+        .iter()
+        .map(|t| {
+            let name = t.name.to_ascii_lowercase();
+            let desc = t.description.to_ascii_lowercase();
+            let score: i32 = words
+                .iter()
+                .map(|w| {
+                    (if name.contains(w.as_str()) { 3 } else { 0 })
+                        + (if desc.contains(w.as_str()) { 1 } else { 0 })
+                })
+                .sum();
+            (score, t)
+        })
+        .filter(|(s, _)| *s > 0 || words.is_empty())
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.name.cmp(&b.1.name)));
+    if scored.is_empty() {
+        return format!(
+            "tool_search: nothing matched \"{query}\" among {} deferred tools.",
+            deferred.len()
+        );
+    }
+    let mut out = "Matching deferred tools (use tool_describe / tool_call):\n".to_string();
+    for (_, t) in scored.iter().take(8) {
+        let desc: String = t.description.chars().take(110).collect();
+        out.push_str(&format!("- {} — {}\n", t.name, desc));
+    }
+    out
+}
+
+fn describe_deferred(deferred: &[ToolSpec], name: &str) -> String {
+    match deferred.iter().find(|t| t.name == name) {
+        Some(t) => format!(
+            "{} — {}\nparameters schema:\n{}",
+            t.name,
+            t.description,
+            serde_json::to_string_pretty(&t.parameters).unwrap_or_else(|_| "{}".into())
+        ),
+        None => format!("tool_describe: no deferred tool named '{name}' — use tool_search."),
+    }
+}
+
 fn filter_mcp_tools(server: &McpServerConfig, tools: Vec<ToolSpec>) -> Vec<ToolSpec> {
     let prefix = format!("mcp__{}__", server.name);
     tools
@@ -1213,6 +1389,8 @@ pub fn spawn(config: Config) -> anyhow::Result<(EngineHandle, mpsc::Receiver<Eve
         checkpoints: Arc::new(Mutex::new(CheckpointStore::default())),
         mcp_clients: Vec::new(),
         mcp_tools: Vec::new(),
+        deferred_tools: Vec::new(),
+        turns_since_review: 0,
         mcp_instructions: Vec::new(),
         required_mcp_unavailable: false,
         browser: None,
@@ -1515,6 +1693,11 @@ struct Engine {
     mcp_clients: Vec<std::sync::Arc<McpClient>>,
     /// Namespaced tool specs discovered from all MCP servers.
     mcp_tools: Vec<ToolSpec>,
+    /// Tools stripped from the model-visible array this turn (schema bloat) —
+    /// reachable via the tool_search/tool_describe/tool_call bridge.
+    deferred_tools: Vec<ToolSpec>,
+    /// Completed turns since the last background self-review fork.
+    turns_since_review: u32,
     /// Server-level MCP instructions returned during initialize.
     mcp_instructions: Vec<(String, String)>,
     /// True when a configured required MCP server failed to connect.
@@ -1821,6 +2004,74 @@ impl Engine {
 
     async fn rewind_checkpoint(&self, checkpoint_id: u64) -> u64 {
         self.checkpoints.lock().await.rewind(checkpoint_id)
+    }
+
+    /// Background self-improvement (hermes' review loop, v1): every
+    /// `SELF_REVIEW_INTERVAL` completed turns, fork a DETACHED reviewer call
+    /// that replays a compact digest of the recent conversation with ONLY the
+    /// `remember`/`save_skill` tools and applies what it saves. The main
+    /// conversation is never touched; failures are silent (best-effort).
+    fn maybe_self_review(&mut self) {
+        const SELF_REVIEW_INTERVAL: u32 = 5;
+        let cli_driver = matches!(
+            self.config.provider.as_str(),
+            "codex" | "claude" | "claude_interactive"
+        );
+        if cli_driver || self.config.provider == "echo" {
+            return;
+        }
+        self.turns_since_review += 1;
+        if self.turns_since_review < SELF_REVIEW_INTERVAL {
+            return;
+        }
+        self.turns_since_review = 0;
+        // Compact digest: the last few user/assistant exchanges.
+        let digest: String = self
+            .session
+            .iter()
+            .rev()
+            .filter(|m| {
+                matches!(
+                    m.role,
+                    oxide_providers::Role::User | oxide_providers::Role::Assistant
+                )
+            })
+            .take(12)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .map(|m| {
+                let role = if matches!(m.role, oxide_providers::Role::User) {
+                    "user"
+                } else {
+                    "assistant"
+                };
+                let text: String = m.content.chars().take(600).collect();
+                format!("[{role}] {text}\n")
+            })
+            .collect();
+        if digest.trim().is_empty() {
+            return;
+        }
+        let provider_id = self.config.provider.clone();
+        let model = self.config.model.clone();
+        let workspace = self.workspace.clone();
+        tokio::spawn(self_review_task(provider_id, model, workspace, digest));
+    }
+
+    /// Surface a session-db failure (if any) before the turn closes. The db
+    /// layer deliberately degrades on errors (warn + empty result) so the app
+    /// keeps working — but the user must KNOW the transcript isn't persisting,
+    /// or messages vanish silently (disk full, locked db, …).
+    async fn note_db_error_once(&self) {
+        if let Some(e) = db::take_db_error() {
+            self.emit(Event::Info {
+                text: format!(
+                    "\u{26a0} session database write failed: {e} — recent messages may not be persisted (check disk space)."
+                ),
+            })
+            .await;
+        }
     }
 
     /// Abort the warm persistent-claude child's in-flight generation (no-op for
@@ -2729,7 +2980,14 @@ Rules:
                                 .into(),
                         })
                         .await;
+                        self.note_db_error_once().await;
                         self.emit(Event::TurnFinished { turn }).await;
+                    } else {
+                        // hermes-style background self-improvement: every few
+                        // turns a detached reviewer distills durable facts/
+                        // skills from the conversation (engine-loop providers
+                        // only — CLI agents run their own memory nudges).
+                        self.maybe_self_review();
                     }
                 }
                 Op::SetHarness { id } => self.set_harness(id).await,
@@ -3039,11 +3297,13 @@ Rules:
                     context_window,
                     cached_input,
                     reasoning_output,
+                    cost_usd,
                 } => {
                     self.emit(Event::TokensUsed {
                         turn,
                         input,
                         output,
+                        cost_usd,
                         cached_input,
                         reasoning_output,
                     })
@@ -3288,8 +3548,8 @@ Rules:
                                         duration_ms,
                                     }).await;
                                 }
-                                Some(StreamItem::Usage { input, output, context_window, cached_input, reasoning_output }) => {
-                                    self.emit(Event::TokensUsed { turn, input, output, cached_input, reasoning_output }).await;
+                                Some(StreamItem::Usage { input, output, context_window, cached_input, reasoning_output, cost_usd }) => {
+                                    self.emit(Event::TokensUsed { turn, input, output, cost_usd, cached_input, reasoning_output }).await;
                                 if let Some(limit) = context_window {
                                     self.ctx_window = Some(limit);
                                     self.emit(Event::ContextWindow { limit }).await;
@@ -3506,6 +3766,8 @@ Reply with text only: summarize what you changed, what you verified, and what re
             checkpoints: Arc::clone(&self.checkpoints),
             mcp_clients: self.mcp_clients.clone(),
             mcp_tools: self.mcp_tools.clone(),
+            deferred_tools: Vec::new(),
+            turns_since_review: 0,
             mcp_instructions: self.mcp_instructions.clone(),
             required_mcp_unavailable: self.required_mcp_unavailable,
             browser: None,
@@ -3699,6 +3961,7 @@ Reply with text only: summarize what you changed, what you verified, and what re
                 message: "required MCP server unavailable; fix MCP settings or disable required before starting a turn".to_string(),
             })
             .await;
+            self.note_db_error_once().await;
             self.emit(Event::TurnFinished { turn }).await;
             return;
         }
@@ -3749,7 +4012,26 @@ Treat the following as the only current, top-priority instruction:]\n\n{user_tex
         // Keep the running history under budget — summarize, don't just drop.
         self.compact_session(turn).await;
 
-        let tools = self.all_tools();
+        // Progressive tool disclosure (hermes tool_search): defer MCP schemas
+        // when they'd eat >~10% of the context window on EVERY request.
+        let tools = {
+            let full = self.all_tools();
+            let (mcp, mut rest): (Vec<ToolSpec>, Vec<ToolSpec>) =
+                full.into_iter().partition(|t| is_mcp_tool(&t.name));
+            let budget = self
+                .ctx_window
+                .map(|c| (c as usize).saturating_mul(4) / 10)
+                .unwrap_or(80_000);
+            if deferrable_schema_chars(&mcp) > budget {
+                self.deferred_tools = mcp;
+                rest.extend(tool_bridge_specs());
+                rest
+            } else {
+                self.deferred_tools.clear();
+                rest.extend(mcp);
+                rest
+            }
+        };
         let mem_block = memory::Memory::new(&self.workspace).load_block();
         let harness = self.active_harness();
         let policy = harness.loop_policy();
@@ -4001,6 +4283,7 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                 })
                 .await;
                 self.run_stop_lifecycle(turn, &user_text, true).await;
+                self.note_db_error_once().await;
                 self.emit(Event::TurnFinished { turn }).await;
                 return;
             }
@@ -4065,6 +4348,7 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                     self.session.push(Message::new(Role::Assistant, assistant));
                 }
                 self.run_stop_lifecycle(turn, &user_text, true).await;
+                self.note_db_error_once().await;
                 self.emit(Event::TurnFinished { turn }).await;
                 return;
             }
@@ -4154,6 +4438,7 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                 self.session.push(Message::new(Role::Assistant, assistant));
             }
             self.run_stop_lifecycle(turn, &user_text, interrupted).await;
+            self.note_db_error_once().await;
             self.emit(Event::TurnFinished { turn }).await;
             return;
         }
@@ -4339,8 +4624,8 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                                         duration_ms,
                                     }).await;
                                 }
-                                Some(StreamItem::Usage { input, output, context_window, cached_input, reasoning_output }) => {
-                                    self.emit(Event::TokensUsed { turn, input, output, cached_input, reasoning_output }).await;
+                                Some(StreamItem::Usage { input, output, context_window, cached_input, reasoning_output, cost_usd }) => {
+                                    self.emit(Event::TokensUsed { turn, input, output, cost_usd, cached_input, reasoning_output }).await;
                                 if let Some(limit) = context_window {
                                     self.ctx_window = Some(limit);
                                     self.emit(Event::ContextWindow { limit }).await;
@@ -4664,6 +4949,7 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
             .await;
         }
         self.run_stop_lifecycle(turn, &user_text, interrupted).await;
+        self.note_db_error_once().await;
         self.emit(Event::TurnFinished { turn }).await;
 
         // Context-aware follow-up suggestions, generated off-turn on the fast
@@ -4952,11 +5238,30 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
         &mut self,
         turn: TurnId,
         name: String,
-        mut arguments: serde_json::Value,
+        arguments: serde_json::Value,
         call_id: String,
         worker_id: Option<&str>,
         op_rx: &mut mpsc::Receiver<Op>,
     ) -> bool {
+        // Unwrap the tool_search bridge invoker FIRST: approval routing keys on
+        // the tool name, so the invocation must proceed as the REAL tool —
+        // guardrails, summaries, and the UI all see the underlying call
+        // (hermes' "routes through the normal dispatcher" rule). An unknown /
+        // non-deferred inner name falls through to the `tool_call` error arm.
+        let (name, mut arguments) = if name == "tool_call" {
+            let inner = arguments["name"].as_str().unwrap_or("").to_string();
+            let inner_args = arguments
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            if !inner.is_empty() && self.deferred_tools.iter().any(|t| t.name == inner) {
+                (inner, inner_args)
+            } else {
+                (name, arguments)
+            }
+        } else {
+            (name, arguments)
+        };
         self.emit(Event::ToolCallBegin {
             turn,
             call_id: call_id.clone(),
@@ -5445,6 +5750,18 @@ Do NOT read it again. Proceed now: make the edits with the edit/write_file tools
                 Ok(Err(_)) => ("session_search: internal error".into(), false),
                 Err(_) => ("session_search: timed out".into(), false),
             }
+        } else if name == "tool_search" {
+            let q = arguments["query"].as_str().unwrap_or("");
+            (crate::search_deferred(&self.deferred_tools, q), true)
+        } else if name == "tool_describe" {
+            let n = arguments["name"].as_str().unwrap_or("");
+            (crate::describe_deferred(&self.deferred_tools, n), true)
+        } else if name == "tool_call" {
+            // Only reached when the unwrap above rejected the inner name.
+            (
+                "tool_call: unknown or non-deferred tool name — find it with `tool_search` first, then pass its exact name.".to_string(),
+                false,
+            )
         } else if name == "edit" {
             match &edit_error {
                 Some(e) => (e.clone(), false),
@@ -6027,6 +6344,29 @@ attributes:
             ),
             vec!["supabase|59e4938976c99701".to_string()]
         );
+    }
+
+    #[test]
+    fn tool_search_bridge_ranks_and_describes() {
+        let deferred = vec![
+            ToolSpec::new(
+                "mcp__gh__create_issue",
+                "Create a GitHub issue in a repository",
+            )
+            .params(serde_json::json!({"type":"object","properties":{"title":{"type":"string"}}})),
+            ToolSpec::new("mcp__db__query", "Run a SQL query against the database"),
+        ];
+        let out = crate::search_deferred(&deferred, "github issue");
+        assert!(out.contains("mcp__gh__create_issue"));
+        // Name+desc hit outranks a non-matching tool (which is filtered out).
+        assert!(!out.contains("mcp__db__query"));
+        let d = crate::describe_deferred(&deferred, "mcp__gh__create_issue");
+        assert!(d.contains("parameters schema"));
+        assert!(d.contains("title"));
+        assert!(crate::describe_deferred(&deferred, "nope").contains("no deferred tool"));
+        assert!(crate::search_deferred(&[], "x").contains("no tools are deferred"));
+        // Char accounting counts name + description + schema.
+        assert!(crate::deferrable_schema_chars(&deferred) > 60);
     }
 
     #[test]

@@ -185,6 +185,9 @@ pub enum StreamItem {
         input: u64,
         output: u64,
         context_window: Option<u64>,
+        /// USD cost of the call when the backend reports it (claude CLI's
+        /// `total_cost_usd`); None elsewhere (subscription/API without a rate).
+        cost_usd: Option<f64>,
         /// Of `input`, how many tokens were served from the prompt cache (0 if the
         /// backend doesn't report it). Drives the cache-hit % in the usage UI.
         cached_input: u64,
@@ -251,6 +254,7 @@ impl Provider for EchoProvider {
         }
         let _ = sink
             .send(StreamItem::Usage {
+                cost_usd: None,
                 input: last_user.split_whitespace().count() as u64,
                 output: reply.split_whitespace().count() as u64,
                 context_window: None,

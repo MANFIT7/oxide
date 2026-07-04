@@ -189,6 +189,7 @@ impl Provider for OpenAiProvider {
             if let Some(usage) = chunk.get("usage").filter(|u| !u.is_null()) {
                 let _ = sink
                     .send(StreamItem::Usage {
+                        cost_usd: None,
                         input: usage["prompt_tokens"].as_u64().unwrap_or(0),
                         output: usage["completion_tokens"].as_u64().unwrap_or(0),
                         context_window: None,
