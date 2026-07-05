@@ -2178,9 +2178,10 @@ details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
 
 /* preview as a right split pane (ara/Cursor style) — chat stays left */
 .center { position: relative; }
-.center.with-preview { padding-right: var(--rpanel, 46%); }
-.center.with-preview .preview-panel { position: absolute; top: 0; right: 0; bottom: 0; width: var(--rpanel, 46%); height: 100%; z-index: 5; box-shadow: -8px 0 24px -18px rgba(0,0,0,.6); }
-@media (max-width: 1100px) { .center.with-preview { padding-right: 52%; } .center.with-preview .preview-panel { width: 52%; } }
+/* padding-right and panel width MUST stay identical, or chat text runs
+   under the panel; min() caps a saved px width wider than the window. */
+.center.with-preview { padding-right: min(var(--rpanel, 46%), calc(100% - 220px)); }
+.center.with-preview .preview-panel { position: absolute; top: 0; right: 0; bottom: 0; width: min(var(--rpanel, 46%), calc(100% - 220px)); height: 100%; z-index: 5; box-shadow: -8px 0 24px -18px rgba(0,0,0,.6); }
 
 /* message hover copy (synara MessageActionButton) */
 .row { position: relative; }
@@ -2408,7 +2409,7 @@ svg { stroke-width: 1.6; }
 }
 
 /* Cursor-style right Changes panel */
-.changes-panel { position: absolute; top: 0; right: 0; bottom: 0; width: var(--rpanel, 46%); z-index: 5; display: flex; flex-direction: column; background: var(--bg); border-left: 1px solid var(--border); animation: panel-in .18s ease-out; }
+.changes-panel { position: absolute; top: 0; right: 0; bottom: 0; width: min(var(--rpanel, 46%), calc(100% - 220px)); z-index: 5; display: flex; flex-direction: column; background: var(--bg); border-left: 1px solid var(--border); animation: panel-in .18s ease-out; }
 .changes-head { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-bottom: 1px solid var(--border); }
 .changes-branch { display: inline-flex; align-items: center; gap: 5px; font-size: 12.5px; font-weight: 600; }
 .changes-branch svg { width: 13px; height: 13px; }
@@ -2714,7 +2715,7 @@ details::details-content { overflow: clip; }
 .queue-steer:hover { color: var(--syn-accent); }
 
 /* ══ Environment pane (synara-style): Files / Terminals / Preview / Diffs ══ */
-.env-panel { position: absolute; top: 0; right: 0; bottom: 0; width: var(--rpanel, 46%); z-index: 5;
+.env-panel { position: absolute; top: 0; right: 0; bottom: 0; width: min(var(--rpanel, 46%), calc(100% - 220px)); z-index: 5;
   display: flex; flex-direction: column; background: var(--bg); border-left: 1px solid var(--border); animation: panel-in .18s ease-out; }
 .env-tabs { display: flex; align-items: center; gap: 2px; padding: 6px 8px; border-bottom: 1px solid var(--border); flex-shrink: 0; }
 .env-tab { display: flex; align-items: center; gap: 6px; padding: 5px 10px; border-radius: 7px; border: none; background: none;
