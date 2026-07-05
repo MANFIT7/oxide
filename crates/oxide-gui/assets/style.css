@@ -3800,17 +3800,22 @@ details.activity-card.has-out .activity-sum { padding: 2px 4px; }
   left: 4.3px;
   top: 4.3px;
   color: var(--muted);
+  /* Graduated opacity per dot — an 8-fold-symmetric ring under steps(8)
+     rotation looks frozen unless the dots differ; the fading tail makes
+     the bright dot visibly tick around. */
   box-shadow:
-    0 -4.4px 0 0,
-    3.1px -3.1px 0 0,
-    4.4px 0 0 0,
-    3.1px 3.1px 0 0,
-    0 4.4px 0 0,
-    -3.1px 3.1px 0 0,
-    -4.4px 0 0 0,
-    -3.1px -3.1px 0 0;
+    0 -4.4px 0 0 currentColor,
+    3.1px -3.1px 0 0 color-mix(in srgb, currentColor 80%, transparent),
+    4.4px 0 0 0 color-mix(in srgb, currentColor 65%, transparent),
+    3.1px 3.1px 0 0 color-mix(in srgb, currentColor 50%, transparent),
+    0 4.4px 0 0 color-mix(in srgb, currentColor 38%, transparent),
+    -3.1px 3.1px 0 0 color-mix(in srgb, currentColor 28%, transparent),
+    -4.4px 0 0 0 color-mix(in srgb, currentColor 20%, transparent),
+    -3.1px -3.1px 0 0 color-mix(in srgb, currentColor 14%, transparent);
   background: transparent;
 }
+/* Spinner alone while a tool runs — the tool icon next to it was redundant. */
+.activity-card.running .activity-tic { display: none; }
 @keyframes dotspin { from { transform: rotate(0); } to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) {
   .activity-spin, .syn-spinner { animation: dotspin 2.4s steps(8) infinite; }
@@ -3847,15 +3852,6 @@ details.activity-card.has-out .activity-sum { padding: 2px 4px; }
 .todo-card { border-radius: 14px; }
 .todo-row { padding: 4px 0; }
 .todo-row.pending .todo-text { color: var(--faint); }
-
-/* Live-changes strip above the composer reads as pills. */
-.composer-live-changes {
-  border-radius: 999px;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  padding: 4px 12px;
-  width: fit-content;
-}
 
 /* Env/changes chips inherit the rounder look. */
 .changes-jump-chip, .bg-chip, .queue-chip { border-radius: 999px; }
