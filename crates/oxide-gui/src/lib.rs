@@ -1260,6 +1260,10 @@ fn parse_ui_spec_message(text: &str) -> Result<UiSpec, String> {
 /// replaces the row's text in place (same ChatMsg id → no DOM remount).
 const UI_SPEC_PREVIEW_MARK: &str = "\u{a7}uispec-preview\t";
 
+/// Env-panel terminals share TerminalView with the TUI tabs — offset their ids
+/// so `term-{id}` DOM hosts and PTY registries never collide with tab ids.
+const ENV_TERM_ID_BASE: u64 = 100_000;
+
 /// Best-effort parse of a truncated JSON prefix (the SpecStream idea from
 /// vercel-labs/json-render): close an open string, trim a dangling
 /// `"key":`/`,` tail, close open braces/brackets — and if that still doesn't
@@ -1584,6 +1588,7 @@ fn visual_fixture_messages(mode: Option<VisualFixtureMode>) -> Vec<ChatMsg> {
 
 fn visual_fixture_ui_spec() -> UiSpec {
     UiSpec {
+        tone: None,
         title: Some("Cursor-grade Visual QA".to_string()),
         root: UiNode {
             id: Some("visual-qa-root".to_string()),
@@ -4266,8 +4271,6 @@ fn app() -> Element {
     let mut recap_text = use_signal(String::new);
     // Multi-terminal model: (id, title, lines).
     let mut terms = use_signal(|| vec![(1u64, "zsh 1".to_string(), Vec::<String>::new())]);
-    // term id → live child pid (streaming runner) for the stop button.
-    let mut term_pids = use_signal(HashMap::<u64, u32>::new);
     let mut term_sel = use_signal(|| 0usize);
     let mut term_seq = use_signal(|| 1u64);
     let mut show_settings = use_signal(|| false);
@@ -5196,7 +5199,6 @@ fn app() -> Element {
     });
 
     // Terminal.
-    let mut term_input = use_signal(String::new);
 
     // ── Engine coroutine (reconfigurable) ─────────────────────────────
     let engine = use_coroutine(move |mut rx: UnboundedReceiver<EngineCmd>| {
@@ -6887,85 +6889,6 @@ fn app() -> Element {
         "Add a unit test for the most important function",
     ];
 
-    // Run a terminal command in the workspace.
-    // Streaming runner: long-lived commands (dev servers, watchers) paint
-    // output line-by-line instead of hanging forever on `.output().await`,
-    // and stay killable via the per-terminal stop button (pid registry).
-    let mut run_term = move || {
-        let cmd = term_input.read().trim().to_string();
-        if cmd.is_empty() {
-            return;
-        }
-        term_input.set(String::new());
-        let term_id = {
-            let sel = *term_sel.peek();
-            let mut tv = terms.write();
-            let Some(t) = tv.get_mut(sel) else { return };
-            t.2.push(format!("$ {cmd}"));
-            t.0
-        };
-        let ws = ui.workspace.read().clone();
-        spawn(async move {
-            use tokio::io::{AsyncBufReadExt, BufReader};
-            const TERM_LINE_CAP: usize = 800;
-            let mut push = move |line: String| {
-                let mut tv = terms.write();
-                if let Some(t) = tv.iter_mut().find(|t| t.0 == term_id) {
-                    t.2.push(line);
-                    let extra = t.2.len().saturating_sub(TERM_LINE_CAP);
-                    if extra > 0 {
-                        t.2.drain(..extra);
-                    }
-                }
-            };
-            let child = tokio::process::Command::new("/bin/sh")
-                .arg("-c")
-                .arg(&cmd)
-                .current_dir(&ws)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .spawn();
-            let mut child = match child {
-                Ok(c) => c,
-                Err(e) => {
-                    push(format!("error: {e}"));
-                    return;
-                }
-            };
-            if let Some(pid) = child.id() {
-                term_pids.write().insert(term_id, pid);
-            }
-            // Signals are thread-local — merge both pipes in THIS dioxus task
-            // (no tokio::spawn) with a select loop until both hit EOF.
-            let mut out_lines = child.stdout.take().map(|r| BufReader::new(r).lines());
-            let mut err_lines = child.stderr.take().map(|r| BufReader::new(r).lines());
-            while out_lines.is_some() || err_lines.is_some() {
-                tokio::select! {
-                    line = async { out_lines.as_mut().expect("guarded").next_line().await }, if out_lines.is_some() => {
-                        match line {
-                            Ok(Some(l)) => push(l),
-                            _ => out_lines = None,
-                        }
-                    }
-                    line = async { err_lines.as_mut().expect("guarded").next_line().await }, if err_lines.is_some() => {
-                        match line {
-                            Ok(Some(l)) => push(l),
-                            _ => err_lines = None,
-                        }
-                    }
-                }
-            }
-            let status = child.wait().await;
-            term_pids.write().remove(&term_id);
-            match status {
-                Ok(st) if !st.success() => push(format!("(exit {})", st.code().unwrap_or(-1))),
-                Err(e) => push(format!("error: {e}")),
-                _ => {}
-            }
-        });
-    };
-
     rsx! {
         style { {CSS} }
         style { {WTERM_CSS} }
@@ -7965,8 +7888,10 @@ fn app() -> Element {
                             }
                         }
                     }
-                    if *show_env.read() {
-                        div { class: "env-panel",
+                    // ALWAYS mounted, CSS-hidden when closed: the Terminals tab hosts
+                    // real PTY shells — unmounting the panel would kill them (same
+                    // Synara lesson as the persistent TUI tabs).
+                    div { class: if *show_env.read() { "env-panel" } else { "env-panel env-hidden" },
                             div { class: "panel-resizer rp", onmousedown: move |e: dioxus::prelude::MouseEvent| {
                                 e.prevent_default();
                                 panel_drag.set(Some((3, e.client_coordinates().x, *rpanel_w.read())));
@@ -8924,8 +8849,11 @@ fn app() -> Element {
                             }
                         }
                     }
-                                if env_tab.read().as_str() == "term" {
-                                    div { class: "env-terms",
+                                // Always mounted (PTY shells live here); hidden via CSS
+                                // when another env tab is active.
+                                {
+                                    rsx! {
+                                    div { class: if env_tab.read().as_str() == "term" { "env-terms" } else { "env-terms env-hidden" },
                                         div { class: "term-tabs",
                                             for ti in 0..terms.read().len() {
                                                 {
@@ -8950,45 +8878,31 @@ fn app() -> Element {
                                                 terms.write().push((id, format!("zsh {id}"), Vec::new()));
                                                 let n = terms.read().len(); term_sel.set(n - 1);
                                             }, Icon { name: "plus" } }
-                                            button { class: "term-tab add", title: "Clear output", onclick: move |_| { let sel = *term_sel.read(); if let Some(t) = terms.write().get_mut(sel) { t.2.clear(); } }, Icon { name: "backspace" } }
-                                            {
-                                                let sel_id = terms.read().get(*term_sel.read()).map(|t| t.0);
-                                                let live_pid = sel_id.and_then(|id| term_pids.read().get(&id).copied());
-                                                rsx! {
-                                                    if let Some(pid) = live_pid {
-                                                        button { class: "term-tab add stop", title: "Stop the running command",
-                                                            onclick: move |_| {
-                                                                let _ = std::process::Command::new("kill").arg("-TERM").arg(pid.to_string()).spawn();
-                                                            }, Icon { name: "stop" } }
+
+
+                                            button { class: "term-tab add", title: "Native GPU terminal (Metal · oxide-term)", onclick: move |_| { launch_native_terminal(); }, Icon { name: "terminal" } }
+                                        }
+                                        // Real PTY login shells (wterm) — one per tab, all
+                                        // kept mounted; only the selected one is visible.
+                                        {
+                                            let sel = *term_sel.read();
+                                            let sel_id = terms.read().get(sel).map(|t| t.0);
+                                            let ws_term = workspace.display().to_string();
+                                            rsx! {
+                                                for t in terms.read().iter().map(|t| t.0).collect::<Vec<_>>() {
+                                                    div {
+                                                        key: "envterm-{t}",
+                                                        class: if Some(t) == sel_id { "env-term-host" } else { "env-term-host env-hidden" },
+                                                        TerminalView { id: ENV_TERM_ID_BASE + t, bin: String::new(), ws: ws_term.clone(), resume: None }
                                                     }
                                                 }
                                             }
-                                            button { class: "term-tab add", title: "Native GPU terminal (Metal · oxide-term)", onclick: move |_| {
-                                                if !launch_native_terminal() {
-                                                    let sel = *term_sel.read();
-                                                    if let Some(t) = terms.write().get_mut(sel) { t.2.push("oxide-term not found — build it: cargo build -p oxide-term".to_string()); }
-                                                }
-                                            }, Icon { name: "terminal" } }
                                         }
-                                        div { class: "term-body",
-                                            {
-                                                let sel = *term_sel.read();
-                                                let tl: Vec<String> = terms.read().get(sel).map(|t| t.2.clone()).unwrap_or_default();
-                                                rsx! { for l in tl { div { class: "term-line", "{l}" } } }
-                                            }
-                                        }
-                                        div { class: "term-input-row",
-                                            span { class: "term-prompt", Icon { name: "chevron" } }
-                                            input { class: "term-input", placeholder: "command…", value: "{term_input}",
-                                                oninput: move |e| term_input.set(e.value()),
-                                                onkeydown: move |e| if e.key() == Key::Enter { run_term(); },
-                                            }
-                                        }
+                                    }
                                     }
                                 }
                             }
                         }
-                    }
                     // Persistent TUI terminals: every "tui" tab renders here ALWAYS,
                     // with a stable key, so switching tabs never unmounts it — which
                     // would close its PTY and kill the CLI (codex/claude), losing the
@@ -9170,6 +9084,15 @@ fn app() -> Element {
                                         },
                                         Icon { name: "spark" } span { "{s}" }
                                     }
+                                }
+                            }
+                            div { class: "hero-pills",
+                                button { class: "hero-pill", onclick: move |_| { let mut pm = plan_mode; let v = *pm.read(); pm.set(!v); },
+                                    if *plan_mode.read() { "Plan mode on" } else { "Plan mode" }
+                                }
+                                button { class: "hero-pill",
+                                    onclick: move |_| select_env_tab(env_tab, show_env, env_tab_by_tab, tabs, active_tab, "files", false),
+                                    "Open Files"
                                 }
                             }
                         }
@@ -12731,11 +12654,6 @@ fn Composer(
                             }
                         }
                     }
-                    div { class: "usage-ring", title: "{ring_title}",
-                        div { class: "ring", style: "{ring_style}",
-                            div { class: "ring-hole", "{ring_num}" }
-                        }
-                    }
                     if *streaming.read() {
                         button { class: "send steer", title: "Steer (inject into the running turn)", onclick: move |_| { let ws = ws_steer.clone(); spawn(async move { submit_ce(streaming, engine, plan_mode, pursue_goal, goal_text, queue, attachments, text_attachments, picked_element, true, ws).await; }); }, Icon { name: "corner-up-right" } }
                         button { class: "send stop", title: "Stop", onclick: move |_| { engine.send(EngineCmd::Interrupt); }, Icon { name: "stop" } }
@@ -12746,6 +12664,11 @@ fn Composer(
             }
         }
         div { class: "selectors",
+            div { class: "usage-ring meta-ring", title: "{ring_title}",
+                div { class: "ring", style: "{ring_style}",
+                    div { class: "ring-hole", "{ring_num}" }
+                }
+            }
             div { class: "sel-anchor",
                 button { class: "selector", onclick: move |_| { let v = *show_proj.read(); show_proj.set(!v); show_branch.set(false); },
                     Icon { name: "folder" } "{project}" span { class: "chev", Icon { name: "chevron" } }
@@ -13408,8 +13331,12 @@ fn tile_leaves(node: &Tile, out: &mut Vec<u64>) {
 
 #[component]
 fn UiSpecView(spec: UiSpec) -> Element {
+    let tone = spec
+        .tone
+        .map(|t| format!(" spec-tone-{}", ui_tone_class(Some(t))))
+        .unwrap_or_default();
     rsx! {
-        div { class: "ui-spec",
+        div { class: "ui-spec{tone}",
             if let Some(title) = spec.title.clone() {
                 div { class: "ui-spec-title", "{title}" }
             }
@@ -13464,6 +13391,10 @@ fn UiNodePreview(node: serde_json::Value, depth: usize) -> Element {
         _ => "",
     };
     match node["type"].as_str() {
+        Some("chart") => {
+            rsx! { div { class: "ui-node ui-chart", span { class: "ui-skel block" } } }
+        }
+        Some("input") | Some("select") => rsx! { span { class: "ui-skel line" } },
         Some("stack") => rsx! {
             div { class: "ui-node ui-stack",
                 for child in children {
@@ -13686,6 +13617,72 @@ fn UiNodeView(node: UiNode) -> Element {
         UiNodeKind::Divider => rsx! {
             div { class: "ui-node ui-divider" }
         },
+        UiNodeKind::Chart => {
+            // Inline SVG sparkline — normalized to the node's min/max.
+            let pts = props.points.clone();
+            let label = props.label.clone().unwrap_or_default();
+            let (min, max) = pts
+                .iter()
+                .fold((f64::MAX, f64::MIN), |(lo, hi), p| (lo.min(*p), hi.max(*p)));
+            let span = if (max - min).abs() < f64::EPSILON {
+                1.0
+            } else {
+                max - min
+            };
+            let n = pts.len().max(2) as f64;
+            let path: String = pts
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    let x = i as f64 / (n - 1.0) * 100.0;
+                    let y = 28.0 - ((p - min) / span * 24.0) - 2.0;
+                    format!("{x:.1},{y:.1}")
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            rsx! {
+                div { class: "ui-node ui-chart",
+                    if !label.is_empty() { div { class: "ui-metric-label", "{label}" } }
+                    svg { view_box: "0 0 100 28", preserve_aspect_ratio: "none",
+                        polyline { points: "{path}", fill: "none" }
+                    }
+                }
+            }
+        }
+        UiNodeKind::Input => {
+            let label = props.label.clone().unwrap_or_default();
+            let ph = props.placeholder.clone().unwrap_or_default();
+            let val = props.value.clone().unwrap_or_default();
+            let key = node
+                .id
+                .clone()
+                .or(props.label.clone())
+                .unwrap_or_else(|| "input".to_string());
+            rsx! {
+                label { class: "ui-node ui-field",
+                    if !label.is_empty() { span { class: "ui-field-label", "{label}" } }
+                    input { class: "ui-input", "data-key": "{key}", placeholder: "{ph}", value: "{val}" }
+                }
+            }
+        }
+        UiNodeKind::Select => {
+            let label = props.label.clone().unwrap_or_default();
+            let key = node
+                .id
+                .clone()
+                .or(props.label.clone())
+                .unwrap_or_else(|| "select".to_string());
+            rsx! {
+                label { class: "ui-node ui-field",
+                    if !label.is_empty() { span { class: "ui-field-label", "{label}" } }
+                    select { class: "ui-select", "data-key": "{key}",
+                        for opt in props.options.clone() {
+                            option { value: "{opt}", "{opt}" }
+                        }
+                    }
+                }
+            }
+        }
         UiNodeKind::Action => {
             if let Some(action) = props.action {
                 let label = action.label.clone();
@@ -13694,15 +13691,39 @@ fn UiNodeView(node: UiNode) -> Element {
                     "payload": action.payload,
                 }))
                 .unwrap_or_default();
-                let clipboard = serde_json::to_string(&payload).unwrap_or_default();
+                // Two-way (json-render style): clicking SUBMITS the action back
+                // to the agent, attaching sibling input/select values from this
+                // card (scraped from the DOM — no per-node signal plumbing).
+                let engine = use_coroutine_handle::<EngineCmd>();
+                let action_name = action.name.clone();
                 rsx! {
                     button {
                         class: "ui-node ui-action",
-                        title: "Copy action payload",
+                        title: "Send this action to the agent",
                         onclick: move |_| {
-                            let c = clipboard.clone();
+                            let payload = payload.clone();
+                            let action_name = action_name.clone();
                             spawn(async move {
-                                let _ = document::eval(&format!("navigator.clipboard.writeText({c})")).await;
+                                let form = dioxus::document::eval(
+                                    "const b=document.activeElement; const c=b&&b.closest?b.closest('.ui-spec'):null; \
+                                     const out={}; if(c){ c.querySelectorAll('.ui-input,.ui-select').forEach(e=>{ out[e.dataset.key||'field']=e.value; }); } \
+                                     return JSON.stringify(out);",
+                                )
+                                .join::<String>()
+                                .await
+                                .unwrap_or_default();
+                                let form_note = if form.is_empty() || form == "{}" {
+                                    String::new()
+                                } else {
+                                    format!("\nForm values: {form}")
+                                };
+                                let text = format!(
+                                    "UI action clicked: {action_name}\nPayload: {payload}{form_note}"
+                                );
+                                engine.send(EngineCmd::Submit {
+                                    engine: text.clone(),
+                                    display: format!("\u{25b8} {action_name}"),
+                                });
                             });
                         },
                         "{label}"

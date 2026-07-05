@@ -322,6 +322,9 @@ const UI_SPEC_MAX_CELL_CHARS: usize = 1_000;
 pub struct UiSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// Optional card theme (tints the whole artifact).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tone: Option<UiTone>,
     pub root: UiNode,
 }
 
@@ -374,6 +377,9 @@ impl UiNode {
                 Err("ui action nodes require props.action".to_string())
             }
             UiNodeKind::Text
+            | UiNodeKind::Chart
+            | UiNodeKind::Input
+            | UiNodeKind::Select
             | UiNodeKind::Metric
             | UiNodeKind::Code
             | UiNodeKind::Alert
@@ -404,6 +410,9 @@ pub enum UiNodeKind {
     Alert,
     Divider,
     Action,
+    Chart,
+    Input,
+    Select,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -428,6 +437,14 @@ pub struct UiProps {
     pub rows: Vec<BTreeMap<String, serde_json::Value>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<UiAction>,
+    /// Chart data points (sparkline), oldest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub points: Vec<f64>,
+    /// Select options.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placeholder: Option<String>,
 }
 
 impl UiProps {
@@ -438,8 +455,21 @@ impl UiProps {
         bounded_text("value", self.value.as_deref(), UI_SPEC_MAX_TEXT_CHARS)?;
         bounded_text("caption", self.caption.as_deref(), UI_SPEC_MAX_TEXT_CHARS)?;
         bounded_text("language", self.language.as_deref(), 40)?;
+        bounded_text("placeholder", self.placeholder.as_deref(), 200)?;
         if let Some(action) = &self.action {
             action.validate()?;
+        }
+        if self.points.len() > 120 {
+            return Err("ui chart exceeds max 120 points".to_string());
+        }
+        if self.points.iter().any(|p| !p.is_finite()) {
+            return Err("ui chart points must be finite numbers".to_string());
+        }
+        if self.options.len() > 12 {
+            return Err("ui select exceeds max 12 options".to_string());
+        }
+        for opt in &self.options {
+            bounded_text("option", Some(opt), 80)?;
         }
         if self.columns.len() > UI_SPEC_MAX_COLUMNS {
             return Err(format!(
@@ -487,6 +517,20 @@ impl UiProps {
                     return Err("ui action nodes cannot define table props".to_string());
                 }
             }
+            UiNodeKind::Chart => {
+                if self.points.len() < 2 {
+                    return Err("ui chart requires at least 2 points".to_string());
+                }
+                if self.action.is_some() {
+                    return Err("ui chart nodes cannot define action props".to_string());
+                }
+            }
+            UiNodeKind::Select => {
+                if self.options.is_empty() {
+                    return Err("ui select requires options".to_string());
+                }
+            }
+            UiNodeKind::Input => {}
             _ => {
                 if !self.columns.is_empty() || !self.rows.is_empty() {
                     return Err(format!(
@@ -497,6 +541,12 @@ impl UiProps {
                 if self.action.is_some() {
                     return Err(format!(
                         "ui {} nodes cannot define action props",
+                        kind.as_str()
+                    ));
+                }
+                if !self.points.is_empty() || !self.options.is_empty() {
+                    return Err(format!(
+                        "ui {} nodes cannot define chart/select props",
                         kind.as_str()
                     ));
                 }
@@ -519,6 +569,9 @@ impl UiNodeKind {
             UiNodeKind::Alert => "alert",
             UiNodeKind::Divider => "divider",
             UiNodeKind::Action => "action",
+            UiNodeKind::Chart => "chart",
+            UiNodeKind::Input => "input",
+            UiNodeKind::Select => "select",
         }
     }
 }
@@ -731,6 +784,7 @@ mod tests {
     #[test]
     fn ui_spec_event_serializes_rust_native_contract() {
         let spec = UiSpec {
+            tone: None,
             title: Some("Build Health".to_string()),
             root: UiNode {
                 id: Some("root".to_string()),
@@ -787,6 +841,7 @@ mod tests {
             };
         }
         let spec = UiSpec {
+            tone: None,
             title: None,
             root: node,
         };
@@ -797,6 +852,7 @@ mod tests {
     #[test]
     fn ui_spec_validation_rejects_invalid_action_and_table_shapes() {
         let action_without_payload = UiSpec {
+            tone: None,
             title: None,
             root: UiNode {
                 id: None,
@@ -811,6 +867,7 @@ mod tests {
             .contains("action"));
 
         let table_with_unknown_key = UiSpec {
+            tone: None,
             title: None,
             root: UiNode {
                 id: None,

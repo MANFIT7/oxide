@@ -55,40 +55,41 @@
 
 /* Light — Synara palette */
 .app[data-theme="light"] {
-  --bg: #fcfcfc;
+  /* Cursor Agents Window porcelain: warm paper, near-black ink. */
+  --bg: #f6f5f2;
   background: var(--bg) !important;
-  --sidebar: #f4f4f5;
-  --surface: #ffffff;
-  --surface-hi: #f0f0f1;
-  --border: rgba(0,0,0,.06);
-  --text: #262626;
-  --muted: #565656;
-  --faint: #8a8a8a;
-  --accent: #262626;
+  --sidebar: #efeeea;
+  --surface: #fbfaf8;
+  --surface-hi: #edece7;
+  --border: rgba(60, 50, 30, 0.09);
+  --text: #2a2a28;
+  --muted: #6b6a66;
+  --faint: #98968f;
+  --accent: #1f1f1e;
   --on-accent: #ffffff;
   --danger: #ba2623;
-  --composer: #ffffff;
-  --menu-bg: #ffffff;
-  --menu-border: rgba(0,0,0,.08);
+  --composer: #fcfbf9;
+  --menu-bg: #fcfbf9;
+  --menu-border: rgba(60, 50, 30, 0.12);
   --syn-accent: #526fff;
   background: var(--bg);
 }
 @media (prefers-color-scheme: light) {
   .app[data-theme="system"] {
-    --bg: #fcfcfc;
-    --sidebar: #f4f4f5;
-    --surface: #ffffff;
-    --surface-hi: #f0f0f1;
-    --border: rgba(0,0,0,.06);
-    --text: #262626;
-    --muted: #565656;
-    --faint: #8a8a8a;
-    --accent: #262626;
+    --bg: #f6f5f2;
+    --sidebar: #efeeea;
+    --surface: #fbfaf8;
+    --surface-hi: #edece7;
+    --border: rgba(60, 50, 30, 0.09);
+    --text: #2a2a28;
+    --muted: #6b6a66;
+    --faint: #98968f;
+    --accent: #1f1f1e;
     --on-accent: #ffffff;
     --danger: #ba2623;
-    --composer: #ffffff;
-    --menu-bg: #ffffff;
-    --menu-border: rgba(0,0,0,.08);
+    --composer: #fcfbf9;
+    --menu-bg: #fcfbf9;
+    --menu-border: rgba(60, 50, 30, 0.12);
     --syn-accent: #526fff;
     background: var(--bg);
   }
@@ -3744,3 +3745,182 @@ details.bg-chip.bg-watch[open] { max-width: 100%; flex-basis: 100%; border-radiu
 
 /* Terminal prompt chevron points right like a shell ">" (default svg points down). */
 .term-prompt svg { transform: rotate(-90deg); }
+
+/* ══ Cursor Agents Window design pass (design + animation only) ═══════════
+   Quiet tool lines, dotted spinners, rounder composer, softer chrome.
+   Palette change is light-theme only; these shape rules apply to both. */
+
+/* Tool calls: quiet text lines instead of bordered cards ("Ran git status"). */
+.activity-card,
+.activity-card.running,
+.activity-card.fail {
+  background: none;
+  border: none;
+  border-radius: 8px;
+  padding: 2px 4px;
+  gap: 8px;
+  font-size: 13px;
+}
+.activity-card .activity-verb { color: var(--text); font-weight: 500; }
+.activity-card .activity-text { color: var(--faint); }
+.activity-card .activity-tic svg { width: 12px; height: 12px; }
+.activity-card.fail .activity-verb { color: var(--danger, #ba2623); }
+details.activity-card.has-out { padding: 0; }
+details.activity-card.has-out .activity-sum { padding: 2px 4px; }
+/* Grouped tools: quiet header, no pill box. */
+.act-group-head {
+  background: none;
+  border: none;
+  padding: 3px 4px;
+  font-size: 13px;
+}
+.act-group-head:hover { background: color-mix(in srgb, var(--text) 4%, transparent); border-radius: 8px; }
+
+/* Dotted orbit spinner (Cursor's subagent/working glyph): 8 dots ticking. */
+.activity-spin,
+.syn-spinner {
+  width: 11px;
+  height: 11px;
+  border: none;
+  border-radius: 0;
+  position: relative;
+  flex-shrink: 0;
+  animation: dotspin 0.9s steps(8) infinite;
+  will-change: transform;
+}
+.activity-spin::before,
+.syn-spinner::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  /* 8-dot ring drawn with one box-shadow (element itself stays invisible). */
+  width: 2.4px;
+  height: 2.4px;
+  left: 4.3px;
+  top: 4.3px;
+  color: var(--muted);
+  box-shadow:
+    0 -4.4px 0 0,
+    3.1px -3.1px 0 0,
+    4.4px 0 0 0,
+    3.1px 3.1px 0 0,
+    0 4.4px 0 0,
+    -3.1px 3.1px 0 0,
+    -4.4px 0 0 0,
+    -3.1px -3.1px 0 0;
+  background: transparent;
+}
+@keyframes dotspin { from { transform: rotate(0); } to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .activity-spin, .syn-spinner { animation: dotspin 2.4s steps(8) infinite; }
+}
+
+/* Composer: big soft rounded field, round dark send button. */
+.composer { border-radius: 22px; }
+.composer .send {
+  border-radius: 50%;
+  width: 30px;
+  height: 30px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.app[data-theme="light"] .composer,
+.app[data-theme="system"] .composer {
+  border-color: rgba(60, 50, 30, 0.12);
+  box-shadow: 0 6px 24px -10px rgba(50, 40, 20, 0.18);
+}
+
+/* Status pill: quiet — no box, just spinner + shimmer inline. */
+.status-pill { background: none; border: none; padding: 4px 0; }
+
+/* Thinking header quiet like "Thought briefly". */
+.thinking-sum { font-weight: 500; }
+
+/* Sidebar rows: soft hover, rounded; unread/status dots already in place. */
+.thread { border-radius: 9px; }
+.thread:hover { background: color-mix(in srgb, var(--text) 5%, transparent); }
+.thread.active { background: color-mix(in srgb, var(--text) 8%, transparent); }
+
+/* Todo card: Cursor checklist — quiet card, hollow/checked circles. */
+.todo-card { border-radius: 14px; }
+.todo-row { padding: 4px 0; }
+.todo-row.pending .todo-text { color: var(--faint); }
+
+/* Live-changes strip above the composer reads as pills. */
+.composer-live-changes {
+  border-radius: 999px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  padding: 4px 12px;
+  width: fit-content;
+}
+
+/* Env/changes chips inherit the rounder look. */
+.changes-jump-chip, .bg-chip, .queue-chip { border-radius: 999px; }
+
+/* Hero suggestion pills (Cursor home: quiet action chips under the composer). */
+.hero-pills { display: flex; gap: 8px; margin-top: 12px; justify-content: center; }
+.hero-pill {
+  padding: 6px 14px; border-radius: 999px; cursor: pointer; font-size: 12.5px;
+  background: var(--surface); border: 1px solid var(--border); color: var(--muted);
+}
+.hero-pill:hover { color: var(--text); border-color: color-mix(in srgb, var(--text) 20%, transparent); }
+
+/* Composer, Cursor-style: quiet inline controls, meta lives BELOW the field. */
+.composer .pill {
+  background: none;
+  border: none;
+  color: var(--muted);
+  padding: 3px 6px;
+}
+.composer .pill:hover { color: var(--text); background: color-mix(in srgb, var(--text) 5%, transparent); border-radius: 7px; }
+/* Meta row under the composer: faint text, no chrome; ring sits at the right. */
+.selectors { align-items: center; gap: 4px; }
+.selectors .selector {
+  background: none;
+  border: none;
+  color: var(--faint);
+  font-size: 12px;
+  padding: 2px 6px;
+}
+.selectors .selector:hover { color: var(--text); }
+.usage-ring.meta-ring { order: 99; margin-left: auto; }
+/* Inline slash-command chip: amber highlight like Cursor's /automate. */
+.ce-chip {
+  background: color-mix(in srgb, #d9930d 16%, transparent);
+  color: #b87a06;
+  border: none;
+  border-radius: 6px;
+  padding: 1px 6px;
+}
+.app[data-theme="dark"] .ce-chip { color: #e8b04b; }
+
+/* UiSpec: chart / form fields / two-way action / spec-level tone. */
+.ui-chart svg { width: 100%; height: 34px; display: block; }
+.ui-chart polyline { stroke: var(--syn-accent, #526fff); stroke-width: 1.6; vector-effect: non-scaling-stroke; }
+.ui-field { display: flex; flex-direction: column; gap: 4px; font-size: 12.5px; }
+.ui-field-label { color: var(--muted); font-size: 11.5px; }
+.ui-input, .ui-select {
+  background: var(--composer); border: 1px solid var(--border); border-radius: 8px;
+  padding: 6px 9px; font-size: 12.5px; color: var(--text); outline: none;
+}
+.ui-input:focus, .ui-select:focus { border-color: color-mix(in srgb, var(--text) 24%, transparent); }
+.ui-action {
+  background: var(--accent); color: var(--on-accent); border: none; cursor: pointer;
+  border-radius: 999px; padding: 6px 14px; font-size: 12.5px; width: fit-content;
+}
+.ui-action:hover { filter: brightness(1.12); }
+.ui-action.ghost { background: var(--surface-hi); color: var(--muted); cursor: default; }
+/* Spec-level theme tint (json-render theming): border + title accent. */
+.ui-spec.spec-tone-info { border-color: color-mix(in srgb, #4a8fd6 45%, var(--border)); }
+.ui-spec.spec-tone-success { border-color: color-mix(in srgb, var(--ok, #56a26e) 45%, var(--border)); }
+.ui-spec.spec-tone-warning { border-color: color-mix(in srgb, #c2895f 50%, var(--border)); }
+.ui-spec.spec-tone-danger { border-color: color-mix(in srgb, var(--danger, #e5534b) 45%, var(--border)); }
+
+/* Env-panel real PTY shells: fill the terminals body, hide inactive ones. */
+.env-term-host { flex: 1; min-height: 0; display: flex; }
+.env-term-host.env-hidden { display: none; }
+.env-term-host .wterm-host { flex: 1; width: 100%; min-height: 0; }
+.env-hidden { display: none !important; }

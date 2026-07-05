@@ -1524,6 +1524,9 @@ fn ui_props_tool_schema() -> serde_json::Value {
             "caption":{"type":"string","maxLength":4000},
             "tone":{"type":"string","enum":["neutral","info","success","warning","danger"]},
             "language":{"type":"string","maxLength":40},
+            "points":{"type":"array","maxItems":120,"items":{"type":"number"},"description":"chart: sparkline values, oldest first"},
+            "options":{"type":"array","maxItems":12,"items":{"type":"string","maxLength":80},"description":"select: choices"},
+            "placeholder":{"type":"string","maxLength":200},
             "columns":{
                 "type":"array",
                 "maxItems":12,
@@ -1575,7 +1578,7 @@ fn ui_node_tool_schema(depth: usize) -> serde_json::Value {
         "additionalProperties":false,
         "properties":{
             "id":{"type":"string","maxLength":120},
-            "type":{"type":"string","enum":["stack","row","card","text","metric","table","code","alert","divider","action"]},
+            "type":{"type":"string","enum":["stack","row","card","text","metric","table","code","alert","divider","action","chart","input","select"]},
             "props": ui_props_tool_schema(),
             "children": children
         },
@@ -1591,9 +1594,10 @@ fn ui_spec_tool_params() -> serde_json::Value {
             "spec":{
                 "type":"object",
                 "additionalProperties":false,
-                "description":"Rust-native UiSpec. Use table only with columns/rows, action only with props.action, and never emit HTML or JavaScript.",
+                "description":"Rust-native UiSpec. Use table only with columns/rows, action only with props.action, chart with props.points, select with props.options; never emit HTML or JavaScript. Action buttons SUBMIT back to you: sibling input/select values are attached.",
                 "properties":{
                     "title":{"type":"string","maxLength":4000},
+                    "tone":{"type":"string","enum":["neutral","info","success","warning","danger"],"description":"optional theme tint for the whole card"},
                     "root": ui_node_tool_schema(4)
                 },
                 "required":["root"]
@@ -2294,7 +2298,7 @@ impl Engine {
                 },"required":["content","status"]}}},
                 "required":["todos"]
             })));
-        tools.push(ToolSpec::new("render_ui_spec", "Render a constrained Rust-native UI artifact in the chat. Use for dashboards, metrics, tables, status panels, and summaries that are clearer as structured UI than markdown. The spec must use Oxide's fixed catalog: stack, row, card, text, metric, table, code, alert, divider, action.")
+        tools.push(ToolSpec::new("render_ui_spec", "Render a constrained Rust-native UI artifact in the chat. Use for dashboards, metrics, tables, status panels, and summaries that are clearer as structured UI than markdown. The spec must use Oxide's fixed catalog: stack, row, card, text, metric, table, code, alert, divider, action, chart (sparkline via props.points), input, select (props.options). Action buttons submit BACK to you with any sibling input/select values filled in by the user.")
             .params(ui_spec_tool_params()));
         tools.push(ToolSpec::new("design_read_system", "Read and validate the workspace DESIGN.md contract. Returns parsed section completeness and a Rust-native token contract.")
             .params(serde_json::json!({"type":"object","properties":{"path":{"type":"string","description":"Optional design system path. Defaults to DESIGN.md."}}})));
