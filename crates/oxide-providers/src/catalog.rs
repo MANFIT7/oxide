@@ -234,6 +234,27 @@ const OPENAI_MODELS: &[ProviderModel] = &[
 ];
 const CODEX_MODELS: &[ProviderModel] = &[
     ProviderModel {
+        id: "gpt-5.6-sol",
+        display_name: "GPT-5.6-Sol",
+        is_default: false,
+        is_fast: false,
+        context_window: Some(372_000),
+    },
+    ProviderModel {
+        id: "gpt-5.6-terra",
+        display_name: "GPT-5.6-Terra",
+        is_default: false,
+        is_fast: false,
+        context_window: Some(372_000),
+    },
+    ProviderModel {
+        id: "gpt-5.6-luna",
+        display_name: "GPT-5.6-Luna",
+        is_default: false,
+        is_fast: false,
+        context_window: Some(372_000),
+    },
+    ProviderModel {
         id: "gpt-5.3-codex",
         display_name: "GPT-5.3 Codex",
         is_default: true,
@@ -278,13 +299,36 @@ const CLAUDE_MODELS: &[ProviderModel] = &[
         context_window: None,
     },
 ];
-const CHATGPT_MODELS: &[ProviderModel] = &[ProviderModel {
-    id: "gpt-5.5",
-    display_name: "GPT-5.5",
-    is_default: true,
-    is_fast: false,
-    context_window: Some(400_000),
-}];
+const CHATGPT_MODELS: &[ProviderModel] = &[
+    ProviderModel {
+        id: "gpt-5.5",
+        display_name: "GPT-5.5",
+        is_default: true,
+        is_fast: false,
+        context_window: Some(400_000),
+    },
+    ProviderModel {
+        id: "gpt-5.6-sol",
+        display_name: "GPT-5.6-Sol",
+        is_default: false,
+        is_fast: false,
+        context_window: Some(372_000),
+    },
+    ProviderModel {
+        id: "gpt-5.6-terra",
+        display_name: "GPT-5.6-Terra",
+        is_default: false,
+        is_fast: false,
+        context_window: Some(372_000),
+    },
+    ProviderModel {
+        id: "gpt-5.6-luna",
+        display_name: "GPT-5.6-Luna",
+        is_default: false,
+        is_fast: false,
+        context_window: Some(372_000),
+    },
+];
 const GEMINI_MODELS: &[ProviderModel] = &[
     ProviderModel {
         id: "gemini-3.5-pro",
@@ -808,6 +852,9 @@ mod tests {
         let models = list_provider_models("codex").expect("codex models");
         let caps = list_provider_capabilities("codex").expect("codex caps");
 
+        assert!(models.iter().any(|model| model.id == "gpt-5.6-sol"));
+        assert!(models.iter().any(|model| model.id == "gpt-5.6-terra"));
+        assert!(models.iter().any(|model| model.id == "gpt-5.6-luna"));
         assert!(models.iter().any(|model| model.id == "gpt-5.3-codex"));
         assert_eq!(
             fast_model_for_provider("codex"),
@@ -815,6 +862,16 @@ mod tests {
         );
         assert!(caps.contains(&ProviderCapability::NativeCliTools));
         assert_eq!(list_provider_models("unknown"), None);
+    }
+
+    #[test]
+    fn chatgpt_catalog_includes_gpt_5_6_family_without_changing_default() {
+        let models = list_provider_models("chatgpt").expect("chatgpt models");
+
+        assert!(models.iter().any(|model| model.id == "gpt-5.6-sol"));
+        assert!(models.iter().any(|model| model.id == "gpt-5.6-terra"));
+        assert!(models.iter().any(|model| model.id == "gpt-5.6-luna"));
+        assert_eq!(default_model_for_provider("chatgpt"), Some("gpt-5.5"));
     }
 
     #[test]

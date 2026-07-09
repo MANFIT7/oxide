@@ -2043,7 +2043,7 @@ details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
 /* subtle accent border while the agent works (no rainbow) */
 .composer.working { border-color: color-mix(in srgb, var(--syn-accent) 45%, var(--border)); }
 
-/* synara ultrathink frame — rainbow ONLY at Extra effort (calm 10s linear) */
+/* Synara ultrathink frame — rainbow only for Ultra Thinking (calm 10s linear). */
 @keyframes ultrathink-rainbow { 0% { background-position: 0% 50%; } 100% { background-position: 200% 50%; } }
 .composer.ultra { position: relative; border-color: transparent; }
 .composer.ultra::after {

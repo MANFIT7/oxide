@@ -62,7 +62,7 @@ const RESPONSE_HEADERS_TIMEOUT: Duration = Duration::from_secs(90);
 fn stream_idle_timeout(reasoning_effort: &str) -> Duration {
     match reasoning_effort.to_ascii_lowercase().as_str() {
         "high" => Duration::from_secs(150),
-        "xhigh" | "max" => Duration::from_secs(180),
+        "xhigh" | "max" | "ultra" => Duration::from_secs(180),
         _ => STREAM_IDLE_TIMEOUT,
     }
 }
@@ -71,7 +71,9 @@ fn stream_idle_timeout(reasoning_effort: &str) -> Duration {
 /// compaction adapts automatically per model instead of a fixed number.
 fn model_context_window(model: &str) -> u64 {
     let m = model.to_ascii_lowercase();
-    if m.contains("gpt-5") || m.contains("gpt5") {
+    if m.contains("gpt-5.6") || m.contains("gpt5.6") {
+        372_000
+    } else if m.contains("gpt-5") || m.contains("gpt5") {
         400_000
     } else if m.contains("gpt-4.1") || m.contains("o3") || m.contains("o4") {
         1_000_000
@@ -1521,6 +1523,17 @@ mod tests {
         assert_eq!(body["store"], false);
     }
 
+    #[test]
+    fn body_forwards_gpt_5_6_sol_with_ultra_reasoning() {
+        let mut req = req_with_tools(Vec::new());
+        req.model = "gpt-5.6-sol".to_string();
+        req.reasoning_effort = "ultra".to_string();
+
+        let body = build_body(&req);
+        assert_eq!(body["model"], "gpt-5.6-sol");
+        assert_eq!(body["reasoning"]["effort"], "ultra");
+    }
+
     fn jwt_with_payload(payload: Value) -> String {
         let encoded = base64_encode(payload.to_string().as_bytes())
             .trim_end_matches('=')
@@ -1769,6 +1782,14 @@ mod tests {
         assert_eq!(stream_idle_timeout("HIGH"), Duration::from_secs(150));
         assert_eq!(stream_idle_timeout("xhigh"), Duration::from_secs(180));
         assert_eq!(stream_idle_timeout("max"), Duration::from_secs(180));
+        assert_eq!(stream_idle_timeout("ultra"), Duration::from_secs(180));
+    }
+
+    #[test]
+    fn gpt_5_6_models_use_subscription_context_window() {
+        assert_eq!(model_context_window("gpt-5.6-sol"), 372_000);
+        assert_eq!(model_context_window("gpt-5.6-terra"), 372_000);
+        assert_eq!(model_context_window("gpt-5.6-luna"), 372_000);
     }
 
     #[test]

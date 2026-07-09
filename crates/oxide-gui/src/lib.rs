@@ -164,7 +164,7 @@ struct ModelPreset {
     fast: bool,
 }
 
-/// Two current production-ready choices per implemented provider.
+/// Current production-ready choices per implemented provider.
 const MODEL_PRESETS: &[ModelPreset] = &[
     ModelPreset {
         provider: "chatgpt",
@@ -173,6 +173,60 @@ const MODEL_PRESETS: &[ModelPreset] = &[
         label: "GPT-5.5",
         summary: "Your ChatGPT Plus/Pro — no API key, no CLI",
         badge: "Subs",
+        fast: false,
+    },
+    ModelPreset {
+        provider: "chatgpt",
+        model: "gpt-5.6-sol",
+        provider_label: "ChatGPT subscription",
+        label: "GPT-5.6-Sol",
+        summary: "Latest frontier agentic coding model",
+        badge: "Subs",
+        fast: false,
+    },
+    ModelPreset {
+        provider: "chatgpt",
+        model: "gpt-5.6-terra",
+        provider_label: "ChatGPT subscription",
+        label: "GPT-5.6-Terra",
+        summary: "Balanced agentic coding model for everyday work",
+        badge: "Subs",
+        fast: false,
+    },
+    ModelPreset {
+        provider: "chatgpt",
+        model: "gpt-5.6-luna",
+        provider_label: "ChatGPT subscription",
+        label: "GPT-5.6-Luna",
+        summary: "Fast and affordable agentic coding model",
+        badge: "Subs",
+        fast: false,
+    },
+    ModelPreset {
+        provider: "codex",
+        model: "gpt-5.6-sol",
+        provider_label: "Codex",
+        label: "GPT-5.6-Sol",
+        summary: "Latest frontier agentic coding model",
+        badge: "New",
+        fast: false,
+    },
+    ModelPreset {
+        provider: "codex",
+        model: "gpt-5.6-terra",
+        provider_label: "Codex",
+        label: "GPT-5.6-Terra",
+        summary: "Balanced agentic coding model for everyday work",
+        badge: "Balanced",
+        fast: false,
+    },
+    ModelPreset {
+        provider: "codex",
+        model: "gpt-5.6-luna",
+        provider_label: "Codex",
+        label: "GPT-5.6-Luna",
+        summary: "Fast and affordable agentic coding model",
+        badge: "Efficient",
         fast: false,
     },
     ModelPreset {
@@ -255,14 +309,23 @@ const EFFORT_PRESETS: &[EffortPreset] = &[
     EffortPreset {
         value: "max",
         label: "Max",
-        summary: "Deepest reasoning (Claude only)",
+        summary: "Deepest reasoning for supported models",
+    },
+    EffortPreset {
+        value: "ultra",
+        label: "Ultra Thinking",
+        summary: "Maximum reasoning with automatic task delegation",
     },
 ];
 
-/// Effort levels the selected provider actually supports — the menu groups to
-/// each provider's own ceiling (GPT tops out at Extra, Claude reaches Max).
-fn effort_levels(provider: &str) -> &'static [EffortPreset] {
+/// Effort levels the selected provider/model actually supports.
+fn effort_levels(provider: &str, model: &str) -> &'static [EffortPreset] {
     match provider {
+        // GPT-5.6 Sol/Terra add Ultra Thinking; Luna reaches Max.
+        "codex" | "chatgpt" if matches!(model, "gpt-5.6-sol" | "gpt-5.6-terra") => {
+            &EFFORT_PRESETS[0..6]
+        }
+        "codex" | "chatgpt" if model == "gpt-5.6-luna" => &EFFORT_PRESETS[0..5],
         // Claude Code CLI + Anthropic API: low/medium/high/xhigh/max.
         "claude" | "claude_interactive" | "anthropic" => &EFFORT_PRESETS[0..5],
         // GPT family (codex/chatgpt/openai): low/medium/high/xhigh.
@@ -273,8 +336,8 @@ fn effort_levels(provider: &str) -> &'static [EffortPreset] {
 }
 
 /// Clamp an effort value to what the provider supports (nearest lower).
-fn clamp_effort(provider: &str, effort: &str) -> String {
-    let levels = effort_levels(provider);
+fn clamp_effort(provider: &str, model: &str, effort: &str) -> String {
+    let levels = effort_levels(provider, model);
     if levels.iter().any(|p| p.value == effort) {
         return effort.to_string();
     }
@@ -3113,6 +3176,43 @@ fn build_projects(current: &Path, recents: &[PathBuf]) -> Vec<ProjectGroup> {
 mod tests {
     use super::*;
 
+    fn model_ids(provider: &str) -> Vec<&'static str> {
+        MODEL_PRESETS
+            .iter()
+            .filter(|preset| preset.provider == provider)
+            .map(|preset| preset.model)
+            .collect()
+    }
+
+    #[test]
+    fn codex_and_subscription_pickers_include_gpt_5_6_family() {
+        for provider in ["codex", "chatgpt"] {
+            let models = model_ids(provider);
+            assert!(models.contains(&"gpt-5.6-sol"));
+            assert!(models.contains(&"gpt-5.6-terra"));
+            assert!(models.contains(&"gpt-5.6-luna"));
+        }
+    }
+
+    #[test]
+    fn gpt_5_6_effort_levels_match_model_capabilities() {
+        assert!(effort_levels("codex", "gpt-5.6-sol")
+            .iter()
+            .any(|preset| preset.value == "ultra"));
+        assert!(effort_levels("codex", "gpt-5.6-terra")
+            .iter()
+            .any(|preset| preset.value == "ultra"));
+        assert!(effort_levels("chatgpt", "gpt-5.6-sol")
+            .iter()
+            .any(|preset| preset.value == "ultra"));
+        assert!(effort_levels("chatgpt", "gpt-5.6-terra")
+            .iter()
+            .any(|preset| preset.value == "ultra"));
+        assert_eq!(clamp_effort("codex", "gpt-5.6-luna", "ultra"), "max");
+        assert_eq!(clamp_effort("chatgpt", "gpt-5.6-luna", "ultra"), "max");
+        assert_eq!(clamp_effort("codex", "gpt-5.5", "ultra"), "xhigh");
+    }
+
     #[test]
     fn scan_agent_osc_detects_states_and_survives_chunk_splits() {
         // Sequence utuh dalam satu chunk.
@@ -4293,7 +4393,7 @@ fn app() -> Element {
     let visual_fixture = VisualFixtureMode::from_env();
 
     // Live, editable configuration.
-    let cfg = use_signal(|| initial.clone());
+    let mut cfg = use_signal(|| initial.clone());
     let ws0 = workspace_of(&initial);
 
     // Chat state.
@@ -5540,7 +5640,12 @@ fn app() -> Element {
                         Some(EngineCmd::Reconfigure(conf)) => {
                             // Effort must fit the (possibly new) provider's range.
                             let mut conf = conf;
-                            conf.reasoning_effort = clamp_effort(&conf.provider, &conf.reasoning_effort);
+                            conf.reasoning_effort = clamp_effort(
+                                &conf.provider,
+                                &conf.model,
+                                &conf.reasoning_effort,
+                            );
+                            cfg.set(conf.clone());
                             // Provider the active tab had BEFORE this reconfigure — used to
                             // drop stale usage when the quota source changes (e.g. ChatGPT to Claude).
                             let prev_provider = tabs
@@ -11680,7 +11785,7 @@ fn SettingsModal(
                                 }
                                 effort.set(next);
                             },
-                            for preset in effort_levels(&cfg.read().provider).iter() {
+                            for preset in effort_levels(provider.read().as_str(), model.read().as_str()).iter() {
                                 option {
                                     value: "{preset.value}",
                                     selected: effort.read().as_str() == preset.value,
@@ -12506,7 +12611,13 @@ fn Composer(
     };
 
     rsx! {
-        div { class: if *streaming.read() { "composer working" } else { "composer" },
+        div {
+            class: match (*streaming.read(), cur_effort.as_str()) {
+                (true, "ultra") => "composer working ultra",
+                (false, "ultra") => "composer ultra",
+                (true, _) => "composer working",
+                (false, _) => "composer",
+            },
             if !slash_items.is_empty() {
                 div { class: "mention-menu",
                     div { class: "menu-label", "Commands" }
@@ -12975,7 +13086,7 @@ fn Composer(
                             div { class: "menu-backdrop", onclick: move |_| show_effort.set(false) }
                             div { class: "effort-menu",
                                 div { class: "menu-label", "Effort" }
-                                for preset in effort_levels(&cfg.read().provider).iter() {
+                                for preset in effort_levels(&cur_provider, &cur_model).iter() {
                                     {
                                         let selected = preset.value == cur_effort;
                                         let value = preset.value.to_string();
