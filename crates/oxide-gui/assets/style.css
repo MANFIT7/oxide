@@ -1865,7 +1865,7 @@ details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
 
 /* ── Live feel: shimmer on active label + status pill ── */
 @keyframes ox-shimmer { 0% { background-position: 160% 0; } 100% { background-position: -60% 0; } }
-.status-shimmer, .activity-card.running .activity-verb {
+.status-shimmer {
   background: linear-gradient(90deg, var(--muted) 0%, var(--muted) 38%, var(--text) 50%, var(--muted) 62%, var(--muted) 100%);
   background-size: 220% 100%;
   -webkit-background-clip: text; background-clip: text;
@@ -1873,7 +1873,7 @@ details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
   animation: ox-shimmer 1.7s linear infinite;
 }
 @media (prefers-reduced-motion: reduce) {
-  .status-shimmer, .activity-card.running .activity-verb,
+  .status-shimmer,
   .live-change-state.shimmer { animation: none; color: var(--muted); -webkit-text-fill-color: currentColor; }
 }
 
@@ -4006,10 +4006,13 @@ details.activity-card.has-out .activity-sum { padding: 2px 4px; }
 /* swap pane (ganti tab/sesi): fade opacity-only, tanpa gerak vertikal */
 .scroll, .hero { animation: chat-pane-enter 140ms ease-out; }
 /* shimmer "working": cadence skeleton Synara (2s linear, offset -1s) */
-.status-shimmer, .activity-card.running .activity-verb,
+.status-shimmer,
 .live-change-state.shimmer, .edits-row.pending .edits-rowcounts.shimmer {
   animation-duration: 2s; animation-delay: -1s;
 }
+/* tool rows ala Synara: statis & tenang — muted, terang saat hover; tanpa shimmer per-row */
+.activity-card.running .activity-verb { color: var(--text); }
+.activity-card:hover .activity-verb, .activity-card:hover .activity-text { color: var(--text); }
 /* dot busy di tab agent: pulse 640ms (opacity+transform saja — GPU friendly) */
 .tab-dot.busy { animation: terminal-run-pulse 640ms ease-in-out infinite; will-change: opacity, transform; }
 /* disclosure: satu rasa 220ms ease-out untuk semua expand/collapse */
@@ -4067,3 +4070,159 @@ details.changes-file[open] .diff-body { animation: disclosure-in 220ms ease-out;
 .term-tab .syn-spinner { width: 10px; height: 10px; }
 /* seksi Chats footer: baris flat tanpa nesting proyek */
 .chats-list { padding: 0 8px; max-height: 180px; overflow-y: auto; flex-shrink: 0; }
+
+/* ── Update UI ala Synara: row sidebar + pill What's New ── */
+/* (banner .update-banner lama tidak dirender lagi) */
+.update-row {
+  position: relative; overflow: hidden;
+  display: flex; align-items: center; gap: 8px;
+  width: 100%; text-align: left; margin: 4px 0 2px;
+  border: 1px solid transparent; border-radius: 8px;
+  background: transparent; cursor: pointer; font-family: inherit;
+  padding: 7px 10px; font-size: 13px;
+  transition: background var(--dur-fast) ease, border-color var(--dur-fast) ease;
+}
+.update-row-ic { display: inline-flex; flex-shrink: 0; }
+.update-row-ic svg { width: 14px; height: 14px; }
+.update-row-label { font-weight: 600; }
+.update-row-ver { margin-left: auto; font-size: 11.5px; color: var(--faint); font-variant-numeric: tabular-nums; }
+/* ready = hijau lembut (Synara "Update" siap dipasang) */
+.update-row.ready { color: var(--ok-strong); }
+.update-row.ready:hover { background: color-mix(in srgb, var(--ok-strong) 10%, transparent); border-color: color-mix(in srgb, var(--ok-strong) 30%, transparent); }
+.update-row.busy { color: var(--muted); cursor: default; }
+.update-row.err { color: var(--danger); }
+.update-row.err:hover { background: color-mix(in srgb, var(--danger) 10%, transparent); border-color: color-mix(in srgb, var(--danger) 30%, transparent); }
+/* garis progres tipis di dasar row saat mengunduh */
+.update-row-bar {
+  position: absolute; left: 0; bottom: 0; height: 2px;
+  background: var(--syn-accent); border-radius: 2px;
+  transition: width .2s ease;
+}
+
+/* pill What's New: muncul sekali setelah update, dekat dock toast */
+.whatsnew-pill {
+  position: fixed; right: 16px; bottom: 16px; z-index: 80;
+  display: flex; align-items: center; gap: 8px;
+  background: var(--menu-bg); border: 1px solid var(--menu-border);
+  border-radius: 999px; padding: 7px 8px 7px 12px;
+  box-shadow: 0 10px 30px -12px rgba(0,0,0,.4);
+  animation: toast-in .2s var(--ease-enter);
+  font-size: 12.5px; color: var(--text);
+}
+.whatsnew-spark { display: inline-flex; color: var(--syn-accent); }
+.whatsnew-spark svg { width: 13px; height: 13px; }
+.whatsnew-link {
+  border: none; background: color-mix(in srgb, var(--syn-accent) 12%, transparent);
+  color: var(--syn-accent); border-radius: 999px; padding: 3px 10px;
+  font-family: inherit; font-size: 12px; font-weight: 600; cursor: pointer;
+}
+.whatsnew-link:hover { background: color-mix(in srgb, var(--syn-accent) 20%, transparent); }
+.whatsnew-x { border: none; background: transparent; color: var(--faint); cursor: pointer; display: inline-flex; padding: 3px; border-radius: 999px; }
+.whatsnew-x:hover { color: var(--text); }
+.whatsnew-x svg { width: 12px; height: 12px; }
+
+/* ── Diagram mermaid (chrome ala Synara: hover fullscreen + copy) ── */
+.agent-md .mermaid {
+  position: relative;
+  background: color-mix(in srgb, var(--text) 3%, transparent);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px;
+  margin: 8px 0 12px;
+  overflow-x: auto;
+  text-align: center;
+}
+/* diagram boleh lebar (Synara membentang hampir selebar kolom chat) */
+.agent-md .mermaid svg { width: 100% !important; max-width: 100% !important; height: auto !important; }
+.agent-md .mermaid.mermaid-err pre {
+  text-align: left; margin: 0; background: transparent; border: none; padding: 0;
+  font-family: ui-monospace, Menlo, monospace; font-size: 12px; color: var(--muted);
+}
+.mmd-actions {
+  position: absolute; top: 8px; right: 8px; display: flex; gap: 4px;
+  opacity: 0; transition: opacity var(--dur-fast) ease;
+}
+.mermaid:hover .mmd-actions { opacity: 1; }
+.mmd-btn {
+  width: 24px; height: 24px; display: inline-flex; align-items: center; justify-content: center;
+  border: 1px solid var(--border); border-radius: 6px;
+  background: var(--surface); color: var(--muted); cursor: pointer;
+  font-size: 13px; line-height: 1; font-family: inherit;
+}
+.mmd-btn:hover { color: var(--text); background: var(--surface-hi); }
+.mmd-overlay {
+  position: fixed; inset: 0; z-index: 300;
+  background: color-mix(in srgb, var(--bg) 82%, transparent);
+  backdrop-filter: blur(10px);
+  display: flex; align-items: center; justify-content: center;
+  cursor: zoom-out;
+  animation: fade-in .15s ease-out;
+}
+.mmd-overlay-inner { max-width: 94vw; max-height: 92vh; overflow: auto; }
+.mmd-overlay-inner svg { width: auto; height: auto; max-width: 94vw; max-height: 92vh; }
+
+/* ── Message trail (Synara): minimap tick per pesan user di tepi kiri ── */
+.msg-trail {
+  position: absolute; left: 0; top: 46px; bottom: 130px; width: 34px; z-index: 12;
+  display: flex; flex-direction: column; justify-content: center; gap: 8px;
+  padding-left: 12px; overflow: hidden; pointer-events: none;
+}
+.trail-tick {
+  pointer-events: auto; position: relative; flex-shrink: 0;
+  width: 7px; height: 2px; border-radius: 999px; border: none; padding: 0;
+  background: var(--text); opacity: .22; cursor: pointer;
+  transition: width 90ms ease, opacity 90ms ease;
+}
+.trail-tick:hover { width: 26px; opacity: 1; }
+.trail-pill {
+  position: absolute; left: 32px; top: 50%; transform: translateY(-50%);
+  background: var(--menu-bg); border: 1px solid var(--menu-border); border-radius: 999px;
+  padding: 5px 12px; font-size: 12.5px; color: var(--text); white-space: nowrap;
+  max-width: 380px; overflow: hidden; text-overflow: ellipsis;
+  box-shadow: 0 8px 24px -10px rgba(0,0,0,.35);
+  opacity: 0; pointer-events: none; transition: opacity 120ms ease;
+  z-index: 30;
+}
+.trail-tick:hover .trail-pill { opacity: 1; }
+@media (max-width: 900px) { .msg-trail { display: none; } }
+
+/* ── Terminal mengikuti tema (palet persis Synara terminalRuntimeAppearance) ──
+   wterm menggambar grid DOM dari CSS var --term-*; .app .wterm menang dari
+   definisi .wterm di wterm.css (dimuat belakangan) lewat spesifisitas. */
+.app .wterm {
+  --term-bg: rgb(14, 18, 24); --term-fg: rgb(237, 241, 247); --term-cursor: rgb(180, 203, 255);
+  --term-color-0: rgb(24, 30, 38);   --term-color-1: rgb(255, 122, 142);
+  --term-color-2: rgb(134, 231, 149); --term-color-3: rgb(244, 205, 114);
+  --term-color-4: rgb(137, 190, 255); --term-color-5: rgb(208, 176, 255);
+  --term-color-6: rgb(124, 232, 237); --term-color-7: rgb(210, 218, 230);
+  --term-color-8: rgb(110, 120, 136); --term-color-9: rgb(255, 168, 180);
+  --term-color-10: rgb(176, 245, 186); --term-color-11: rgb(255, 224, 149);
+  --term-color-12: rgb(174, 210, 255); --term-color-13: rgb(229, 203, 255);
+  --term-color-14: rgb(167, 244, 247); --term-color-15: rgb(244, 247, 252);
+}
+.app[data-theme="light"] .wterm {
+  --term-bg: #ffffff; --term-fg: rgb(28, 33, 41); --term-cursor: rgb(38, 56, 78);
+  --term-color-0: rgb(44, 53, 66);   --term-color-1: rgb(191, 70, 87);
+  --term-color-2: rgb(60, 126, 86);  --term-color-3: rgb(146, 112, 35);
+  --term-color-4: rgb(72, 102, 163); --term-color-5: rgb(132, 86, 149);
+  --term-color-6: rgb(53, 127, 141); --term-color-7: rgb(210, 215, 223);
+  --term-color-8: rgb(112, 123, 140); --term-color-9: rgb(212, 95, 112);
+  --term-color-10: rgb(85, 148, 111); --term-color-11: rgb(173, 133, 45);
+  --term-color-12: rgb(91, 124, 194); --term-color-13: rgb(153, 107, 172);
+  --term-color-14: rgb(70, 149, 164); --term-color-15: rgb(236, 240, 246);
+  box-shadow: 0 4px 18px rgba(20, 20, 20, .1);
+}
+@media (prefers-color-scheme: light) {
+  .app[data-theme="system"] .wterm {
+    --term-bg: #ffffff; --term-fg: rgb(28, 33, 41); --term-cursor: rgb(38, 56, 78);
+    --term-color-0: rgb(44, 53, 66);   --term-color-1: rgb(191, 70, 87);
+    --term-color-2: rgb(60, 126, 86);  --term-color-3: rgb(146, 112, 35);
+    --term-color-4: rgb(72, 102, 163); --term-color-5: rgb(132, 86, 149);
+    --term-color-6: rgb(53, 127, 141); --term-color-7: rgb(210, 215, 223);
+    --term-color-8: rgb(112, 123, 140); --term-color-9: rgb(212, 95, 112);
+    --term-color-10: rgb(85, 148, 111); --term-color-11: rgb(173, 133, 45);
+    --term-color-12: rgb(91, 124, 194); --term-color-13: rgb(153, 107, 172);
+    --term-color-14: rgb(70, 149, 164); --term-color-15: rgb(236, 240, 246);
+    box-shadow: 0 4px 18px rgba(20, 20, 20, .1);
+  }
+}

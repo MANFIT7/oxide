@@ -63,6 +63,11 @@ pub struct Config {
     /// URL of an update manifest JSON (`{version,url,notes}`) for OTA updates.
     #[serde(default)]
     pub update_url: String,
+    /// Versi app terakhir yang sudah dilihat user (penanda pill "What's New",
+    /// Synara model): pill hanya muncul saat versi berjalan melompati ini;
+    /// launch pertama diam-diam memajukan penanda tanpa pill.
+    #[serde(default)]
+    pub last_seen_version: String,
     /// GitHub repo (`owner/name`) to pull the latest release from for updates.
     #[serde(default = "default_github_repo")]
     pub github_repo: String,
@@ -304,6 +309,7 @@ impl Default for Config {
             subagents: false,
             recent_workspaces: Vec::new(),
             update_url: String::new(),
+            last_seen_version: String::new(),
             github_repo: default_github_repo(),
             default_tab_mode: default_tab_mode(),
             browser_headless: true,

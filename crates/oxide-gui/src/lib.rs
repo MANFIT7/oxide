@@ -4628,10 +4628,13 @@ fn app() -> Element {
         dirty,
     });
 
-    // OTA self-update.
+    // OTA self-update — UX ala Synara: cek di background (launch + poll 4 jam),
+    // UI hanya muncul di sidebar saat ADA yang bisa dilakukan; install selalu
+    // klik eksplisit; gagal → state Retry, bukan banner error.
     let mut update_info = use_signal(|| None::<update::UpdateInfo>);
     let mut updating = use_signal(|| false);
     let mut update_pct = use_signal(|| 0.0f32);
+    let mut update_err = use_signal(|| false);
     use_effect(move || {
         let repo = {
             let r = cfg.read().github_repo.clone();
@@ -4643,10 +4646,26 @@ fn app() -> Element {
         };
         let url = cfg.read().update_url.clone();
         spawn(async move {
-            if let Some(info) = update::check(&repo, &url).await {
-                update_info.set(Some(info));
+            loop {
+                if let Some(info) = update::check(&repo, &url).await {
+                    update_info.set(Some(info));
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(4 * 3600)).await;
             }
         });
+    });
+    // What's New (Synara): pill sekali-tampil setelah update berhasil; launch
+    // pertama memajukan penanda diam-diam (silent bootstrap, tanpa pill).
+    let mut whats_new = use_signal(|| None::<String>);
+    use_hook(move || {
+        let seen = cfg.peek().last_seen_version.clone();
+        if seen != update::CURRENT {
+            if seen.is_empty() {
+                mark_seen_version(cfg);
+            } else {
+                whats_new.set(Some(update::CURRENT.to_string()));
+            }
+        }
     });
 
     // Warm the syntect syntax set off-thread so the first code block in a reply
@@ -4856,27 +4875,92 @@ fn app() -> Element {
     });
 
     // Load mermaid (v11, bundled) from the same-origin asset handler.
+    // Hardening ala Synara: parse+render DISERIALISASI lewat satu promise
+    // chain (mermaid v11 tidak aman untuk render paralel), retry terbatas
+    // lalu fallback ke source mentah, re-theme live saat ganti tema, dan
+    // chrome hover fullscreen + copy seperti di app Synara.
     use_future(move || async move {
-        let theme = if cfg.peek().theme != "light" {
-            "dark"
-        } else {
-            "default"
-        };
+        let theme = cfg.peek().theme.clone();
         let js = format!(
             r#"
             (function(){{
               if (window.__oxmermaid) return;
               window.__oxmermaid = 1;
+              window.__oxmmTheme = '{theme}';
+              const mmTheme = () => {{
+                const t = window.__oxmmTheme;
+                if (t === 'light') return 'default';
+                if (t === 'dark') return 'dark';
+                return matchMedia('(prefers-color-scheme: light)').matches ? 'default' : 'dark';
+              }};
               const boot = () => {{
                 const M = window.mermaid; if (!M) return;
-                try {{ M.initialize({{startOnLoad:false,theme:'{theme}',securityLevel:'loose',fontFamily:'inherit'}}); }} catch(e){{}}
+                const init = () => {{ try {{ M.initialize({{startOnLoad:false,theme:mmTheme(),securityLevel:'loose',fontFamily:'inherit'}}); }} catch(e){{}} }};
+                init();
+                let chain = Promise.resolve(); // serialisasi parse+render
+                const addChrome = (el, src) => {{
+                  const bar = document.createElement('div');
+                  bar.className = 'mmd-actions';
+                  const fs = document.createElement('button');
+                  fs.className = 'mmd-btn'; fs.title = 'Fullscreen'; fs.textContent = '⛶';
+                  fs.onclick = (e) => {{
+                    e.stopPropagation();
+                    const svg = el.querySelector('svg'); if (!svg) return;
+                    const ov = document.createElement('div'); ov.className = 'mmd-overlay';
+                    const inner = document.createElement('div'); inner.className = 'mmd-overlay-inner';
+                    inner.innerHTML = svg.outerHTML;
+                    ov.appendChild(inner);
+                    ov.onclick = () => ov.remove();
+                    document.body.appendChild(ov);
+                  }};
+                  const cp = document.createElement('button');
+                  cp.className = 'mmd-btn'; cp.title = 'Copy source'; cp.textContent = '⎘';
+                  cp.onclick = (e) => {{
+                    e.stopPropagation();
+                    try {{ navigator.clipboard.writeText(src); }} catch (err) {{}}
+                    cp.textContent = '✓';
+                    setTimeout(() => {{ cp.textContent = '⎘'; }}, 1200);
+                  }};
+                  bar.appendChild(fs); bar.appendChild(cp);
+                  el.appendChild(bar);
+                }};
+                const renderOne = (el) => {{
+                  const src = el.getAttribute('data-mmd-src') || (el.textContent||'').trim();
+                  if (!src) return Promise.resolve();
+                  el.setAttribute('data-mmd-src', src);
+                  const tries = +(el.getAttribute('data-mmd-tries')||0);
+                  const id = 'oxmmd-'+(window.__oxmc=(window.__oxmc||0)+1);
+                  return M.parse(src).then(() => M.render(id, src)).then((r) => {{
+                    el.innerHTML = r.svg;
+                    el.setAttribute('data-ox-done','1');
+                    el.classList.remove('mermaid-err');
+                    addChrome(el, src);
+                  }}).catch(() => {{
+                    if (tries >= 2) {{
+                      // menyerah: tampilkan source mentah (jangan churn selamanya)
+                      el.setAttribute('data-ox-done','1');
+                      el.classList.add('mermaid-err');
+                      const pre = document.createElement('pre');
+                      const code = document.createElement('code');
+                      code.textContent = src; pre.appendChild(code);
+                      el.innerHTML = ''; el.appendChild(pre);
+                    }} else {{
+                      el.setAttribute('data-mmd-tries', String(tries+1));
+                    }}
+                  }});
+                }};
                 const run = () => {{
                   document.querySelectorAll('.mermaid:not([data-ox-done])').forEach((el)=>{{
-                    const src=(el.textContent||'').trim(); if(!src) return;
-                    el.setAttribute('data-ox-done','1');
-                    const id='oxmmd-'+(window.__oxmc=(window.__oxmc||0)+1);
-                    M.render(id,src).then(r=>{{el.innerHTML=r.svg;}}).catch(()=>{{el.removeAttribute('data-ox-done');el.classList.add('mermaid-err');}});
+                    chain = chain.then(() => renderOne(el));
                   }});
+                }};
+                window.__oxmmRetheme = (t) => {{
+                  window.__oxmmTheme = t; init();
+                  document.querySelectorAll('.mermaid[data-mmd-src]').forEach((el)=>{{
+                    el.removeAttribute('data-ox-done');
+                    el.removeAttribute('data-mmd-tries');
+                  }});
+                  run();
                 }};
                 run();
                 new MutationObserver(run).observe(document.body,{{childList:true,subtree:true}});
@@ -4891,6 +4975,14 @@ fn app() -> Element {
             "#
         );
         let _ = dioxus::document::eval(&js).recv::<String>().await;
+    });
+    // Ganti tema → diagram dirender ulang dengan tema mermaid yang cocok.
+    use_effect(move || {
+        let t = cfg.read().theme.clone();
+        spawn(async move {
+            let js = format!("window.__oxmmRetheme && window.__oxmmRetheme('{t}');");
+            let _ = dioxus::document::eval(&js).recv::<String>().await;
+        });
     });
 
     // Autoscroll via ONE persistent MutationObserver (installed once) instead of
@@ -7519,6 +7611,41 @@ fn app() -> Element {
                         }
                     }
                 }
+                // Row update ala Synara: hanya tampil saat ada aksi nyata
+                // (available / downloading / retry) — cek background tak pernah
+                // memunculkan UI; install selalu klik eksplisit.
+                if let Some(info) = update_info.read().clone() {
+                    {
+                        let pct = (*update_pct.read() * 100.0) as u32;
+                        let err = *update_err.read();
+                        let busy = *updating.read();
+                        let row_cls = if err { "update-row err" } else if busy { "update-row busy" } else { "update-row ready" };
+                        let info_run = info.clone();
+                        rsx! {
+                            button { class: "{row_cls}",
+                                title: "v{info.version} — {info.notes}",
+                                disabled: busy,
+                                onclick: move |_| {
+                                    updating.set(true);
+                                    update_err.set(false);
+                                    update_pct.set(0.0);
+                                    let info = info_run.clone();
+                                    spawn(async move {
+                                        match update::apply(&info, move |p| { let mut up = update_pct; up.set(p); }).await {
+                                            Ok(()) => update::restart(),
+                                            Err(_) => { updating.set(false); update_err.set(true); }
+                                        }
+                                    });
+                                },
+                                span { class: "update-row-ic", Icon { name: "arrow-up" } }
+                                if busy { span { class: "update-row-label", "Updating… {pct}%" } }
+                                else if err { span { class: "update-row-label", "Retry update" } }
+                                else { span { class: "update-row-label", "Update" } span { class: "update-row-ver", "v{info.version}" } }
+                                if busy { span { class: "update-row-bar", style: "width:{pct}%" } }
+                            }
+                        }
+                    }
+                }
                 button { class: "settings-btn", onclick: move |_| {
                         settings_initial_tab.set("model".to_string());
                         show_settings.set(true);
@@ -7535,41 +7662,7 @@ fn app() -> Element {
                 },
             }
             main { class: "main",
-                if let Some(info) = update_info.read().clone() {
-                    {
-                    let pct = (*update_pct.read() * 100.0) as u32;
-                    rsx! {
-                    div { class: "update-banner",
-                        span { class: "update-ic", Icon { name: "arrow-up" } }
-                        span { class: "update-text",
-                            "Update available · v{info.version}"
-                        }
-                        if *updating.read() {
-                            div { class: "update-progress",
-                                div { class: "update-bar", style: "width: {pct}%" }
-                            }
-                        }
-                        div { class: "update-actions",
-                            button { class: "update-btn", disabled: *updating.read(),
-                                onclick: move |_| {
-                                    updating.set(true);
-                                    update_pct.set(0.0);
-                                    let info = info.clone();
-                                    spawn(async move {
-                                        match update::apply(&info, move |p| { let mut up = update_pct; up.set(p); }).await {
-                                            Ok(()) => update::restart(),
-                                            Err(_) => updating.set(false),
-                                        }
-                                    });
-                                },
-                                if *updating.read() { "Updating… {pct}%" } else { "Update & restart" }
-                            }
-                            button { class: "update-x", onclick: move |_| update_info.set(None), Icon { name: "x" } }
-                        }
-                    }
-                    }
-                    }
-                }
+                // Update UI pindah ke row sidebar (Synara) — tidak ada banner lagi.
                 if cfg.read().workspace.is_some() {
                     div { class: "agent-tabs",
                         div { class: "agent-tabs-scroll",
@@ -8371,7 +8464,7 @@ fn app() -> Element {
                                                                 let expanded = expanded_user.read().contains(&idx);
                                                                 let text_cls = if long && !expanded { "user-text clamped" } else { "user-text" };
                                                                 rsx! {
-                                                                    div { key: "m-{m.id}", class: "{row_cls}",
+                                                                    div { key: "m-{m.id}", id: "msgrow-{idx}", class: "{row_cls}",
                                                                         div { class: "bubble",
                                                                             if !imgs.is_empty() {
                                                                                 div { class: "msg-imgs",
@@ -8915,6 +9008,32 @@ fn app() -> Element {
                                     }
                                 }
                             }
+                        }
+                        // Message trail (Synara): satu tick per pesan user di tepi kiri;
+                        // hover = pill preview, klik = lompat ke pesan. CSS-only magnify.
+                        {
+                            let trail: Vec<(usize, String)> = messages.read().iter().enumerate()
+                                .filter(|(_, m)| matches!(m.author, Author::User))
+                                .map(|(i, m)| {
+                                    let prev: String = strip_scaffold(&m.text).chars().take(90).collect();
+                                    (i, prev)
+                                })
+                                .collect();
+                            if trail.len() > 1 && !active_is_tui && !*show_board.read() {
+                                rsx! {
+                                    nav { class: "msg-trail",
+                                        for (ti, prev) in trail {
+                                            button { class: "trail-tick", key: "tt-{ti}",
+                                                onclick: move |_| {
+                                                    let js = format!("var e=document.getElementById('msgrow-{ti}'); if(e) e.scrollIntoView({{behavior:'smooth',block:'start'}});");
+                                                    spawn(async move { let _ = dioxus::document::eval(&js).recv::<String>().await; });
+                                                },
+                                                span { class: "trail-pill", "{prev}" }
+                                            }
+                                        }
+                                    }
+                                }
+                            } else { rsx! {} }
                         }
                         div { class: "composer-dock",
                             if *streaming.read() && !turn_edits.read().is_empty() {
@@ -10082,6 +10201,36 @@ fn app() -> Element {
             if *show_mcp.read() {
                 McpModal { cfg, engine, status: mcp_status, on_close: move |_| show_mcp.set(false) }
             }
+            // Pill What's New (Synara): sekali-tampil setelah update berhasil;
+            // klik → buka halaman rilis, dismiss → majukan penanda.
+            if let Some(v) = whats_new.read().clone() {
+                {
+                    let repo = {
+                        let r = cfg.read().github_repo.clone();
+                        if r.trim().is_empty() { "MANFIT7/oxide".to_string() } else { r }
+                    };
+                    let rel_url = format!("https://github.com/{repo}/releases/tag/v{v}");
+                    rsx! {
+                        div { class: "whatsnew-pill",
+                            span { class: "whatsnew-spark", Icon { name: "spark" } }
+                            span { class: "whatsnew-text", "Updated to v{v}" }
+                            button { class: "whatsnew-link",
+                                onclick: move |_| {
+                                    let url = rel_url.clone();
+                                    mark_seen_version(cfg);
+                                    whats_new.set(None);
+                                    spawn(async move { let _ = tokio::process::Command::new("open").arg(url).output().await; });
+                                },
+                                "What's new"
+                            }
+                            button { class: "whatsnew-x",
+                                onclick: move |_| { mark_seen_version(cfg); whats_new.set(None); },
+                                Icon { name: "x" }
+                            }
+                        }
+                    }
+                }
+            }
             div { class: "toasts",
                 for toast in toasts.read().iter().cloned() {
                     {
@@ -10807,6 +10956,24 @@ fn set_theme(mut cfg: Signal<Config>, theme: &str) {
 }
 
 /// Set a custom accent color (empty = theme default) and persist.
+/// Majukan penanda What's New ke versi berjalan dan persist — global config
+/// saja, supaya bootstrap penanda tidak menulis oxide.toml ke cwd.
+fn mark_seen_version(mut cfg: Signal<Config>) {
+    let mut c = cfg.read().clone();
+    if c.last_seen_version == update::CURRENT {
+        return;
+    }
+    c.last_seen_version = update::CURRENT.to_string();
+    cfg.set(c.clone());
+    if let Ok(s) = toml::to_string(&c) {
+        if let Some(home) = std::env::var_os("HOME") {
+            let d = std::path::PathBuf::from(home).join(".config/oxide");
+            let _ = std::fs::create_dir_all(&d);
+            let _ = std::fs::write(d.join("config.toml"), &s);
+        }
+    }
+}
+
 fn set_accent(mut cfg: Signal<Config>, accent: &str) {
     let mut c = cfg.read().clone();
     c.accent_color = accent.to_string();
