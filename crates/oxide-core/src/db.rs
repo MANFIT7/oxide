@@ -94,6 +94,8 @@ impl LocalDb {
             "ALTER TABLE sessions ADD COLUMN model TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE sessions ADD COLUMN harness TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE sessions ADD COLUMN reasoning_effort TEXT NOT NULL DEFAULT ''",
+            // Synara model: sesi anak sub-agent menunjuk sesi induknya.
+            "ALTER TABLE sessions ADD COLUMN parent_id TEXT NOT NULL DEFAULT ''",
         ] {
             let _ = self.rt.block_on(self.conn.execute(sql, ()));
         }
@@ -285,6 +287,8 @@ pub struct SessionMeta {
     pub title: String,
     pub pinned: bool,
     pub updated_ms: i64,
+    /// Sesi induk bila ini sesi anak sub-agent (Synara model); kosong = sesi biasa.
+    pub parent_id: String,
 }
 
 /// Mint a fresh session id (row is created lazily on the first message).
@@ -443,6 +447,19 @@ pub fn set_title(id: &str, title: &str) {
             "set session title",
             "UPDATE sessions SET title=?2 WHERE id=?1",
             turso::params![id, t],
+        );
+    });
+}
+
+/// Tandai sesi sebagai anak sub-agent dari `parent` (Synara model).
+pub fn set_parent(id: &str, parent: &str) {
+    let id = id.to_string();
+    let parent = parent.to_string();
+    with_db(move |db| {
+        db.execute(
+            "set session parent",
+            "UPDATE sessions SET parent_id=?2 WHERE id=?1",
+            turso::params![id, parent],
         );
     });
 }
@@ -1007,7 +1024,7 @@ where
 {
     let cond = cond.to_string();
     let sql = format!(
-        "SELECT id, workspace, provider, model, harness, reasoning_effort, title, pinned, updated_ms FROM sessions
+        "SELECT id, workspace, provider, model, harness, reasoning_effort, title, pinned, updated_ms, COALESCE(parent_id,'') FROM sessions
          WHERE {cond} ORDER BY pinned DESC, updated_ms DESC LIMIT {limit}"
     );
     with_db(move |db| {
@@ -1022,6 +1039,7 @@ where
                 title: r.get(6)?,
                 pinned: r.get::<i64>(7)? != 0,
                 updated_ms: r.get(8)?,
+                parent_id: r.get(9)?,
             })
         })
     })

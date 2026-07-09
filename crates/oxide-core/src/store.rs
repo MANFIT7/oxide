@@ -44,6 +44,21 @@ impl SessionStore {
         })
     }
 
+    /// Sesi baru dengan suffix id eksplisit — dipakai sesi anak sub-agent agar
+    /// dua worker yang selesai pada milidetik yang sama tidak bertabrakan id.
+    pub fn open_child(workspace: &Path, suffix: &str) -> std::io::Result<Self> {
+        let safe: String = suffix
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .take(24)
+            .collect();
+        Ok(Self {
+            id: format!("{}-{}", crate::db::new_id(), safe),
+            workspace: workspace.to_path_buf(),
+            config: std::sync::Mutex::new(SessionRuntimeConfig::default()),
+        })
+    }
+
     /// Attach to an EXISTING session by id — appends continue it.
     pub fn attach(id: &str, workspace: &Path) -> std::io::Result<Self> {
         if !crate::db::exists(id) {

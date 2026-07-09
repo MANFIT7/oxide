@@ -366,6 +366,16 @@ pub fn run(config: Config) -> anyhow::Result<()> {
         .with_maximized(true)
         .with_transparent(true)
         .with_inner_size(dioxus::desktop::tao::dpi::LogicalSize::new(1280.0, 820.0));
+    // Synara/Codex-style borderless: konten full-window, traffic light overlay
+    // di atas sidebar (inset via CSS .mac-titlebar; drag via strip di sidebar).
+    #[cfg(target_os = "macos")]
+    let window = {
+        use dioxus::desktop::tao::platform::macos::WindowBuilderExtMacOS;
+        window
+            .with_titlebar_transparent(true)
+            .with_title_hidden(true)
+            .with_fullsize_content_view(true)
+    };
     LaunchBuilder::desktop()
         .with_cfg(
             DesktopConfig::new()
@@ -1505,7 +1515,11 @@ struct SessionListItem {
     provider: String,
 }
 
-type ProjectGroup = (PathBuf, String, Vec<(PathBuf, String, String, String)>);
+type ProjectGroup = (
+    PathBuf,
+    String,
+    Vec<(PathBuf, String, String, String, String)>,
+);
 const PROJECT_SESSION_LIMIT: usize = 500;
 const PROJECT_SESSION_PAGE_SIZE: usize = 5;
 
@@ -1525,6 +1539,8 @@ struct SubagentCard {
     running: bool,
     ok: bool,
     logs: Vec<CommandLog>,
+    /// Id sesi anak yang dipersist engine (Synara model) — klik untuk membuka.
+    session: String,
 }
 
 #[derive(Clone, PartialEq)]
@@ -1689,6 +1705,7 @@ fn visual_fixture_subagents(mode: Option<VisualFixtureMode>) -> Vec<SubagentCard
         summary: "Auditing waiting, reasoning, activity, and edit-review states.".to_string(),
         running: true,
         ok: true,
+        session: String::new(),
         logs: vec![CommandLog {
             command_id: "visual-check".to_string(),
             command: "python3 scripts/gui-visual-qa.py --runtime".to_string(),
@@ -2936,7 +2953,7 @@ fn restore_deleted_session(spec: &DeletedSessionSpec) {
 
 /// Recent non-empty sessions `(path, title, msg_count)`, newest first. Deletes
 /// empty/0-byte session files as it scans (cleanup).
-fn recent_sessions(ws: &Path) -> Vec<(PathBuf, std::time::SystemTime, String, String)> {
+fn recent_sessions(ws: &Path) -> Vec<(PathBuf, std::time::SystemTime, String, String, String)> {
     // Import legacy JSONL + Claude Code TUI transcripts, then query the global db.
     oxide_core::db::import_workspace(ws);
     oxide_core::db::import_claude_sessions(ws);
@@ -2948,7 +2965,7 @@ fn recent_sessions(ws: &Path) -> Vec<(PathBuf, std::time::SystemTime, String, St
 fn db_recent_sessions(
     ws: &Path,
     limit: usize,
-) -> Vec<(PathBuf, std::time::SystemTime, String, String)> {
+) -> Vec<(PathBuf, std::time::SystemTime, String, String, String)> {
     oxide_core::db::list(ws, limit)
         .into_iter()
         .map(|m| {
@@ -2964,7 +2981,7 @@ fn db_recent_sessions(
                     .take(38)
                     .collect::<String>()
             };
-            (PathBuf::from(m.id), t, title, m.provider)
+            (PathBuf::from(m.id), t, title, m.provider, m.parent_id)
         })
         .collect()
 }
@@ -3063,12 +3080,31 @@ fn build_projects(current: &Path, recents: &[PathBuf]) -> Vec<ProjectGroup> {
                 .take(PROJECT_SESSION_LIMIT)
                 .collect()
         };
-        let items: Vec<(PathBuf, String, String, String)> = sessions
+        let items: Vec<(PathBuf, String, String, String, String)> = sessions
             .into_iter()
-            .map(|(p, m, t, prov)| (p, t, relative_time(m), prov))
+            .map(|(p, m, t, prov, parent)| (p, t, relative_time(m), prov, parent))
             .collect();
+        // Synara: sesi anak sub-agent dibariskan tepat di bawah sesi induknya.
+        let (parents, children): (Vec<_>, Vec<_>) =
+            items.into_iter().partition(|it| it.4.is_empty());
+        let mut by_parent: HashMap<String, Vec<_>> = HashMap::new();
+        for c in children {
+            by_parent.entry(c.4.clone()).or_default().push(c);
+        }
+        let mut ordered = Vec::with_capacity(parents.len());
+        for p in parents {
+            let pid = p.0.display().to_string();
+            ordered.push(p);
+            if let Some(kids) = by_parent.remove(&pid) {
+                ordered.extend(kids);
+            }
+        }
+        // Anak yatim (induk terarsip/terhapus) tetap tampil sebagai baris biasa.
+        for (_, kids) in by_parent {
+            ordered.extend(kids);
+        }
         let name = project_name(&ws);
-        out.push((ws, name, items));
+        out.push((ws, name, ordered));
     }
     out
 }
@@ -3076,6 +3112,27 @@ fn build_projects(current: &Path, recents: &[PathBuf]) -> Vec<ProjectGroup> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scan_agent_osc_detects_states_and_survives_chunk_splits() {
+        // Sequence utuh dalam satu chunk.
+        let mut acc = b"hello\x1b]633;OXIDE_AGENT_EVENT=Start\x07world".to_vec();
+        assert_eq!(scan_agent_osc(&mut acc), vec!["running"]);
+        // Terbelah dua chunk: prefix di chunk pertama, sisanya menyusul.
+        let mut acc = b"x\x1b]633;OXIDE_AGENT_EVENT=Permis".to_vec();
+        assert!(scan_agent_osc(&mut acc).is_empty());
+        acc.extend_from_slice(b"sionRequest\x07");
+        assert_eq!(scan_agent_osc(&mut acc), vec!["attention"]);
+        // Dua event beruntun + event tak dikenal diabaikan.
+        let mut acc =
+            b"\x1b]633;OXIDE_AGENT_EVENT=Stop\x07\x1b]633;OXIDE_AGENT_EVENT=Nope\x07".to_vec();
+        assert_eq!(scan_agent_osc(&mut acc), vec!["review"]);
+        // Malformed (tanpa BEL) tidak membuat buffer macet.
+        let mut acc = b"\x1b]633;OXIDE_AGENT_EVENT=AAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_vec();
+        assert!(scan_agent_osc(&mut acc).is_empty());
+        acc.extend_from_slice(b"\x1b]633;OXIDE_AGENT_EVENT=Start\x07");
+        assert_eq!(scan_agent_osc(&mut acc), vec!["running"]);
+    }
 
     #[test]
     fn flatten_turns_yields_one_keyed_item_per_root() {
@@ -4284,6 +4341,11 @@ fn app() -> Element {
     let mut show_shortcuts = use_signal(|| false);
     // Cursor-style icon rail: sidebar collapses to a thin strip.
     let mut sidebar_collapsed = use_signal(|| false);
+    // Synara-style sidebar segmented tabs: "threads" (sessions) | "workspace" (tools).
+    let mut sidebar_tab = use_signal(|| "threads".to_string());
+    // Induk sub-agent yang anak-anaknya dilipat di sidebar (Synara:
+    // expandedSubagentParentIds — di sini disimpan kebalikannya, default terbuka).
+    let mut collapsed_subagents = use_signal(HashSet::<String>::new);
     // Resizable side panels: (which: 1=left sidebar, 2=right inspector, start_x, start_w).
     let mut panel_drag = use_signal(|| None::<(u8, f64, f64)>);
     // Width (px) of the Environment panel (drag id 3) — persisted.
@@ -4382,6 +4444,11 @@ fn app() -> Element {
     let mut collapsed_projects = use_signal(HashSet::<String>::new);
     // Bump to force the sidebar (pins/projects) to re-read the session db.
     let mut sessions_refresh = use_signal(|| 0u64);
+    // Seksi "Chats" footer (Synara): sesi tanpa proyek/workspace, flat tanpa nesting.
+    let chats_list = use_memo(move || {
+        let _ = sessions_refresh();
+        db_recent_sessions(std::path::Path::new(""), 10)
+    });
     let mut confirm_archive_workspace = use_signal(|| None::<String>);
     let restored_sessions = use_signal(HashSet::<String>::new);
     // Tab currently animating closed.
@@ -6116,6 +6183,7 @@ fn app() -> Element {
                                         running: true,
                                         ok: true,
                                         logs: Vec::new(),
+                                        session: String::new(),
                                     });
                                 timeline.write().push(TimelineItem {
                                     title: format!("Subagent · {profile}"),
@@ -6137,6 +6205,7 @@ fn app() -> Element {
                                             running: true,
                                             ok: true,
                                             logs: Vec::new(),
+                                            session: String::new(),
                                         });
                                     }
                                 }
@@ -6146,7 +6215,7 @@ fn app() -> Element {
                                 });
                                 scroll_chat_bottom_if_sticky();
                             }
-                            Event::SubagentFinished { worker_id, profile, task, summary, ok, .. } => {
+                            Event::SubagentFinished { worker_id, profile, task, summary, ok, session, .. } => {
                                 // Settle the transcript anchor row for this worker.
                                 {
                                     let anchor = format!("subagent:{worker_id}");
@@ -6170,6 +6239,7 @@ fn app() -> Element {
                                         card.summary = summary.clone();
                                         card.running = false;
                                         card.ok = ok;
+                                        card.session = session.clone();
                                     } else {
                                         cards.push(SubagentCard {
                                             worker_id,
@@ -6179,6 +6249,7 @@ fn app() -> Element {
                                                 running: false,
                                                 ok,
                                                 logs: Vec::new(),
+                                                session: session.clone(),
                                             });
                                     }
                                 }
@@ -6892,7 +6963,8 @@ fn app() -> Element {
     rsx! {
         style { {CSS} }
         style { {WTERM_CSS} }
-        div { class: "app", "data-theme": "{cfg.read().theme}", "data-density": "{cfg.read().density}", style: "{accent_style}",
+        div { class: if cfg!(target_os = "macos") { "app mac-titlebar" } else { "app" },
+            "data-theme": "{cfg.read().theme}", "data-density": "{cfg.read().density}", style: "{accent_style}",
             onmousemove: move |e: dioxus::prelude::MouseEvent| {
                 if let Some((which, sx, sw)) = *panel_drag.read() {
                     let x = e.client_coordinates().x;
@@ -6926,7 +6998,10 @@ fn app() -> Element {
                 }
             },
             // ── Sidebar ────────────────────────────────────────────────
-            aside { class: if *sidebar_collapsed.read() { "sidebar collapsed" } else { "sidebar" },
+            aside { class: {
+                    let base = if *sidebar_collapsed.read() { "sidebar collapsed" } else { "sidebar" };
+                    if *sidebar_tab.read() == "workspace" { format!("{base} ws-mode") } else { base.to_string() }
+                },
                 style: if *sidebar_collapsed.read() { String::new() } else { format!("width:{}px", *sidebar_w.read()) },
                 oncontextmenu: move |e: dioxus::prelude::MouseEvent| { e.prevent_default(); let c = e.client_coordinates(); theme_menu_pos.set((c.x, c.y)); session_menu.set(None); show_theme_menu.set(true); },
                 if *show_theme_menu.read() {
@@ -6998,11 +7073,26 @@ fn app() -> Element {
                         }
                     }
                 }
+                // Strip drag window: pengganti titlebar native yang disembunyikan
+                // (macOS borderless); traffic light overlay di area ini.
+                div { class: "drag-strip",
+                    onmousedown: {
+                        let win = win.clone();
+                        move |_| win.drag()
+                    }
+                }
                 div { class: "brand",
                     img { class: "logo", src: logo_uri(),
                           title: "Collapse/expand sidebar",
                           onclick: move |_| { let v = *sidebar_collapsed.read(); sidebar_collapsed.set(!v); } }
                     span { class: "brand-name", "Oxide" }
+                }
+                // Synara-style segmented control: Threads (sessions) | Workspace (tools).
+                div { class: "side-seg",
+                    button { class: if *sidebar_tab.read() == "threads" { "on" } else { "" },
+                        onclick: move |_| sidebar_tab.set("threads".to_string()), "Threads" }
+                    button { class: if *sidebar_tab.read() == "workspace" { "on" } else { "" },
+                        onclick: move |_| sidebar_tab.set("workspace".to_string()), "Workspace" }
                 }
                 nav { class: "nav",
                     button { class: "nav-item", onclick: move |_| {
@@ -7013,7 +7103,17 @@ fn app() -> Element {
                             thinking.set(String::new());
                             status.set(String::new());
                             let cur = *active_tab.read();
-                            if let Some(t) = tabs.write().get_mut(cur) { t.messages.clear(); t.title = provider_title(&t.provider).to_string(); }
+                            if let Some(t) = tabs.write().get_mut(cur) {
+                                t.messages.clear();
+                                t.title = provider_title(&t.provider).to_string();
+                                // Fresh chat = fresh session. Tanpa ini, Reconfigure
+                                // (same-workspace) mengadopsi ulang t.session sebagai
+                                // resume_path → engine baru memuat SELURUH history lama:
+                                // tampilan kosong tapi konteks tab sebelumnya masih ikut,
+                                // dan pesan baru ter-append ke row sesi lama di db.
+                                t.session = None;
+                                t.resume = None;
+                            }
                             engine.send(EngineCmd::Reconfigure(cfg.read().clone()));
                         },
                         Icon { name: "edit" } span { "New chat" }
@@ -7021,17 +7121,17 @@ fn app() -> Element {
                     button { class: "nav-item", onclick: move |_| { show_palette.set(true); palette_query.set(String::new()); palette_sel.set(0); },
                         Icon { name: "search" } span { "Search" }
                     }
-                    button { class: "nav-item", onclick: move |_| show_mcp.set(true),
+                    button { class: "nav-item ws-item", onclick: move |_| show_mcp.set(true),
                         if let Some(l) = provider_logo("mcp") { span { class: "nav-logo", dangerous_inner_html: l } } else { Icon { name: "plugins" } }
                         span { "MCP" }
                     }
-                    button { class: "nav-item", onclick: move |_| show_skills.set(true),
+                    button { class: "nav-item ws-item", onclick: move |_| show_skills.set(true),
                         Icon { name: "target" } span { "Skills" }
                     }
-                    button { class: if *show_board.read() { "nav-item on" } else { "nav-item" }, onclick: move |_| { let v = *show_board.read(); show_board.set(!v); },
+                    button { class: if *show_board.read() { "nav-item ws-item on" } else { "nav-item ws-item" }, onclick: move |_| { let v = *show_board.read(); show_board.set(!v); },
                         Icon { name: "list" } span { "Board" }
                     }
-                    button { class: "nav-item", onclick: move |_| {
+                    button { class: "nav-item ws-item", onclick: move |_| {
                             settings_initial_tab.set("automations".to_string());
                             show_settings.set(true);
                         },
@@ -7175,6 +7275,7 @@ fn app() -> Element {
                                                 let is_active = i == *active_tab.read();
                                                 // Per-tab: a backgrounded tab keeps its spinner while its turn runs.
                                                 let busy = busy_tabs.read().contains(&id) || (is_active && *streaming.read());
+                                                let tui_state = TUI_AGENT_STATES.read().get(&id).copied().unwrap_or("");
                                                 let prov = t.provider.clone();
                                                 let logo = provider_logo(&prov);
                                                 let tab_status = tab_statuses.read().get(&id).cloned();
@@ -7187,7 +7288,9 @@ fn app() -> Element {
                                                         onclick: move |_| { unread_tabs.write().remove(&id); show_board.set(false); switch_tab(tabs, active_tab, messages, cfg, engine, i); },
                                                         ondoubleclick: move |_| { rename_text.set(ttl_dc.clone()); renaming_tab.set(Some(id)); },
                                                         span { class: "sess-branch", Icon { name: "branch" } }
-                                                        if busy { span { class: "syn-spinner" } }
+                                                        if busy || tui_state == "running" { span { class: "syn-spinner" } }
+                                                        else if tui_state == "attention" { span { class: "tab-agent-dot attention", title: "Needs permission" } }
+                                                        else if tui_state == "review" { span { class: "tab-agent-dot review", title: "Turn finished — review" } }
                                                         else if let Some(l) = logo { span { class: "tab-prov", dangerous_inner_html: l } }
                                                         if editing {
                                                             input { class: "rename-input", value: "{rename_text}", autofocus: true,
@@ -7226,9 +7329,15 @@ fn app() -> Element {
                                         // One pinned-id query per project render, not per row.
                                         let pinned_ids: std::collections::HashSet<String> =
                                             oxide_core::db::pinned().into_iter().map(|m| m.id).collect();
+                                        // Synara: badge jumlah anak + lipat anak dari induk yang di-collapse.
+                                        let mut child_counts: HashMap<String, usize> = HashMap::new();
+                                        for it in sessions.iter().filter(|it| !it.4.is_empty()) {
+                                            *child_counts.entry(it.4.clone()).or_default() += 1;
+                                        }
                                         rsx! {
-                                    for (path, title, reltime, sprov) in sessions.iter()
-                                        .filter(|(p, _, _, _)| !is_current || !tabs.read().iter().any(|t| t.session.as_deref() == Some(p.as_path())))
+                                    for (path, title, reltime, sprov, sparent) in sessions.iter()
+                                        .filter(|(p, _, _, _, _)| !is_current || !tabs.read().iter().any(|t| t.session.as_deref() == Some(p.as_path())))
+                                        .filter(|(_, _, _, _, par)| par.is_empty() || !collapsed_subagents.read().contains(par))
                                         .take(if collapsed { 0 } else { shown }).cloned() {
                                         {
                                             let p_open = path.clone();
@@ -7243,6 +7352,9 @@ fn app() -> Element {
                                             let path_str_archive = path_str.clone();
                                             let path_str_menu_archive = path_str.clone();
                                             let is_pinned = pinned_ids.contains(&path_str);
+                                            let n_children = child_counts.get(&path_str).copied().unwrap_or(0);
+                                            let kids_collapsed = collapsed_subagents.read().contains(&path_str);
+                                            let path_str_fold = path_str.clone();
                                             let anchor_class = if restored_sessions.read().contains(&path_str) { "thread-anchor restored" } else { "thread-anchor" };
                                             rsx! {
                                                 div { class: "{anchor_class}",
@@ -7268,7 +7380,8 @@ fn app() -> Element {
                                                         // menu and in Settings / Archived sessions, so a stray click
                                                         // never destroys a CLI-backed session.
                                                     }
-                                                    div { class: "thread recent sub", title: "right-click / double-click for options",
+                                                    div { class: if sparent.is_empty() { "thread recent sub" } else { "thread recent sub subchild" },
+                                                        title: "right-click / double-click for options",
                                                         onclick: move |_| { show_board.set(false); open_session_tab(tabs, active_tab, messages, next_tab_id, cfg, ui, engine, busy_tabs, p_open.clone(), t_open.clone()); },
                                                         oncontextmenu: {
                                                             let p = p_dbl.clone();
@@ -7278,6 +7391,19 @@ fn app() -> Element {
                                                         span { class: "sess-branch", Icon { name: "branch" } }
                                                         if let Some(l) = provider_logo(&sprov) { span { class: "sess-logo prov-logo", dangerous_inner_html: l } }
                                                     span { class: "thread-title", title: "{title}", "{title}" }
+                                                        // Synara: lipat/buka anak sub-agent dari baris induknya.
+                                                        if n_children > 0 {
+                                                            button { class: if kids_collapsed { "sub-toggle folded" } else { "sub-toggle" },
+                                                                title: if kids_collapsed { "Show subagents" } else { "Hide subagents" },
+                                                                onclick: move |e: dioxus::prelude::MouseEvent| {
+                                                                    e.stop_propagation();
+                                                                    let mut set = collapsed_subagents.write();
+                                                                    if !set.remove(&path_str_fold) { set.insert(path_str_fold.clone()); }
+                                                                },
+                                                                span { class: "sub-toggle-chev", Icon { name: "chevron" } }
+                                                                span { class: "sub-toggle-count", "{n_children}" }
+                                                            }
+                                                        }
                                                         span { class: "thread-time", "{reltime}" }
                                                     }
                                                     if menu_open {
@@ -7340,6 +7466,28 @@ fn app() -> Element {
                                         }, "{show_more_label}" }
                                     }
                                   }
+                                }
+                            }
+                        }
+                    }
+                }
+                // Synara: seksi "Chats" — sesi tanpa proyek, flat di footer sidebar.
+                // Hanya dirender bila memang ada (tanpa placeholder "No chats yet").
+                if !chats_list.read().is_empty() && *sidebar_tab.read() == "threads" {
+                    div { class: "section-row",
+                        span { class: "section-label", "Chats" }
+                    }
+                    div { class: "chats-list",
+                        for (cpath, _ct, ctitle, cprov, _cparent) in chats_list.read().clone() {
+                            {
+                                let c_open = cpath.clone();
+                                let c_title = ctitle.clone();
+                                rsx! {
+                                    div { class: "thread recent", key: "chat-{cpath.display()}",
+                                        onclick: move |_| { show_board.set(false); open_session_tab(tabs, active_tab, messages, next_tab_id, cfg, ui, engine, busy_tabs, c_open.clone(), c_title.clone()); },
+                                        if let Some(l) = provider_logo(&cprov) { span { class: "sess-logo prov-logo", dangerous_inner_html: l } }
+                                        span { class: "thread-title", title: "{ctitle}", "{ctitle}" }
+                                    }
                                 }
                             }
                         }
@@ -7442,11 +7590,17 @@ fn app() -> Element {
                                 } else {
                                     "agent-tab"
                                 };
+                                // Status TUI dari hook OSC 633 (Synara):
+                                // running = spinner, review/attention = dot.
+                                let tui_state = TUI_AGENT_STATES.read().get(&id).copied().unwrap_or("");
                                 rsx! {
                                     div { key: "{id}", class: "{tab_class}",
                                         onclick: move |_| switch_tab(tabs, active_tab, messages, cfg, engine, i),
                                         if let Some(l) = logo { span { class: "agent-tab-logo prov-logo", dangerous_inner_html: l } }
                                         span { class: "agent-tab-title", "{title}" }
+                                        if tui_state == "running" { span { class: "syn-spinner" } }
+                                        else if tui_state == "attention" { span { class: "tab-agent-dot attention", title: "Needs permission" } }
+                                        else if tui_state == "review" { span { class: "tab-agent-dot review", title: "Turn finished — review" } }
                                         if tab_status.is_some() {
                                             span {
                                                 class: "tab-state {tab_status_class_name}",
@@ -7554,8 +7708,10 @@ fn app() -> Element {
                     }
                 }
 
-                div { class: if *show_env.read() { "center with-preview" } else { "center" },
+                // Synara: chat card + dock kanan = dua kartu sibling di atas shell.
+                div { class: "main-body",
                     style: if *show_env.read() { format!("--rpanel:{}px", *rpanel_w.read()) } else { String::new() },
+                div { class: if *show_env.read() { "center with-preview" } else { "center" },
                     if cfg.read().workspace.is_some() && !*show_env.read() && !active_is_tui {
                         {
                             let n_changed = changed_files.read().len();
@@ -7888,16 +8044,985 @@ fn app() -> Element {
                             }
                         }
                     }
-                    // ALWAYS mounted, CSS-hidden when closed: the Terminals tab hosts
-                    // real PTY shells — unmounting the panel would kill them (same
-                    // Synara lesson as the persistent TUI tabs).
-                    div { class: if *show_env.read() { "env-panel" } else { "env-panel env-hidden" },
+                    // Persistent TUI terminals: every "tui" tab renders here ALWAYS,
+                    // with a stable key, so switching tabs never unmounts it — which
+                    // would close its PTY and kill the CLI (codex/claude), losing the
+                    // session. Only the active tui tab is shown (display:contents so
+                    // .xterm-host fills the content area exactly as before); the rest
+                    // stay mounted but hidden (display:none). This is the only place
+                    // TerminalView is mounted. (Synara lesson: persist via mount +
+                    // stable id, hide with CSS — never mount/unmount on tab switch.)
+                    for t in tabs.read().iter().filter(|t| t.mode == "tui") {
+                        div {
+                            key: "tuihost-{t.id}",
+                            class: if active_is_tui && t.id == active_tab_id && !editor_open {
+                                "tui-host-live"
+                            } else {
+                                "tui-host-off"
+                            },
+                            TerminalView {
+                                id: t.id,
+                                bin: t.bin.clone(),
+                                ws: workspace.display().to_string(),
+                                resume: t.resume.clone(),
+                            }
+                        }
+                    }
+                    if *show_split.read() && cfg.read().workspace.is_some() {
+                        SplitView {
+                            node: match *split_maximized.read() {
+                                Some(pid) => Tile::Leaf(pid),
+                                None => split_layout.read().clone(),
+                            },
+                            workspace: workspace.clone(),
+                            panes: split_panes,
+                            layout: split_layout,
+                            next_id: split_next_id,
+                            drag: split_drag,
+                            rects: split_rects,
+                            def_provider: cfg.read().provider.clone(),
+                            def_model: cfg.read().model.clone(),
+                        }
+                    } else if *show_board.read() && cfg.read().workspace.is_some() {
+                        div { class: "board",
+                            div { class: "board-head",
+                                h2 { "Board" }
+                                div { class: "board-actions",
+                                    input { class: "board-input", placeholder: "New task…", value: "{new_card_title}",
+                                        oninput: move |e| new_card_title.set(e.value()),
+                                        onkeydown: move |e| {
+                                            if e.key() == Key::Enter {
+                                                let t = new_card_title.read().trim().to_string();
+                                                if !t.is_empty() {
+                                                    board.write().add(t, String::new());
+                                                    new_card_title.set(String::new());
+                                                    let snap = board.read().clone(); snap.save(&workspace_of(&cfg.read()));
+                                                }
+                                            }
+                                        }
+                                    }
+                                    button { class: "board-btn", onclick: move |_| { let _ = workspace_of(&cfg.read()); run_board(board, cfg, workspace_of(&cfg.read())); }, Icon { name: "play" } "Run To-Do" }
+                                    button { class: "board-btn ghost", onclick: move |_| {
+                                            let root = workspace_of(&cfg.read());
+                                            sync_board_issues(board, root, board_sync_status, board_syncing);
+                                        },
+                                        if *board_syncing.read() { "Syncing…" } else { span { Icon { name: "refresh" } "Sync issues" } }
+                                    }
+                                }
+                            }
+                            div { class: "board-sync-status", "{board_sync_status}" }
+                            div { class: "board-cols four",
+                                for (col, label) in [(board::TODO, "To Do"), (board::DOING, "In Progress"), (board::REVIEW, "Review"), (board::DONE, "Done")] {
+                                    div { class: "board-col",
+                                        div { class: "board-col-head", "{label}" }
+                                        for card in board.read().cards.iter().filter(|c| c.column == col).cloned() {
+                                            {
+                                                let cid = card.id;
+                                                let cbranch = card.branch.clone();
+                                                let has_source = !card.source.is_empty();
+                                                let meta = [
+                                                    card.source_status.clone(),
+                                                    card.source_priority.clone(),
+                                                    card.source_assignee.clone(),
+                                                ]
+                                                .into_iter()
+                                                .filter(|item| !item.trim().is_empty())
+                                                .collect::<Vec<_>>()
+                                                .join(" · ");
+                                                let issue_url = card.source_url.clone();
+                                                rsx! {
+                                                    div { class: if col == board::DOING { "board-card doing" } else { "board-card" },
+                                                        if has_source {
+                                                            div { class: "board-card-meta",
+                                                                span { class: if card.source == "Linear" { "board-source linear" } else { "board-source github" }, "{card.source}" }
+                                                                if !meta.is_empty() { span { "{meta}" } }
+                                                            }
+                                                        }
+                                                        div { class: "board-card-title", "{card.title}" }
+                                                        if !issue_url.is_empty() {
+                                                            a { class: "board-card-link", href: "{issue_url}", target: "_blank", "Open issue" }
+                                                        }
+                                                        if !card.result.is_empty() { div { class: "board-card-result", "{card.result}" } }
+                                                        if !card.branch.is_empty() { div { class: "board-card-branch", "{card.branch}" } }
+                                                        if col == board::REVIEW && !cbranch.is_empty() {
+                                                            button { class: "board-merge", onclick: move |_| {
+                                                                let root = workspace_of(&cfg.read());
+                                                                let branch = cbranch.clone();
+                                                                spawn(async move {
+                                                                    let (ok, msg) = board::merge_branch(&root, &branch).await;
+                                                                    let snap = {
+                                                                        let mut b = board.write();
+                                                                        if let Some(c) = b.cards.iter_mut().find(|c| c.id == cid) {
+                                                                            if ok { c.column = board::DONE.to_string(); }
+                                                                            c.result = format!("{}\n\n[merge] {msg}", c.result);
+                                                                        }
+                                                                        b.clone()
+                                                                    };
+                                                                    snap.save(&root);
+                                                                });
+                                                            }, Icon { name: "check" } "Merge" }
+                                                        }
+                                                        button { class: "board-card-x", onclick: move |_| {
+                                                            board.write().cards.retain(|c| c.id != cid);
+                                                            let snap = board.read().clone(); snap.save(&workspace_of(&cfg.read()));
+                                                        }, Icon { name: "x" } }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else if editor_open {
+                        // Editor outranks the TUI view: opening a file from the Files
+                        // panel must show it even when a terminal tab is active (the
+                        // PTY stays mounted, just hidden).
+                        Editor {}
+                    } else if active_is_tui {
+                        // The active terminal is rendered by the persistent TUI layer
+                        // above (kept mounted across tab switches); nothing here.
+                    } else if cfg.read().workspace.is_none() {
+                        div { class: "hero welcome-screen",
+                            img { class: "welcome-logo", src: logo_uri() }
+                            h1 { class: "hero-title", "Welcome to Oxide" }
+                            p { class: "welcome-sub", "Open a project folder to get started." }
+                            button { class: "welcome-btn", onclick: move |_| open_folder(cfg, ui, engine), "Open folder" }
+                            if !cfg.read().recent_workspaces.is_empty() {
+                                div { class: "welcome-recent",
+                                    div { class: "menu-label", "Recent" }
+                                    for p in cfg.read().recent_workspaces.clone() {
+                                        {
+                                            let name = p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| p.display().to_string());
+                                            rsx! {
+                                                button { class: "welcome-recent-item", onclick: move |_| apply_workspace(cfg, ui, engine, p.clone()),
+                                                    Icon { name: "folder" } span { "{name}" }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else if is_empty {
+                        div { class: "hero",
+                            h1 { class: "hero-title", "What should we build in {project}?" }
+                            Composer { streaming, engine, cfg, model_label: model_label.clone(),
+                                       bypass, project: project.clone(), branch: branch.clone(),
+                                       context_used: ctx_used, context_limit: ctx_limit,
+                                       workspace: workspace.clone(), plan_mode, pursue_goal, goal_text, queue, picked_element,
+                                       on_settings: move |_| {
+                                           settings_initial_tab.set("model".to_string());
+                                           show_settings.set(true);
+                                       },
+                                       on_open_folder: move |_| open_folder(cfg, ui, engine), on_pick_workspace: move |dir| apply_workspace(cfg, ui, engine, dir) }
+                            div { class: "suggestions",
+                                for s in suggestions.iter() {
+                                    button { class: "suggestion",
+                                        onclick: {
+                                            let p = s.to_string();
+                                            move |_| { engine.send(EngineCmd::Submit { engine: p.clone(), display: p.clone() }); }
+                                        },
+                                        Icon { name: "spark" } span { "{s}" }
+                                    }
+                                }
+                            }
+                            div { class: "hero-pills",
+                                button { class: "hero-pill", onclick: move |_| { let mut pm = plan_mode; let v = *pm.read(); pm.set(!v); },
+                                    if *plan_mode.read() { "Plan mode on" } else { "Plan mode" }
+                                }
+                                button { class: "hero-pill",
+                                    onclick: move |_| select_env_tab(env_tab, show_env, env_tab_by_tab, tabs, active_tab, "files", false),
+                                    "Open Files"
+                                }
+                            }
+                        }
+                    } else {
+                        div { class: if *streaming.read() { "scroll" } else { "scroll smooth" },
+                            div { class: "jump-anchor",
+                                button { class: "jump-bottom", title: "Scroll to bottom",
+                                    onclick: move |_| { spawn(async move { let _ = dioxus::document::eval("window.__oxstick = true; const s=document.querySelector('.scroll'); if(s) s.scrollTo({top:s.scrollHeight, behavior:'smooth'});").await; }); },
+                                    Icon { name: "arrow-down" }
+                                }
+                            }
+                            div {
+                                // Key on the active tab so switching tabs remounts the
+                                // transcript and replays the crossfade (col-cross), instead
+                                // of an instant content swap.
+                                key: "col-{active_tab}",
+                                class: if *streaming.read() { "col streaming" } else { "col" },
+                                {
+                                    let last_user_idx = messages.read().iter().rposition(|m| m.author == Author::User);
+                                    let last_agent_idx = messages.read().iter().rposition(|m| m.author == Author::Agent);
+                                    let rturns = {
+                                        let msgs = messages.read();
+                                        flatten_turns(build_transcript_turns(&msgs), &msgs)
+                                    };
+                                    rsx! {
+                                        for turn in rturns.into_iter() {
+                                        div { key: "t-{turn.key}", class: "turn",
+                                        for item in turn.items.into_iter() {
+                                            {
+                                                match item {
+                                            TurnItem::Act(group) => {
+                                                {
+                                                    let idxs = group.indices;
+                                                    let group_key = group.key;
+                                                    let rows: Vec<(String, bool, bool)> = idxs.iter().map(|&i| {
+                                                        let m = &messages.read()[i];
+                                                        if let Author::Activity { running, ok, .. } = m.author { (m.text.clone(), running, ok) } else { (m.text.clone(), false, true) }
+                                                    }).collect();
+                                                    let (icon, label) = activity_group_display(&rows);
+                                                    // Default COLLAPSED, even while live — an open group with dozens
+                                                    // of (animating) rows lags hard. The header shows live progress;
+                                                    // the user expands for detail. And cap rendered rows to the most
+                                                    // recent so expanding a huge group stays light.
+                                                    let tool_detail = cfg.read().tool_detail.clone();
+                                                    let is_open = act_open
+                                                        .read()
+                                                        .get(&group_key)
+                                                        .copied()
+                                                        .unwrap_or(tool_detail == "detailed");
+                                                    const ACT_ROW_CAP: usize = 12;
+                                                    // Compact density: settled-ok rows collapse into the header;
+                                                    // running and failed rows always stay visible.
+                                                    let rows: Vec<(String, bool, bool)> = if tool_detail == "compact" {
+                                                        rows.into_iter().filter(|(_, r, o)| *r || !*o).collect()
+                                                    } else {
+                                                        rows
+                                                    };
+                                                    let hidden = rows.len().saturating_sub(ACT_ROW_CAP);
+                                                    let shown: Vec<(String, bool, bool)> = rows.into_iter().skip(hidden).collect();
+                                                    rsx! {
+                                                        details { key: "g-{group_key}", class: "act-group", open: is_open,
+                                                            summary { class: "act-group-head",
+                                                                onclick: move |e: dioxus::prelude::MouseEvent| {
+                                                                    e.prevent_default();
+                                                                    let cur = act_open.read().get(&group_key).copied().unwrap_or(false);
+                                                                    act_open.write().insert(group_key, !cur);
+                                                                },
+                                                                span { class: "diff-caret", Icon { name: "chevron" } }
+                                                                span { class: "act-group-icon", Icon { name: icon } }
+                                                                "{label}"
+                                                            }
+                                                            if hidden > 0 { div { class: "act-more", "… {hidden} earlier" } }
+                                                            for (t, r, o, count) in coalesce_activity_rows(shown) {
+                                                                {
+                                                                    let view = activity_view(&t);
+                                                                    if matches!(view.kind, ActivityKind::FileChange) {
+                                                                        // Join the file's cumulative +/− from turn_edits by
+                                                                        // basename so the coalesced row carries live counts.
+                                                                        let want = std::path::Path::new(&view.detail)
+                                                                            .file_name()
+                                                                            .map(|n| n.to_owned());
+                                                                        let (adds, dels) = turn_edits
+                                                                            .read()
+                                                                            .iter()
+                                                                            .filter(|e| {
+                                                                                std::path::Path::new(&e.0)
+                                                                                    .file_name()
+                                                                                    .map(|n| n.to_owned())
+                                                                                    == want
+                                                                            })
+                                                                            .fold((0u32, 0u32), |(a, d), e| (a + e.1, d + e.2));
+                                                                        let secs = if r { tool_start.read().as_ref().map(|ts| ts.elapsed().as_secs()).unwrap_or(0) } else { 0 };
+                                                                        rsx! { EditActivityRow { text: t, running: r, ok: o, count, adds, dels, secs } }
+                                                                    } else {
+                                                                        let secs = if r { tool_start.read().as_ref().map(|ts| ts.elapsed().as_secs()).unwrap_or(0) } else { 0 };
+                                                                        rsx! { ActivityRow { text: t, running: r, ok: o, secs, auto_open: tool_detail == "detailed" } }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            TurnItem::Row(i) => {
+                                                    {
+                                                        let m = messages.read()[i].clone();
+                                                        match &m.author {
+                                                            // Diff rows were dropped in flatten_turns; User rows and
+                                                            // the rest each render ONE keyed root.
+                                                            Author::Diff(_, _) => rsx! {},
+                                                            Author::User => {
+                                                                // Display text may carry pasted images after \u{2} separators —
+                                                                // either inline data URLs or persisted `wsimg:` file refs.
+                                                                let markers: Vec<String> = m.text.split('\u{2}').skip(1).map(String::from).collect();
+                                                                let imgs: Vec<String> = markers.iter()
+                                                                    .filter_map(|s| {
+                                                                        if let Some(rel) = s.strip_prefix("wsimg:") {
+                                                                            Some(format!("/wsimg/{rel}"))
+                                                                        } else if s.starts_with("data:image") {
+                                                                            Some(s.to_string())
+                                                                        } else { None }
+                                                                    }).collect();
+                                                                let text_files: Vec<(String, String)> = markers.iter()
+                                                                    .filter_map(|s| s.strip_prefix("wstxt:").map(|rel| (text_attachment_name(rel), rel.to_string())))
+                                                                    .collect();
+                                                                let segs = user_segments(&m.text);
+                                                                let copy = serde_json::to_string(&strip_scaffold(&m.text)).unwrap_or_default();
+                                                                let edit_text = strip_scaffold(&m.text);
+                                                                let idx = i;
+                                                                let _ = last_user_idx; let row_cls = "row user sticky-turn";
+                                                                // Clamp long prompts (esp. while sticky) — expandable. Clamp the
+                                                                // TEXT only (line-clamp), never the bubble itself; masking the
+                                                                // bubble fights its backdrop-filter and renders it blank.
+                                                                let long = edit_text.chars().count() > 240 || edit_text.lines().count() > 3;
+                                                                let expanded = expanded_user.read().contains(&idx);
+                                                                let text_cls = if long && !expanded { "user-text clamped" } else { "user-text" };
+                                                                rsx! {
+                                                                    div { key: "m-{m.id}", class: "{row_cls}",
+                                                                        div { class: "bubble",
+                                                                            if !imgs.is_empty() {
+                                                                                div { class: "msg-imgs",
+                                                                                    for src in imgs {
+                                                                                        img { class: "msg-img", src: "{src}",
+                                                                                            onclick: { let s = src.clone(); move |_| chat_img.set(Some(s.clone())) } }
+                                                                                    }
+                                                                                }
+                                                                            }
+                                                                            if !text_files.is_empty() {
+                                                                                div { class: "msg-files",
+                                                                                    for (name, rel) in text_files {
+                                                                                        div { class: "msg-file", title: "{rel}",
+                                                                                            Icon { name: "file" }
+                                                                                            span { "{name}" }
+                                                                                        }
+                                                                                    }
+                                                                                }
+                                                                            }
+                                                                            div { class: "{text_cls}",
+                                                                                for (is_m, s) in segs {
+                                                                                    if is_m { span { class: "inline-chip", "{s}" } } else { "{s}" }
+                                                                                }
+                                                                            }
+                                                                            if long {
+                                                                                button { class: "bubble-more",
+                                                                                    onclick: move |_| {
+                                                                                        let mut e = expanded_user.write();
+                                                                                        if !e.insert(idx) { e.remove(&idx); }
+                                                                                    },
+                                                                                    if expanded { "show less" } else { "show more" }
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                        div { class: "msg-actions",
+                                                                            button { class: "msg-act", title: "Copy message", onclick: move |_| { let c = copy.clone(); spawn(async move { let _ = document::eval(&format!("navigator.clipboard.writeText({c})")).await; }); push_toast(toasts, toast_seq, "ok", "Copied"); }, Icon { name: "copy" } }
+                                                                            if *confirm_restore.read() == Some(idx) {
+                                                                                button { class: "msg-act danger", title: "Click again to confirm — reverts files and brings this message back to the composer to edit & resend", onclick: move |_| {
+                                                                                    confirm_restore.set(None);
+                                                                                    // Revert every file change from this turn onward.
+                                                                                    let floor = { let ms = messages.read(); ms.iter().skip(idx).find_map(|mm| if let Author::Diff(_, cp) = mm.author { Some(cp) } else { None }) };
+                                                                                    if let Some(fl) = floor {
+                                                                                        let ids: Vec<u64> = checkpoints.read().iter().map(|(id, _)| *id).filter(|id| *id >= fl).collect();
+                                                                                        for id in ids.into_iter().rev() { engine.send(EngineCmd::Rewind { id }); reverted.write().insert(id); }
+                                                                                    }
+                                                                                    // Drop this turn and everything after it (UI)…
+                                                                                    messages.write().truncate(idx);
+                                                                                    // …and trim the engine + session history so the
+                                                                                    // model forgets the removed turns (no pile-up).
+                                                                                    let hist: Vec<(String, String)> = messages.read().iter().filter_map(|mm| match mm.author {
+                                                                                        Author::User => Some(("user".to_string(), strip_scaffold(&mm.text))),
+                                                                                        Author::Agent if !mm.text.is_empty() => Some(("assistant".to_string(), mm.text.clone())),
+                                                                                        _ => None,
+                                                                                    }).collect();
+                                                                                    engine.send(EngineCmd::SetHistory(hist));
+                                                                                    // …and load the message back into the composer to edit & resend.
+                                                                                    let t = edit_text.clone();
+                                                                                    spawn(async move {
+                                                                                        let js = format!("const e=document.getElementById('ce-input'); if(e){{ e.textContent={}; e.focus(); const r=document.createRange(); r.selectNodeContents(e); r.collapse(false); const s=window.getSelection(); s.removeAllRanges(); s.addRange(r); }} return true;", serde_json::to_string(&t).unwrap_or_default());
+                                                                                        let _ = dioxus::document::eval(&js).join::<bool>().await;
+                                                                                    });
+                                                                                }, "Edit & restore?" }
+                                                                            } else {
+                                                                                button { class: "msg-act", title: "Restore — revert files and edit this message", onclick: move |_| confirm_restore.set(Some(idx)), Icon { name: "undo" } }
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                            _ if m.author == Author::Note && m.text.starts_with("§thought\t") => {
+                                                                let mut parts = m.text.splitn(3, '\t');
+                                                                let _ = parts.next();
+                                                                let secs = parts.next().unwrap_or("1").to_string();
+                                                                let body = parts.next().unwrap_or("").to_string();
+                                                                rsx! {
+                                                                    details { key: "m-{m.id}", class: "thought-row",
+                                                                        summary { class: "thought-sum", "Thought for {secs}s" }
+                                                                        div { class: "thought-body", "{body}" }
+                                                                    }
+                                                                }
+                                                            }
+                                                            _ => {
+                                                                // Live = the NEWEST agent bubble while streaming — not "the last
+                                                                // row": a tool/command row landing after the bubble used to flip
+                                                                // it to the cached non-live path mid-stream (one full re-render =
+                                                                // visible flicker), and hid the reasoning box while tools ran.
+                                                                let is_live = *streaming.read() && m.author == Author::Agent && Some(i) == last_agent_idx;
+                                                                let pin_snip: String = m.text.lines().find(|l| !l.trim().is_empty()).unwrap_or("").chars().take(64).collect();
+                                                                let is_agent = m.author == Author::Agent && !m.text.is_empty();
+                                                                let ws_pin = workspace.clone();
+                                                                let ws_mark = workspace.clone();
+                                                                let snip2 = pin_snip.clone();
+                                                                rsx! {
+                                                                    // ONE keyed root per row — the thinking-box rides INSIDE it
+                                                                    // (an unkeyed conditional sibling used to bury the row key
+                                                                    // under a fragment root → positional diffing → reversal).
+                                                                    div { key: "m-{m.id}", class: "rowwrap",
+                                                                    if is_live && !thinking.read().is_empty() {
+                                                                        details { class: "thinking-box", open: think_open.read().unwrap_or(true),
+                                                                            summary {
+                                                                                class: "thinking-sum live",
+                                                                                onclick: move |e: dioxus::prelude::MouseEvent| {
+                                                                                    e.prevent_default();
+                                                                                    let cur = think_open.read().unwrap_or(true);
+                                                                                    think_open.set(Some(!cur));
+                                                                                },
+                                                                                span { class: "thinking-glow", "Reasoning" }
+                                                                                {
+                                                                                    let el = *think_secs.read();
+                                                                                    if el >= 1 {
+                                                                                        rsx! { span { class: "thinking-secs", "{el}s" } }
+                                                                                    } else {
+                                                                                        rsx! {}
+                                                                                    }
+                                                                                }
+                                                                            }
+                                                                            div { class: "thinking-body", "{thinking}" }
+                                                                        }
+                                                                    }
+                                                                    div { id: "msg-{i}", class: "pinwrap",
+                                                                        Message {
+                                                                            author: m.author.clone(),
+                                                                            text: m.text.clone(),
+                                                                            live: is_live,
+                                                                            tool_secs: tool_start.read().as_ref().map(|t| t.elapsed().as_secs()).unwrap_or(0),
+                                                                            compact_tools: cfg.read().tool_detail == "compact",
+                                                                        }
+                                                                        if is_agent && !is_live {
+                                                                            div { class: "msg-side",
+                                                                                button { class: "msg-pin", title: "Pin message",
+                                                                                    onclick: move |_| {
+                                                                                        if !pinned_msgs.read().iter().any(|p| p.0 == i) {
+                                                                                            pinned_msgs.write().push((i, pin_snip.clone(), false));
+                                                                                            thread_json_save(&ws_pin, "pins", &thread_stem(&tabs, &active_tab), &*pinned_msgs.read());
+                                                                                        }
+                                                                                    }, Icon { name: "pin" } }
+                                                                                button { class: "msg-pin", title: "Mark — highlights selected text (or the message)",
+                                                                                    onclick: move |_| {
+                                                                                        let ws3 = ws_mark.clone();
+                                                                                        let fallback = snip2.clone();
+                                                                                        spawn(async move {
+                                                                                            let sel = dioxus::document::eval("return (window.getSelection()||'').toString();")
+                                                                                                .join::<String>().await.unwrap_or_default();
+                                                                                            let text = if sel.trim().is_empty() { fallback } else { sel.chars().take(80).collect() };
+                                                                                            let color = (markers.peek().len() % 4) as u8;
+                                                                                            markers.write().push((i, text, color, false));
+                                                                                            thread_json_save(&ws3, "markers", &thread_stem(&tabs, &active_tab), &*markers.read());
+                                                                                        });
+                                                                                    }, span { class: "mark-swatch c0" } }
+                                                    }
+                                                }
+                                            }
+                                            }
+                                        }
+                                        }
+                                        }
+                                    }
+                                }
+                                                }
+                                            }
+                                        }
+                                        if let Some(sum) = turn.done_summary {
+                                            div { key: "done-{turn.key}", class: "pinwrap", Message { author: Author::Note, text: sum, live: false } }
+                                        }
+                                        }
+                                        }
+                                    }
+                                }
+                                if !*streaming.read() && !thinking.read().is_empty() {
+                                    {
+                                        let live = *streaming.read();
+                                        rsx! {
+                                            details { class: "thinking-box", open: think_open.read().unwrap_or(live),
+                                                summary {
+                                                    class: if live { "thinking-sum live" } else { "thinking-sum" },
+                                                    onclick: move |e: dioxus::prelude::MouseEvent| {
+                                                        e.prevent_default();
+                                                        let cur = think_open.read().unwrap_or(live);
+                                                        think_open.set(Some(!cur));
+                                                    },
+                                                    // Cursor-style: shimmering "Reasoning" + live timer while
+                                                    // thinking; settles to a plain label once the turn ends.
+                                                    if live {
+                                                        span { class: "thinking-glow", "Reasoning" }
+                                                        {
+                                                            let el = *think_secs.read();
+                                                            if el >= 1 {
+                                                                rsx! { span { class: "thinking-secs", "{el}s" } }
+                                                            } else {
+                                                                rsx! {}
+                                                            }
+                                                        }
+                                                    } else {
+                                                        {
+                                                            let t = *think_secs.read();
+                                                            if t >= 1 {
+                                                                rsx! { "Thought for {t}s" }
+                                                            } else {
+                                                                rsx! { "Reasoning" }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                div { class: "thinking-body", "{thinking}" }
+                                            }
+                                        }
+                                    }
+                                }
+                                if *streaming.read() {
+                                    // Keep the pill mounted for the WHOLE turn — gating it on a
+                                    // non-empty status made it unmount/remount whenever `status`
+                                    // momentarily emptied between events, restarting the spinner's
+                                    // CSS animation each time (it looked frozen/stuck). A stable
+                                    // key + always-mounted pill lets the spin run continuously.
+                                    StatusPill {
+                                        text: status.read().clone(),
+                                        elapsed_s: *elapsed_s.read(),
+                                        stalled_s: elapsed_s.read().saturating_sub(*last_ev_s.read()),
+                                    }
+                                }
+                                if !bg_jobs.read().is_empty() || !bg_watch.read().is_empty() {
+                                    {
+                                        let all_settled = bg_jobs.read().is_empty()
+                                            && bg_watch.read().iter().all(|j| bg_settled.read().contains(&j.0));
+                                        rsx! {
+                                    div { class: "bg-bar",
+                                        span { class: if all_settled { "bg-orbit settled" } else { "bg-orbit" } }
+                                        span { class: "bg-label", "Background" }
+                                        // Watched jobs: their output FILE is tailed across turns,
+                                        // so the result stays readable here — expand for the tail.
+                                        for (id, command, _path) in bg_watch.read().iter().cloned() {
+                                            {
+                                                let tail = bg_tails.read().get(&id).cloned().unwrap_or_default();
+                                                let short: String = command.chars().take(60).collect();
+                                                let did = id.clone();
+                                                let settled = bg_settled.read().contains(&id);
+                                                rsx! {
+                                                    details { key: "bgw-{id}", class: "bg-chip bg-watch",
+                                                        summary { class: "bg-watch-sum",
+                                                            title: if settled { "No new output for ~20s — likely finished. Expand for the tail; ✕ to dismiss." } else { "{command}" },
+                                                            span { class: if settled { "bg-dot settled" } else { "bg-dot" } }
+                                                            span { class: "bg-chip-text", "{short}" }
+                                                            button { class: "bg-x", title: "Stop watching",
+                                                                onclick: move |e: dioxus::prelude::MouseEvent| {
+                                                                    e.prevent_default();
+                                                                    e.stop_propagation();
+                                                                    // Tailer sees the removal and stops itself.
+                                                                    bg_watch.clone().write().retain(|j| j.0 != did);
+                                                                },
+                                                                Icon { name: "x" } }
+                                                        }
+                                                        if tail.is_empty() {
+                                                            div { class: "bg-watch-out empty", "no output yet…" }
+                                                        } else {
+                                                            pre { class: "bg-watch-out", "{tail}" }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        // Legacy chips (no known output file — label only).
+                                        for (bi, job) in bg_jobs.read().iter().cloned().enumerate() {
+                                            if !bg_watch.read().iter().any(|j| j.1 == job) {
+                                                span { class: "bg-chip", title: "Running in background — result won't auto-return",
+                                                    span { class: "bg-dot" }
+                                                    span { class: "bg-chip-text", "{job}" }
+                                                    button { class: "bg-x", title: "Dismiss", onclick: move |_| { let mut v = bg_jobs.write(); if bi < v.len() { v.remove(bi); } }, Icon { name: "x" } }
+                                                }
+                                            }
+                                        }
+                                    }
+                                        }
+                                    }
+                                }
+                                if !queue.read().is_empty() {
+                                    div { class: "queue-bar",
+                                        span { class: "queue-label", Icon { name: "clock" } "Queued ({queue.read().len()})" }
+                                        for (qi, q) in queue.read().iter().enumerate() {
+                                            {
+                                                let preview = queue_preview(q);
+                                                let full = q.clone();
+                                                rsx! {
+                                                    span { class: "queue-chip", title: "Click to edit this queued message",
+                                                        onclick: move |_| {
+                                                            // Pull the item back into the composer for editing.
+                                                            let mut qv = queue.write();
+                                                            if qi < qv.len() { qv.remove(qi); }
+                                                            let full = strip_scaffold(&full);
+                                                            let js = format!(
+                                                                "const e=document.getElementById('ce-input'); if(e){{ e.textContent={}; e.focus(); const r=document.createRange(); r.selectNodeContents(e); r.collapse(false); const s=window.getSelection(); s.removeAllRanges(); s.addRange(r); }} return true;",
+                                                                serde_json::to_string(&full).unwrap_or_default()
+                                                            );
+                                                                spawn(async move { let _ = dioxus::document::eval(&js).join::<bool>().await; });
+                                                        },
+                                                        span { class: "queue-index", "{qi + 1}" }
+                                                        "{preview}"
+                                                        if qi > 0 {
+                                                            button { class: "queue-steer", title: "Move up in the queue",
+                                                                onclick: move |e: dioxus::prelude::MouseEvent| {
+                                                                    e.stop_propagation();
+                                                                    let mut qv = queue.write();
+                                                                    if qi > 0 && qi < qv.len() { qv.swap(qi, qi - 1); }
+                                                                }, Icon { name: "arrow-up" } }
+                                                        }
+                                                        button { class: "queue-steer", title: "Steer now — inject into the running turn instead of waiting",
+                                                            onclick: move |e: dioxus::prelude::MouseEvent| {
+                                                                e.stop_propagation();
+                                                                let text = {
+                                                                    let mut qv = queue.write();
+                                                                    if qi < qv.len() { Some(qv.remove(qi)) } else { None }
+                                                                };
+                                                                if let Some(t) = text {
+                                                                    let display = strip_scaffold(&t);
+                                                                    engine.send(EngineCmd::Submit { engine: t, display });
+                                                                }
+                                                            }, Icon { name: "corner-up-right" } }
+                                                        button { class: "queue-x", onclick: move |e: dioxus::prelude::MouseEvent| { e.stop_propagation(); let mut qv = queue.write(); if qi < qv.len() { qv.remove(qi); } }, Icon { name: "x" } }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        if queue.read().len() > 1 {
+                                            button { class: "queue-clear", title: "Clear queued prompts", onclick: move |_| queue.write().clear(), "Clear" }
+                                        }
+                                    }
+                                }
+                                for (qid, question, options) in questions.read().iter().cloned() {
+                                    div { class: "question-card",
+                                        div { class: "question-q", Icon { name: "help" } span { "{question}" } }
+                                        div { class: "question-opts",
+                                            for (oi, opt) in options.iter().enumerate() {
+                                                {
+                                                    let opt = opt.clone();
+                                                    rsx! {
+                                                        button { class: "question-opt", onclick: move |_| { engine.send(EngineCmd::Answer { id: qid, text: opt.clone() }); q_answer.set(String::new()); },
+                                                            span { class: "question-num", "{oi + 1}" } "{opt}"
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        div { class: "question-free",
+                                            input { class: "question-input", placeholder: "Or type your answer…", value: "{q_answer}",
+                                                oninput: move |e| q_answer.set(e.value()),
+                                                onkeydown: move |e| {
+                                                    if e.key() == Key::Enter {
+                                                        let a = q_answer.read().trim().to_string();
+                                                        if !a.is_empty() { engine.send(EngineCmd::Answer { id: qid, text: a }); q_answer.set(String::new()); }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                for (id, tool, summary) in approvals.read().iter().cloned() {
+                                    div { class: "approval-card",
+                                        div { class: "approval-q", "Allow " span { class: "approval-tool", "{tool}" } "?" }
+                                        if !summary.is_empty() { div { class: "approval-sum", "{summary}" } }
+                                        div { class: "approval-actions",
+                                            // Remove the card optimistically: it otherwise stays
+                                            // clickable until the coroutine drains the command, and
+                                            // a double-click re-marks the tab "Running" for nothing.
+                                            button { class: "approval-yes", onclick: move |_| { approvals.write().retain(|(i, _, _)| *i != id); engine.send(EngineCmd::Approve { id, decision: ApprovalDecision::Approve }); }, "Approve" }
+                                            button { class: "approval-always", onclick: move |_| { approvals.write().retain(|(i, _, _)| *i != id); engine.send(EngineCmd::Approve { id, decision: ApprovalDecision::ApproveForSession }); }, "Always" }
+                                            button { class: "approval-no", onclick: move |_| { approvals.write().retain(|(i, _, _)| *i != id); engine.send(EngineCmd::Approve { id, decision: ApprovalDecision::Reject }); }, "Reject" }
+                                        }
+                                    }
+                                }
+                                if !*streaming.read() && !turn_edits.read().is_empty() {
+                                    {
+                                        let edits = turn_edits.read().clone();
+                                        let n = edits.len();
+                                        let total_add: u32 = edits.iter().map(|e| e.1).sum();
+                                        let total_del: u32 = edits.iter().map(|e| e.2).sum();
+                                        let expanded = *edits_expanded.read();
+                                        let shown = if expanded { n } else { n.min(3) };
+                                        let plural = if n == 1 { "" } else { "s" };
+                                        let more_txt = if expanded { "Show less".to_string() } else { format!("Show {} more files", n.saturating_sub(3)) };
+                                        rsx! {
+                                            div { class: "edits-card",
+                                                div { class: "edits-head",
+                                                    span { class: "edits-ic", Icon { name: "list" } }
+                                                    div { class: "edits-title-col",
+                                                        span { class: "edits-title", "Edited {n} file{plural}" }
+                                                        span { class: "edits-counts", span { class: "diff-adds countup plus", style: "--n:{total_add}" } " " span { class: "diff-dels countup minus", style: "--n:{total_del}" } }
+                                                    }
+                                                    if *edits_undone.read() {
+                                                        span { class: "edits-undone slot-status icon-slot", Icon { name: "check" } SlotText { text: "Undone".to_string(), reverse: true } }
+                                                    } else {
+                                                        div { class: "edits-actions",
+                                                            button { class: "edits-undo", onclick: move |_| {
+                                                                for (_, _, _, cp, _) in turn_edits.read().iter() { engine.send(EngineCmd::Rewind { id: *cp }); reverted.write().insert(*cp); }
+                                                                edits_undone.set(true);
+                                                            }, Icon { name: "undo" } SlotText { text: "Undo".to_string(), reverse: true } }
+                                                        }
+                                                    }
+                                                }
+                                                for (path, a, d, cp, diff) in edits.iter().take(shown).cloned() {
+                                                    {
+                                                        let is_reverted = reverted.read().contains(&cp);
+                                                        let pending = diff.is_empty() && cp == 0;
+                                                        if pending {
+                                                            // Live row: the CLI is editing this file right now;
+                                                            // the diff lands at the end of the turn.
+                                                            rsx! {
+                                                                div { class: "edits-row pending",
+                                                                    span { class: "syn-spinner" }
+                                                                    span { class: "edits-path", "{path}" }
+                                                                    span { class: "edits-rowcounts shimmer slot-status", SlotText { text: "editing…".to_string() } }
+                                                                }
+                                                            }
+                                                        } else {
+                                                            rsx! {
+                                                                details { class: "edits-row-d",
+                                                                    summary { class: "edits-row",
+                                                                        span { class: "edits-caret", Icon { name: "chevron" } }
+                                                                        span { class: "edits-path", "{path}" }
+                                                                        span { class: "edits-rowcounts", span { class: "diff-adds", SlotText { text: format!("+{a}") } } " " span { class: "diff-dels", SlotText { text: format!("\u{2212}{d}") } } }
+                                                                        if is_reverted {
+                                                                            span { class: "diff-reverted slot-status icon-slot", Icon { name: "check" } SlotText { text: "Reverted".to_string(), reverse: true } }
+                                                                        } else if accepted.read().contains(&cp) {
+                                                                            span { class: "diff-kept slot-status icon-slot", Icon { name: "check" } SlotText { text: "Kept".to_string() } }
+                                                                        } else if cp != 0 {
+                                                                            // Revert only — keeping is the default outcome; a
+                                                                            // dedicated Keep button was noise ("Kept" still shows
+                                                                            // when the review panel accepts a checkpoint).
+                                                                            button { class: "edits-row-revert",
+                                                                                onclick: move |e: dioxus::prelude::MouseEvent| { e.prevent_default(); e.stop_propagation(); engine.send(EngineCmd::Rewind { id: cp }); reverted.write().insert(cp); },
+                                                                                SlotText { text: "Revert".to_string(), reverse: true } }
+                                                                        }
+                                                                    }
+                                                                    HunkedDiff { ws: workspace.clone(), path: path.clone(), diff }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                if n > 3 {
+                                                    button { class: "edits-more", onclick: move |_| { let v = *edits_expanded.read(); edits_expanded.set(!v); },
+                                                        "{more_txt}"
+                                                        Icon { name: "chevron" }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if !subagent_cards.read().is_empty() {
+                            {
+                                let cards = subagent_cards.read().clone();
+                                let done = cards.iter().filter(|c| !c.running).count();
+                                let total = cards.len();
+                                rsx! {
+                                    div { class: "subagents-card",
+                                        div { class: "subagents-head",
+                                            span { class: "workflow-ic", Icon { name: "spark" } }
+                                            span { "Subagents {done}/{total}" }
+                                        }
+                                        for card in cards {
+                                            {
+                                                let row_cls = if card.running { "subagent-row running" } else if card.ok { "subagent-row done" } else { "subagent-row fail" };
+                                                let child_session = card.session.clone();
+                                                let child_title = format!("{}: {}", card.profile, card.task);
+                                                rsx! {
+                                                    div { key: "sa-{card.worker_id}", class: "{row_cls}",
+                                                        span { class: "subagent-status",
+                                                            if card.running { span { class: "syn-spinner" } }
+                                                            else if card.ok { Icon { name: "check" } }
+                                                            else { Icon { name: "alert" } }
+                                                        }
+                                                        // Synara: thread anak first-class — buka transkripnya.
+                                                        if !child_session.is_empty() {
+                                                            button { class: "subagent-open", title: "Open subagent thread",
+                                                                onclick: move |_| {
+                                                                    show_board.set(false);
+                                                                    open_session_tab(tabs, active_tab, messages, next_tab_id, cfg, ui, engine, busy_tabs, PathBuf::from(child_session.clone()), child_title.clone());
+                                                                },
+                                                                Icon { name: "external-link" } span { "Open" }
+                                                            }
+                                                        }
+                                                        div { class: "subagent-copy",
+                                                            div { class: "subagent-title", "{card.profile} · {card.task}" }
+                                                                if !card.summary.trim().is_empty() {
+                                                                    div { class: "subagent-summary", "{card.summary}" }
+                                                                }
+                                                                if !card.logs.is_empty() {
+                                                                    div { class: "subagent-logs",
+                                                                        for log in card.logs {
+                                                                            {
+                                                                                let log_cls = if log.running { "subagent-log running" } else if log.ok { "subagent-log done" } else { "subagent-log fail" };
+                                                                                let lines = log.output.lines().count();
+                                                                                rsx! {
+                                                                                    details { class: "{log_cls}", open: log.running,
+                                                                                        summary { class: "subagent-log-head",
+                                                                                            span { class: "subagent-log-status",
+                                                                                                if log.running { span { class: "syn-spinner" } }
+                                                                                                else if log.ok { Icon { name: "check" } }
+                                                                                                else { Icon { name: "alert" } }
+                                                                                            }
+                                                                                            span { class: "subagent-log-command", "{log.command}" }
+                                                                                            if lines > 0 {
+                                                                                                span { class: "subagent-log-lines", "{lines} lines" }
+                                                                                            }
+                                                                                        }
+                                                                                        if !log.output.trim().is_empty() {
+                                                                                            pre { class: "subagent-log-output", "{log.output}" }
+                                                                                        }
+                                                                                    }
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if !todos.read().is_empty() {
+                            {
+                                let items = todos.read().clone();
+                                let done = items.iter().filter(|(_, s)| s == "completed").count();
+                                let n = items.len();
+                                rsx! {
+                                    div { class: "todo-card",
+                                        div { class: "todo-head", span { class: "todo-ic", Icon { name: "list" } } "Tasks {done}/{n}" }
+                                        for (content, st) in items {
+                                            div { class: "todo-row {st}",
+                                                span { class: "todo-box",
+                                                    if st == "completed" { Icon { name: "check" } } else if st == "in_progress" { span { class: "syn-spinner" } } else { "" }
+                                                }
+                                                span { class: "todo-text", "{content}" }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        div { class: "composer-dock",
+                            if *streaming.read() && !turn_edits.read().is_empty() {
+                                {
+                                    let edits = turn_edits.read().clone();
+                                    let n = edits.len();
+                                    let total_add: u32 = edits.iter().map(|e| e.1).sum();
+                                    let total_del: u32 = edits.iter().map(|e| e.2).sum();
+                                    let pending = edits.iter().filter(|e| e.4.is_empty() && e.3 == 0).count();
+                                    let plural = if n == 1 { "" } else { "s" };
+                                    let shown = n.min(3);
+                                    let more = n.saturating_sub(shown);
+                                    let subtitle = if pending > 0 {
+                                        format!("{pending} live · diffs settle after the turn")
+                                    } else {
+                                        "Diffs ready for review".to_string()
+                                    };
+                                    rsx! {
+                                        div { class: "composer-live-changes",
+                                            div { class: "live-changes-head",
+                                                span { class: "live-changes-icon", Icon { name: "edit" } }
+                                                div { class: "live-changes-copy",
+                                                    span { class: "live-changes-title", "Changing {n} file{plural}" }
+                                                    span { class: "live-changes-sub", "{subtitle}" }
+                                                }
+                                                if total_add + total_del > 0 {
+                                                    // Digits ROLL as edits land (slot/odometer style) —
+                                                    // only the changed characters animate.
+                                                    span { class: "live-changes-counts",
+                                                        span { class: "diff-adds", SlotText { text: format!("+{total_add}") } }
+                                                        span { class: "diff-dels", SlotText { text: format!("\u{2212}{total_del}") } }
+                                                    }
+                                                }
+                                                // No empty skeleton pill while counts are 0 — the
+                                                // subtitle ("… diffs settle after the turn") already
+                                                // signals pending; a blank grey bar just looked broken.
+                                                button { class: "live-changes-review", title: "Open diffs",
+                                                    onclick: move |_| {
+                                                        edits_expanded.set(true);
+                                                        select_env_tab(env_tab, show_env, env_tab_by_tab, tabs, active_tab, "changes", false);
+                                                    },
+                                                    Icon { name: "branch" }
+                                                }
+                                            }
+                                            div { class: "live-changes-files",
+                                                for (path, a, d, cp, diff) in edits.iter().take(shown).cloned() {
+                                                    {
+                                                        let row_pending = diff.is_empty() && cp == 0;
+                                                        let row_cls = if row_pending { "live-change-file pending" } else { "live-change-file" };
+                                                        rsx! {
+                                                            div { class: "{row_cls}",
+                                                                if row_pending { span { class: "syn-spinner" } } else { span { class: "live-change-ready", Icon { name: "check" } } }
+                                                                span { class: "live-change-path", "{path}" }
+                                                                if row_pending {
+                                                                    span { class: "live-change-state shimmer slot-status", SlotText { text: "editing…".to_string() } }
+                                                                } else {
+                                                                    span { class: "live-change-state", span { class: "diff-adds", SlotText { text: format!("+{a}") } } " " span { class: "diff-dels", SlotText { text: format!("\u{2212}{d}") } } }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                if more > 0 {
+                                                    div { class: "live-change-more", "+{more} more" }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if !*streaming.read() && !followups.read().is_empty() && !messages.read().is_empty() {
+                                div { class: "followups",
+                                    for f in followups.read().iter().cloned() {
+                                        button { class: "suggestion followup",
+                                            onclick: {
+                                                let p = f.clone();
+                                                move |_| { engine.send(EngineCmd::Submit { engine: p.clone(), display: p.clone() }); }
+                                            },
+                                            Icon { name: "spark" } span { "{f}" }
+                                        }
+                                    }
+                                    button { class: "followups-x", title: "Dismiss", onclick: move |_| followups.write().clear(), Icon { name: "x" } }
+                                }
+                            }
+                            Composer { streaming, engine, cfg, model_label, bypass,
+                                       followup: !messages.read().is_empty(),
+                                       project: project.clone(), branch: branch.clone(),
+                                       context_used: ctx_used, context_limit: ctx_limit,
+                                       workspace: workspace.clone(), plan_mode, pursue_goal, goal_text, queue, picked_element,
+                                       on_settings: move |_| {
+                                           settings_initial_tab.set("model".to_string());
+                                           show_settings.set(true);
+                                       },
+                                       on_open_folder: move |_| open_folder(cfg, ui, engine), on_pick_workspace: move |dir| apply_workspace(cfg, ui, engine, dir) }
+                        }
+                    }
+                }
                             div { class: "panel-resizer rp", onmousedown: move |e: dioxus::prelude::MouseEvent| {
                                 e.prevent_default();
                                 panel_drag.set(Some((3, e.client_coordinates().x, *rpanel_w.read())));
                             } }
+                    // ALWAYS mounted, CSS-hidden when closed: the Terminals tab hosts
+                    // real PTY shells — unmounting the panel would kill them (same
+                    // Synara lesson as the persistent TUI tabs).
+                    div { class: if *show_env.read() { "env-panel" } else { "env-panel env-hidden" },
                             div { class: "env-tabs",
-                                for (tid, label, ic) in [("files", "Files", "plugins"), ("term", "Terminals", "terminal"), ("preview", "Preview", "spark"), ("changes", "Diffs", "branch")] {
+                                // Synara dock order: Diff | Terminal | Browser | Files.
+                                for (tid, label, ic) in [("changes", "Diff", "branch"), ("term", "Terminal", "terminal"), ("preview", "Browser", "browser"), ("files", "Files", "plugins")] {
                                     button { class: if env_tab.read().as_str() == tid { "env-tab on" } else { "env-tab" },
                                         onclick: move |_| select_env_tab(env_tab, show_env, env_tab_by_tab, tabs, active_tab, tid, false),
                                         Icon { name: ic } span { "{label}" }
@@ -8858,10 +9983,22 @@ fn app() -> Element {
                                             for ti in 0..terms.read().len() {
                                                 {
                                                     let title = terms.read()[ti].1.clone();
+                                                    // Identitas Synara: shell yang menjalankan claude (terdeteksi
+                                                    // via OSC 633) dapat logo provider + dot status di tab-nya.
+                                                    let term_state = {
+                                                        let tid = terms.read()[ti].0;
+                                                        TUI_AGENT_STATES.read().get(&(ENV_TERM_ID_BASE + tid)).copied().unwrap_or("")
+                                                    };
                                                     rsx! {
                                                         button { class: if ti == *term_sel.read() { "term-tab on" } else { "term-tab" },
                                                             onclick: move |_| term_sel.set(ti),
+                                                            if !term_state.is_empty() {
+                                                                if let Some(l) = provider_logo("claude") { span { class: "term-tab-prov prov-logo", dangerous_inner_html: l } }
+                                                            }
                                                             "{title}"
+                                                            if term_state == "running" { span { class: "syn-spinner" } }
+                                                            else if term_state == "attention" { span { class: "tab-agent-dot attention", title: "Needs permission" } }
+                                                            else if term_state == "review" { span { class: "tab-agent-dot review", title: "Turn finished — review" } }
                                                             if terms.read().len() > 1 {
                                                                 span { class: "term-tab-x", onclick: move |e: dioxus::prelude::MouseEvent| {
                                                                     e.stop_propagation();
@@ -8903,962 +10040,7 @@ fn app() -> Element {
                                 }
                             }
                         }
-                    // Persistent TUI terminals: every "tui" tab renders here ALWAYS,
-                    // with a stable key, so switching tabs never unmounts it — which
-                    // would close its PTY and kill the CLI (codex/claude), losing the
-                    // session. Only the active tui tab is shown (display:contents so
-                    // .xterm-host fills the content area exactly as before); the rest
-                    // stay mounted but hidden (display:none). This is the only place
-                    // TerminalView is mounted. (Synara lesson: persist via mount +
-                    // stable id, hide with CSS — never mount/unmount on tab switch.)
-                    for t in tabs.read().iter().filter(|t| t.mode == "tui") {
-                        div {
-                            key: "tuihost-{t.id}",
-                            class: if active_is_tui && t.id == active_tab_id && !editor_open {
-                                "tui-host-live"
-                            } else {
-                                "tui-host-off"
-                            },
-                            TerminalView {
-                                id: t.id,
-                                bin: t.bin.clone(),
-                                ws: workspace.display().to_string(),
-                                resume: t.resume.clone(),
-                            }
-                        }
-                    }
-                    if *show_split.read() && cfg.read().workspace.is_some() {
-                        SplitView {
-                            node: match *split_maximized.read() {
-                                Some(pid) => Tile::Leaf(pid),
-                                None => split_layout.read().clone(),
-                            },
-                            workspace: workspace.clone(),
-                            panes: split_panes,
-                            layout: split_layout,
-                            next_id: split_next_id,
-                            drag: split_drag,
-                            rects: split_rects,
-                            def_provider: cfg.read().provider.clone(),
-                            def_model: cfg.read().model.clone(),
-                        }
-                    } else if *show_board.read() && cfg.read().workspace.is_some() {
-                        div { class: "board",
-                            div { class: "board-head",
-                                h2 { "Board" }
-                                div { class: "board-actions",
-                                    input { class: "board-input", placeholder: "New task…", value: "{new_card_title}",
-                                        oninput: move |e| new_card_title.set(e.value()),
-                                        onkeydown: move |e| {
-                                            if e.key() == Key::Enter {
-                                                let t = new_card_title.read().trim().to_string();
-                                                if !t.is_empty() {
-                                                    board.write().add(t, String::new());
-                                                    new_card_title.set(String::new());
-                                                    let snap = board.read().clone(); snap.save(&workspace_of(&cfg.read()));
-                                                }
-                                            }
-                                        }
-                                    }
-                                    button { class: "board-btn", onclick: move |_| { let _ = workspace_of(&cfg.read()); run_board(board, cfg, workspace_of(&cfg.read())); }, Icon { name: "play" } "Run To-Do" }
-                                    button { class: "board-btn ghost", onclick: move |_| {
-                                            let root = workspace_of(&cfg.read());
-                                            sync_board_issues(board, root, board_sync_status, board_syncing);
-                                        },
-                                        if *board_syncing.read() { "Syncing…" } else { span { Icon { name: "refresh" } "Sync issues" } }
-                                    }
-                                }
-                            }
-                            div { class: "board-sync-status", "{board_sync_status}" }
-                            div { class: "board-cols four",
-                                for (col, label) in [(board::TODO, "To Do"), (board::DOING, "In Progress"), (board::REVIEW, "Review"), (board::DONE, "Done")] {
-                                    div { class: "board-col",
-                                        div { class: "board-col-head", "{label}" }
-                                        for card in board.read().cards.iter().filter(|c| c.column == col).cloned() {
-                                            {
-                                                let cid = card.id;
-                                                let cbranch = card.branch.clone();
-                                                let has_source = !card.source.is_empty();
-                                                let meta = [
-                                                    card.source_status.clone(),
-                                                    card.source_priority.clone(),
-                                                    card.source_assignee.clone(),
-                                                ]
-                                                .into_iter()
-                                                .filter(|item| !item.trim().is_empty())
-                                                .collect::<Vec<_>>()
-                                                .join(" · ");
-                                                let issue_url = card.source_url.clone();
-                                                rsx! {
-                                                    div { class: if col == board::DOING { "board-card doing" } else { "board-card" },
-                                                        if has_source {
-                                                            div { class: "board-card-meta",
-                                                                span { class: if card.source == "Linear" { "board-source linear" } else { "board-source github" }, "{card.source}" }
-                                                                if !meta.is_empty() { span { "{meta}" } }
-                                                            }
-                                                        }
-                                                        div { class: "board-card-title", "{card.title}" }
-                                                        if !issue_url.is_empty() {
-                                                            a { class: "board-card-link", href: "{issue_url}", target: "_blank", "Open issue" }
-                                                        }
-                                                        if !card.result.is_empty() { div { class: "board-card-result", "{card.result}" } }
-                                                        if !card.branch.is_empty() { div { class: "board-card-branch", "{card.branch}" } }
-                                                        if col == board::REVIEW && !cbranch.is_empty() {
-                                                            button { class: "board-merge", onclick: move |_| {
-                                                                let root = workspace_of(&cfg.read());
-                                                                let branch = cbranch.clone();
-                                                                spawn(async move {
-                                                                    let (ok, msg) = board::merge_branch(&root, &branch).await;
-                                                                    let snap = {
-                                                                        let mut b = board.write();
-                                                                        if let Some(c) = b.cards.iter_mut().find(|c| c.id == cid) {
-                                                                            if ok { c.column = board::DONE.to_string(); }
-                                                                            c.result = format!("{}\n\n[merge] {msg}", c.result);
-                                                                        }
-                                                                        b.clone()
-                                                                    };
-                                                                    snap.save(&root);
-                                                                });
-                                                            }, Icon { name: "check" } "Merge" }
-                                                        }
-                                                        button { class: "board-card-x", onclick: move |_| {
-                                                            board.write().cards.retain(|c| c.id != cid);
-                                                            let snap = board.read().clone(); snap.save(&workspace_of(&cfg.read()));
-                                                        }, Icon { name: "x" } }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    } else if editor_open {
-                        // Editor outranks the TUI view: opening a file from the Files
-                        // panel must show it even when a terminal tab is active (the
-                        // PTY stays mounted, just hidden).
-                        Editor {}
-                    } else if active_is_tui {
-                        // The active terminal is rendered by the persistent TUI layer
-                        // above (kept mounted across tab switches); nothing here.
-                    } else if cfg.read().workspace.is_none() {
-                        div { class: "hero welcome-screen",
-                            img { class: "welcome-logo", src: logo_uri() }
-                            h1 { class: "hero-title", "Welcome to Oxide" }
-                            p { class: "welcome-sub", "Open a project folder to get started." }
-                            button { class: "welcome-btn", onclick: move |_| open_folder(cfg, ui, engine), "Open folder" }
-                            if !cfg.read().recent_workspaces.is_empty() {
-                                div { class: "welcome-recent",
-                                    div { class: "menu-label", "Recent" }
-                                    for p in cfg.read().recent_workspaces.clone() {
-                                        {
-                                            let name = p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| p.display().to_string());
-                                            rsx! {
-                                                button { class: "welcome-recent-item", onclick: move |_| apply_workspace(cfg, ui, engine, p.clone()),
-                                                    Icon { name: "folder" } span { "{name}" }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    } else if is_empty {
-                        div { class: "hero",
-                            h1 { class: "hero-title", "What should we build in {project}?" }
-                            Composer { streaming, engine, cfg, model_label: model_label.clone(),
-                                       bypass, project: project.clone(), branch: branch.clone(),
-                                       context_used: ctx_used, context_limit: ctx_limit,
-                                       workspace: workspace.clone(), plan_mode, pursue_goal, goal_text, queue, picked_element,
-                                       on_settings: move |_| {
-                                           settings_initial_tab.set("model".to_string());
-                                           show_settings.set(true);
-                                       },
-                                       on_open_folder: move |_| open_folder(cfg, ui, engine), on_pick_workspace: move |dir| apply_workspace(cfg, ui, engine, dir) }
-                            div { class: "suggestions",
-                                for s in suggestions.iter() {
-                                    button { class: "suggestion",
-                                        onclick: {
-                                            let p = s.to_string();
-                                            move |_| { engine.send(EngineCmd::Submit { engine: p.clone(), display: p.clone() }); }
-                                        },
-                                        Icon { name: "spark" } span { "{s}" }
-                                    }
-                                }
-                            }
-                            div { class: "hero-pills",
-                                button { class: "hero-pill", onclick: move |_| { let mut pm = plan_mode; let v = *pm.read(); pm.set(!v); },
-                                    if *plan_mode.read() { "Plan mode on" } else { "Plan mode" }
-                                }
-                                button { class: "hero-pill",
-                                    onclick: move |_| select_env_tab(env_tab, show_env, env_tab_by_tab, tabs, active_tab, "files", false),
-                                    "Open Files"
-                                }
-                            }
-                        }
-                    } else {
-                        div { class: if *streaming.read() { "scroll" } else { "scroll smooth" },
-                            div { class: "jump-anchor",
-                                button { class: "jump-bottom", title: "Scroll to bottom",
-                                    onclick: move |_| { spawn(async move { let _ = dioxus::document::eval("window.__oxstick = true; const s=document.querySelector('.scroll'); if(s) s.scrollTo({top:s.scrollHeight, behavior:'smooth'});").await; }); },
-                                    Icon { name: "arrow-down" }
-                                }
-                            }
-                            div {
-                                // Key on the active tab so switching tabs remounts the
-                                // transcript and replays the crossfade (col-cross), instead
-                                // of an instant content swap.
-                                key: "col-{active_tab}",
-                                class: if *streaming.read() { "col streaming" } else { "col" },
-                                {
-                                    let last_user_idx = messages.read().iter().rposition(|m| m.author == Author::User);
-                                    let last_agent_idx = messages.read().iter().rposition(|m| m.author == Author::Agent);
-                                    let rturns = {
-                                        let msgs = messages.read();
-                                        flatten_turns(build_transcript_turns(&msgs), &msgs)
-                                    };
-                                    rsx! {
-                                        for turn in rturns.into_iter() {
-                                        div { key: "t-{turn.key}", class: "turn",
-                                        for item in turn.items.into_iter() {
-                                            {
-                                                match item {
-                                            TurnItem::Act(group) => {
-                                                {
-                                                    let idxs = group.indices;
-                                                    let group_key = group.key;
-                                                    let rows: Vec<(String, bool, bool)> = idxs.iter().map(|&i| {
-                                                        let m = &messages.read()[i];
-                                                        if let Author::Activity { running, ok, .. } = m.author { (m.text.clone(), running, ok) } else { (m.text.clone(), false, true) }
-                                                    }).collect();
-                                                    let (icon, label) = activity_group_display(&rows);
-                                                    // Default COLLAPSED, even while live — an open group with dozens
-                                                    // of (animating) rows lags hard. The header shows live progress;
-                                                    // the user expands for detail. And cap rendered rows to the most
-                                                    // recent so expanding a huge group stays light.
-                                                    let tool_detail = cfg.read().tool_detail.clone();
-                                                    let is_open = act_open
-                                                        .read()
-                                                        .get(&group_key)
-                                                        .copied()
-                                                        .unwrap_or(tool_detail == "detailed");
-                                                    const ACT_ROW_CAP: usize = 12;
-                                                    // Compact density: settled-ok rows collapse into the header;
-                                                    // running and failed rows always stay visible.
-                                                    let rows: Vec<(String, bool, bool)> = if tool_detail == "compact" {
-                                                        rows.into_iter().filter(|(_, r, o)| *r || !*o).collect()
-                                                    } else {
-                                                        rows
-                                                    };
-                                                    let hidden = rows.len().saturating_sub(ACT_ROW_CAP);
-                                                    let shown: Vec<(String, bool, bool)> = rows.into_iter().skip(hidden).collect();
-                                                    rsx! {
-                                                        details { key: "g-{group_key}", class: "act-group", open: is_open,
-                                                            summary { class: "act-group-head",
-                                                                onclick: move |e: dioxus::prelude::MouseEvent| {
-                                                                    e.prevent_default();
-                                                                    let cur = act_open.read().get(&group_key).copied().unwrap_or(false);
-                                                                    act_open.write().insert(group_key, !cur);
-                                                                },
-                                                                span { class: "diff-caret", Icon { name: "chevron" } }
-                                                                span { class: "act-group-icon", Icon { name: icon } }
-                                                                "{label}"
-                                                            }
-                                                            if hidden > 0 { div { class: "act-more", "… {hidden} earlier" } }
-                                                            for (t, r, o, count) in coalesce_activity_rows(shown) {
-                                                                {
-                                                                    let view = activity_view(&t);
-                                                                    if matches!(view.kind, ActivityKind::FileChange) {
-                                                                        // Join the file's cumulative +/− from turn_edits by
-                                                                        // basename so the coalesced row carries live counts.
-                                                                        let want = std::path::Path::new(&view.detail)
-                                                                            .file_name()
-                                                                            .map(|n| n.to_owned());
-                                                                        let (adds, dels) = turn_edits
-                                                                            .read()
-                                                                            .iter()
-                                                                            .filter(|e| {
-                                                                                std::path::Path::new(&e.0)
-                                                                                    .file_name()
-                                                                                    .map(|n| n.to_owned())
-                                                                                    == want
-                                                                            })
-                                                                            .fold((0u32, 0u32), |(a, d), e| (a + e.1, d + e.2));
-                                                                        let secs = if r { tool_start.read().as_ref().map(|ts| ts.elapsed().as_secs()).unwrap_or(0) } else { 0 };
-                                                                        rsx! { EditActivityRow { text: t, running: r, ok: o, count, adds, dels, secs } }
-                                                                    } else {
-                                                                        let secs = if r { tool_start.read().as_ref().map(|ts| ts.elapsed().as_secs()).unwrap_or(0) } else { 0 };
-                                                                        rsx! { ActivityRow { text: t, running: r, ok: o, secs, auto_open: tool_detail == "detailed" } }
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            TurnItem::Row(i) => {
-                                                    {
-                                                        let m = messages.read()[i].clone();
-                                                        match &m.author {
-                                                            // Diff rows were dropped in flatten_turns; User rows and
-                                                            // the rest each render ONE keyed root.
-                                                            Author::Diff(_, _) => rsx! {},
-                                                            Author::User => {
-                                                                // Display text may carry pasted images after \u{2} separators —
-                                                                // either inline data URLs or persisted `wsimg:` file refs.
-                                                                let markers: Vec<String> = m.text.split('\u{2}').skip(1).map(String::from).collect();
-                                                                let imgs: Vec<String> = markers.iter()
-                                                                    .filter_map(|s| {
-                                                                        if let Some(rel) = s.strip_prefix("wsimg:") {
-                                                                            Some(format!("/wsimg/{rel}"))
-                                                                        } else if s.starts_with("data:image") {
-                                                                            Some(s.to_string())
-                                                                        } else { None }
-                                                                    }).collect();
-                                                                let text_files: Vec<(String, String)> = markers.iter()
-                                                                    .filter_map(|s| s.strip_prefix("wstxt:").map(|rel| (text_attachment_name(rel), rel.to_string())))
-                                                                    .collect();
-                                                                let segs = user_segments(&m.text);
-                                                                let copy = serde_json::to_string(&strip_scaffold(&m.text)).unwrap_or_default();
-                                                                let edit_text = strip_scaffold(&m.text);
-                                                                let idx = i;
-                                                                let _ = last_user_idx; let row_cls = "row user sticky-turn";
-                                                                // Clamp long prompts (esp. while sticky) — expandable. Clamp the
-                                                                // TEXT only (line-clamp), never the bubble itself; masking the
-                                                                // bubble fights its backdrop-filter and renders it blank.
-                                                                let long = edit_text.chars().count() > 240 || edit_text.lines().count() > 3;
-                                                                let expanded = expanded_user.read().contains(&idx);
-                                                                let text_cls = if long && !expanded { "user-text clamped" } else { "user-text" };
-                                                                rsx! {
-                                                                    div { key: "m-{m.id}", class: "{row_cls}",
-                                                                        div { class: "bubble",
-                                                                            if !imgs.is_empty() {
-                                                                                div { class: "msg-imgs",
-                                                                                    for src in imgs {
-                                                                                        img { class: "msg-img", src: "{src}",
-                                                                                            onclick: { let s = src.clone(); move |_| chat_img.set(Some(s.clone())) } }
-                                                                                    }
-                                                                                }
-                                                                            }
-                                                                            if !text_files.is_empty() {
-                                                                                div { class: "msg-files",
-                                                                                    for (name, rel) in text_files {
-                                                                                        div { class: "msg-file", title: "{rel}",
-                                                                                            Icon { name: "file" }
-                                                                                            span { "{name}" }
-                                                                                        }
-                                                                                    }
-                                                                                }
-                                                                            }
-                                                                            div { class: "{text_cls}",
-                                                                                for (is_m, s) in segs {
-                                                                                    if is_m { span { class: "inline-chip", "{s}" } } else { "{s}" }
-                                                                                }
-                                                                            }
-                                                                            if long {
-                                                                                button { class: "bubble-more",
-                                                                                    onclick: move |_| {
-                                                                                        let mut e = expanded_user.write();
-                                                                                        if !e.insert(idx) { e.remove(&idx); }
-                                                                                    },
-                                                                                    if expanded { "show less" } else { "show more" }
-                                                                                }
-                                                                            }
-                                                                        }
-                                                                        div { class: "msg-actions",
-                                                                            button { class: "msg-act", title: "Copy message", onclick: move |_| { let c = copy.clone(); spawn(async move { let _ = document::eval(&format!("navigator.clipboard.writeText({c})")).await; }); push_toast(toasts, toast_seq, "ok", "Copied"); }, Icon { name: "copy" } }
-                                                                            if *confirm_restore.read() == Some(idx) {
-                                                                                button { class: "msg-act danger", title: "Click again to confirm — reverts files and brings this message back to the composer to edit & resend", onclick: move |_| {
-                                                                                    confirm_restore.set(None);
-                                                                                    // Revert every file change from this turn onward.
-                                                                                    let floor = { let ms = messages.read(); ms.iter().skip(idx).find_map(|mm| if let Author::Diff(_, cp) = mm.author { Some(cp) } else { None }) };
-                                                                                    if let Some(fl) = floor {
-                                                                                        let ids: Vec<u64> = checkpoints.read().iter().map(|(id, _)| *id).filter(|id| *id >= fl).collect();
-                                                                                        for id in ids.into_iter().rev() { engine.send(EngineCmd::Rewind { id }); reverted.write().insert(id); }
-                                                                                    }
-                                                                                    // Drop this turn and everything after it (UI)…
-                                                                                    messages.write().truncate(idx);
-                                                                                    // …and trim the engine + session history so the
-                                                                                    // model forgets the removed turns (no pile-up).
-                                                                                    let hist: Vec<(String, String)> = messages.read().iter().filter_map(|mm| match mm.author {
-                                                                                        Author::User => Some(("user".to_string(), strip_scaffold(&mm.text))),
-                                                                                        Author::Agent if !mm.text.is_empty() => Some(("assistant".to_string(), mm.text.clone())),
-                                                                                        _ => None,
-                                                                                    }).collect();
-                                                                                    engine.send(EngineCmd::SetHistory(hist));
-                                                                                    // …and load the message back into the composer to edit & resend.
-                                                                                    let t = edit_text.clone();
-                                                                                    spawn(async move {
-                                                                                        let js = format!("const e=document.getElementById('ce-input'); if(e){{ e.textContent={}; e.focus(); const r=document.createRange(); r.selectNodeContents(e); r.collapse(false); const s=window.getSelection(); s.removeAllRanges(); s.addRange(r); }} return true;", serde_json::to_string(&t).unwrap_or_default());
-                                                                                        let _ = dioxus::document::eval(&js).join::<bool>().await;
-                                                                                    });
-                                                                                }, "Edit & restore?" }
-                                                                            } else {
-                                                                                button { class: "msg-act", title: "Restore — revert files and edit this message", onclick: move |_| confirm_restore.set(Some(idx)), Icon { name: "undo" } }
-                                                                            }
-                                                                        }
-                                                                    }
-                                                                }
-                                                            }
-                                                            _ if m.author == Author::Note && m.text.starts_with("§thought\t") => {
-                                                                let mut parts = m.text.splitn(3, '\t');
-                                                                let _ = parts.next();
-                                                                let secs = parts.next().unwrap_or("1").to_string();
-                                                                let body = parts.next().unwrap_or("").to_string();
-                                                                rsx! {
-                                                                    details { key: "m-{m.id}", class: "thought-row",
-                                                                        summary { class: "thought-sum", "Thought for {secs}s" }
-                                                                        div { class: "thought-body", "{body}" }
-                                                                    }
-                                                                }
-                                                            }
-                                                            _ => {
-                                                                // Live = the NEWEST agent bubble while streaming — not "the last
-                                                                // row": a tool/command row landing after the bubble used to flip
-                                                                // it to the cached non-live path mid-stream (one full re-render =
-                                                                // visible flicker), and hid the reasoning box while tools ran.
-                                                                let is_live = *streaming.read() && m.author == Author::Agent && Some(i) == last_agent_idx;
-                                                                let pin_snip: String = m.text.lines().find(|l| !l.trim().is_empty()).unwrap_or("").chars().take(64).collect();
-                                                                let is_agent = m.author == Author::Agent && !m.text.is_empty();
-                                                                let ws_pin = workspace.clone();
-                                                                let ws_mark = workspace.clone();
-                                                                let snip2 = pin_snip.clone();
-                                                                rsx! {
-                                                                    // ONE keyed root per row — the thinking-box rides INSIDE it
-                                                                    // (an unkeyed conditional sibling used to bury the row key
-                                                                    // under a fragment root → positional diffing → reversal).
-                                                                    div { key: "m-{m.id}", class: "rowwrap",
-                                                                    if is_live && !thinking.read().is_empty() {
-                                                                        details { class: "thinking-box", open: think_open.read().unwrap_or(true),
-                                                                            summary {
-                                                                                class: "thinking-sum live",
-                                                                                onclick: move |e: dioxus::prelude::MouseEvent| {
-                                                                                    e.prevent_default();
-                                                                                    let cur = think_open.read().unwrap_or(true);
-                                                                                    think_open.set(Some(!cur));
-                                                                                },
-                                                                                span { class: "thinking-glow", "Reasoning" }
-                                                                                {
-                                                                                    let el = *think_secs.read();
-                                                                                    if el >= 1 {
-                                                                                        rsx! { span { class: "thinking-secs", "{el}s" } }
-                                                                                    } else {
-                                                                                        rsx! {}
-                                                                                    }
-                                                                                }
-                                                                            }
-                                                                            div { class: "thinking-body", "{thinking}" }
-                                                                        }
-                                                                    }
-                                                                    div { id: "msg-{i}", class: "pinwrap",
-                                                                        Message {
-                                                                            author: m.author.clone(),
-                                                                            text: m.text.clone(),
-                                                                            live: is_live,
-                                                                            tool_secs: tool_start.read().as_ref().map(|t| t.elapsed().as_secs()).unwrap_or(0),
-                                                                            compact_tools: cfg.read().tool_detail == "compact",
-                                                                        }
-                                                                        if is_agent && !is_live {
-                                                                            div { class: "msg-side",
-                                                                                button { class: "msg-pin", title: "Pin message",
-                                                                                    onclick: move |_| {
-                                                                                        if !pinned_msgs.read().iter().any(|p| p.0 == i) {
-                                                                                            pinned_msgs.write().push((i, pin_snip.clone(), false));
-                                                                                            thread_json_save(&ws_pin, "pins", &thread_stem(&tabs, &active_tab), &*pinned_msgs.read());
-                                                                                        }
-                                                                                    }, Icon { name: "pin" } }
-                                                                                button { class: "msg-pin", title: "Mark — highlights selected text (or the message)",
-                                                                                    onclick: move |_| {
-                                                                                        let ws3 = ws_mark.clone();
-                                                                                        let fallback = snip2.clone();
-                                                                                        spawn(async move {
-                                                                                            let sel = dioxus::document::eval("return (window.getSelection()||'').toString();")
-                                                                                                .join::<String>().await.unwrap_or_default();
-                                                                                            let text = if sel.trim().is_empty() { fallback } else { sel.chars().take(80).collect() };
-                                                                                            let color = (markers.peek().len() % 4) as u8;
-                                                                                            markers.write().push((i, text, color, false));
-                                                                                            thread_json_save(&ws3, "markers", &thread_stem(&tabs, &active_tab), &*markers.read());
-                                                                                        });
-                                                                                    }, span { class: "mark-swatch c0" } }
-                                                    }
-                                                }
-                                            }
-                                            }
-                                        }
-                                        }
-                                        }
-                                    }
-                                }
-                                                }
-                                            }
-                                        }
-                                        if let Some(sum) = turn.done_summary {
-                                            div { key: "done-{turn.key}", class: "pinwrap", Message { author: Author::Note, text: sum, live: false } }
-                                        }
-                                        }
-                                        }
-                                    }
-                                }
-                                if !*streaming.read() && !thinking.read().is_empty() {
-                                    {
-                                        let live = *streaming.read();
-                                        rsx! {
-                                            details { class: "thinking-box", open: think_open.read().unwrap_or(live),
-                                                summary {
-                                                    class: if live { "thinking-sum live" } else { "thinking-sum" },
-                                                    onclick: move |e: dioxus::prelude::MouseEvent| {
-                                                        e.prevent_default();
-                                                        let cur = think_open.read().unwrap_or(live);
-                                                        think_open.set(Some(!cur));
-                                                    },
-                                                    // Cursor-style: shimmering "Reasoning" + live timer while
-                                                    // thinking; settles to a plain label once the turn ends.
-                                                    if live {
-                                                        span { class: "thinking-glow", "Reasoning" }
-                                                        {
-                                                            let el = *think_secs.read();
-                                                            if el >= 1 {
-                                                                rsx! { span { class: "thinking-secs", "{el}s" } }
-                                                            } else {
-                                                                rsx! {}
-                                                            }
-                                                        }
-                                                    } else {
-                                                        {
-                                                            let t = *think_secs.read();
-                                                            if t >= 1 {
-                                                                rsx! { "Thought for {t}s" }
-                                                            } else {
-                                                                rsx! { "Reasoning" }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                                div { class: "thinking-body", "{thinking}" }
-                                            }
-                                        }
-                                    }
-                                }
-                                if *streaming.read() {
-                                    // Keep the pill mounted for the WHOLE turn — gating it on a
-                                    // non-empty status made it unmount/remount whenever `status`
-                                    // momentarily emptied between events, restarting the spinner's
-                                    // CSS animation each time (it looked frozen/stuck). A stable
-                                    // key + always-mounted pill lets the spin run continuously.
-                                    StatusPill {
-                                        text: status.read().clone(),
-                                        elapsed_s: *elapsed_s.read(),
-                                        stalled_s: elapsed_s.read().saturating_sub(*last_ev_s.read()),
-                                    }
-                                }
-                                if !bg_jobs.read().is_empty() || !bg_watch.read().is_empty() {
-                                    {
-                                        let all_settled = bg_jobs.read().is_empty()
-                                            && bg_watch.read().iter().all(|j| bg_settled.read().contains(&j.0));
-                                        rsx! {
-                                    div { class: "bg-bar",
-                                        span { class: if all_settled { "bg-orbit settled" } else { "bg-orbit" } }
-                                        span { class: "bg-label", "Background" }
-                                        // Watched jobs: their output FILE is tailed across turns,
-                                        // so the result stays readable here — expand for the tail.
-                                        for (id, command, _path) in bg_watch.read().iter().cloned() {
-                                            {
-                                                let tail = bg_tails.read().get(&id).cloned().unwrap_or_default();
-                                                let short: String = command.chars().take(60).collect();
-                                                let did = id.clone();
-                                                let settled = bg_settled.read().contains(&id);
-                                                rsx! {
-                                                    details { key: "bgw-{id}", class: "bg-chip bg-watch",
-                                                        summary { class: "bg-watch-sum",
-                                                            title: if settled { "No new output for ~20s — likely finished. Expand for the tail; ✕ to dismiss." } else { "{command}" },
-                                                            span { class: if settled { "bg-dot settled" } else { "bg-dot" } }
-                                                            span { class: "bg-chip-text", "{short}" }
-                                                            button { class: "bg-x", title: "Stop watching",
-                                                                onclick: move |e: dioxus::prelude::MouseEvent| {
-                                                                    e.prevent_default();
-                                                                    e.stop_propagation();
-                                                                    // Tailer sees the removal and stops itself.
-                                                                    bg_watch.clone().write().retain(|j| j.0 != did);
-                                                                },
-                                                                Icon { name: "x" } }
-                                                        }
-                                                        if tail.is_empty() {
-                                                            div { class: "bg-watch-out empty", "no output yet…" }
-                                                        } else {
-                                                            pre { class: "bg-watch-out", "{tail}" }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        // Legacy chips (no known output file — label only).
-                                        for (bi, job) in bg_jobs.read().iter().cloned().enumerate() {
-                                            if !bg_watch.read().iter().any(|j| j.1 == job) {
-                                                span { class: "bg-chip", title: "Running in background — result won't auto-return",
-                                                    span { class: "bg-dot" }
-                                                    span { class: "bg-chip-text", "{job}" }
-                                                    button { class: "bg-x", title: "Dismiss", onclick: move |_| { let mut v = bg_jobs.write(); if bi < v.len() { v.remove(bi); } }, Icon { name: "x" } }
-                                                }
-                                            }
-                                        }
-                                    }
-                                        }
-                                    }
-                                }
-                                if !queue.read().is_empty() {
-                                    div { class: "queue-bar",
-                                        span { class: "queue-label", Icon { name: "clock" } "Queued ({queue.read().len()})" }
-                                        for (qi, q) in queue.read().iter().enumerate() {
-                                            {
-                                                let preview = queue_preview(q);
-                                                let full = q.clone();
-                                                rsx! {
-                                                    span { class: "queue-chip", title: "Click to edit this queued message",
-                                                        onclick: move |_| {
-                                                            // Pull the item back into the composer for editing.
-                                                            let mut qv = queue.write();
-                                                            if qi < qv.len() { qv.remove(qi); }
-                                                            let full = strip_scaffold(&full);
-                                                            let js = format!(
-                                                                "const e=document.getElementById('ce-input'); if(e){{ e.textContent={}; e.focus(); const r=document.createRange(); r.selectNodeContents(e); r.collapse(false); const s=window.getSelection(); s.removeAllRanges(); s.addRange(r); }} return true;",
-                                                                serde_json::to_string(&full).unwrap_or_default()
-                                                            );
-                                                                spawn(async move { let _ = dioxus::document::eval(&js).join::<bool>().await; });
-                                                        },
-                                                        span { class: "queue-index", "{qi + 1}" }
-                                                        "{preview}"
-                                                        if qi > 0 {
-                                                            button { class: "queue-steer", title: "Move up in the queue",
-                                                                onclick: move |e: dioxus::prelude::MouseEvent| {
-                                                                    e.stop_propagation();
-                                                                    let mut qv = queue.write();
-                                                                    if qi > 0 && qi < qv.len() { qv.swap(qi, qi - 1); }
-                                                                }, Icon { name: "arrow-up" } }
-                                                        }
-                                                        button { class: "queue-steer", title: "Steer now — inject into the running turn instead of waiting",
-                                                            onclick: move |e: dioxus::prelude::MouseEvent| {
-                                                                e.stop_propagation();
-                                                                let text = {
-                                                                    let mut qv = queue.write();
-                                                                    if qi < qv.len() { Some(qv.remove(qi)) } else { None }
-                                                                };
-                                                                if let Some(t) = text {
-                                                                    let display = strip_scaffold(&t);
-                                                                    engine.send(EngineCmd::Submit { engine: t, display });
-                                                                }
-                                                            }, Icon { name: "corner-up-right" } }
-                                                        button { class: "queue-x", onclick: move |e: dioxus::prelude::MouseEvent| { e.stop_propagation(); let mut qv = queue.write(); if qi < qv.len() { qv.remove(qi); } }, Icon { name: "x" } }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        if queue.read().len() > 1 {
-                                            button { class: "queue-clear", title: "Clear queued prompts", onclick: move |_| queue.write().clear(), "Clear" }
-                                        }
-                                    }
-                                }
-                                for (qid, question, options) in questions.read().iter().cloned() {
-                                    div { class: "question-card",
-                                        div { class: "question-q", Icon { name: "help" } span { "{question}" } }
-                                        div { class: "question-opts",
-                                            for (oi, opt) in options.iter().enumerate() {
-                                                {
-                                                    let opt = opt.clone();
-                                                    rsx! {
-                                                        button { class: "question-opt", onclick: move |_| { engine.send(EngineCmd::Answer { id: qid, text: opt.clone() }); q_answer.set(String::new()); },
-                                                            span { class: "question-num", "{oi + 1}" } "{opt}"
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        div { class: "question-free",
-                                            input { class: "question-input", placeholder: "Or type your answer…", value: "{q_answer}",
-                                                oninput: move |e| q_answer.set(e.value()),
-                                                onkeydown: move |e| {
-                                                    if e.key() == Key::Enter {
-                                                        let a = q_answer.read().trim().to_string();
-                                                        if !a.is_empty() { engine.send(EngineCmd::Answer { id: qid, text: a }); q_answer.set(String::new()); }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                for (id, tool, summary) in approvals.read().iter().cloned() {
-                                    div { class: "approval-card",
-                                        div { class: "approval-q", "Allow " span { class: "approval-tool", "{tool}" } "?" }
-                                        if !summary.is_empty() { div { class: "approval-sum", "{summary}" } }
-                                        div { class: "approval-actions",
-                                            // Remove the card optimistically: it otherwise stays
-                                            // clickable until the coroutine drains the command, and
-                                            // a double-click re-marks the tab "Running" for nothing.
-                                            button { class: "approval-yes", onclick: move |_| { approvals.write().retain(|(i, _, _)| *i != id); engine.send(EngineCmd::Approve { id, decision: ApprovalDecision::Approve }); }, "Approve" }
-                                            button { class: "approval-always", onclick: move |_| { approvals.write().retain(|(i, _, _)| *i != id); engine.send(EngineCmd::Approve { id, decision: ApprovalDecision::ApproveForSession }); }, "Always" }
-                                            button { class: "approval-no", onclick: move |_| { approvals.write().retain(|(i, _, _)| *i != id); engine.send(EngineCmd::Approve { id, decision: ApprovalDecision::Reject }); }, "Reject" }
-                                        }
-                                    }
-                                }
-                                if !*streaming.read() && !turn_edits.read().is_empty() {
-                                    {
-                                        let edits = turn_edits.read().clone();
-                                        let n = edits.len();
-                                        let total_add: u32 = edits.iter().map(|e| e.1).sum();
-                                        let total_del: u32 = edits.iter().map(|e| e.2).sum();
-                                        let expanded = *edits_expanded.read();
-                                        let shown = if expanded { n } else { n.min(3) };
-                                        let plural = if n == 1 { "" } else { "s" };
-                                        let more_txt = if expanded { "Show less".to_string() } else { format!("Show {} more files", n.saturating_sub(3)) };
-                                        rsx! {
-                                            div { class: "edits-card",
-                                                div { class: "edits-head",
-                                                    span { class: "edits-ic", Icon { name: "list" } }
-                                                    div { class: "edits-title-col",
-                                                        span { class: "edits-title", "Edited {n} file{plural}" }
-                                                        span { class: "edits-counts", span { class: "diff-adds countup plus", style: "--n:{total_add}" } " " span { class: "diff-dels countup minus", style: "--n:{total_del}" } }
-                                                    }
-                                                    if *edits_undone.read() {
-                                                        span { class: "edits-undone slot-status icon-slot", Icon { name: "check" } SlotText { text: "Undone".to_string(), reverse: true } }
-                                                    } else {
-                                                        div { class: "edits-actions",
-                                                            button { class: "edits-undo", onclick: move |_| {
-                                                                for (_, _, _, cp, _) in turn_edits.read().iter() { engine.send(EngineCmd::Rewind { id: *cp }); reverted.write().insert(*cp); }
-                                                                edits_undone.set(true);
-                                                            }, Icon { name: "undo" } SlotText { text: "Undo".to_string(), reverse: true } }
-                                                        }
-                                                    }
-                                                }
-                                                for (path, a, d, cp, diff) in edits.iter().take(shown).cloned() {
-                                                    {
-                                                        let is_reverted = reverted.read().contains(&cp);
-                                                        let pending = diff.is_empty() && cp == 0;
-                                                        if pending {
-                                                            // Live row: the CLI is editing this file right now;
-                                                            // the diff lands at the end of the turn.
-                                                            rsx! {
-                                                                div { class: "edits-row pending",
-                                                                    span { class: "syn-spinner" }
-                                                                    span { class: "edits-path", "{path}" }
-                                                                    span { class: "edits-rowcounts shimmer slot-status", SlotText { text: "editing…".to_string() } }
-                                                                }
-                                                            }
-                                                        } else {
-                                                            rsx! {
-                                                                details { class: "edits-row-d",
-                                                                    summary { class: "edits-row",
-                                                                        span { class: "edits-caret", Icon { name: "chevron" } }
-                                                                        span { class: "edits-path", "{path}" }
-                                                                        span { class: "edits-rowcounts", span { class: "diff-adds", SlotText { text: format!("+{a}") } } " " span { class: "diff-dels", SlotText { text: format!("\u{2212}{d}") } } }
-                                                                        if is_reverted {
-                                                                            span { class: "diff-reverted slot-status icon-slot", Icon { name: "check" } SlotText { text: "Reverted".to_string(), reverse: true } }
-                                                                        } else if accepted.read().contains(&cp) {
-                                                                            span { class: "diff-kept slot-status icon-slot", Icon { name: "check" } SlotText { text: "Kept".to_string() } }
-                                                                        } else if cp != 0 {
-                                                                            // Revert only — keeping is the default outcome; a
-                                                                            // dedicated Keep button was noise ("Kept" still shows
-                                                                            // when the review panel accepts a checkpoint).
-                                                                            button { class: "edits-row-revert",
-                                                                                onclick: move |e: dioxus::prelude::MouseEvent| { e.prevent_default(); e.stop_propagation(); engine.send(EngineCmd::Rewind { id: cp }); reverted.write().insert(cp); },
-                                                                                SlotText { text: "Revert".to_string(), reverse: true } }
-                                                                        }
-                                                                    }
-                                                                    HunkedDiff { ws: workspace.clone(), path: path.clone(), diff }
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                                if n > 3 {
-                                                    button { class: "edits-more", onclick: move |_| { let v = *edits_expanded.read(); edits_expanded.set(!v); },
-                                                        "{more_txt}"
-                                                        Icon { name: "chevron" }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        if !subagent_cards.read().is_empty() {
-                            {
-                                let cards = subagent_cards.read().clone();
-                                let done = cards.iter().filter(|c| !c.running).count();
-                                let total = cards.len();
-                                rsx! {
-                                    div { class: "subagents-card",
-                                        div { class: "subagents-head",
-                                            span { class: "workflow-ic", Icon { name: "spark" } }
-                                            span { "Subagents {done}/{total}" }
-                                        }
-                                        for card in cards {
-                                            {
-                                                let row_cls = if card.running { "subagent-row running" } else if card.ok { "subagent-row done" } else { "subagent-row fail" };
-                                                rsx! {
-                                                    div { key: "sa-{card.worker_id}", class: "{row_cls}",
-                                                        span { class: "subagent-status",
-                                                            if card.running { span { class: "syn-spinner" } }
-                                                            else if card.ok { Icon { name: "check" } }
-                                                            else { Icon { name: "alert" } }
-                                                        }
-                                                        div { class: "subagent-copy",
-                                                            div { class: "subagent-title", "{card.profile} · {card.task}" }
-                                                                if !card.summary.trim().is_empty() {
-                                                                    div { class: "subagent-summary", "{card.summary}" }
-                                                                }
-                                                                if !card.logs.is_empty() {
-                                                                    div { class: "subagent-logs",
-                                                                        for log in card.logs {
-                                                                            {
-                                                                                let log_cls = if log.running { "subagent-log running" } else if log.ok { "subagent-log done" } else { "subagent-log fail" };
-                                                                                let lines = log.output.lines().count();
-                                                                                rsx! {
-                                                                                    details { class: "{log_cls}", open: log.running,
-                                                                                        summary { class: "subagent-log-head",
-                                                                                            span { class: "subagent-log-status",
-                                                                                                if log.running { span { class: "syn-spinner" } }
-                                                                                                else if log.ok { Icon { name: "check" } }
-                                                                                                else { Icon { name: "alert" } }
-                                                                                            }
-                                                                                            span { class: "subagent-log-command", "{log.command}" }
-                                                                                            if lines > 0 {
-                                                                                                span { class: "subagent-log-lines", "{lines} lines" }
-                                                                                            }
-                                                                                        }
-                                                                                        if !log.output.trim().is_empty() {
-                                                                                            pre { class: "subagent-log-output", "{log.output}" }
-                                                                                        }
-                                                                                    }
-                                                                                }
-                                                                            }
-                                                                        }
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        if !todos.read().is_empty() {
-                            {
-                                let items = todos.read().clone();
-                                let done = items.iter().filter(|(_, s)| s == "completed").count();
-                                let n = items.len();
-                                rsx! {
-                                    div { class: "todo-card",
-                                        div { class: "todo-head", span { class: "todo-ic", Icon { name: "list" } } "Tasks {done}/{n}" }
-                                        for (content, st) in items {
-                                            div { class: "todo-row {st}",
-                                                span { class: "todo-box",
-                                                    if st == "completed" { Icon { name: "check" } } else if st == "in_progress" { span { class: "syn-spinner" } } else { "" }
-                                                }
-                                                span { class: "todo-text", "{content}" }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        div { class: "composer-dock",
-                            if *streaming.read() && !turn_edits.read().is_empty() {
-                                {
-                                    let edits = turn_edits.read().clone();
-                                    let n = edits.len();
-                                    let total_add: u32 = edits.iter().map(|e| e.1).sum();
-                                    let total_del: u32 = edits.iter().map(|e| e.2).sum();
-                                    let pending = edits.iter().filter(|e| e.4.is_empty() && e.3 == 0).count();
-                                    let plural = if n == 1 { "" } else { "s" };
-                                    let shown = n.min(3);
-                                    let more = n.saturating_sub(shown);
-                                    let subtitle = if pending > 0 {
-                                        format!("{pending} live · diffs settle after the turn")
-                                    } else {
-                                        "Diffs ready for review".to_string()
-                                    };
-                                    rsx! {
-                                        div { class: "composer-live-changes",
-                                            div { class: "live-changes-head",
-                                                span { class: "live-changes-icon", Icon { name: "edit" } }
-                                                div { class: "live-changes-copy",
-                                                    span { class: "live-changes-title", "Changing {n} file{plural}" }
-                                                    span { class: "live-changes-sub", "{subtitle}" }
-                                                }
-                                                if total_add + total_del > 0 {
-                                                    // Digits ROLL as edits land (slot/odometer style) —
-                                                    // only the changed characters animate.
-                                                    span { class: "live-changes-counts",
-                                                        span { class: "diff-adds", SlotText { text: format!("+{total_add}") } }
-                                                        span { class: "diff-dels", SlotText { text: format!("\u{2212}{total_del}") } }
-                                                    }
-                                                }
-                                                // No empty skeleton pill while counts are 0 — the
-                                                // subtitle ("… diffs settle after the turn") already
-                                                // signals pending; a blank grey bar just looked broken.
-                                                button { class: "live-changes-review", title: "Open diffs",
-                                                    onclick: move |_| {
-                                                        edits_expanded.set(true);
-                                                        select_env_tab(env_tab, show_env, env_tab_by_tab, tabs, active_tab, "changes", false);
-                                                    },
-                                                    Icon { name: "branch" }
-                                                }
-                                            }
-                                            div { class: "live-changes-files",
-                                                for (path, a, d, cp, diff) in edits.iter().take(shown).cloned() {
-                                                    {
-                                                        let row_pending = diff.is_empty() && cp == 0;
-                                                        let row_cls = if row_pending { "live-change-file pending" } else { "live-change-file" };
-                                                        rsx! {
-                                                            div { class: "{row_cls}",
-                                                                if row_pending { span { class: "syn-spinner" } } else { span { class: "live-change-ready", Icon { name: "check" } } }
-                                                                span { class: "live-change-path", "{path}" }
-                                                                if row_pending {
-                                                                    span { class: "live-change-state shimmer slot-status", SlotText { text: "editing…".to_string() } }
-                                                                } else {
-                                                                    span { class: "live-change-state", span { class: "diff-adds", SlotText { text: format!("+{a}") } } " " span { class: "diff-dels", SlotText { text: format!("\u{2212}{d}") } } }
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                                if more > 0 {
-                                                    div { class: "live-change-more", "+{more} more" }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            if !*streaming.read() && !followups.read().is_empty() && !messages.read().is_empty() {
-                                div { class: "followups",
-                                    for f in followups.read().iter().cloned() {
-                                        button { class: "suggestion followup",
-                                            onclick: {
-                                                let p = f.clone();
-                                                move |_| { engine.send(EngineCmd::Submit { engine: p.clone(), display: p.clone() }); }
-                                            },
-                                            Icon { name: "spark" } span { "{f}" }
-                                        }
-                                    }
-                                    button { class: "followups-x", title: "Dismiss", onclick: move |_| followups.write().clear(), Icon { name: "x" } }
-                                }
-                            }
-                            Composer { streaming, engine, cfg, model_label, bypass,
-                                       followup: !messages.read().is_empty(),
-                                       project: project.clone(), branch: branch.clone(),
-                                       context_used: ctx_used, context_limit: ctx_limit,
-                                       workspace: workspace.clone(), plan_mode, pursue_goal, goal_text, queue, picked_element,
-                                       on_settings: move |_| {
-                                           settings_initial_tab.set("model".to_string());
-                                           show_settings.set(true);
-                                       },
-                                       on_open_folder: move |_| open_folder(cfg, ui, engine), on_pick_workspace: move |dir| apply_workspace(cfg, ui, engine, dir) }
-                        }
-                    }
-                }
+                }  // /main-body
 
                 // Terminal dock
             }
@@ -12975,6 +13157,142 @@ fn scan_mouse_mode(bytes: &[u8]) -> Option<bool> {
     result
 }
 
+/// Status agent per tab TUI dari hook OSC 633 (Synara model):
+/// "running" | "review" (turn selesai, siap direview) | "attention" (butuh izin).
+static TUI_AGENT_STATES: GlobalSignal<HashMap<u64, &'static str>> = Signal::global(HashMap::new);
+
+/// Scan OSC 633 `OXIDE_AGENT_EVENT=<ev>` BEL dari stream PTY. `acc` menyimpan
+/// ekor antar-chunk supaya sequence yang terbelah dua read tetap terdeteksi.
+fn scan_agent_osc(acc: &mut Vec<u8>) -> Vec<&'static str> {
+    const PREFIX: &[u8] = b"\x1b]633;OXIDE_AGENT_EVENT=";
+    const MAX_EV: usize = 24;
+    let mut out = Vec::new();
+    loop {
+        let Some(i) = acc.windows(PREFIX.len()).position(|w| w == PREFIX) else {
+            // simpan ekor sepanjang prefix-1 saja — cukup untuk sambungan chunk
+            let keep = acc.len().min(PREFIX.len() - 1);
+            let cut = acc.len() - keep;
+            acc.drain(..cut);
+            return out;
+        };
+        let body = i + PREFIX.len();
+        match acc[body..].iter().take(MAX_EV).position(|&b| b == 0x07) {
+            Some(j) => {
+                match &acc[body..body + j] {
+                    b"Start" => out.push("running"),
+                    b"Stop" => out.push("review"),
+                    b"PermissionRequest" => out.push("attention"),
+                    _ => {}
+                }
+                acc.drain(..body + j + 1);
+            }
+            None if acc.len() - body >= MAX_EV => {
+                // tanpa BEL dalam batas wajar — malformed, buang agar tidak macet
+                acc.drain(..body);
+                return out;
+            }
+            None => {
+                // sequence belum lengkap; tunggu chunk berikutnya
+                acc.drain(..i);
+                return out;
+            }
+        }
+    }
+}
+
+/// Tulis aset hook OSC 633 sekali ke `~/.oxide/agent-hooks/` (Synara model):
+/// skrip notify yang printf ke /dev/tty + settings Claude yang memanggilnya.
+/// Mengembalikan path settings untuk `claude --settings`.
+fn ensure_agent_hook_assets() -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    let dir = std::path::PathBuf::from(home).join(".oxide/agent-hooks");
+    std::fs::create_dir_all(&dir).ok()?;
+    let hook = dir.join("notify-hook.sh");
+    let script = concat!(
+        "#!/bin/sh\n",
+        "set -eu\n",
+        "if [ \"$#\" -gt 0 ]; then in=\"$1\"; else in=\"$(cat)\"; fi\n",
+        "ev=$(printf '%s' \"$in\" | sed -n 's/.*\"hook_event_name\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p' | head -n 1)\n",
+        // stdout hook ditelan CLI — tulis ke /dev/tty agar sampai ke stream PTY.
+        "emit() { if [ -w /dev/tty ]; then printf '%b' \"$1\" > /dev/tty 2>/dev/null || printf '%b' \"$1\"; else printf '%b' \"$1\"; fi; }\n",
+        "case \"$ev\" in\n",
+        "  UserPromptSubmit|PostToolUse|PostToolUseFailure) emit '\\033]633;OXIDE_AGENT_EVENT=Start\\007' ;;\n",
+        "  Stop) emit '\\033]633;OXIDE_AGENT_EVENT=Stop\\007' ;;\n",
+        "  PermissionRequest|Notification) emit '\\033]633;OXIDE_AGENT_EVENT=PermissionRequest\\007' ;;\n",
+        "esac\n",
+    );
+    if std::fs::read_to_string(&hook).ok().as_deref() != Some(script) {
+        std::fs::write(&hook, script).ok()?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755));
+    }
+    let cmd = hook.display().to_string();
+    let one = |m: bool| {
+        if m {
+            serde_json::json!([{ "matcher": "*", "hooks": [{ "type": "command", "command": cmd.as_str() }] }])
+        } else {
+            serde_json::json!([{ "hooks": [{ "type": "command", "command": cmd.as_str() }] }])
+        }
+    };
+    let json = serde_json::to_string_pretty(&serde_json::json!({
+        "hooks": {
+            "UserPromptSubmit": one(false),
+            "Stop": one(false),
+            "PostToolUse": one(true),
+            "PostToolUseFailure": one(true),
+            "PermissionRequest": one(true),
+            "Notification": one(true),
+        }
+    }))
+    .ok()?;
+    let settings = dir.join("claude-settings.json");
+    if std::fs::read_to_string(&settings).ok().as_deref() != Some(json.as_str()) {
+        std::fs::write(&settings, &json).ok()?;
+    }
+    Some(settings.display().to_string())
+}
+
+/// ZDOTDIR shim (Synara "managed zsh"): source rc user asli, lalu bungkus
+/// `claude` dengan `--settings` hook OSC 633 — sehingga claude yang diketik
+/// MANUAL di shell dock pun melaporkan status running/review/attention.
+fn ensure_managed_zsh() -> Option<std::path::PathBuf> {
+    let settings = ensure_agent_hook_assets()?;
+    let home = std::env::var("HOME").ok()?;
+    let dir = std::path::PathBuf::from(&home).join(".oxide/agent-hooks/zsh");
+    std::fs::create_dir_all(&dir).ok()?;
+    let dq = dir.display();
+    let files = [
+        (
+            ".zshenv",
+            format!(
+                "# Oxide zsh env shim\n_ox_home=\"${{OXIDE_ORIGINAL_ZDOTDIR:-$HOME}}\"\nexport ZDOTDIR=\"$_ox_home\"\n[[ -f \"$_ox_home/.zshenv\" ]] && source \"$_ox_home/.zshenv\"\nexport ZDOTDIR=\"{dq}\"\n"
+            ),
+        ),
+        (
+            ".zprofile",
+            format!(
+                "# Oxide zsh profile shim\n_ox_home=\"${{OXIDE_ORIGINAL_ZDOTDIR:-$HOME}}\"\nexport ZDOTDIR=\"$_ox_home\"\n[[ -f \"$_ox_home/.zprofile\" ]] && source \"$_ox_home/.zprofile\"\nexport ZDOTDIR=\"{dq}\"\n"
+            ),
+        ),
+        (
+            ".zshrc",
+            format!(
+                "# Oxide zsh rc shim (hook OSC 633)\n_ox_home=\"${{OXIDE_ORIGINAL_ZDOTDIR:-$HOME}}\"\nexport ZDOTDIR=\"$_ox_home\"\n[[ -f \"$_ox_home/.zshrc\" ]] && source \"$_ox_home/.zshrc\"\nexport ZDOTDIR=\"{dq}\"\nunalias claude 2>/dev/null || true\nclaude() {{ command claude --settings \"{settings}\" \"$@\" }}\n"
+            ),
+        ),
+    ];
+    for (name, content) in files {
+        let f = dir.join(name);
+        if std::fs::read_to_string(&f).ok().as_deref() != Some(content.as_str()) {
+            std::fs::write(&f, content).ok()?;
+        }
+    }
+    Some(dir)
+}
+
 /// Embedded terminal entry: mounts wterm into the panel and bridges it to a real
 /// PTY running `bin` (codex / claude / shell). The terminal renders inside the
 /// Dioxus webview (DOM grid), not a separate native window.
@@ -13086,6 +13404,12 @@ fn TerminalView(id: u64, bin: String, ws: String, resume: Option<String>) -> Ele
                 }
                 "claude" => {
                     cmd.arg("--dangerously-skip-permissions");
+                    // Hook OSC 633 (Synara): status Start/Stop/PermissionRequest
+                    // dari CLI mengalir lewat stream PTY → dot status di tab.
+                    if let Some(settings) = ensure_agent_hook_assets() {
+                        cmd.arg("--settings");
+                        cmd.arg(settings);
+                    }
                     if let Some(sid) = &resume {
                         cmd.arg("--resume");
                         cmd.arg(sid);
@@ -13095,6 +13419,15 @@ fn TerminalView(id: u64, bin: String, ws: String, resume: Option<String>) -> Ele
             }
             cmd.cwd(&ws);
             cmd.env("TERM", "xterm-256color");
+            // Shell polos: pasang ZDOTDIR shim agar `claude` manual ter-hook.
+            if bin.is_empty() && shell.ends_with("zsh") {
+                if let Some(zdir) = ensure_managed_zsh() {
+                    if let Ok(orig) = std::env::var("ZDOTDIR") {
+                        cmd.env("OXIDE_ORIGINAL_ZDOTDIR", orig);
+                    }
+                    cmd.env("ZDOTDIR", zdir.display().to_string());
+                }
+            }
             if let Ok(home) = std::env::var("HOME") {
                 let path = std::env::var("PATH").unwrap_or_default();
                 cmd.env("PATH", format!("{home}/.superconductor/bin:{home}/.local/bin:{home}/.bun/bin:/opt/homebrew/bin:/usr/local/bin:{path}"));
@@ -13117,6 +13450,7 @@ fn TerminalView(id: u64, bin: String, ws: String, resume: Option<String>) -> Ele
             let mouse_on = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let mouse_on_rd = mouse_on.clone();
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+            let (agent_tx, mut agent_rx) = tokio::sync::mpsc::unbounded_channel::<&'static str>();
             std::thread::spawn(move || {
                 use std::io::Read;
                 use std::sync::atomic::Ordering;
@@ -13124,6 +13458,8 @@ fn TerminalView(id: u64, bin: String, ws: String, resume: Option<String>) -> Ele
                 // Carry the last few bytes so a mouse-mode escape split across two
                 // reads is still detected.
                 let mut carry: Vec<u8> = Vec::new();
+                // Buffer terpisah untuk OSC 633 agent-state (Synara).
+                let mut osc_acc: Vec<u8> = Vec::new();
                 loop {
                     match reader.read(&mut buf) {
                         Ok(0) | Err(_) => break,
@@ -13135,6 +13471,10 @@ fn TerminalView(id: u64, bin: String, ws: String, resume: Option<String>) -> Ele
                             let keep = carry.len().min(6);
                             let cut = carry.len() - keep;
                             carry.drain(..cut);
+                            osc_acc.extend_from_slice(&buf[..n]);
+                            for st in scan_agent_osc(&mut osc_acc) {
+                                let _ = agent_tx.send(st);
+                            }
                             if tx.send(buf[..n].to_vec()).is_err() {
                                 break;
                             }
@@ -13145,6 +13485,7 @@ fn TerminalView(id: u64, bin: String, ws: String, resume: Option<String>) -> Ele
 
             use base64::Engine;
             use std::io::Write;
+            let mut agent_rx_open = true;
             loop {
                 tokio::select! {
                     bytes = rx.recv() => match bytes {
@@ -13153,6 +13494,10 @@ fn TerminalView(id: u64, bin: String, ws: String, resume: Option<String>) -> Ele
                             if eval.send(serde_json::Value::String(b64)).is_err() { break; }
                         }
                         None => break,
+                    },
+                    st = agent_rx.recv(), if agent_rx_open => match st {
+                        Some(st) => { TUI_AGENT_STATES.write().insert(id, st); }
+                        None => agent_rx_open = false,
                     },
                     msg = eval.recv::<String>() => match msg {
                         Ok(s) => {
@@ -13218,6 +13563,7 @@ fn TerminalView(id: u64, bin: String, ws: String, resume: Option<String>) -> Ele
                 }
             }
             let _ = child.kill();
+            TUI_AGENT_STATES.write().remove(&id);
         }
     });
     rsx! { div { id: "{host}", class: "wterm-host", tabindex: "0" } }

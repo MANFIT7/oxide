@@ -13,6 +13,7 @@ Cargo.lock.bak
 **/oxide.toml
 .oxide/sessions/
 .oxide/memory/
+.oxide/gui-layout.json
 .oxide/**/.DS_Store
 **/.oxide/sessions/
 **/.oxide/memory/

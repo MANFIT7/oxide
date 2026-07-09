@@ -10,25 +10,25 @@
 }
 * { margin: 0; padding: 0; box-sizing: border-box; }
 
-/* Dark (default) — Synara palette: deep ink, hairline borders */
+/* Dark (default) — Synara "codex" seed: neutral ink #111, hairline borders */
 :root {
-  --bg: #0d0c0b;                       /* warm near-black, darker */
-  --sidebar: rgba(24, 22, 19, 0.42);   /* glass tint — vibrancy blurs behind */
-  --surface: #181510;
-  --surface-hi: #211e17;
-  --border: rgba(240, 232, 220, .07);
-  --text: #ece7df;                     /* warm light */
-  --muted: #a59c8e;
-  --faint: #6f675b;
-  --accent: #ece7df;
-  --on-accent: #0d0c0b;
-  --danger: #e8624a;
-  --composer: #161310;
-  --menu-bg: #1a1713;
-  --menu-border: rgba(240, 232, 220, .1);
-  --syn-accent: #c2895f;               /* muted warm amber — not bright orange */
-  --ok: #86ddb0; --ok-strong: #43c285; --del-soft: #e8a087;
-  --ctx-text: #c4bbac; --hunk-text: var(--syn-accent); --pre-text: #d4cbbb;
+  --bg: #111111;                       /* neutral near-black (Synara codex surface) */
+  --sidebar: rgba(20, 20, 20, 0.42);   /* glass tint — vibrancy blurs behind */
+  --surface: #191919;
+  --surface-hi: #222222;
+  --border: rgba(255, 255, 255, .08);
+  --text: #fcfcfc;                     /* Synara codex ink */
+  --muted: #a3a3a3;
+  --faint: #6e6e6e;
+  --accent: #fcfcfc;
+  --on-accent: #111111;
+  --danger: #ff5f38;
+  --composer: #171717;
+  --menu-bg: #191919;
+  --menu-border: rgba(255, 255, 255, .1);
+  --syn-accent: #5c9cf5;               /* Synara codex blue, lifted for dark bg */
+  --ok: #7fd99a; --ok-strong: #00c853; --del-soft: #ff8f75; --warn: #d9a35c;
+  --ctx-text: #b8b8b8; --hunk-text: var(--syn-accent); --pre-text: #d6d6d6;
   --dur-instant: .08s;
   --dur-fast: .12s;
   --dur-med: .18s;
@@ -47,50 +47,53 @@
   background: var(--sidebar);
   /* glass sheen: top/left highlight edge + soft inner depth (the native
      vibrancy provides the actual blur — backdrop-filter can't reach it). */
-  box-shadow: inset 1px 1px 0 rgba(255,248,238,.06),
+  box-shadow: inset 1px 1px 0 rgba(255,255,255,.05),
               inset -1px 0 0 rgba(0,0,0,.25),
               1px 0 24px -12px rgba(0,0,0,.5);
-  border-right: 1px solid rgba(240,232,220,.06);
+  border-right: 1px solid rgba(255,255,255,.06);
 }
 
-/* Light — Synara palette */
+/* Light — Synara "codex" seed: near-white paper, neutral ink #0d0d0d.
+   SINGLE source of truth: token duplikat di pass-pass lama sudah dihapus. */
 .app[data-theme="light"] {
-  /* Cursor Agents Window porcelain: warm paper, near-black ink. */
-  --bg: #f6f5f2;
+  --bg: #fcfcfc;
   background: var(--bg) !important;
-  --sidebar: #efeeea;
-  --surface: #fbfaf8;
-  --surface-hi: #edece7;
-  --border: rgba(60, 50, 30, 0.09);
-  --text: #2a2a28;
-  --muted: #6b6a66;
-  --faint: #98968f;
-  --accent: #1f1f1e;
+  --sidebar: #f4f4f5;
+  --surface: #ffffff;
+  --surface-hi: #f0f0f1;
+  --border: rgba(13, 13, 13, 0.08);
+  --text: rgba(13, 13, 13, 0.92);
+  --muted: rgba(13, 13, 13, 0.64);
+  --faint: rgba(13, 13, 13, 0.45);
+  --accent: #1a1a1a;
   --on-accent: #ffffff;
-  --danger: #ba2623;
-  --composer: #fcfbf9;
-  --menu-bg: #fcfbf9;
-  --menu-border: rgba(60, 50, 30, 0.12);
-  --syn-accent: #526fff;
-  background: var(--bg);
+  --danger: #e02e2a;
+  --composer: #ffffff;
+  --menu-bg: #ffffff;
+  --menu-border: rgba(13, 13, 13, 0.1);
+  --syn-accent: #0169cc;
+  --ok: #1f8a65; --ok-strong: #00a240; --del-soft: #e02e2a; --warn: #b5762a;
+  --ctx-text: rgba(13, 13, 13, .6); --hunk-text: #0169cc; --pre-text: rgba(13, 13, 13, .78);
 }
 @media (prefers-color-scheme: light) {
   .app[data-theme="system"] {
-    --bg: #f6f5f2;
-    --sidebar: #efeeea;
-    --surface: #fbfaf8;
-    --surface-hi: #edece7;
-    --border: rgba(60, 50, 30, 0.09);
-    --text: #2a2a28;
-    --muted: #6b6a66;
-    --faint: #98968f;
-    --accent: #1f1f1e;
+    --bg: #fcfcfc;
+    --sidebar: #f4f4f5;
+    --surface: #ffffff;
+    --surface-hi: #f0f0f1;
+    --border: rgba(13, 13, 13, 0.08);
+    --text: rgba(13, 13, 13, 0.92);
+    --muted: rgba(13, 13, 13, 0.64);
+    --faint: rgba(13, 13, 13, 0.45);
+    --accent: #1a1a1a;
     --on-accent: #ffffff;
-    --danger: #ba2623;
-    --composer: #fcfbf9;
-    --menu-bg: #fcfbf9;
-    --menu-border: rgba(60, 50, 30, 0.12);
-    --syn-accent: #526fff;
+    --danger: #e02e2a;
+    --composer: #ffffff;
+    --menu-bg: #ffffff;
+    --menu-border: rgba(13, 13, 13, 0.1);
+    --syn-accent: #0169cc;
+    --ok: #1f8a65; --ok-strong: #00a240; --del-soft: #e02e2a; --warn: #b5762a;
+    --ctx-text: rgba(13, 13, 13, .6); --hunk-text: #0169cc; --pre-text: rgba(13, 13, 13, .78);
     background: var(--bg);
   }
 }
@@ -2011,16 +2014,7 @@ details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
 
 
 /* ── Synara structure + motion (applies to all themes) ──────── */
-/* floating chat-card seam: main content as a rounded card over the sidebar */
-.main {
-  border-top-left-radius: 15px; border-bottom-left-radius: 15px;
-  background: var(--bg); position: relative; z-index: 5;
-  box-shadow: -6.5px 0 9px -13px rgba(0,0,0,.45);
-}
-.app[data-theme="light"] .main, .app[data-theme="system"] .main { box-shadow: -6.5px 0 9px -13px rgba(0,0,0,.09); }
-/* big squircle composer + soft dispersed shadow */
-.composer { border-radius: 19px; corner-shape: squircle; box-shadow: 0 6px 24px -10px rgba(0,0,0,.4); }
-.app[data-theme="light"] .composer, .app[data-theme="system"] .composer { box-shadow: 0 4px 18px -6px rgba(0,0,0,.08); }
+/* (kartu chat floating pindah ke seksi SYNARA REDESIGN di akhir file) */
 .composer:focus-within { border-color: color-mix(in srgb, var(--syn-accent) 55%, transparent) !important; }
 /* frosted translucent surfaces */
 /* NOTE: no backdrop-filter here — it creates a containing block that clips the
@@ -2035,12 +2029,12 @@ details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
 .bubble { background: color-mix(in srgb, var(--text) 5%, transparent); border-radius: 13px; box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text) 5%, transparent); }
 /* synara-blue accents on mention chips */
 .ce-chip, .inline-chip { background: color-mix(in srgb, var(--syn-accent) 15%, transparent); color: var(--syn-accent); border-color: color-mix(in srgb, var(--syn-accent) 35%, transparent); }
-/* semantic triad for diffs */
-.dl.add { background: rgba(64,201,119,.14); }
-.dl.del { background: rgba(250,66,62,.14); }
-.diff-adds, .review-accept { color: #40c977; }
-.diff-dels { color: #fa423e; }
-.skill-src.claude { color: #ad7bf9; background: rgba(173,123,249,.14); }
+/* semantic triad for diffs (Synara codex: add #00c853 / del #ff5f38) */
+.dl.add { background: rgba(0,200,83,.13); }
+.dl.del { background: rgba(255,95,56,.13); }
+.diff-adds, .review-accept { color: #00c853; }
+.diff-dels { color: #ff5f38; }
+.skill-src.claude { color: #b06dff; background: rgba(176,109,255,.14); }
 /* floating scrollbars */
 *::-webkit-scrollbar { width: 10px; height: 10px; }
 *::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--text) 12%, transparent); border: 2px solid transparent; background-clip: padding-box; border-radius: 999px; }
@@ -2164,7 +2158,7 @@ details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
 .preview-empty { padding: 24px; text-align: center; margin: auto; }
 .port-chip { display: inline-flex; align-items: center; gap: 6px; background: var(--surface-hi); border: 1px solid var(--border); color: var(--text); border-radius: 999px; padding: 4px 10px; font-size: 12px; cursor: pointer; font-family: ui-monospace, Menlo, monospace; }
 .port-chip:hover { border-color: var(--syn-accent); }
-.port-dot { width: 7px; height: 7px; border-radius: 50%; background: #40c977; box-shadow: 0 0 6px #40c977aa; }
+.port-dot { width: 7px; height: 7px; border-radius: 50%; background: #00c853; box-shadow: 0 0 6px #00c853aa; }
 .port-cmd { color: var(--faint); font-size: 11px; }
 .preview-frame { flex: 1; width: 100%; border: 0; background: #fff; }
 
@@ -2220,7 +2214,7 @@ details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
    card and squeeze the transcript / push the composer down mid-stream. */
 .subagents-card { display: grid; gap: 7px; max-height: 260px; overflow-y: auto; }
 .subagent-row { display: grid; grid-template-columns: 20px minmax(0, 1fr); gap: 9px; align-items: start; padding: 5px 0; }
-.subagent-row.done .subagent-status { color: #40c977; border-color: rgba(64,201,119,.6); background: rgba(64,201,119,.10); }
+.subagent-row.done .subagent-status { color: #00c853; border-color: rgba(0,200,83,.55); background: rgba(0,200,83,.10); }
 .subagent-row.fail .subagent-status { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 60%, var(--border)); }
 .subagent-logs { margin-top: 7px; display: grid; gap: 5px; }
 .subagent-log { border-left: 1px solid var(--border); padding-left: 8px; }
@@ -2239,7 +2233,7 @@ details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
 .todo-head { display: flex; align-items: center; gap: 7px; font-size: 12.5px; font-weight: 600; color: var(--text); margin-bottom: 6px; }
 .todo-head .todo-ic svg { width: 14px; height: 14px; color: var(--muted); }
 .todo-row { display: flex; align-items: center; gap: 9px; padding: 3px 0; font-size: 13px; }
-.todo-box { width: 16px; height: 16px; display: inline-flex; align-items: center; justify-content: center; border: 1px solid var(--border); border-radius: 5px; font-size: 11px; color: #40c977; flex-shrink: 0; }
+.todo-box { width: 16px; height: 16px; display: inline-flex; align-items: center; justify-content: center; border: 1px solid var(--border); border-radius: 5px; font-size: 11px; color: #00c853; flex-shrink: 0; }
 .todo-row.completed .todo-text { color: var(--muted); text-decoration: line-through; }
 .todo-row.in_progress .todo-text { color: var(--text); }
 .todo-row.pending .todo-text { color: var(--muted); }
@@ -2288,8 +2282,6 @@ details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
 /* ════ CURSOR-CLEAN OVERHAUL · Phase 1 ════════════════════════════
    Flat document-flow chat, elevation via background (not borders),
    sans UI type (mono reserved for code/paths), one calm accent. */
-:root { --syn-accent: #599CE7; }
-[data-theme="light"], .app[data-theme="light"] { --syn-accent: #3685BF; }
 .app { font-family: -apple-system, 'SF Pro Text', Inter, 'Segoe UI', sans-serif; }
 
 /* chat = document flow: agent text is plain prose, full width, no avatar */
@@ -2340,7 +2332,6 @@ details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
 /* headers/panels: drop hairlines, rely on spacing */
 .tabs-bar, .insp-tabs { border-bottom-color: color-mix(in srgb, var(--text) 6%, transparent); }
 .sidebar { border-right: none; }
-.main { box-shadow: none; border-radius: 0; }
 
 /* ── Phase 2: icon rail + minimal header ── */
 .sidebar { transition: width .18s ease; }
@@ -2379,34 +2370,16 @@ svg { stroke-width: 1.6; }
 .ficon-svg { width: 16px; height: 16px; display: inline-flex; flex-shrink: 0; }
 .ficon-svg svg { width: 16px; height: 16px; stroke-width: 0; }
 
-/* ── Cursor 3.0 light palette (exact hexes, ink-alpha layering) ── */
-.app[data-theme="light"] {
-  --bg: #fcfcfc;
-  background: var(--bg) !important; --sidebar: #f3f3f3; --surface: #ffffff; --surface-hi: #f0f0f1;
-  --composer: #ffffff; --menu-bg: #ffffff;
-  --border: rgba(20,20,20,.08); --menu-border: rgba(20,20,20,.10);
-  --text: rgba(20,20,20,.92); --muted: rgba(20,20,20,.68); --faint: rgba(20,20,20,.48);
-  --accent: #3c7cab; --syn-accent: #3c7cab; --danger: #cf2d56;
-}
-.app[data-theme="light"] .diff-adds { color: #1f8a65; }
-.app[data-theme="light"] .diff-dels { color: #cf2d56; }
-.app[data-theme="light"] .dl.add { background: rgba(31,138,101,.12); }
-.app[data-theme="light"] .dl.del { background: rgba(207,45,86,.10); }
+/* ── Light-theme component tweaks (token dupes dihapus — token di atas file) ── */
+.app[data-theme="light"] .diff-adds { color: var(--ok); }
+.app[data-theme="light"] .diff-dels { color: var(--danger); }
+.app[data-theme="light"] .dl.add { background: rgba(0,162,64,.10); }
+.app[data-theme="light"] .dl.del { background: rgba(224,46,42,.09); }
 /* Opaque equivalent of the old rgba(20,20,20,.04) wash — see the sticky note
    on .row.user .bubble: translucency here made streaming text bleed through. */
 .app[data-theme="light"] .row.user .bubble { background: color-mix(in srgb, var(--text) 4%, var(--bg)); }
 .app[data-theme="light"] .sidebar { background: var(--sidebar); box-shadow: none; }
-.app[data-theme="light"] { --sidebar: #f4f4f5; }
 .app[data-theme="light"] .composer { box-shadow: 0 2px 14px -8px rgba(20,20,20,.18); }
-@media (prefers-color-scheme: light) {
-  .app[data-theme="system"] {
-    --bg: #fcfcfc; --sidebar: #f3f3f3; --surface: #ffffff; --surface-hi: #f0f0f1;
-    --composer: #ffffff; --menu-bg: #ffffff;
-    --border: rgba(20,20,20,.08); --menu-border: rgba(20,20,20,.10);
-    --text: rgba(20,20,20,.92); --muted: rgba(20,20,20,.68); --faint: rgba(20,20,20,.48);
-    --accent: #3c7cab; --syn-accent: #3c7cab; --danger: #cf2d56;
-  }
-}
 
 /* Cursor-style right Changes panel */
 .changes-panel { position: absolute; top: 0; right: 0; bottom: 0; width: min(var(--rpanel, 46%), calc(100% - 220px)); z-index: 5; display: flex; flex-direction: column; background: var(--bg); border-left: 1px solid var(--border); animation: panel-in .18s ease-out; }
@@ -2475,31 +2448,21 @@ svg { stroke-width: 1.6; }
 .thread-title { font-size: 12.5px; }
 .thread-time { font-size: 11px; }
 /* word-level diff highlights */
-.dw.add { background: rgba(64,201,119,.28); border-radius: 3px; }
-.dw.del { background: rgba(250,66,62,.26); border-radius: 3px; }
-.app[data-theme="light"] .dw.add { background: rgba(31,138,101,.25); }
-.app[data-theme="light"] .dw.del { background: rgba(207,45,86,.22); }
+.dw.add { background: rgba(0,200,83,.26); border-radius: 3px; }
+.dw.del { background: rgba(255,95,56,.24); border-radius: 3px; }
+.app[data-theme="light"] .dw.add { background: rgba(0,162,64,.22); }
+.app[data-theme="light"] .dw.del { background: rgba(224,46,42,.18); }
 
 /* draggable panel resizers */
 .panel-resizer { width: 5px; flex-shrink: 0; cursor: col-resize; background: transparent; transition: background .12s ease; z-index: 6; margin: 0 -2px; }
 .panel-resizer:hover, .panel-resizer:active { background: color-mix(in srgb, var(--syn-accent) 45%, transparent); }
 
 
-/* light-theme readable status/diff colors */
-.app[data-theme="light"] {
-  --ok: #1f8a65; --ok-strong: #1f8a65; --del-soft: #cf2d56;
-  --ctx-text: rgba(20,20,20,.60); --hunk-text: #3c7cab; --pre-text: rgba(20,20,20,.78);
-}
-@media (prefers-color-scheme: light) {
-  .app[data-theme="system"] {
-    --ok: #1f8a65; --ok-strong: #1f8a65; --del-soft: #cf2d56;
-    --ctx-text: rgba(20,20,20,.60); --hunk-text: #3c7cab; --pre-text: rgba(20,20,20,.78);
-  }
-}
-.app[data-theme="light"] .term-prompt { color: #1f8a65; }
-.app[data-theme="light"] .menu-check { color: #1f8a65; }
-.app[data-theme="light"] .pill.fast.on { color: #1f8a65; border-color: rgba(31,138,101,.4); background: rgba(31,138,101,.08); }
-.app[data-theme="light"] .pill.fast.on svg { color: #1f8a65; }
+/* light-theme readable status colors (token di atas file) */
+.app[data-theme="light"] .term-prompt { color: var(--ok); }
+.app[data-theme="light"] .menu-check { color: var(--ok); }
+.app[data-theme="light"] .pill.fast.on { color: var(--ok); border-color: rgba(31,138,101,.4); background: rgba(31,138,101,.08); }
+.app[data-theme="light"] .pill.fast.on svg { color: var(--ok); }
 
 /* ── Cursor-style animated counters: +N/−N tick up smoothly ── */
 @property --n { syntax: '<integer>'; initial-value: 0; inherits: false; }
@@ -2534,9 +2497,9 @@ svg { stroke-width: 1.6; }
 .app[data-theme="light"] .hl .string { color: #1f8a65; }
 .app[data-theme="light"] .hl .constant, .app[data-theme="light"] .hl .number { color: #b3591f; }
 .app[data-theme="light"] .hl .keyword, .app[data-theme="light"] .hl .storage { color: #a626a4; }
-.app[data-theme="light"] .hl .entity { color: #3c7cab; }
+.app[data-theme="light"] .hl .entity { color: #0169cc; }
 .app[data-theme="light"] .hl .support { color: #0e7490; }
-.app[data-theme="light"] .hl .variable { color: #cf2d56; }
+.app[data-theme="light"] .hl .variable { color: #e02e2a; }
 /* provider logo on session rows */
 .sess-logo { width: 13px; height: 13px; display: inline-flex; flex-shrink: 0; opacity: .8; }
 .sess-logo svg { width: 13px; height: 13px; }
@@ -2586,11 +2549,11 @@ details::details-content { overflow: clip; }
 .app[data-theme="light"] .access-menu, .app[data-theme="light"] .theme-menu,
 .app[data-theme="light"] .mention-menu, .app[data-theme="light"] .palette,
 .app[data-theme="light"] .modal { box-shadow: 0 12px 34px rgba(20,20,20,.14); }
-.app[data-theme="light"] .review-accept { color: #1f8a65; border-color: rgba(31,138,101,.35); }
-.app[data-theme="light"] .git-badge.a { color: #1f8a65; }
-.app[data-theme="light"] .git-badge.d { color: #cf2d56; }
+.app[data-theme="light"] .review-accept { color: var(--ok); border-color: rgba(31,138,101,.35); }
+.app[data-theme="light"] .git-badge.a { color: var(--ok); }
+.app[data-theme="light"] .git-badge.d { color: var(--danger); }
 .app[data-theme="light"] .git-badge.m { color: #b3591f; }
-.app[data-theme="light"] .menu-badge.fast { color: #1f8a65; }
+.app[data-theme="light"] .menu-badge.fast { color: var(--ok); }
 @media (prefers-reduced-motion: reduce) {
   .modal-overlay, .palette-overlay, .pane-mode-menu, .agent-tab.active::after { animation: none; }
   details::details-content { transition: none; }
@@ -2612,7 +2575,7 @@ details::details-content { overflow: clip; }
 .app[data-theme="light"] .toast { box-shadow: 0 8px 28px rgba(20,20,20,.14); }
 @keyframes toast-in { from { opacity: 0; transform: translateY(10px) scale(.97); } to { opacity: 1; transform: none; } }
 .toast-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; background: var(--muted); }
-.toast.ok .toast-dot { background: var(--ok-strong, #40c977); }
+.toast.ok .toast-dot { background: var(--ok-strong, #00c853); }
 .toast.err .toast-dot { background: var(--danger); }
 .toast-action {
   margin-left: auto;
@@ -3004,7 +2967,7 @@ details.bg-chip.bg-watch[open] { max-width: 100%; flex-basis: 100%; border-radiu
 .bg-chip-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono, monospace); }
 .bg-dot {
   width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0;
-  background: var(--warn, #c2895f); animation: bg-pulse 1.2s ease-in-out infinite;
+  background: var(--warn, #d9a35c); animation: bg-pulse 1.2s ease-in-out infinite;
 }
 @keyframes bg-pulse { 0%,100% { opacity: .35; } 50% { opacity: 1; } }
 /* Live per-tool elapsed timer on the running activity row (Cursor doesn't
@@ -3025,8 +2988,8 @@ details.bg-chip.bg-watch[open] { max-width: 100%; flex-basis: 100%; border-radiu
    WKWebView (the rotate didn't re-composite), this animates reliably. */
 .bg-orbit {
   width: 13px; height: 13px; border-radius: 50%; flex-shrink: 0;
-  border: 2px solid color-mix(in srgb, var(--warn, #c2895f) 28%, transparent);
-  border-top-color: var(--warn, #c2895f);
+  border: 2px solid color-mix(in srgb, var(--warn, #d9a35c) 28%, transparent);
+  border-top-color: var(--warn, #d9a35c);
   animation: bg-orbit-rot .7s linear infinite;
   will-change: transform;
 }
@@ -3834,7 +3797,7 @@ details.activity-card.has-out .activity-sum { padding: 2px 4px; }
 }
 .app[data-theme="light"] .composer,
 .app[data-theme="system"] .composer {
-  border-color: rgba(60, 50, 30, 0.12);
+  border-color: rgba(13, 13, 13, 0.1);
   box-shadow: 0 6px 24px -10px rgba(50, 40, 20, 0.18);
 }
 
@@ -3896,7 +3859,7 @@ details.activity-card.has-out .activity-sum { padding: 2px 4px; }
 
 /* UiSpec: chart / form fields / two-way action / spec-level tone. */
 .ui-chart svg { width: 100%; height: 34px; display: block; }
-.ui-chart polyline { stroke: var(--syn-accent, #526fff); stroke-width: 1.6; vector-effect: non-scaling-stroke; }
+.ui-chart polyline { stroke: var(--syn-accent, #0169cc); stroke-width: 1.6; vector-effect: non-scaling-stroke; }
 .ui-field { display: flex; flex-direction: column; gap: 4px; font-size: 12.5px; }
 .ui-field-label { color: var(--muted); font-size: 11.5px; }
 .ui-input, .ui-select {
@@ -3913,7 +3876,7 @@ details.activity-card.has-out .activity-sum { padding: 2px 4px; }
 /* Spec-level theme tint (json-render theming): border + title accent. */
 .ui-spec.spec-tone-info { border-color: color-mix(in srgb, #4a8fd6 45%, var(--border)); }
 .ui-spec.spec-tone-success { border-color: color-mix(in srgb, var(--ok, #56a26e) 45%, var(--border)); }
-.ui-spec.spec-tone-warning { border-color: color-mix(in srgb, #c2895f 50%, var(--border)); }
+.ui-spec.spec-tone-warning { border-color: color-mix(in srgb, var(--warn, #d9a35c) 50%, var(--border)); }
 .ui-spec.spec-tone-danger { border-color: color-mix(in srgb, var(--danger, #e5534b) 45%, var(--border)); }
 
 /* Env-panel real PTY shells: fill the terminals body, hide inactive ones. */
@@ -3921,3 +3884,186 @@ details.activity-card.has-out .activity-sum { padding: 2px 4px; }
 .env-term-host.env-hidden { display: none; }
 .env-term-host .wterm-host { flex: 1; width: 100%; min-height: 0; }
 .env-hidden { display: none !important; }
+
+/* ════ SYNARA REDESIGN · kartu floating di atas shell vibrancy ═══════════════
+   Bahasa visual final (menang kaskade — jangan tambah pass palet baru di atas):
+   shell = material sidebar full-window; chat = kartu rounded; dock kanan =
+   kartu terpisah dengan gap. Token warna hanya di :root / [data-theme] atas file. */
+
+/* .main = kontainer transparan di atas shell; dua kartu sibling di dalamnya:
+   .center (kartu chat) dan .env-panel (kartu dock), dipisah gap bermaterial shell. */
+.main {
+  background: transparent;
+  position: relative; z-index: 5;
+  margin: 8px 8px 8px 0;
+  border: none; border-radius: 0; box-shadow: none;
+  overflow: visible;
+}
+.main-body { flex: 1; display: flex; min-height: 0; }
+.center {
+  flex: 1; min-width: 0;
+  background: var(--bg);
+  border-radius: 12px;
+  border: 1px solid color-mix(in srgb, var(--text) 9%, transparent);
+  box-shadow: 0 10px 30px -18px rgba(0,0,0,.55);
+  overflow: hidden; /* clip isi ke sudut rounded kartu */
+}
+.app[data-theme="light"] .center, .app[data-theme="system"] .center {
+  box-shadow: 0 8px 24px -16px rgba(20,20,20,.2);
+}
+/* padding overlay lama tidak diperlukan: dock bukan lagi absolute di dalam .center */
+.center.with-preview { padding-right: 0; }
+.app.pip .main { margin: 0; }
+.app.pip .center { border-radius: 0; border: none; box-shadow: none; }
+.sidebar.collapsed + .panel-resizer + .main { margin-left: 8px; }
+
+/* dock kanan (env-panel): kartu terpisah, flex sibling dari .center */
+.env-panel {
+  position: static; top: auto; right: auto; bottom: auto;
+  width: min(var(--rpanel, 46%), calc(100% - 260px));
+  flex-shrink: 0;
+  margin-left: 10px;
+  background: var(--bg);
+  border: 1px solid color-mix(in srgb, var(--text) 9%, transparent);
+  border-radius: 12px;
+  box-shadow: 0 14px 40px -20px rgba(0,0,0,.6);
+  overflow: hidden;
+}
+.env-panel.env-hidden { display: none; }
+.app[data-theme="light"] .env-panel, .app[data-theme="system"] .env-panel {
+  box-shadow: 0 10px 32px -18px rgba(20,20,20,.22);
+}
+/* resizer dock: anak .main-body, duduk di gap antar kartu */
+.main-body > .panel-resizer.rp { height: 100%; }
+
+/* strip tab agent duduk di material shell, bukan di kartu */
+.agent-tabs { background: transparent; border-bottom: none; }
+
+/* header dock: tab segmented Synara (Diff | Terminal | Browser | Files) */
+.env-tabs { gap: 4px; padding: 8px 10px; }
+.env-tab { border-radius: 8px; padding: 5px 11px; font-weight: 500; }
+.env-tab.on { background: color-mix(in srgb, var(--text) 9%, transparent); font-weight: 600; }
+.term-tab { border-radius: 7px; padding: 4px 10px; }
+
+/* composer: kartu opaque bersih (bukan slab translucent) */
+.composer {
+  background: var(--composer);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  box-shadow: 0 6px 22px -14px rgba(0,0,0,.5);
+  backdrop-filter: none;
+}
+.app[data-theme="light"] .composer, .app[data-theme="system"] .composer {
+  box-shadow: 0 4px 16px -10px rgba(20,20,20,.18);
+}
+
+/* sidebar: segmented control Threads | Workspace */
+.side-seg {
+  display: flex; gap: 2px; margin: 0 8px 10px;
+  background: color-mix(in srgb, var(--text) 6%, transparent);
+  border-radius: 9px; padding: 2px;
+}
+.side-seg button {
+  flex: 1; border: none; background: transparent; cursor: pointer;
+  font-family: inherit; font-size: 12.5px; font-weight: 500;
+  color: var(--muted); border-radius: 7px; padding: 5px 0;
+  transition: background var(--dur-fast) ease, color var(--dur-fast) ease;
+}
+.side-seg button:hover { color: var(--text); }
+.side-seg button.on {
+  color: var(--text); font-weight: 600;
+  background: var(--surface);
+  box-shadow: 0 1px 3px rgba(0,0,0,.18), 0 0 0 1px var(--border);
+}
+.app[data-theme="light"] .side-seg button.on { box-shadow: 0 1px 3px rgba(20,20,20,.1), 0 0 0 1px var(--border); }
+
+/* switching tab sidebar: Threads = daftar sesi, Workspace = tool nav */
+.sidebar .nav-item.ws-item { display: none; }
+.sidebar.ws-mode .nav-item.ws-item { display: flex; }
+.sidebar.ws-mode .section-row, .sidebar.ws-mode .projects { display: none; }
+.sidebar.ws-mode .nav { flex: 1; }
+/* rail collapsed: segmented disembunyikan, semua ikon nav tampil */
+.sidebar.collapsed .side-seg { display: none; }
+.sidebar.collapsed .nav-item.ws-item { display: flex; }
+/* resizer ikut sembunyi saat dock tertutup (dulu berada di dalam env-panel) */
+.main-body > .panel-resizer.rp:has(+ .env-panel.env-hidden) { display: none; }
+
+/* borderless macOS: strip drag + clearance traffic light di sidebar */
+.drag-strip { display: none; }
+.app.mac-titlebar .drag-strip { display: block; height: 30px; flex-shrink: 0; cursor: default; }
+
+/* ── Motion Synara (port dari apps/web: index.css + disclosureMotion.ts) ────
+   Empat primitif: send-enter 180ms, pane-enter 140ms, skeleton shimmer 2s -1s,
+   pulse indikator 640ms; disclosure 220ms ease-out untuk semua toggle. */
+@keyframes chat-message-send-enter { from { opacity: 0; transform: translateY(3px) scale(.992); } to { opacity: 1; transform: none; } }
+@keyframes chat-pane-enter { from { opacity: 0; } to { opacity: 1; } }
+@keyframes terminal-run-pulse { 0%, 100% { opacity: .24; transform: scale(.7); } 35% { opacity: .92; transform: scale(1); } }
+@keyframes disclosure-in { from { opacity: 0; transform: translateY(-2px); } to { opacity: 1; transform: none; } }
+
+/* baris user baru: micro-entry; baris agent/stream tanpa animasi (anti-jank) */
+.col > .row:last-child { animation: none; }
+.col > .row.user:last-child { animation: chat-message-send-enter 180ms ease-out both; will-change: opacity, transform; }
+/* swap pane (ganti tab/sesi): fade opacity-only, tanpa gerak vertikal */
+.scroll, .hero { animation: chat-pane-enter 140ms ease-out; }
+/* shimmer "working": cadence skeleton Synara (2s linear, offset -1s) */
+.status-shimmer, .activity-card.running .activity-verb,
+.live-change-state.shimmer, .edits-row.pending .edits-rowcounts.shimmer {
+  animation-duration: 2s; animation-delay: -1s;
+}
+/* dot busy di tab agent: pulse 640ms (opacity+transform saja — GPU friendly) */
+.tab-dot.busy { animation: terminal-run-pulse 640ms ease-in-out infinite; will-change: opacity, transform; }
+/* disclosure: satu rasa 220ms ease-out untuk semua expand/collapse */
+.edits-caret, .changes-file summary svg { transition: transform 220ms ease-out; }
+.edits-row-d[open] .diff-body, .review-diff-d[open] .diff-body,
+details.changes-file[open] .diff-body { animation: disclosure-in 220ms ease-out; }
+
+@media (prefers-reduced-motion: reduce) {
+  .col > .row.user:last-child, .scroll, .hero,
+  .edits-row-d[open] .diff-body, .review-diff-d[open] .diff-body,
+  details.changes-file[open] .diff-body { animation: none; }
+  .tab-dot.busy { animation: none; }
+}
+
+/* ── Sub-agent first-class (Synara) ── */
+/* baris sesi anak: nested di bawah induk dengan penanda cabang */
+.thread.subchild { margin-left: 18px; position: relative; }
+.thread.subchild::before {
+  content: ""; position: absolute; left: -10px; top: -6px; bottom: 50%;
+  width: 8px; border-left: 1px solid var(--border); border-bottom: 1px solid var(--border);
+  border-bottom-left-radius: 6px;
+}
+/* tombol buka thread anak di kartu subagent */
+.subagent-open {
+  display: inline-flex; align-items: center; gap: 4px; flex-shrink: 0;
+  border: 1px solid var(--border); border-radius: 6px; background: transparent;
+  color: var(--muted); cursor: pointer; font: inherit; font-size: 11.5px;
+  padding: 2px 8px; order: 2; margin-left: auto;
+  transition: background var(--dur-fast) ease, color var(--dur-fast) ease;
+}
+.subagent-open:hover { color: var(--syn-accent); background: color-mix(in srgb, var(--syn-accent) 8%, transparent); border-color: color-mix(in srgb, var(--syn-accent) 30%, var(--border)); }
+.subagent-open svg { width: 12px; height: 12px; }
+.subagent-row { display: flex; align-items: flex-start; gap: 8px; }
+
+/* dot status agent tab TUI (hook OSC 633, Synara): attention pulse / review hijau */
+.tab-agent-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; display: inline-block; }
+.tab-agent-dot.attention { background: var(--warn, #d9a35c); animation: terminal-run-pulse 640ms ease-in-out infinite; }
+.tab-agent-dot.review { background: var(--ok-strong, #00c853); }
+@media (prefers-reduced-motion: reduce) { .tab-agent-dot.attention { animation: none; } }
+
+/* toggle lipat anak sub-agent di baris induk (Synara childCount + chevron) */
+.sub-toggle {
+  display: inline-flex; align-items: center; gap: 2px; flex-shrink: 0;
+  border: none; background: transparent; color: var(--faint); cursor: pointer;
+  font-size: 10.5px; font-variant-numeric: tabular-nums;
+  border-radius: 5px; padding: 1px 4px;
+}
+.sub-toggle:hover { color: var(--text); background: color-mix(in srgb, var(--text) 8%, transparent); }
+.sub-toggle svg { width: 11px; height: 11px; }
+.sub-toggle-chev { display: inline-flex; transition: transform 220ms ease-out; }
+.sub-toggle.folded .sub-toggle-chev { transform: rotate(-90deg); }
+/* logo provider kecil di tab terminal dock (identitas ala Synara) */
+.term-tab-prov { width: 13px; height: 13px; display: inline-flex; align-items: center; flex-shrink: 0; }
+.term-tab-prov svg { width: 12px; height: 12px; }
+.term-tab .syn-spinner { width: 10px; height: 10px; }
+/* seksi Chats footer: baris flat tanpa nesting proyek */
+.chats-list { padding: 0 8px; max-height: 180px; overflow-y: auto; flex-shrink: 0; }

@@ -1443,6 +1443,7 @@ pub fn spawn(config: Config) -> anyhow::Result<(EngineHandle, mpsc::Receiver<Eve
         checkpoints: Arc::new(Mutex::new(CheckpointStore::load(&workspace))),
         workspace,
         session_store,
+        subagent_parent: None,
         mcp_clients: Vec::new(),
         mcp_tools: Vec::new(),
         deferred_tools: Vec::new(),
@@ -1753,6 +1754,9 @@ struct Engine {
     workspace: PathBuf,
     /// Append-only session log (None if persistence is off/unavailable).
     session_store: Option<SessionStore>,
+    /// Id sesi induk saat engine ini adalah worker sub-agent (Synara model):
+    /// transkrip anak dipersist sebagai sesi ber-parent_id, bukan dibuang.
+    subagent_parent: Option<String>,
     /// Undo log for file-mutating tool calls.
     checkpoints: Arc<Mutex<CheckpointStore>>,
     /// Connected MCP servers (one per configured launcher).
@@ -3894,7 +3898,12 @@ Reply with text only: summarize what you changed, what you verified, and what re
         let worker_edited = self.turn_edited;
         let worker_edit_paths = std::mem::take(&mut self.turn_edit_paths);
         let worker_edit_paths_for_bridge = worker_edit_paths.clone();
-        self.session = saved_session;
+        // Synara model: transkrip anak dipersist sebagai sesi first-class
+        // ber-parent_id (bukan dibuang) sebelum session induk dipulihkan.
+        let child_transcript = std::mem::replace(&mut self.session, saved_session);
+        let child_session = self
+            .persist_subagent_session(worker_id, &profile_id, user, &child_transcript)
+            .unwrap_or_default();
         self.turn_reads = saved_turn_reads;
         self.turn_edit_paths = saved_turn_edit_paths;
         self.turn_edit_paths.extend(worker_edit_paths);
@@ -3934,6 +3943,7 @@ Reply with text only: summarize what you changed, what you verified, and what re
             task: user.to_string(),
             summary: summary.clone(),
             ok: !interrupted,
+            session: child_session,
         })
         .await;
         self.emit_audit(
@@ -4107,6 +4117,44 @@ Produce a compact, self-contained answer (read files only when needed; do NOT ed
         true
     }
 
+    /// Persist transkrip worker sebagai sesi anak ber-`parent_id` (Synara
+    /// model: sub-agent = thread first-class yang bisa dibuka seperti sesi
+    /// biasa). None bila induk tidak menyimpan sesi atau transkrip kosong.
+    fn persist_subagent_session(
+        &self,
+        worker_id: &str,
+        profile_id: &str,
+        task: &str,
+        transcript: &[Message],
+    ) -> Option<String> {
+        let parent = self.subagent_parent.clone()?;
+        if transcript.len() <= 1 {
+            return None; // hanya prompt penugasan — tidak ada isi untuk dibuka
+        }
+        let store = SessionStore::open_child(&self.workspace, worker_id).ok()?;
+        store.set_runtime_config(
+            &self.config.provider,
+            &self.config.model,
+            &self.config.harness,
+            &self.config.reasoning_effort,
+        );
+        for m in transcript {
+            let role = match m.role {
+                Role::System => "system",
+                Role::User => "user",
+                Role::Assistant => "assistant",
+                Role::Tool => "tool",
+            };
+            let _ = store.append(role, &m.content);
+        }
+        crate::db::set_parent(&store.id, &parent);
+        crate::db::set_title(
+            &store.id,
+            &format!("{profile_id}: {}", compact_chars(task, 48)),
+        );
+        Some(store.id.clone())
+    }
+
     fn subagent_worker_engine(&self) -> anyhow::Result<Self> {
         let mut config = self.config.clone();
         config.persist = false;
@@ -4121,6 +4169,13 @@ Produce a compact, self-contained answer (read files only when needed; do NOT ed
             session_approved: self.session_approved.clone(),
             workspace: self.workspace.clone(),
             session_store: None,
+            // Worker mengingat sesi induk agar transkripnya bisa dipersist
+            // sebagai sesi anak (worker bersarang mewarisi induk terdekat).
+            subagent_parent: self
+                .session_store
+                .as_ref()
+                .map(|s| s.id.clone())
+                .or_else(|| self.subagent_parent.clone()),
             checkpoints: Arc::clone(&self.checkpoints),
             mcp_clients: self.mcp_clients.clone(),
             mcp_tools: self.mcp_tools.clone(),

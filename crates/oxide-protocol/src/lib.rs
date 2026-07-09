@@ -205,6 +205,10 @@ pub enum Event {
         task: String,
         summary: String,
         ok: bool,
+        /// Id sesi anak yang dipersist (Synara model) — kosong bila engine
+        /// berjalan tanpa persistence, frontend bisa membukanya sebagai sesi biasa.
+        #[serde(default)]
+        session: String,
     },
     /// The agent is asking the user a question, optionally with choices.
     QuestionAsked {
