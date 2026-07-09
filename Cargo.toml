@@ -71,5 +71,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 
 [profile.release]
 lto = "thin"
-codegen-units = 1
+# 16 (default) bukan 1: codegen paralel memangkas build rilis CI hampir
+# separuh; dengan thin-LTO selisih performa binary-nya tidak terasa.
+codegen-units = 16
 strip = true
