@@ -6620,16 +6620,12 @@ fn parse_self_improvement_capture(text: &str) -> Option<SelfImproveCapture> {
     if let Ok(capture) = serde_json::from_str::<SelfImproveCapture>(trimmed) {
         return Some(capture);
     }
-    let candidate = if let Some(start) = trimmed.find('{') {
-        let end = trimmed.rfind('}')?;
-        if end <= start {
-            return None;
-        }
-        &trimmed[start..=end]
-    } else {
+    let start = trimmed.find('{')?;
+    let end = trimmed.rfind('}')?;
+    if end <= start {
         return None;
-    };
-    serde_json::from_str::<SelfImproveCapture>(candidate).ok()
+    }
+    serde_json::from_str::<SelfImproveCapture>(&trimmed[start..=end]).ok()
 }
 
 fn clean_memory_fact(text: &str) -> String {

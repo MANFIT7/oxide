@@ -3032,7 +3032,7 @@ impl OxideDesktop {
     fn render_composer(&mut self, ui: &mut Ui) {
         Frame::default()
             .fill(Color32::from_rgb(34, 34, 39))
-            .stroke(Stroke::new(1.0, Color32::from_rgb(50, 50, 58)))
+            .stroke(Stroke::new(1.0_f32, Color32::from_rgb(50, 50, 58)))
             .rounding(16.0)
             .inner_margin(Margin::same(12.0))
             .show(ui, |ui| {
@@ -3258,7 +3258,7 @@ impl OxideDesktop {
         if self.streaming || !self.queued_prompts.is_empty() {
             Frame::default()
                 .fill(Color32::from_rgb(34, 34, 39))
-                .stroke(Stroke::new(1.0, PANEL_HI))
+                .stroke(Stroke::new(1.0_f32, PANEL_HI))
                 .rounding(8.0)
                 .inner_margin(Margin::same(9.0))
                 .show(ui, |ui| {
@@ -3432,7 +3432,7 @@ impl OxideDesktop {
         );
         Frame::default()
             .fill(PANEL)
-            .stroke(Stroke::new(1.0, PANEL_HI))
+            .stroke(Stroke::new(1.0_f32, PANEL_HI))
             .rounding(8.0)
             .inner_margin(Margin::same(9.0))
             .show(ui, |ui| {
@@ -3457,7 +3457,7 @@ impl OxideDesktop {
             for approval in self.pending_approvals.clone().iter().rev() {
                 Frame::default()
                     .fill(PANEL)
-                    .stroke(Stroke::new(1.0, PANEL_HI))
+                    .stroke(Stroke::new(1.0_f32, PANEL_HI))
                     .rounding(8.0)
                     .inner_margin(Margin::same(10.0))
                     .show(ui, |ui| {
@@ -3511,7 +3511,7 @@ impl OxideDesktop {
             for checkpoint in self.checkpoints.clone().iter().rev() {
                 Frame::default()
                     .fill(PANEL)
-                    .stroke(Stroke::new(1.0, PANEL_HI))
+                    .stroke(Stroke::new(1.0_f32, PANEL_HI))
                     .rounding(8.0)
                     .inner_margin(Margin::same(10.0))
                     .show(ui, |ui| {
@@ -3577,7 +3577,7 @@ impl OxideDesktop {
         ui.add_space(8.0);
         Frame::default()
             .fill(PANEL)
-            .stroke(Stroke::new(1.0, PANEL_HI))
+            .stroke(Stroke::new(1.0_f32, PANEL_HI))
             .rounding(8.0)
             .inner_margin(Margin::same(10.0))
             .show(ui, |ui| {
@@ -3914,7 +3914,7 @@ impl OxideDesktop {
         ui.add_space(10.0);
         Frame::default()
             .fill(PANEL)
-            .stroke(Stroke::new(1.0, PANEL_HI))
+            .stroke(Stroke::new(1.0_f32, PANEL_HI))
             .rounding(10.0)
             .inner_margin(Margin::same(12.0))
             .show(ui, |ui| {
@@ -4003,7 +4003,7 @@ impl OxideDesktop {
     fn render_git_controls(&mut self, ui: &mut Ui) {
         Frame::default()
             .fill(PANEL)
-            .stroke(Stroke::new(1.0, PANEL_HI))
+            .stroke(Stroke::new(1.0_f32, PANEL_HI))
             .rounding(10.0)
             .inner_margin(Margin::same(12.0))
             .show(ui, |ui| {
@@ -4145,7 +4145,7 @@ impl OxideDesktop {
     fn render_appshots_panel(&mut self, ui: &mut Ui) {
         Frame::default()
             .fill(PANEL)
-            .stroke(Stroke::new(1.0, PANEL_HI))
+            .stroke(Stroke::new(1.0_f32, PANEL_HI))
             .rounding(10.0)
             .inner_margin(Margin::same(12.0))
             .show(ui, |ui| {
@@ -4199,7 +4199,7 @@ impl OxideDesktop {
         for appshot in self.appshots.clone() {
             Frame::default()
                 .fill(Color32::from_rgb(24, 24, 28))
-                .stroke(Stroke::new(1.0, PANEL_HI))
+                .stroke(Stroke::new(1.0_f32, PANEL_HI))
                 .rounding(8.0)
                 .inner_margin(Margin::same(9.0))
                 .show(ui, |ui| {
@@ -4618,7 +4618,7 @@ impl OxideDesktop {
         for item in results.into_iter().take(80) {
             Frame::default()
                 .fill(Color32::from_rgb(24, 24, 28))
-                .stroke(Stroke::new(1.0, PANEL_HI))
+                .stroke(Stroke::new(1.0_f32, PANEL_HI))
                 .rounding(8.0)
                 .inner_margin(Margin::same(9.0))
                 .show(ui, |ui| {
@@ -4675,7 +4675,7 @@ impl OxideDesktop {
             let health = mcp_health_for(&self.mcp_health, &server);
             Frame::default()
                 .fill(Color32::from_rgb(24, 24, 28))
-                .stroke(Stroke::new(1.0, PANEL_HI))
+                .stroke(Stroke::new(1.0_f32, PANEL_HI))
                 .rounding(8.0)
                 .inner_margin(Margin::same(9.0))
                 .show(ui, |ui| {
@@ -4758,7 +4758,7 @@ impl OxideDesktop {
         ui.add_space(10.0);
         Frame::default()
             .fill(PANEL)
-            .stroke(Stroke::new(1.0, PANEL_HI))
+            .stroke(Stroke::new(1.0_f32, PANEL_HI))
             .rounding(10.0)
             .inner_margin(Margin::same(12.0))
             .show(ui, |ui| {
@@ -4811,7 +4811,7 @@ impl OxideDesktop {
             let latest_run = latest_automation_run(&self.automation_runs, &spec.id);
             Frame::default()
                 .fill(Color32::from_rgb(24, 24, 28))
-                .stroke(Stroke::new(1.0, PANEL_HI))
+                .stroke(Stroke::new(1.0_f32, PANEL_HI))
                 .rounding(8.0)
                 .inner_margin(Margin::same(9.0))
                 .show(ui, |ui| {
@@ -4903,7 +4903,7 @@ impl OxideDesktop {
         ui.add_space(10.0);
         Frame::default()
             .fill(PANEL)
-            .stroke(Stroke::new(1.0, PANEL_HI))
+            .stroke(Stroke::new(1.0_f32, PANEL_HI))
             .rounding(10.0)
             .inner_margin(Margin::same(12.0))
             .show(ui, |ui| {
@@ -5289,7 +5289,7 @@ impl OxideDesktop {
         ui.add_space(8.0);
         Frame::default()
             .fill(PANEL)
-            .stroke(Stroke::new(1.0, PANEL_HI))
+            .stroke(Stroke::new(1.0_f32, PANEL_HI))
             .rounding(10.0)
             .inner_margin(Margin::same(12.0))
             .show(ui, |ui| {
@@ -5325,7 +5325,7 @@ impl OxideDesktop {
         ui.add_space(8.0);
         Frame::default()
             .fill(PANEL)
-            .stroke(Stroke::new(1.0, PANEL_HI))
+            .stroke(Stroke::new(1.0_f32, PANEL_HI))
             .rounding(10.0)
             .inner_margin(Margin::same(12.0))
             .show(ui, |ui| {
@@ -5374,7 +5374,7 @@ impl OxideDesktop {
         for profile in profiles {
             Frame::default()
                 .fill(Color32::from_rgb(24, 24, 28))
-                .stroke(Stroke::new(1.0, PANEL_HI))
+                .stroke(Stroke::new(1.0_f32, PANEL_HI))
                 .rounding(8.0)
                 .inner_margin(Margin::same(9.0))
                 .show(ui, |ui| {
@@ -5427,7 +5427,7 @@ impl OxideDesktop {
         ui.add_space(8.0);
         Frame::default()
             .fill(PANEL)
-            .stroke(Stroke::new(1.0, PANEL_HI))
+            .stroke(Stroke::new(1.0_f32, PANEL_HI))
             .rounding(10.0)
             .inner_margin(Margin::same(12.0))
             .show(ui, |ui| {
@@ -5519,7 +5519,7 @@ impl OxideDesktop {
         ui.separator();
         Frame::default()
             .fill(PANEL)
-            .stroke(Stroke::new(1.0, PANEL_HI))
+            .stroke(Stroke::new(1.0_f32, PANEL_HI))
             .rounding(10.0)
             .inner_margin(Margin::same(12.0))
             .show(ui, |ui| {
@@ -5548,7 +5548,7 @@ impl OxideDesktop {
         for memory in memories {
             Frame::default()
                 .fill(Color32::from_rgb(24, 24, 28))
-                .stroke(Stroke::new(1.0, PANEL_HI))
+                .stroke(Stroke::new(1.0_f32, PANEL_HI))
                 .rounding(8.0)
                 .inner_margin(Margin::same(9.0))
                 .show(ui, |ui| {
@@ -5617,7 +5617,7 @@ impl OxideDesktop {
         for shortcut in filtered {
             Frame::default()
                 .fill(Color32::from_rgb(24, 24, 28))
-                .stroke(Stroke::new(1.0, PANEL_HI))
+                .stroke(Stroke::new(1.0_f32, PANEL_HI))
                 .rounding(8.0)
                 .inner_margin(Margin::same(9.0))
                 .show(ui, |ui| {
@@ -5666,7 +5666,7 @@ impl OxideDesktop {
         for item in diagnostics {
             Frame::default()
                 .fill(Color32::from_rgb(24, 24, 28))
-                .stroke(Stroke::new(1.0, PANEL_HI))
+                .stroke(Stroke::new(1.0_f32, PANEL_HI))
                 .rounding(8.0)
                 .inner_margin(Margin::same(9.0))
                 .show(ui, |ui| {
@@ -5909,15 +5909,15 @@ fn install_style(ctx: &Context) {
     visuals.widgets.hovered.bg_fill = PANEL_HI;
     visuals.widgets.active.bg_fill = Color32::from_rgb(52, 52, 60);
     visuals.selection.bg_fill = Color32::from_rgb(46, 96, 78);
-    visuals.selection.stroke = Stroke::new(1.0, ACCENT);
+    visuals.selection.stroke = Stroke::new(1.0_f32, ACCENT);
     visuals.hyperlink_color = ACCENT;
 
     // Softer separators / strokes so panels read calmer.
     let hairline = Color32::from_rgb(40, 40, 46);
-    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, hairline);
-    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(48, 48, 55));
-    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, Color32::from_rgb(60, 60, 68));
-    visuals.window_stroke = Stroke::new(1.0, Color32::from_rgb(48, 48, 55));
+    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, hairline);
+    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, Color32::from_rgb(48, 48, 55));
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, Color32::from_rgb(60, 60, 68));
+    visuals.window_stroke = Stroke::new(1.0_f32, Color32::from_rgb(48, 48, 55));
 
     // ── Rounded corners everywhere (kills the boxy look) ────
     let r = Rounding::same(9.0);
@@ -6036,7 +6036,7 @@ fn model_matches(model: &ModelPreset, query: &str) -> bool {
 fn panel_frame() -> Frame {
     Frame::default()
         .fill(PANEL)
-        .stroke(Stroke::new(1.0, Color32::from_rgb(43, 43, 49)))
+        .stroke(Stroke::new(1.0_f32, Color32::from_rgb(43, 43, 49)))
 }
 
 fn section_text(text: impl Into<String>) -> RichText {
@@ -6218,7 +6218,7 @@ fn toggle_pill(ui: &mut Ui, text: &str, on: bool, color: Color32) -> egui::Respo
         } else {
             Color32::TRANSPARENT
         })
-        .stroke(Stroke::new(1.0, if on { color } else { PANEL_HI })),
+        .stroke(Stroke::new(1.0_f32, if on { color } else { PANEL_HI })),
     )
 }
 
@@ -6234,7 +6234,7 @@ fn send_button(disabled: bool) -> egui::Button<'static> {
     } else {
         ACCENT
     })
-    .stroke(Stroke::new(1.0, ACCENT))
+    .stroke(Stroke::new(1.0_f32, ACCENT))
 }
 
 fn inspector_tab(ui: &mut Ui, tab: &mut InspectorTab, value: InspectorTab, label: &str) {
@@ -6252,7 +6252,7 @@ fn settings_tab(ui: &mut Ui, tab: &mut SettingsTab, value: SettingsTab, label: &
 fn feature_card(ui: &mut Ui, title: &str, body: &str, available: bool) {
     Frame::default()
         .fill(PANEL)
-        .stroke(Stroke::new(1.0, PANEL_HI))
+        .stroke(Stroke::new(1.0_f32, PANEL_HI))
         .rounding(10.0)
         .inner_margin(Margin::same(12.0))
         .show(ui, |ui| {
