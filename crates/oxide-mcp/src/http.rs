@@ -7,6 +7,7 @@
 use crate::Transport;
 use anyhow::Context;
 use async_trait::async_trait;
+use futures::StreamExt;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -21,6 +22,7 @@ pub struct HttpTransport {
     env_headers: BTreeMap<String, String>,
     next_id: AtomicU64,
     session: Mutex<Option<String>>,
+    protocol_version: std::sync::RwLock<String>,
 }
 
 impl HttpTransport {
@@ -41,6 +43,7 @@ impl HttpTransport {
             env_headers: options.env_headers,
             next_id: AtomicU64::new(1),
             session: Mutex::new(None),
+            protocol_version: std::sync::RwLock::new(String::new()),
         }
     }
 
@@ -70,6 +73,14 @@ impl HttpTransport {
         if let Some(sid) = self.session.lock().await.clone() {
             req = req.header("Mcp-Session-Id", sid);
         }
+        let protocol_version = self
+            .protocol_version
+            .read()
+            .map(|value| value.clone())
+            .unwrap_or_default();
+        if !protocol_version.is_empty() {
+            req = req.header("MCP-Protocol-Version", protocol_version);
+        }
         let resp = req.json(body).send().await?;
         if let Some(sid) = resp
             .headers()
@@ -92,15 +103,11 @@ impl HttpTransport {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
+        if ct.contains("text/event-stream") {
+            return read_sse_response(resp, want_id).await;
+        }
         let text = resp.text().await?;
-
-        // Collect candidate JSON-RPC messages: either a single JSON body, or the
-        // `data:` payloads of an SSE stream.
-        let msgs: Vec<Value> = if ct.contains("text/event-stream") {
-            parse_sse_json_messages(&text)
-        } else {
-            serde_json::from_str::<Value>(&text).into_iter().collect()
-        };
+        let msgs: Vec<Value> = serde_json::from_str::<Value>(&text).into_iter().collect();
         for m in msgs {
             if m.get("id").and_then(|v| v.as_u64()) == Some(want_id) {
                 if let Some(err) = m.get("error") {
@@ -110,6 +117,60 @@ impl HttpTransport {
             }
         }
         anyhow::bail!("mcp http: no response for id {want_id}");
+    }
+}
+
+async fn read_sse_response(resp: reqwest::Response, want_id: u64) -> anyhow::Result<Value> {
+    let mut stream = resp.bytes_stream();
+    let mut pending = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        pending.extend_from_slice(&chunk?);
+        for message in take_complete_sse_messages(&mut pending) {
+            if let Some(result) = response_result_for_id(message, want_id)? {
+                return Ok(result);
+            }
+        }
+    }
+    if !pending.is_empty() {
+        let tail = String::from_utf8_lossy(&pending);
+        for message in parse_sse_json_messages(&tail) {
+            if let Some(result) = response_result_for_id(message, want_id)? {
+                return Ok(result);
+            }
+        }
+    }
+    anyhow::bail!("mcp http: SSE stream ended without response for id {want_id}")
+}
+
+fn response_result_for_id(message: Value, want_id: u64) -> anyhow::Result<Option<Value>> {
+    if message.get("id").and_then(Value::as_u64) != Some(want_id) {
+        return Ok(None);
+    }
+    if let Some(error) = message.get("error") {
+        anyhow::bail!("mcp error: {error}");
+    }
+    Ok(Some(message.get("result").cloned().unwrap_or(Value::Null)))
+}
+
+fn take_complete_sse_messages(pending: &mut Vec<u8>) -> Vec<Value> {
+    let mut messages = Vec::new();
+    while let Some((end, delimiter_len)) = sse_event_end(pending) {
+        let event = pending.drain(..end + delimiter_len).collect::<Vec<_>>();
+        let text = String::from_utf8_lossy(&event);
+        messages.extend(parse_sse_json_messages(&text));
+    }
+    messages
+}
+
+fn sse_event_end(bytes: &[u8]) -> Option<(usize, usize)> {
+    let lf = bytes.windows(2).position(|window| window == b"\n\n");
+    let crlf = bytes.windows(4).position(|window| window == b"\r\n\r\n");
+    match (lf, crlf) {
+        (Some(left), Some(right)) if left <= right => Some((left, 2)),
+        (Some(_), Some(right)) => Some((right, 4)),
+        (Some(left), None) => Some((left, 2)),
+        (None, Some(right)) => Some((right, 4)),
+        (None, None) => None,
     }
 }
 
@@ -189,11 +250,18 @@ impl Transport for HttpTransport {
             .map(|_| ())
             .with_context(|| format!("mcp http notification {method} failed"))
     }
+
+    fn set_protocol_version(&self, version: &str) {
+        if let Ok(mut current) = self.protocol_version.write() {
+            *current = version.to_string();
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn parses_multiline_sse_data_event() {
@@ -231,5 +299,62 @@ mod tests {
                 json!({ "id": 2, "result": "two" })
             ]
         );
+    }
+
+    #[test]
+    fn chunked_sse_parser_waits_for_complete_event() {
+        let mut pending = b"data: {\"id\":1,".to_vec();
+        assert!(take_complete_sse_messages(&mut pending).is_empty());
+        pending.extend_from_slice(b"\"result\":{\"ok\":true}}\n\n");
+
+        let messages = take_complete_sse_messages(&mut pending);
+
+        assert_eq!(messages, vec![json!({ "id": 1, "result": { "ok": true } })]);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn negotiated_protocol_version_is_retained_for_http_headers() {
+        let transport = HttpTransport::new("https://example.com/mcp");
+
+        transport.set_protocol_version("2025-11-25");
+
+        assert_eq!(
+            transport.protocol_version.read().unwrap().as_str(),
+            "2025-11-25"
+        );
+    }
+
+    #[tokio::test]
+    async fn negotiated_protocol_version_header_is_sent() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let request = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                let count = socket.read(&mut chunk).await.unwrap();
+                if count == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&chunk[..count]);
+            }
+            let request = String::from_utf8_lossy(&bytes).to_string();
+            let body = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            request
+        });
+        let transport = HttpTransport::new(format!("http://{address}/mcp"));
+        transport.set_protocol_version("2025-11-25");
+
+        transport.call("ping", json!({})).await.unwrap();
+        let request = request.await.unwrap().to_ascii_lowercase();
+
+        assert!(request.contains("mcp-protocol-version: 2025-11-25"));
     }
 }

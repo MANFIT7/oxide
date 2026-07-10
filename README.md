@@ -110,7 +110,29 @@ so it works even with the black-box CLI providers.
 - **Slash commands** — drop `.oxide/commands/name.md` (YAML frontmatter `description:` + body with `$ARGUMENTS`). Type `/` in the composer.
 - **Hooks** — `.oxide/hooks.toml`: `pre_tool = ["./guard.sh"]` (non-zero exit blocks), `post_tool = ["cargo fmt"]`, `stop = ["cargo test"]`. Payload JSON in `$OXIDE_HOOK_PAYLOAD`.
 - **Harnesses** — drop a `*.toml` manifest into `harness_dir` to add/update behavior without recompiling.
-- **MCP** — add `[[mcp_servers]]` entries in `oxide.toml`.
+- **MCP** — open **MCP servers** to trust servers discovered from Codex/Claude,
+  or add an explicit stdio/HTTP server. Discovered servers are persisted as
+  secret-free references and resolved from their source config at runtime.
+
+```toml
+[[mcp_servers]]
+name = "filesystem"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
+env_vars = ["FILESYSTEM_TOKEN"] # forwarded explicitly; parent secrets are not inherited
+startup_timeout_sec = 15
+tool_timeout_sec = 60
+disabled_tools = ["delete_file"]
+required = false
+
+[[mcp_servers]]
+name = "remote"
+url = "https://example.com/mcp"
+bearer_token_env_var = "REMOTE_MCP_TOKEN"
+```
+
+MCP tools require approval by default. Fully unrestricted access remains an
+explicit per-process opt-in via `--dangerously-skip-permissions`.
 
 ## Install (macOS)
 

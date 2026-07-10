@@ -13,14 +13,16 @@ use anyhow::Context;
 use async_trait::async_trait;
 use oxide_protocol::ToolSpec;
 use serde_json::{json, Value};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::HashSet;
 
 mod http;
 mod stdio;
 pub use http::{HttpOptions, HttpTransport};
 pub use stdio::{StdioSpawnOptions, StdioTransport};
 
-const PROTOCOL_VERSION: &str = "2024-11-05";
+const PROTOCOL_VERSION: &str = "2025-11-25";
+const SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
+    &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
 /// Separator used to namespace a server's tools: `mcp__<server>__<tool>`.
 pub const PREFIX: &str = "mcp__";
@@ -32,14 +34,17 @@ pub trait Transport: Send + Sync {
     async fn call(&self, method: &str, params: Value) -> anyhow::Result<Value>;
     /// Send a notification (no response expected).
     async fn notify(&self, method: &str, params: Value) -> anyhow::Result<()>;
+    /// Record the protocol version selected during initialization. HTTP uses
+    /// this for the mandatory MCP-Protocol-Version request header.
+    fn set_protocol_version(&self, _version: &str) {}
 }
 
 /// A connected MCP server, surfacing its tools to Oxide.
 pub struct McpClient {
     server: String,
     transport: Box<dyn Transport>,
-    next_id: AtomicU64,
     instructions: String,
+    protocol_version: String,
 }
 
 impl McpClient {
@@ -51,10 +56,12 @@ impl McpClient {
         let mut client = Self {
             server: server.into(),
             transport,
-            next_id: AtomicU64::new(1),
             instructions: String::new(),
+            protocol_version: String::new(),
         };
-        client.instructions = client.initialize().await?;
+        let (instructions, protocol_version) = client.initialize().await?;
+        client.instructions = instructions;
+        client.protocol_version = protocol_version;
         Ok(client)
     }
 
@@ -101,7 +108,11 @@ impl McpClient {
         &self.instructions
     }
 
-    async fn initialize(&self) -> anyhow::Result<String> {
+    pub fn protocol_version(&self) -> &str {
+        &self.protocol_version
+    }
+
+    async fn initialize(&self) -> anyhow::Result<(String, String)> {
         let result = self
             .transport
             .call(
@@ -113,6 +124,17 @@ impl McpClient {
                 }),
             )
             .await?;
+        let negotiated = result
+            .get("protocolVersion")
+            .and_then(Value::as_str)
+            .unwrap_or(PROTOCOL_VERSION);
+        if !SUPPORTED_PROTOCOL_VERSIONS.contains(&negotiated) {
+            anyhow::bail!(
+                "mcp server {} selected unsupported protocol version {negotiated}",
+                self.server
+            );
+        }
+        self.transport.set_protocol_version(negotiated);
         // Per spec, follow up with the initialized notification.
         self.transport
             .notify("notifications/initialized", json!({}))
@@ -120,23 +142,49 @@ impl McpClient {
             .with_context(|| {
                 format!("mcp server {} initialized notification failed", self.server)
             })?;
-        let _ = self.next_id.fetch_add(1, Ordering::Relaxed);
-        Ok(result
-            .get("instructions")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim()
-            .to_string())
+        Ok((
+            result
+                .get("instructions")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string(),
+            negotiated.to_string(),
+        ))
     }
 
     /// List the server's tools as namespaced [`ToolSpec`]s.
     pub async fn list_tools(&self) -> anyhow::Result<Vec<ToolSpec>> {
-        let result = self.transport.call("tools/list", json!({})).await?;
-        let tools = result
-            .get("tools")
-            .and_then(|t| t.as_array())
-            .cloned()
-            .unwrap_or_default();
+        let mut tools = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut seen_cursors = HashSet::new();
+        for page in 0..100 {
+            let params = cursor
+                .as_ref()
+                .map(|value| json!({ "cursor": value }))
+                .unwrap_or_else(|| json!({}));
+            let result = self.transport.call("tools/list", params).await?;
+            tools.extend(
+                result
+                    .get("tools")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default(),
+            );
+            let next = result
+                .get("nextCursor")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .filter(|value| !value.is_empty());
+            let Some(next) = next else { break };
+            if !seen_cursors.insert(next.clone()) {
+                anyhow::bail!("mcp tools/list returned a repeated pagination cursor");
+            }
+            if page == 99 {
+                anyhow::bail!("mcp tools/list exceeded 100 pagination pages");
+            }
+            cursor = Some(next);
+        }
         let specs = tools
             .into_iter()
             .filter_map(|t| {
@@ -179,18 +227,42 @@ impl McpClient {
             .get("isError")
             .and_then(|b| b.as_bool())
             .unwrap_or(false);
-        let text = result
-            .get("content")
-            .and_then(|c| c.as_array())
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|i| i.get("text").and_then(|t| t.as_str()))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-            .unwrap_or_default();
+        let text = render_tool_result(&result);
         Ok((text, !is_error))
+    }
+}
+
+fn render_tool_result(result: &Value) -> String {
+    let mut parts = Vec::new();
+    if let Some(items) = result.get("content").and_then(Value::as_array) {
+        for item in items {
+            if let Some(text) = item.get("text").and_then(Value::as_str) {
+                parts.push(text.to_string());
+                continue;
+            }
+            let mut safe = item.clone();
+            if matches!(
+                safe.get("type").and_then(Value::as_str),
+                Some("image" | "audio")
+            ) {
+                if let Some(data) = safe.get_mut("data") {
+                    let size = data.as_str().map(str::len).unwrap_or(0);
+                    *data = Value::String(format!("<omitted {size} base64 chars>"));
+                }
+            }
+            parts.push(serde_json::to_string_pretty(&safe).unwrap_or_else(|_| safe.to_string()));
+        }
+    }
+    if let Some(structured) = result.get("structuredContent") {
+        parts.push(format!(
+            "[structuredContent]\n{}",
+            serde_json::to_string_pretty(structured).unwrap_or_else(|_| structured.to_string())
+        ));
+    }
+    if parts.is_empty() {
+        serde_json::to_string_pretty(result).unwrap_or_else(|_| result.to_string())
+    } else {
+        parts.join("\n")
     }
 }
 
@@ -222,6 +294,8 @@ mod tests {
     }
 
     struct InitNotifyFailsTransport;
+    struct PaginatedTransport;
+    struct UnsupportedVersionTransport;
 
     #[async_trait]
     impl Transport for MockTransport {
@@ -261,12 +335,47 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl Transport for PaginatedTransport {
+        async fn call(&self, method: &str, params: Value) -> anyhow::Result<Value> {
+            Ok(match method {
+                "initialize" => {
+                    json!({ "protocolVersion": PROTOCOL_VERSION, "capabilities": {} })
+                }
+                "tools/list" if params.get("cursor").is_none() => json!({
+                    "tools": [{ "name": "one", "inputSchema": { "type": "object" } }],
+                    "nextCursor": "page-2"
+                }),
+                "tools/list" => json!({
+                    "tools": [{ "name": "two", "inputSchema": { "type": "object" } }]
+                }),
+                _ => json!({}),
+            })
+        }
+
+        async fn notify(&self, _method: &str, _params: Value) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl Transport for UnsupportedVersionTransport {
+        async fn call(&self, _method: &str, _params: Value) -> anyhow::Result<Value> {
+            Ok(json!({ "protocolVersion": "2099-01-01", "capabilities": {} }))
+        }
+
+        async fn notify(&self, _method: &str, _params: Value) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn lists_and_namespaces_tools() {
         let t = Box::new(MockTransport {
             last_call: Mutex::new(None),
         });
         let client = McpClient::connect("fs", t).await.unwrap();
+        assert_eq!(client.protocol_version(), PROTOCOL_VERSION);
         let tools = client.list_tools().await.unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "mcp__fs__echo");
@@ -299,5 +408,45 @@ mod tests {
         let message = format!("{err:#}");
         assert!(message.contains("mcp server fs initialized notification failed"));
         assert!(message.contains("write failed"));
+    }
+
+    #[tokio::test]
+    async fn tools_list_follows_pagination_cursor() {
+        let client = McpClient::connect("paged", Box::new(PaginatedTransport))
+            .await
+            .unwrap();
+
+        let tools = client.list_tools().await.unwrap();
+
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].name, "mcp__paged__one");
+        assert_eq!(tools[1].name, "mcp__paged__two");
+    }
+
+    #[tokio::test]
+    async fn unsupported_negotiated_protocol_version_is_rejected() {
+        let error = match McpClient::connect("future", Box::new(UnsupportedVersionTransport)).await
+        {
+            Ok(_) => panic!("unsupported protocol version should fail"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("unsupported protocol version"));
+    }
+
+    #[test]
+    fn structured_and_non_text_tool_results_are_not_silently_dropped() {
+        let rendered = render_tool_result(&json!({
+            "content": [
+                { "type": "image", "mimeType": "image/png", "data": "abcd" },
+                { "type": "resource_link", "uri": "file:///tmp/report.json", "name": "report" }
+            ],
+            "structuredContent": { "count": 3 }
+        }));
+
+        assert!(rendered.contains("<omitted 4 base64 chars>"));
+        assert!(rendered.contains("file:///tmp/report.json"));
+        assert!(rendered.contains("structuredContent"));
+        assert!(rendered.contains("\"count\": 3"));
     }
 }

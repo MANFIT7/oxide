@@ -3246,6 +3246,25 @@ mod tests {
     }
 
     #[test]
+    fn mcp_args_support_quotes_and_json_arrays() {
+        assert_eq!(
+            parse_mcp_args(r#"--root "/Volumes/Data/My Project""#).unwrap(),
+            vec!["--root", "/Volumes/Data/My Project"]
+        );
+        assert_eq!(
+            parse_mcp_args(r#"["--root","/Volumes/Data/My Project"]"#).unwrap(),
+            vec!["--root", "/Volumes/Data/My Project"]
+        );
+    }
+
+    #[test]
+    fn mcp_timeout_parser_rejects_zero_and_non_numeric_values() {
+        assert_eq!(optional_positive_u64("15", "timeout").unwrap(), Some(15));
+        assert!(optional_positive_u64("0", "timeout").is_err());
+        assert!(optional_positive_u64("soon", "timeout").is_err());
+    }
+
+    #[test]
     fn codex_and_subscription_pickers_include_gpt_5_6_family() {
         for provider in ["codex", "chatgpt"] {
             let models = model_ids(provider);
@@ -4538,6 +4557,14 @@ fn submit_hermes_prompt(
     status.set("Hermes evolve started".to_string());
 }
 
+#[derive(Clone, Default)]
+struct McpUiStatus {
+    status: String,
+    tool_count: usize,
+    tools: Vec<String>,
+    detail: String,
+}
+
 fn app() -> Element {
     let initial = use_context::<Config>();
     let visual_fixture = VisualFixtureMode::from_env();
@@ -4613,7 +4640,7 @@ fn app() -> Element {
     let mut palette_sel = use_signal(|| 0usize);
     let mut pinned = use_signal(|| false);
     let win = dioxus::desktop::use_window();
-    let mut mcp_status = use_signal(std::collections::HashMap::<String, String>::new);
+    let mut mcp_status = use_signal(std::collections::HashMap::<String, McpUiStatus>::new);
     // ChatGPT subscription usage: (plan, 5h %, weekly %, 5h reset s, weekly reset s).
     // (family "gpt"/"claude", plan, 5h-remaining %, weekly-remaining %, 5h reset, weekly reset).
     // Family-tagged so the card never shows one provider's quota while another is active.
@@ -6514,8 +6541,13 @@ fn app() -> Element {
                                 }
                             }
                             Event::ContextWindow { limit } => context_limit.set(Some(limit)),
-                            Event::McpServerStatus { name, status, tool_count, detail, .. } => {
-                                mcp_status.write().insert(name.clone(), format!("{status} · {tool_count} tool(s) · {detail}"));
+                            Event::McpServerStatus { name, status, tool_count, tools, detail } => {
+                                mcp_status.write().insert(name.clone(), McpUiStatus {
+                                    status,
+                                    tool_count,
+                                    tools,
+                                    detail,
+                                });
                             }
                             // ── Inspector capture ──────────────────────────
                             Event::Ready { harness } => {
@@ -10985,115 +11017,269 @@ fn app() -> Element {
     }
 }
 
+fn parse_mcp_args(input: &str) -> Result<Vec<String>, String> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Ok(Vec::new());
+    }
+    if input.starts_with('[') {
+        return serde_json::from_str(input).map_err(|error| format!("Invalid JSON args: {error}"));
+    }
+    shell_words::split(input).map_err(|error| format!("Invalid quoted args: {error}"))
+}
+
+fn comma_values(input: &str) -> Vec<String> {
+    input
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn optional_positive_u64(input: &str, label: &str) -> Result<Option<u64>, String> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Ok(None);
+    }
+    input
+        .parse::<u64>()
+        .ok()
+        .filter(|value| *value > 0)
+        .map(Some)
+        .ok_or_else(|| format!("{label} must be a positive number"))
+}
+
 #[component]
 fn McpModal(
     cfg: Signal<Config>,
     engine: Coroutine<EngineCmd>,
-    status: Signal<std::collections::HashMap<String, String>>,
+    status: Signal<std::collections::HashMap<String, McpUiStatus>>,
     on_close: EventHandler<()>,
 ) -> Element {
+    let mut editing_name = use_signal(|| None::<String>);
     let mut name = use_signal(String::new);
     let mut command = use_signal(String::new);
     let mut args = use_signal(String::new);
+    let mut url = use_signal(String::new);
+    let mut cwd = use_signal(String::new);
+    let mut env_vars = use_signal(String::new);
+    let mut bearer_env = use_signal(String::new);
+    let mut enabled_tools = use_signal(String::new);
+    let mut disabled_tools = use_signal(String::new);
+    let mut startup_timeout = use_signal(String::new);
+    let mut tool_timeout = use_signal(String::new);
+    let mut required = use_signal(|| false);
+    let mut form_message = use_signal(String::new);
     let servers = cfg.read().mcp_servers.clone();
     let workspace = workspace_of(&cfg.read());
-    let imported: Vec<oxide_config::McpServerConfig> =
-        oxide_core::discover_external_mcp_for_workspace(&workspace)
-            .into_iter()
-            .filter(|e| !servers.iter().any(|s| s.name == e.name))
-            .collect();
+    let discovered = oxide_core::discover_external_mcp_for_workspace(&workspace);
+    let imported: Vec<oxide_config::McpServerConfig> = discovered
+        .iter()
+        .filter(|external| !servers.iter().any(|server| server.name == external.name))
+        .cloned()
+        .collect();
     rsx! {
         div { class: "modal-overlay", onclick: move |_| on_close.call(()),
-            div { class: "modal skills-modal", onclick: move |e| e.stop_propagation(),
+            div { class: "modal skills-modal", onclick: move |event| event.stop_propagation(),
                 div { class: "modal-head",
                     h2 { "MCP servers" }
+                    button { class: "board-btn", onclick: move |_| engine.send(EngineCmd::Reconfigure(cfg.read().clone())), "Reconnect" }
                     button { class: "term-x", onclick: move |_| on_close.call(()), Icon { name: "x" } }
                 }
                 div { class: "modal-body skills-body",
                     if servers.is_empty() {
-                        div { class: "insp-empty", "No MCP servers. Add one below (e.g. npx @modelcontextprotocol/server-filesystem)." }
+                        div { class: "insp-empty", "No trusted MCP servers. Trust a discovered server or add one below." }
                     }
-                    for (i, s) in servers.iter().enumerate() {
+                    for (index, server) in servers.iter().enumerate() {
                         {
-                            let st = status.read().get(&s.name).cloned();
-                            let connected = st.as_deref().map(|x| x.starts_with("connected")).unwrap_or(false);
-                            let cmdline = if s.url.is_empty() { format!("{} {}", s.command, s.args.join(" ")) } else { s.url.clone() };
-                            let servers2 = servers.clone();
+                            let current_status = status.read().get(&server.name).cloned();
+                            let connected = current_status.as_ref().map(|value| value.status == "connected").unwrap_or(false);
+                            let tool_names = current_status.as_ref().map(|value| value.tools.join(", ")).unwrap_or_default();
+                            let resolved = if server.external_ref {
+                                discovered.iter().find(|external| external.name == server.name)
+                            } else {
+                                None
+                            };
+                            let display = resolved.unwrap_or(server);
+                            let command_line = if !display.url.is_empty() {
+                                display.url.clone()
+                            } else {
+                                format!("{} {}", display.command, display.args.join(" ")).trim().to_string()
+                            };
+                            let tag = if server.external_ref { "external" } else if display.url.is_empty() { "local" } else { "http" };
+                            let list_for_remove = servers.clone();
+                            let editable = server.clone();
                             rsx! {
                                 div { class: "mcp-item",
                                     div { class: "mcp-top",
                                         span { class: if connected { "mcp-dot on" } else { "mcp-dot" } }
-                                        span { class: "skill-name", "{s.name}" }
-                                        span { class: "mcp-tag", if s.url.is_empty() { "local" } else { "http" } }
+                                        span { class: "skill-name", "{server.name}" }
+                                        span { class: "mcp-tag", "{tag}" }
+                                        if !server.external_ref {
+                                            button { class: "mcp-remove", onclick: move |_| {
+                                                editing_name.set(Some(editable.name.clone()));
+                                                name.set(editable.name.clone());
+                                                command.set(editable.command.clone());
+                                                args.set(serde_json::to_string(&editable.args).unwrap_or_default());
+                                                url.set(editable.url.clone());
+                                                cwd.set(editable.cwd.clone());
+                                                env_vars.set(editable.env_vars.iter().map(|value| value.name()).collect::<Vec<_>>().join(", "));
+                                                bearer_env.set(editable.bearer_token_env_var.clone());
+                                                enabled_tools.set(editable.enabled_tools.join(", "));
+                                                disabled_tools.set(editable.disabled_tools.join(", "));
+                                                startup_timeout.set(editable.startup_timeout_sec.map(|value| value.to_string()).unwrap_or_default());
+                                                tool_timeout.set(editable.tool_timeout_sec.map(|value| value.to_string()).unwrap_or_default());
+                                                required.set(editable.required);
+                                                form_message.set(String::new());
+                                            }, "Edit" }
+                                        }
                                         button { class: "mcp-remove", onclick: move |_| {
-                                            let mut list = servers2.clone(); list.remove(i);
-                                            let mut c = cfg.read().clone(); c.mcp_servers = list; cfg.set(c.clone());
-                                            engine.send(EngineCmd::Reconfigure(c));
+                                            let mut list = list_for_remove.clone();
+                                            list.remove(index);
+                                            let mut next = cfg.read().clone();
+                                            next.mcp_servers = list;
+                                            cfg.set(next.clone());
+                                            engine.send(EngineCmd::Reconfigure(next));
                                         }, "Remove" }
                                     }
-                                    div { class: "mcp-cmd", "{cmdline}" }
-                                    if let Some(st) = st { div { class: "mcp-st", "{st}" } }
+                                    if server.external_ref && !server.source.is_empty() { div { class: "mcp-src", "{server.source}" } }
+                                    div { class: "mcp-cmd", "{command_line}" }
+                                    if let Some(current_status) = current_status {
+                                        div { class: "mcp-st", "{current_status.status} · {current_status.tool_count} tool(s) · {current_status.detail}" }
+                                        if !current_status.tools.is_empty() {
+                                            div { class: "mcp-src", "{tool_names}" }
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
                     if !imported.is_empty() {
-                        div { class: "mcp-section", "Imported from Codex / Claude" }
-                        for s in imported.iter() {
+                        div { class: "mcp-section", "Discovered from Codex / Claude" }
+                        for external in imported.iter() {
                             {
-                                let st = status.read().get(&s.name).cloned();
-                                let connected = st.as_deref().map(|x| x.starts_with("connected")).unwrap_or(false);
-                                let line = if s.url.is_empty() { format!("{} {}", s.command, s.args.join(" ")) } else { s.url.clone() };
-                                let disabled = !s.enabled;
-                                let source = if s.source.is_empty() { "imported".to_string() } else { s.source.clone() };
-                                let trusted = s.clone();
+                                let current_status = status.read().get(&external.name).cloned();
+                                let line = if external.url.is_empty() { format!("{} {}", external.command, external.args.join(" ")) } else { external.url.clone() };
+                                let source = if external.source.is_empty() { "external config".to_string() } else { external.source.clone() };
+                                let to_trust = external.clone();
                                 rsx! {
                                     div { class: "mcp-item",
                                         div { class: "mcp-top",
-                                            span { class: if connected { "mcp-dot on" } else { "mcp-dot" } }
-                                            span { class: "skill-name", "{s.name}" }
-                                            span { class: "mcp-tag", if disabled { "disabled" } else if s.url.is_empty() { "imported" } else { "http" } }
+                                            span { class: "mcp-dot" }
+                                            span { class: "skill-name", "{external.name}" }
+                                            span { class: "mcp-tag", "untrusted" }
                                             button { class: "mcp-remove", onclick: move |_| {
-                                                let mut server = trusted.clone();
-                                                server.enabled = true;
+                                                let mut reference = to_trust.as_external_reference();
+                                                reference.enabled = true;
                                                 let mut list = cfg.read().mcp_servers.clone();
-                                                if !list.iter().any(|item| item.name == server.name) {
-                                                    list.push(server);
-                                                    list.sort_by(|a, b| a.name.cmp(&b.name));
+                                                if !list.iter().any(|item| item.name == reference.name) {
+                                                    list.push(reference);
+                                                    list.sort_by(|left, right| left.name.cmp(&right.name));
                                                 }
-                                                let mut c = cfg.read().clone(); c.mcp_servers = list; cfg.set(c.clone());
-                                                engine.send(EngineCmd::Reconfigure(c));
+                                                let mut next = cfg.read().clone();
+                                                next.mcp_servers = list;
+                                                cfg.set(next.clone());
+                                                engine.send(EngineCmd::Reconfigure(next));
                                             }, "Trust" }
                                         }
                                         div { class: "mcp-src", "{source}" }
                                         div { class: "mcp-cmd", "{line}" }
-                                        if let Some(st) = st { div { class: "mcp-st", "{st}" } }
+                                        if let Some(current_status) = current_status {
+                                            div { class: "mcp-st", "{current_status.status} · {current_status.detail}" }
+                                        }
                                     }
                                 }
                             }
                         }
                     }
-                    div { class: "mcp-section", "Add server" }
+                    div { class: "mcp-section", if editing_name.read().is_some() { "Edit server" } else { "Add server" } }
                     div { class: "mcp-add",
-                        input { class: "field-input", placeholder: "name (e.g. fs)", value: "{name}", oninput: move |e| name.set(e.value()) }
-                        input { class: "field-input", style: "margin-top:6px", placeholder: "command (e.g. npx)", value: "{command}", oninput: move |e| command.set(e.value()) }
-                        input { class: "field-input", style: "margin-top:6px", placeholder: "args (space-separated)", value: "{args}", oninput: move |e| args.set(e.value()) }
-                        button { class: "board-btn", style: "margin-top:8px", onclick: move |_| {
-                            let n = name.read().trim().to_string();
-                            let cmd = command.read().trim().to_string();
-                            if n.is_empty() || cmd.is_empty() { return; }
-                            let a: Vec<String> = args.read().split_whitespace().map(String::from).collect();
-                            let mut list = cfg.read().mcp_servers.clone();
-                            list.push(oxide_config::McpServerConfig {
-                                name: n,
-                                command: cmd,
-                                args: a,
-                                ..oxide_config::McpServerConfig::default()
-                            });
-                            let mut c = cfg.read().clone(); c.mcp_servers = list; cfg.set(c.clone());
-                            engine.send(EngineCmd::Reconfigure(c));
-                            name.set(String::new()); command.set(String::new()); args.set(String::new());
-                        }, "+ Add server" }
+                        input { class: "field-input", placeholder: "name (letters, numbers, - and _)", value: "{name}", oninput: move |event| name.set(event.value()) }
+                        input { class: "field-input", style: "margin-top:6px", placeholder: "command (local stdio, e.g. npx)", value: "{command}", oninput: move |event| command.set(event.value()) }
+                        input { class: "field-input", style: "margin-top:6px", placeholder: "args (quoted shell syntax or JSON array)", value: "{args}", oninput: move |event| args.set(event.value()) }
+                        input { class: "field-input", style: "margin-top:6px", placeholder: "or remote MCP URL", value: "{url}", oninput: move |event| url.set(event.value()) }
+                        input { class: "field-input", style: "margin-top:6px", placeholder: "working directory (optional)", value: "{cwd}", oninput: move |event| cwd.set(event.value()) }
+                        input { class: "field-input", style: "margin-top:6px", placeholder: "forward env names, comma-separated", value: "{env_vars}", oninput: move |event| env_vars.set(event.value()) }
+                        input { class: "field-input", style: "margin-top:6px", placeholder: "bearer token env var (HTTP)", value: "{bearer_env}", oninput: move |event| bearer_env.set(event.value()) }
+                        input { class: "field-input", style: "margin-top:6px", placeholder: "enabled tools, comma-separated (optional)", value: "{enabled_tools}", oninput: move |event| enabled_tools.set(event.value()) }
+                        input { class: "field-input", style: "margin-top:6px", placeholder: "disabled tools, comma-separated (optional)", value: "{disabled_tools}", oninput: move |event| disabled_tools.set(event.value()) }
+                        div { style: "display:flex;gap:6px;margin-top:6px",
+                            input { class: "field-input", placeholder: "startup timeout seconds", value: "{startup_timeout}", oninput: move |event| startup_timeout.set(event.value()) }
+                            input { class: "field-input", placeholder: "tool timeout seconds", value: "{tool_timeout}", oninput: move |event| tool_timeout.set(event.value()) }
+                        }
+                        label { class: "field toggle-field", style: "margin-top:6px",
+                            input { r#type: "checkbox", checked: *required.read(), onchange: move |event| required.set(event.checked()) }
+                            span { class: "field-label", "Block turns when this server is unavailable" }
+                        }
+                        if !form_message.read().is_empty() { div { class: "mcp-st", "{form_message}" } }
+                        div { style: "display:flex;gap:6px;margin-top:8px",
+                            button { class: "board-btn", onclick: move |_| {
+                                let server_name = name.read().trim().to_string();
+                                let server_command = command.read().trim().to_string();
+                                let server_url = url.read().trim().to_string();
+                                if server_name.is_empty() || !server_name.chars().all(|value| value.is_ascii_alphanumeric() || value == '-' || value == '_') {
+                                    form_message.set("Name may only contain letters, numbers, '-' and '_'".to_string());
+                                    return;
+                                }
+                                if server_command.is_empty() == server_url.is_empty() {
+                                    form_message.set("Set exactly one of command or URL".to_string());
+                                    return;
+                                }
+                                let parsed_args = match parse_mcp_args(&args.read()) {
+                                    Ok(value) => value,
+                                    Err(error) => { form_message.set(error); return; }
+                                };
+                                let startup = match optional_positive_u64(&startup_timeout.read(), "Startup timeout") {
+                                    Ok(value) => value,
+                                    Err(error) => { form_message.set(error); return; }
+                                };
+                                let timeout = match optional_positive_u64(&tool_timeout.read(), "Tool timeout") {
+                                    Ok(value) => value,
+                                    Err(error) => { form_message.set(error); return; }
+                                };
+                                let old_name = editing_name.read().clone();
+                                let mut list = cfg.read().mcp_servers.clone();
+                                if list.iter().any(|item| item.name == server_name && old_name.as_deref() != Some(server_name.as_str())) {
+                                    form_message.set(format!("A server named '{server_name}' already exists"));
+                                    return;
+                                }
+                                if let Some(old_name) = old_name { list.retain(|item| item.name != old_name); }
+                                list.push(oxide_config::McpServerConfig {
+                                    name: server_name,
+                                    command: server_command,
+                                    args: parsed_args,
+                                    url: server_url,
+                                    cwd: cwd.read().trim().to_string(),
+                                    env_vars: comma_values(&env_vars.read()).into_iter().map(oxide_config::McpEnvVar::Name).collect(),
+                                    bearer_token_env_var: bearer_env.read().trim().to_string(),
+                                    startup_timeout_sec: startup,
+                                    tool_timeout_sec: timeout,
+                                    enabled_tools: comma_values(&enabled_tools.read()),
+                                    disabled_tools: comma_values(&disabled_tools.read()),
+                                    required: *required.read(),
+                                    ..oxide_config::McpServerConfig::default()
+                                });
+                                list.sort_by(|left, right| left.name.cmp(&right.name));
+                                let mut next = cfg.read().clone();
+                                next.mcp_servers = list;
+                                cfg.set(next.clone());
+                                engine.send(EngineCmd::Reconfigure(next));
+                                editing_name.set(None);
+                                name.set(String::new()); command.set(String::new()); args.set(String::new()); url.set(String::new());
+                                cwd.set(String::new()); env_vars.set(String::new()); bearer_env.set(String::new());
+                                enabled_tools.set(String::new()); disabled_tools.set(String::new());
+                                startup_timeout.set(String::new()); tool_timeout.set(String::new()); required.set(false);
+                                form_message.set("Server saved and reconnecting".to_string());
+                            }, if editing_name.read().is_some() { "Save changes" } else { "+ Add server" } }
+                            if editing_name.read().is_some() {
+                                button { class: "mcp-remove", onclick: move |_| {
+                                    editing_name.set(None);
+                                    name.set(String::new()); command.set(String::new()); args.set(String::new()); url.set(String::new());
+                                    form_message.set(String::new());
+                                }, "Cancel" }
+                            }
+                        }
                     }
                 }
             }
@@ -15397,6 +15583,9 @@ fn ChatPane(
             cfg.workspace = Some(ws_eff);
             cfg.provider = p;
             cfg.model = m;
+            // Detached panes have no MCP approval UI. Keep their native coding
+            // workflow autonomous, but never expose external MCP tools ungated.
+            cfg.mcp_servers.clear();
             cfg.approval_policy = oxide_protocol::ApprovalPolicy::Never;
             cfg.persist = true;
             cfg.resume = false;

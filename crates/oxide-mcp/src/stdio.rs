@@ -40,23 +40,11 @@ impl StdioTransport {
         args: &[String],
         options: StdioSpawnOptions,
     ) -> anyhow::Result<Self> {
-        let mut cmd = tokio::process::Command::new(command);
-        cmd.args(args)
-            .stdin(Stdio::piped())
+        let mut cmd = mcp_process_command(command, args, &options);
+        cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true);
-        if let Some(cwd) = options.cwd {
-            cmd.current_dir(cwd);
-        }
-        for (key, value) in options.env {
-            cmd.env(key, value);
-        }
-        for key in options.env_vars {
-            if let Ok(value) = std::env::var(&key) {
-                cmd.env(key, value);
-            }
-        }
         let mut child = cmd.spawn()?;
         let stdin = child
             .stdin
@@ -84,6 +72,45 @@ impl StdioTransport {
         io.stdin.flush().await?;
         Ok(())
     }
+}
+
+fn mcp_process_command(
+    command: &str,
+    args: &[String],
+    options: &StdioSpawnOptions,
+) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(command);
+    cmd.args(args).env_clear();
+    // Keep only the environment needed to resolve executables and user-local
+    // runtime state. Credentials must be opted in through env/env_vars.
+    for key in [
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "TMPDIR",
+        "LANG",
+        "LC_ALL",
+        "XDG_CONFIG_HOME",
+        "XDG_CACHE_HOME",
+    ] {
+        if let Some(value) = std::env::var_os(key) {
+            cmd.env(key, value);
+        }
+    }
+    if let Some(cwd) = &options.cwd {
+        cmd.current_dir(cwd);
+    }
+    for (key, value) in &options.env {
+        cmd.env(key, value);
+    }
+    for key in &options.env_vars {
+        if let Some(value) = std::env::var_os(key) {
+            cmd.env(key, value);
+        }
+    }
+    cmd
 }
 
 #[async_trait]
@@ -151,5 +178,49 @@ impl Default for StdioSpawnOptions {
             env_vars: Vec::new(),
             request_timeout: std::time::Duration::from_secs(60),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn stdio_server_gets_only_baseline_and_explicit_environment() {
+        const SECRET_KEY: &str = "OXIDE_MCP_TEST_PARENT_SECRET";
+        std::env::set_var(SECRET_KEY, "must-not-leak");
+        let options = StdioSpawnOptions {
+            env: BTreeMap::from([("EXPLICIT_VALUE".into(), "allowed".into())]),
+            ..StdioSpawnOptions::default()
+        };
+        let output = mcp_process_command("/usr/bin/env", &[], &options)
+            .output()
+            .await
+            .unwrap();
+        std::env::remove_var(SECRET_KEY);
+        let stdout = String::from_utf8(output.stdout).unwrap();
+
+        assert!(stdout.lines().any(|line| line == "EXPLICIT_VALUE=allowed"));
+        assert!(!stdout.contains(SECRET_KEY));
+    }
+
+    #[tokio::test]
+    async fn stdio_server_can_forward_an_explicit_parent_variable() {
+        const KEY: &str = "OXIDE_MCP_TEST_FORWARDED";
+        std::env::set_var(KEY, "forwarded");
+        let options = StdioSpawnOptions {
+            env_vars: vec![KEY.into()],
+            ..StdioSpawnOptions::default()
+        };
+        let output = mcp_process_command("/usr/bin/env", &[], &options)
+            .output()
+            .await
+            .unwrap();
+        std::env::remove_var(KEY);
+        let stdout = String::from_utf8(output.stdout).unwrap();
+
+        assert!(stdout
+            .lines()
+            .any(|line| line == format!("{KEY}=forwarded")));
     }
 }

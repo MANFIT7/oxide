@@ -8103,8 +8103,11 @@ fn validate_mcp_server(server: &McpServerConfig) -> anyhow::Result<()> {
     {
         anyhow::bail!("MCP server name may only contain letters, numbers, '-' and '_'");
     }
-    if server.command.trim().is_empty() {
-        anyhow::bail!("MCP server command is required");
+    if server.external_ref {
+        return Ok(());
+    }
+    if server.command.trim().is_empty() == server.url.trim().is_empty() {
+        anyhow::bail!("set exactly one MCP server command or URL");
     }
     Ok(())
 }

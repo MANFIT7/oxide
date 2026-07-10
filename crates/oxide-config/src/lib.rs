@@ -40,10 +40,9 @@ pub struct Config {
     /// External MCP tool servers to launch and expose to the model.
     #[serde(default)]
     pub mcp_servers: Vec<McpServerConfig>,
-    /// Auto-import MCP servers configured in other agent CLIs (codex's
-    /// `~/.codex/config.toml`) on load, so existing plugins work without
-    /// re-configuring. Names already present in `mcp_servers` win.
-    #[serde(default = "default_true")]
+    /// Legacy compatibility flag. External MCP servers are discovered by the
+    /// UI, but must be explicitly trusted before Oxide launches them.
+    #[serde(default)]
     pub import_external_mcp: bool,
     /// Two-stage orchestration: a front planner delegates to a backend implementer.
     #[serde(default)]
@@ -197,6 +196,10 @@ pub struct McpServerConfig {
     /// Source that was imported from (for UI/debug only).
     #[serde(skip_serializing_if = "String::is_empty")]
     pub source: String,
+    /// Resolve this trusted server by name from Codex/Claude config at runtime.
+    /// The reference intentionally stores no copied command, headers, or secrets.
+    #[serde(skip_serializing_if = "is_false")]
+    pub external_ref: bool,
     /// Working directory for stdio MCP launchers.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub cwd: String,
@@ -261,6 +264,7 @@ impl Default for McpServerConfig {
             url: String::new(),
             enabled: true,
             source: String::new(),
+            external_ref: false,
             cwd: String::new(),
             env: BTreeMap::new(),
             env_vars: Vec::new(),
@@ -281,6 +285,23 @@ impl McpServerConfig {
         let explicitly_enabled = self.enabled_tools.is_empty()
             || self.enabled_tools.iter().any(|name| name == bare_name);
         explicitly_enabled && !self.disabled_tools.iter().any(|name| name == bare_name)
+    }
+
+    /// Persist only a trust reference for an externally discovered server.
+    /// Runtime discovery supplies the launcher/auth fields from the source config.
+    pub fn as_external_reference(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            enabled: self.enabled,
+            source: self.source.clone(),
+            external_ref: true,
+            startup_timeout_sec: self.startup_timeout_sec,
+            tool_timeout_sec: self.tool_timeout_sec,
+            enabled_tools: self.enabled_tools.clone(),
+            disabled_tools: self.disabled_tools.clone(),
+            required: self.required,
+            ..Self::default()
+        }
     }
 }
 
@@ -305,7 +326,7 @@ impl Default for Config {
             persist: true,
             resume: false,
             mcp_servers: Vec::new(),
-            import_external_mcp: true,
+            import_external_mcp: false,
             orchestrate: false,
             front_provider: default_front(),
             backend_provider: default_backend(),
@@ -357,20 +378,16 @@ impl Config {
                 eprintln!("oxide: ignoring unreadable oxide.toml: {e:#}");
             }
         }
-        if cfg.import_external_mcp {
-            cfg.merge_imported_mcp(import_codex_mcp_servers());
-        }
+        cfg.normalize_external_mcp_references();
         Ok(cfg)
     }
 
-    /// Add imported MCP servers that aren't already configured (by name).
-    /// Explicit config in `mcp_servers` always wins over an import.
-    pub fn merge_imported_mcp(&mut self, imported: Vec<McpServerConfig>) {
-        for s in imported {
-            if self.mcp_servers.iter().any(|e| e.name == s.name) {
-                continue;
+    /// Migrate previously auto-imported full configs to secret-free references.
+    fn normalize_external_mcp_references(&mut self) {
+        for server in &mut self.mcp_servers {
+            if !server.source.trim().is_empty() && !server.external_ref {
+                *server = server.as_external_reference();
             }
-            self.mcp_servers.push(s);
         }
     }
 
@@ -390,6 +407,7 @@ impl Config {
         *self = base
             .try_into()
             .with_context(|| format!("merging config {}", path.display()))?;
+        self.normalize_external_mcp_references();
         Ok(())
     }
 
@@ -439,149 +457,65 @@ fn user_config_path() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".config/oxide/config.toml"))
 }
 
-/// Parse codex's `[mcp_servers.<name>]` tables into Oxide MCP configs. Codex and
-/// Oxide share the same MCP wire protocol, so a stdio (`command`/`args`/`env`)
-/// or remote (`url`) server defined for codex runs as-is in Oxide.
-fn parse_codex_mcp(text: &str) -> Vec<McpServerConfig> {
-    let Ok(root) = toml::from_str::<toml::Value>(text) else {
-        return Vec::new();
-    };
-    let Some(servers) = root.get("mcp_servers").and_then(|v| v.as_table()) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for (name, def) in servers {
-        let Some(def) = def.as_table() else { continue };
-        let command = def
-            .get("command")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
-        let url = def
-            .get("url")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
-        // Skip entries that aren't launchable (neither a command nor a URL).
-        if command.is_empty() && url.is_empty() {
-            continue;
-        }
-        let args = def
-            .get("args")
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|x| x.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let env = def
-            .get("env")
-            .and_then(|v| v.as_table())
-            .map(|t| {
-                t.iter()
-                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let bearer_token_env_var = def
-            .get("bearer_token_env_var")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
-        out.push(McpServerConfig {
-            name: name.clone(),
-            command,
-            args,
-            url,
-            enabled: true,
-            source: "codex".to_string(),
-            env,
-            bearer_token_env_var,
-            ..Default::default()
-        });
-    }
-    out
-}
-
-/// Read + parse codex's MCP servers from `~/.codex/config.toml` (empty if absent).
-fn import_codex_mcp_servers() -> Vec<McpServerConfig> {
-    let Some(home) = std::env::var_os("HOME") else {
-        return Vec::new();
-    };
-    let path = PathBuf::from(home).join(".codex/config.toml");
-    match std::fs::read_to_string(&path) {
-        Ok(text) => parse_codex_mcp(&text),
-        Err(_) => Vec::new(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn parses_codex_mcp_servers_stdio_and_remote() {
-        let text = r#"
-[mcp_servers.github]
-command = "npx"
-args = ["-y", "@modelcontextprotocol/server-github"]
-env = { GITHUB_TOKEN = "x" }
+    fn imported_mcp_config_is_reduced_to_secret_free_reference() {
+        let mut server = McpServerConfig {
+            name: "github".into(),
+            command: "npx".into(),
+            args: vec!["-y".into(), "server".into()],
+            source: "Codex user config".into(),
+            env: BTreeMap::from([("GITHUB_TOKEN".into(), "secret".into())]),
+            http_headers: BTreeMap::from([("Authorization".into(), "Bearer secret".into())]),
+            required: true,
+            ..Default::default()
+        };
 
-[mcp_servers.remote]
-url = "https://example.com/mcp"
-bearer_token_env_var = "TOK"
+        server = server.as_external_reference();
 
-[mcp_servers.broken]
-description = "no command or url — skipped"
-"#;
-        let mut servers = parse_codex_mcp(text);
-        servers.sort_by(|a, b| a.name.cmp(&b.name));
-        assert_eq!(servers.len(), 2); // "broken" skipped
-        let gh = servers.iter().find(|s| s.name == "github").unwrap();
-        assert_eq!(gh.command, "npx");
-        assert_eq!(gh.args, ["-y", "@modelcontextprotocol/server-github"]);
-        assert_eq!(gh.env.get("GITHUB_TOKEN").map(String::as_str), Some("x"));
-        assert_eq!(gh.source, "codex");
-        assert!(gh.enabled);
-        let r = servers.iter().find(|s| s.name == "remote").unwrap();
-        assert_eq!(r.url, "https://example.com/mcp");
-        assert_eq!(r.bearer_token_env_var, "TOK");
+        assert!(server.external_ref);
+        assert_eq!(server.name, "github");
+        assert_eq!(server.source, "Codex user config");
+        assert!(server.command.is_empty());
+        assert!(server.args.is_empty());
+        assert!(server.env.is_empty());
+        assert!(server.http_headers.is_empty());
+        assert!(server.required);
+        let serialized = toml::to_string(&server).unwrap();
+        assert!(!serialized.contains("secret"));
     }
 
     #[test]
-    fn merge_imported_mcp_keeps_explicit_config() {
-        let mut cfg = Config {
-            mcp_servers: vec![McpServerConfig {
-                name: "github".into(),
-                command: "mine".into(),
-                ..Default::default()
-            }],
-            ..Config::default()
-        };
-        cfg.merge_imported_mcp(vec![
-            McpServerConfig {
-                name: "github".into(),
-                command: "codex".into(),
-                source: "codex".into(),
-                ..Default::default()
-            },
-            McpServerConfig {
-                name: "fs".into(),
-                command: "npx".into(),
-                source: "codex".into(),
-                ..Default::default()
-            },
-        ]);
-        // Explicit "github" wins; new "fs" is added.
-        assert_eq!(cfg.mcp_servers.len(), 2);
-        let gh = cfg.mcp_servers.iter().find(|s| s.name == "github").unwrap();
-        assert_eq!(gh.command, "mine");
-        assert_eq!(gh.source, "");
-        assert!(cfg
-            .mcp_servers
-            .iter()
-            .any(|s| s.name == "fs" && s.source == "codex"));
+    fn overlay_migrates_legacy_import_before_it_can_be_persisted_again() {
+        let dir =
+            std::env::temp_dir().join(format!("oxide-config-mcp-migration-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("oxide.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[mcp_servers]]
+name = "github"
+command = "npx"
+source = "Codex user config"
+env = { GITHUB_TOKEN = "legacy-secret" }
+"#,
+        )
+        .unwrap();
+        let mut config = Config::default();
+
+        config.overlay_file(&path).unwrap();
+
+        assert_eq!(config.mcp_servers.len(), 1);
+        assert!(config.mcp_servers[0].external_ref);
+        assert!(config.mcp_servers[0].command.is_empty());
+        assert!(config.mcp_servers[0].env.is_empty());
+        assert!(!toml::to_string(&config).unwrap().contains("legacy-secret"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -26,10 +26,13 @@ struct Cli {
     #[arg(long, global = true)]
     resume: bool,
 
-    /// Re-enable permission prompts (default is bypass, like `codex --yolo` /
-    /// `claude --dangerously-skip-permissions`).
+    /// Require permission prompts. Kept for compatibility; safe mode is now the default.
     #[arg(long, global = true)]
     safe: bool,
+
+    /// Explicitly bypass permission prompts and use unrestricted tool access.
+    #[arg(long, global = true, conflicts_with = "safe")]
+    dangerously_skip_permissions: bool,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -139,10 +142,7 @@ fn main() -> Result<()> {
     if cli.resume {
         config.resume = true;
     }
-    // Bypass permissions by default (no prompts), unless --safe is passed.
-    if !cli.safe {
-        config.approval_policy = oxide_protocol::ApprovalPolicy::Never;
-    }
+    apply_permission_mode(&mut config, cli.safe, cli.dangerously_skip_permissions);
 
     match cli.command.unwrap_or(Command::Tui) {
         // The GUI owns the platform event loop and must run on the main thread,
@@ -187,6 +187,72 @@ fn main() -> Result<()> {
     }
 }
 
+fn apply_permission_mode(config: &mut Config, safe: bool, skip_permissions: bool) {
+    if skip_permissions {
+        config.approval_policy = oxide_protocol::ApprovalPolicy::Never;
+        config.sandbox = oxide_protocol::SandboxPolicy::DangerFullAccess;
+        return;
+    }
+    // Old releases overwrote and then persisted `Never` on every GUI launch.
+    // Treat that legacy state as unsafe-by-default unless the user explicitly
+    // opts into the bypass flag for this process.
+    if safe
+        || matches!(
+            config.approval_policy,
+            oxide_protocol::ApprovalPolicy::Never
+        )
+    {
+        config.approval_policy = oxide_protocol::ApprovalPolicy::OnRequest;
+    }
+    if matches!(
+        config.sandbox,
+        oxide_protocol::SandboxPolicy::DangerFullAccess
+    ) {
+        config.sandbox = oxide_protocol::SandboxPolicy::WorkspaceWrite;
+    }
+}
+
+#[cfg(test)]
+mod permission_tests {
+    use super::*;
+
+    #[test]
+    fn default_launch_migrates_legacy_bypass_to_safe_access() {
+        let mut config = Config {
+            approval_policy: oxide_protocol::ApprovalPolicy::Never,
+            sandbox: oxide_protocol::SandboxPolicy::DangerFullAccess,
+            ..Config::default()
+        };
+
+        apply_permission_mode(&mut config, false, false);
+
+        assert_eq!(
+            config.approval_policy,
+            oxide_protocol::ApprovalPolicy::OnRequest
+        );
+        assert_eq!(
+            config.sandbox,
+            oxide_protocol::SandboxPolicy::WorkspaceWrite
+        );
+    }
+
+    #[test]
+    fn explicit_skip_permissions_preserves_full_access_workflow() {
+        let mut config = Config::default();
+
+        apply_permission_mode(&mut config, false, true);
+
+        assert_eq!(
+            config.approval_policy,
+            oxide_protocol::ApprovalPolicy::Never
+        );
+        assert_eq!(
+            config.sandbox,
+            oxide_protocol::SandboxPolicy::DangerFullAccess
+        );
+    }
+}
+
 /// Minimal MCP server over stdio (JSON-RPC 2.0): exposes Oxide's cross-session
 /// recall to external agents. Claude Code connects to it when the claude
 /// driver is launched with `OXIDE_MCP_BRIDGE=<path-to-oxide-binary>`.
@@ -215,7 +281,7 @@ fn run_mcp_serve() -> Result<()> {
         let method = req["method"].as_str().unwrap_or("");
         let result = match method {
             "initialize" => Some(serde_json::json!({
-                "protocolVersion": "2024-11-05",
+                "protocolVersion": "2025-11-25",
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": "oxide", "version": env!("CARGO_PKG_VERSION")}
             })),

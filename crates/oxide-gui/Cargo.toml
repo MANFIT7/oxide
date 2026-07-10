@@ -23,6 +23,7 @@ self-replace = { workspace = true }
 sha2 = { workspace = true }
 flate2 = "1"
 portable-pty = { workspace = true }
+shell-words = { workspace = true }
 dioxus = { version = "0.6", features = ["desktop"] }
 pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }

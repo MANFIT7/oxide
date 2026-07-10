@@ -473,6 +473,7 @@ fn toml_mcp_server(name: &str, entry: &toml::Value, source: &str) -> McpServerCo
             .and_then(|x| x.as_bool())
             .unwrap_or(true),
         source: source.to_string(),
+        external_ref: false,
         cwd: s("cwd"),
         env: toml_string_map(entry.get("env")),
         env_vars: toml_env_vars(entry.get("env_vars")),
@@ -565,6 +566,7 @@ fn json_mcp_server(name: &str, entry: &serde_json::Value, source: &str) -> McpSe
             .and_then(|x| x.as_bool())
             .unwrap_or(true),
         source: source.to_string(),
+        external_ref: false,
         cwd: s("cwd"),
         env: json_string_map(entry.get("env")),
         env_vars: json_env_vars(entry.get("env_vars")),
@@ -1083,6 +1085,13 @@ fn tool_bridge_specs() -> Vec<ToolSpec> {
     ]
 }
 
+fn tools_for_routing(mut tools: Vec<ToolSpec>, deferred_active: bool) -> Vec<ToolSpec> {
+    if deferred_active {
+        tools.extend(tool_bridge_specs());
+    }
+    tools
+}
+
 /// Keyword search over deferred tools (name > description weighting).
 fn search_deferred(deferred: &[ToolSpec], query: &str) -> String {
     if deferred.is_empty() {
@@ -1145,6 +1154,39 @@ fn filter_mcp_tools(server: &McpServerConfig, tools: Vec<ToolSpec>) -> Vec<ToolS
             server.tool_allowed(bare)
         })
         .collect()
+}
+
+fn resolve_external_mcp_reference(
+    reference: &McpServerConfig,
+    discovered: &[McpServerConfig],
+) -> Option<McpServerConfig> {
+    if !reference.external_ref {
+        return Some(reference.clone());
+    }
+    let mut resolved = if reference.source.is_empty() {
+        discovered
+            .iter()
+            .find(|server| server.name == reference.name)
+    } else {
+        discovered
+            .iter()
+            .find(|server| server.name == reference.name && server.source == reference.source)
+    }?
+    .clone();
+    resolved.enabled = reference.enabled;
+    resolved.required = reference.required;
+    resolved.startup_timeout_sec = reference
+        .startup_timeout_sec
+        .or(resolved.startup_timeout_sec);
+    resolved.tool_timeout_sec = reference.tool_timeout_sec.or(resolved.tool_timeout_sec);
+    if !reference.enabled_tools.is_empty() {
+        resolved.enabled_tools = reference.enabled_tools.clone();
+    }
+    if !reference.disabled_tools.is_empty() {
+        resolved.disabled_tools = reference.disabled_tools.clone();
+    }
+    resolved.external_ref = false;
+    Some(resolved)
 }
 
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
@@ -2427,10 +2469,13 @@ impl Engine {
         let pool = MCP_POOL.get_or_init(Default::default);
 
         self.required_mcp_unavailable = false;
-        let servers = self.config.mcp_servers.clone();
-        let configured_names: HashSet<String> =
-            servers.iter().map(|server| server.name.clone()).collect();
-        for ext in discover_external_mcp_for_workspace(&self.workspace) {
+        let configured = self.config.mcp_servers.clone();
+        let discovered = discover_external_mcp_for_workspace(&self.workspace);
+        let configured_names: HashSet<String> = configured
+            .iter()
+            .map(|server| server.name.clone())
+            .collect();
+        for ext in &discovered {
             if !configured_names.contains(&ext.name) {
                 let source = if ext.source.is_empty() {
                     "external config"
@@ -2449,6 +2494,44 @@ impl Engine {
                 .await;
             }
         }
+        let mut servers = Vec::with_capacity(configured.len());
+        for server in configured {
+            if let Some(resolved) = resolve_external_mcp_reference(&server, &discovered) {
+                servers.push(resolved);
+            } else if server.enabled {
+                if server.required {
+                    self.required_mcp_unavailable = true;
+                }
+                let detail = format!(
+                    "trusted external config from '{}' is no longer available",
+                    if server.source.is_empty() {
+                        "external config"
+                    } else {
+                        server.source.as_str()
+                    }
+                );
+                self.emit(Event::McpServerStatus {
+                    name: server.name.clone(),
+                    status: "error".to_string(),
+                    tool_count: 0,
+                    tools: Vec::new(),
+                    detail: detail.clone(),
+                })
+                .await;
+                self.emit(Event::Error {
+                    message: format!("mcp '{}' {detail}", server.name),
+                })
+                .await;
+            }
+        }
+        let active_pool_keys: HashSet<String> = servers
+            .iter()
+            .filter(|server| server.enabled)
+            .map(mcp_pool_key)
+            .collect();
+        pool.lock()
+            .await
+            .retain(|key, _| active_pool_keys.contains(key));
         // Connect all servers CONCURRENTLY with a hard per-server deadline —
         // sequential 60s connects to stale npx servers used to make the engine
         // ignore the first user message for minutes.
@@ -2460,15 +2543,14 @@ impl Engine {
                 async move {
                     let key = mcp_pool_key(&srv);
                     // Reuse a live pooled connection when it still answers.
-                    if let Some((client, tools)) = pool.lock().await.get(&key).cloned() {
-                        let alive = tokio::time::timeout(
+                    if let Some((client, _cached_tools)) = pool.lock().await.get(&key).cloned() {
+                        let refreshed = tokio::time::timeout(
                             std::time::Duration::from_secs(5),
                             client.list_tools(),
                         )
-                        .await
-                        .map(|r| r.is_ok())
-                        .unwrap_or(false);
-                        if alive {
+                        .await;
+                        if let Ok(Ok(tools)) = refreshed {
+                            let tools = filter_mcp_tools(&srv, tools);
                             return (srv, Ok((client, tools)));
                         }
                         pool.lock().await.remove(&key);
@@ -5894,11 +5976,12 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
             }
         }
 
+        let routing_tools = tools_for_routing(self.all_tools(), !self.deferred_tools.is_empty());
         let mut router = ToolRouter::new(
             self.config.approval_policy,
             self.config.sandbox,
             self.workspace.clone(),
-            &self.all_tools(),
+            &routing_tools,
         );
         for t in &self.session_approved {
             router.approve_for_session(t);
@@ -7013,6 +7096,65 @@ attributes:
         assert!(crate::search_deferred(&[], "x").contains("no tools are deferred"));
         // Char accounting counts name + description + schema.
         assert!(crate::deferrable_schema_chars(&deferred) > 60);
+    }
+
+    #[test]
+    fn progressive_bridge_tools_are_registered_with_the_router() {
+        let tools = crate::tools_for_routing(Vec::new(), true);
+        let router = crate::ToolRouter::new(
+            oxide_protocol::ApprovalPolicy::OnRequest,
+            oxide_protocol::SandboxPolicy::WorkspaceWrite,
+            std::path::PathBuf::from("."),
+            &tools,
+        );
+
+        assert!(matches!(router.route("tool_search"), crate::Routed::Run));
+        assert!(matches!(router.route("tool_describe"), crate::Routed::Run));
+        assert!(matches!(
+            router.route("tool_call"),
+            crate::Routed::NeedsApproval
+        ));
+    }
+
+    #[test]
+    fn external_mcp_reference_resolves_without_persisting_secrets() {
+        let discovered = McpServerConfig {
+            name: "github".into(),
+            command: "npx".into(),
+            source: "Codex user config".into(),
+            env: std::collections::BTreeMap::from([("TOKEN".into(), "secret".into())]),
+            ..McpServerConfig::default()
+        };
+        let reference = discovered.as_external_reference();
+
+        let resolved = super::resolve_external_mcp_reference(&reference, &[discovered]).unwrap();
+
+        assert_eq!(resolved.command, "npx");
+        assert_eq!(
+            resolved.env.get("TOKEN").map(String::as_str),
+            Some("secret")
+        );
+        assert!(!resolved.external_ref);
+        let persisted = toml::to_string(&reference).unwrap();
+        assert!(!persisted.contains("secret"));
+    }
+
+    #[test]
+    fn external_mcp_reference_never_falls_back_to_a_different_source() {
+        let reference = McpServerConfig {
+            name: "shared".into(),
+            source: "Codex user config".into(),
+            external_ref: true,
+            ..McpServerConfig::default()
+        };
+        let replacement = McpServerConfig {
+            name: "shared".into(),
+            command: "malicious-replacement".into(),
+            source: "Claude Desktop".into(),
+            ..McpServerConfig::default()
+        };
+
+        assert!(super::resolve_external_mcp_reference(&reference, &[replacement]).is_none());
     }
 
     #[test]

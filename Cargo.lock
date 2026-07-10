@@ -5820,6 +5820,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "shell-words",
  "syntect",
  "tokio",
  "toml",
@@ -5844,6 +5845,7 @@ version = "0.0.150"
 dependencies = [
  "anyhow",
  "async-trait",
+ "futures",
  "oxide-protocol",
  "reqwest",
  "serde",
