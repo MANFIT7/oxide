@@ -67,16 +67,25 @@ impl Default for HookAuto {
 
 impl Hooks {
     pub fn load(workspace: &Path) -> Self {
+        if let Ok(text) = std::fs::read_to_string(workspace.join(".oxide/hooks.toml")) {
+            return Self::from_text(&text).unwrap_or_default();
+        }
+        Self::default()
+    }
+
+    pub fn from_text(text: &str) -> Result<Self, String> {
+        let value = text
+            .parse::<toml::Value>()
+            .map_err(|error| format!("invalid hooks.toml: {error}"))?;
+        let toml::Value::Table(table) = value else {
+            return Err("hooks.toml must contain a TOML table".to_string());
+        };
         let mut hooks = Self {
             map: HashMap::new(),
             auto: HookAuto::default(),
         };
-        if let Ok(text) = std::fs::read_to_string(workspace.join(".oxide/hooks.toml")) {
-            if let Ok(toml::Value::Table(table)) = text.parse::<toml::Value>() {
-                hooks.load_table(table);
-            }
-        }
-        hooks
+        hooks.load_table(table);
+        Ok(hooks)
     }
 
     pub fn auto(&self) -> &HookAuto {

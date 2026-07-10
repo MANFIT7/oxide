@@ -317,7 +317,7 @@ def main() -> int:
     parser.add_argument("--strict", action="store_true", help="treat permission/platform skips as failures")
     parser.add_argument(
         "--fixture-state",
-        choices=["streaming", "off"],
+        choices=["streaming", "review", "verification", "off"],
         default="streaming",
         help="seed deterministic GUI visual state before capture",
     )

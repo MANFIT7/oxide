@@ -12,20 +12,25 @@ It focuses on states that compile tests cannot prove.
 5. Run `python3 scripts/gui-visual-qa.py` before manual inspection. It checks the source-level visual-state contracts and writes `target/gui-visual-qa/fixture.html` for quick browser inspection.
 6. When a Chromium-compatible browser is available, run `python3 scripts/gui-visual-qa.py --runtime`. It opens the fixture through the existing CDP harness, checks required selectors/layout order, captures `target/gui-visual-qa/fixture-cdp.png`, and performs a PNG nonblank sanity check.
 7. For a native app/window smoke on macOS, run `python3 scripts/gui-native-visual-smoke.py --no-build --strict` after building. It launches `./target/debug/oxide gui` with `OXIDE_GUI_VISUAL_FIXTURE=streaming`, captures the Oxide window region to `target/gui-native-visual-smoke/oxide-gui-native.png`, and performs PNG pixel sanity. This requires Accessibility and Screen Recording permission for the host terminal/Codex app.
+8. Record all deterministic native states with `python3 scripts/gui-native-visual-record.py --no-build`. Add `--golden-dir docs/gui-goldens --accept` to establish baselines, then rerun without `--accept` to enforce the pixel-difference thresholds.
 
 ## Streaming And Motion
 
 - Submit a normal prompt and confirm the empty live agent row shows the subtle pre-first-token shimmer.
+- Confirm the streaming rail breathes beside the active assistant row without restarting or flickering as each text chunk arrives.
+- Confirm the first token rises in once, while subsequent tokens remain stable and only the live tail uses the soft readability fade.
 - While reasoning streams, confirm the `Reasoning` panel appears inside the current turn, above the live answer, and does not jump when the turn finishes.
 - Confirm the final `Thought for Ns` row stays in transcript order above the final assistant text.
 - Trigger a tool call with streamed arguments, then confirm the activity row first shows `Preparing <tool> ...`, updates as args stream, and settles into the final tool label when execution starts.
-- Confirm command/activity rows spin only while running and settle to a check or failure icon after completion or error.
+- Confirm command/activity rows keep one fixed status slot: the spinner cross-fades to a check or failure icon without nudging the label horizontally.
+- Expand and collapse a tool with output; confirm the content and caret transition smoothly without shifting neighboring transcript rows.
 
 ## Reduced Motion
 
 - Enable Reduce Motion and repeat a streaming prompt.
 - Confirm the pre-token shimmer row collapses so it does not leave a blank bar between the user message and the working status.
 - Confirm shimmer/sweep animations stop, while active status spinner rings still rotate and do not become solid dots.
+- Confirm the streaming rail becomes static, tool halos stop pulsing, and disclosure content remains immediately readable.
 - Confirm status text still communicates the active state.
 - Confirm tab switch and panel transitions are instant and do not overlap content.
 
@@ -37,6 +42,12 @@ It focuses on states that compile tests cannot prove.
 - Click `Accept` in the inspector and confirm the row remains visible as `Kept`, instead of disappearing.
 - Click `Reject`/`Undo` and confirm the checkpoint rewind event appears and the row is removed or marked reverted.
 - Confirm edit/remove status labels such as `editing...`, `Keep`, `Reject`, `Kept`, `Reverted`, and `Undone` use the slot-roll transition without shifting row width.
+- Expand a changed file, click `Comment` on two hunks, and confirm `Fix feedback` submits both exact hunk locations and notes in one turn.
+
+## Verification Center
+
+- Trigger an edit with auto-verify enabled and confirm `Verify` shows started then passed/failed evidence with the exact command.
+- Confirm a timeout, spawn error, unsupported project, and unrelated pre-existing failure are labeled distinctly instead of appearing as passed.
 
 ## Structured UI Artifacts
 
@@ -80,8 +91,10 @@ It focuses on states that compile tests cannot prove.
 - `python3 scripts/gui-visual-qa.py` passes.
 - Optional runtime gate passes: `python3 scripts/gui-visual-qa.py --runtime`.
 - Optional native window smoke passes on macOS: `python3 scripts/gui-native-visual-smoke.py --no-build --strict`.
+- Native state recorder captures `streaming`, `review`, and `verification` with a manifest.
 - No visible text overlap at the default 1280x820 window.
 - No activity row remains running after turn error/finish.
+- Streaming and tool status motion stays compositor-only and never restarts on every token update.
 - No reasoning panel jumps below the answer on completion.
 - Edit/remove slot text freezes cleanly when Reduce Motion is enabled.
 - Structured UI artifacts render from the native catalog and never expose arbitrary HTML/JS.

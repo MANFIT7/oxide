@@ -20,7 +20,7 @@ mod commands;
 mod context;
 pub mod db;
 mod embed;
-mod hooks;
+pub mod hooks;
 mod index;
 pub mod memory;
 mod ptc;
@@ -1738,6 +1738,12 @@ fn render_skill_route(route: &SkillRoute) -> String {
         }
     }
     out
+}
+
+enum VerifyOutcome {
+    Passed,
+    Failed(String),
+    Skipped,
 }
 
 struct Engine {
@@ -4712,7 +4718,7 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
             // could edit files and stop before proving the changes compile.
             if self.config.auto_verify && self.turn_edited {
                 for verify_iter in 1..=2 {
-                    let Some(report) = self.run_verify().await else {
+                    let VerifyOutcome::Failed(report) = self.run_verify(turn).await else {
                         break;
                     };
                     self.turn_edited = false;
@@ -5289,17 +5295,19 @@ If yes, do it now with edit/write_file/shell — don't describe it. Only end whe
                 // Auto-verify: build/typecheck the edits and feed failures back
                 // so the agent fixes them before finishing (Cursor-style).
                 if self.config.auto_verify && self.turn_edited && verifies < 2 {
-                    if let Some(report) = self.run_verify().await {
-                        verifies += 1;
-                        self.turn_edited = false;
-                        self.session.push(Message::new(Role::User, format!(
-                            "<system-reminder>\nA build/typecheck failed after your edits. Fix the errors below, \
+                    match self.run_verify(turn).await {
+                        VerifyOutcome::Failed(report) => {
+                            verifies += 1;
+                            self.turn_edited = false;
+                            self.session.push(Message::new(Role::User, format!(
+                                "<system-reminder>\nA build/typecheck failed after your edits. Fix the errors below, \
 then stop. Apply fixes with edit/write_file — do not just explain.\n\n{report}\n</system-reminder>"
-                        )));
-                        continue;
+                            )));
+                            continue;
+                        }
+                        VerifyOutcome::Passed => self.turn_verify_passed = true,
+                        VerifyOutcome::Skipped => {}
                     }
-                    // Reaching here = the auto-verify ran clean: that IS evidence.
-                    self.turn_verify_passed = true;
                 }
                 // hermes verify-on-stop: code was edited but NO verification
                 // command ran and passed this turn — demand evidence (or an
@@ -5560,10 +5568,9 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
 
     /// Route one tool call through approval + sandbox and emit its result.
     /// Returns `true` if the turn was interrupted/shut down while waiting.
-    /// Run the project's build/typecheck after edits. Returns `Some(report)`
-    /// when it fails (so the agent can auto-fix), `None` when it passes, can't
-    /// be detected, errors out, or times out (never blocks the turn).
-    async fn run_verify(&self) -> Option<String> {
+    /// Run the project's build/typecheck after edits and emit a durable audit
+    /// row for every outcome so frontends can show verification evidence.
+    async fn run_verify(&self, turn: TurnId) -> VerifyOutcome {
         let ws = &self.workspace;
         // Only verify when a relevant source file was edited. A docs/config-only
         // edit (e.g. README.md) must NOT trigger a project-wide typecheck that
@@ -5602,10 +5609,27 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
         {
             ("ruff".into(), vec!["check".into(), ".".into()])
         } else {
-            return None;
+            self.emit_audit(
+                Some(turn),
+                "verify",
+                "Verification skipped",
+                "No matching verifier for the edited files",
+                "skipped",
+            )
+            .await;
+            return VerifyOutcome::Skipped;
         };
+        let command = format!("{prog} {}", args.join(" "));
+        self.emit_audit(
+            Some(turn),
+            "verify",
+            "Verification started",
+            command.clone(),
+            "running",
+        )
+        .await;
         self.emit(Event::Info {
-            text: format!("auto-verify: {prog} {}", args.join(" ")),
+            text: format!("auto-verify: {command}"),
         })
         .await;
         let fut = tokio::process::Command::new(&prog)
@@ -5613,17 +5637,52 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
             .current_dir(ws)
             .output();
         let out = match tokio::time::timeout(std::time::Duration::from_secs(180), fut).await {
-            Ok(Ok(o)) => o,
-            _ => return None, // spawn error / timeout; don't block
+            Ok(Ok(output)) => output,
+            Ok(Err(err)) => {
+                self.emit_audit(
+                    Some(turn),
+                    "verify",
+                    "Verification could not start",
+                    format!("{command}: {err}"),
+                    "failed",
+                )
+                .await;
+                return VerifyOutcome::Skipped;
+            }
+            Err(_) => {
+                self.emit_audit(
+                    Some(turn),
+                    "verify",
+                    "Verification timed out",
+                    format!("{command} exceeded 180 seconds"),
+                    "failed",
+                )
+                .await;
+                return VerifyOutcome::Skipped;
+            }
         };
         if out.status.success() {
-            return None;
+            self.emit_audit(Some(turn), "verify", "Verification passed", command, "done")
+                .await;
+            return VerifyOutcome::Passed;
         }
         let mut s = String::from_utf8_lossy(&out.stdout).to_string();
         s.push_str(&String::from_utf8_lossy(&out.stderr));
         let s = s.trim();
         if s.is_empty() {
-            return None;
+            let report = format!(
+                "$ {command}\nexited with status {} and no diagnostics",
+                out.status.code().unwrap_or(-1)
+            );
+            self.emit_audit(
+                Some(turn),
+                "verify",
+                "Verification failed",
+                report.clone(),
+                "failed",
+            )
+            .await;
+            return VerifyOutcome::Failed(report);
         }
         // Surface ONLY diagnostics that reference a file edited this turn — a
         // build failing on pre-existing errors elsewhere isn't this turn's job
@@ -5644,13 +5703,39 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
                 .collect::<Vec<_>>()
                 .join("\n");
             if relevant.trim().is_empty() {
-                return None; // failures are all in files we didn't touch
+                self.emit_audit(
+                    Some(turn),
+                    "verify",
+                    "Verification found unrelated failures",
+                    command,
+                    "skipped",
+                )
+                .await;
+                return VerifyOutcome::Skipped;
             }
             let capped: String = relevant.chars().take(6000).collect();
-            return Some(format!("$ {} {}\n{capped}", prog, args.join(" ")));
+            let report = format!("$ {command}\n{capped}");
+            self.emit_audit(
+                Some(turn),
+                "verify",
+                "Verification failed",
+                report.clone(),
+                "failed",
+            )
+            .await;
+            return VerifyOutcome::Failed(report);
         }
         let capped: String = s.chars().take(6000).collect();
-        Some(format!("$ {} {}\n{capped}", prog, args.join(" ")))
+        let report = format!("$ {command}\n{capped}");
+        self.emit_audit(
+            Some(turn),
+            "verify",
+            "Verification failed",
+            report.clone(),
+            "failed",
+        )
+        .await;
+        VerifyOutcome::Failed(report)
     }
 
     /// Validate an `edit` and compute the resulting full file content.

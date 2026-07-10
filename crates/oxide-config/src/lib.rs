@@ -80,6 +80,9 @@ pub struct Config {
     /// Play a short notification sound when a turn finishes.
     #[serde(default = "default_true")]
     pub notification_sound: bool,
+    /// Show native OS notifications for background turns, approvals, and updates.
+    #[serde(default = "default_true")]
+    pub native_notifications: bool,
     /// Local webhook listener port for automation triggers
     /// (`POST 127.0.0.1:{port}/hook/{automation_id}`); None = disabled.
     #[serde(default)]
@@ -314,6 +317,7 @@ impl Default for Config {
             default_tab_mode: default_tab_mode(),
             browser_headless: true,
             notification_sound: true,
+            native_notifications: true,
             webhook_port: None,
             notification_volume: default_notify_volume(),
             theme: default_theme(),

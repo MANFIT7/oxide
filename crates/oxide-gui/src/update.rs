@@ -7,7 +7,7 @@
 
 pub const CURRENT: &str = env!("CARGO_PKG_VERSION");
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct UpdateInfo {
     pub version: String,
     pub url: String,
@@ -131,7 +131,7 @@ async fn check_manifest(manifest_url: &str) -> Option<UpdateInfo> {
 
 /// Download the new binary (streamed, with progress 0.0–1.0) and replace the
 /// running executable. A `.gz` asset is decompressed on the fly.
-pub async fn apply<F: Fn(f32)>(info: &UpdateInfo, on_progress: F) -> anyhow::Result<()> {
+pub async fn apply<F: FnMut(f32)>(info: &UpdateInfo, mut on_progress: F) -> anyhow::Result<()> {
     use futures::StreamExt;
     let client = reqwest::Client::builder()
         .user_agent("oxide-updater")
@@ -152,11 +152,10 @@ pub async fn apply<F: Fn(f32)>(info: &UpdateInfo, on_progress: F) -> anyhow::Res
             on_progress((got as f32 / total as f32).min(0.98));
         }
     }
-    if let Some(expected) = expected_sha256(&client, info).await? {
-        let actual = sha256_hex(&buf);
-        if !actual.eq_ignore_ascii_case(&expected) {
-            anyhow::bail!("update checksum mismatch: expected {expected}, got {actual}");
-        }
+    let expected = expected_sha256(&client, info).await?;
+    let actual = sha256_hex(&buf);
+    if !actual.eq_ignore_ascii_case(&expected) {
+        anyhow::bail!("update checksum mismatch: expected {expected}, got {actual}");
     }
     // Decompress gzip assets in memory.
     let data = if info.url.ends_with(".gz") {
@@ -203,6 +202,17 @@ async fn update_oxide_term(client: &reqwest::Client, main_url: &str) -> anyhow::
         anyhow::bail!("oxide-term download failed: {}", resp.status());
     }
     let buf = resp.bytes().await?;
+    let checksum_url = format!("{term_url}.sha256");
+    let checksum = client.get(&checksum_url).send().await?;
+    if !checksum.status().is_success() {
+        anyhow::bail!("oxide-term checksum download failed: {}", checksum.status());
+    }
+    let checksum_text = checksum.text().await?;
+    let expected = parse_sha256(&checksum_text)?;
+    let actual = sha256_hex(&buf);
+    if !actual.eq_ignore_ascii_case(&expected) {
+        anyhow::bail!("oxide-term checksum mismatch: expected {expected}, got {actual}");
+    }
     use std::io::Read;
     let mut d = flate2::read::GzDecoder::new(&buf[..]);
     let mut out = Vec::new();
@@ -220,25 +230,26 @@ async fn update_oxide_term(client: &reqwest::Client, main_url: &str) -> anyhow::
     Ok(())
 }
 
-async fn expected_sha256(
-    client: &reqwest::Client,
-    info: &UpdateInfo,
-) -> anyhow::Result<Option<String>> {
-    let Some(url) = info.sha256_url.as_deref() else {
-        return Ok(None);
-    };
+async fn expected_sha256(client: &reqwest::Client, info: &UpdateInfo) -> anyhow::Result<String> {
+    let url = info
+        .sha256_url
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("update refused: release is missing a SHA-256 checksum"))?;
     let resp = client.get(url).send().await?;
     if !resp.status().is_success() {
         anyhow::bail!("checksum download failed: {}", resp.status());
     }
-    let text = resp.text().await?;
+    parse_sha256(&resp.text().await?)
+}
+
+fn parse_sha256(text: &str) -> anyhow::Result<String> {
     let Some(first) = text.split_whitespace().next() else {
         anyhow::bail!("checksum file is empty");
     };
     if first.len() != 64 || !first.chars().all(|c| c.is_ascii_hexdigit()) {
         anyhow::bail!("checksum file does not start with a SHA-256 hex digest");
     }
-    Ok(Some(first.to_string()))
+    Ok(first.to_string())
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {

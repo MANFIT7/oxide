@@ -25,6 +25,9 @@ pub struct AutomationSpec {
     /// header `x-oxide-token`). Set on creation; None on legacy specs.
     #[serde(default)]
     pub webhook_token: Option<String>,
+    /// Optional session id whose recent transcript is injected on every run.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 /// Deterministic webhook token (not cryptographic — the listener binds to
@@ -63,6 +66,7 @@ pub fn new_spec(name: &str, schedule: &str, prompt: &str, created_ms: u64) -> Au
             &id_from_name(name, created_ms),
             created_ms,
         )),
+        session_id: None,
     }
 }
 
@@ -199,6 +203,26 @@ pub async fn build_run_prompt_full(
     if let Some(body) = payload.filter(|b| !b.trim().is_empty()) {
         let body: String = body.chars().take(4_000).collect();
         prompt.push_str(&format!("\n\nWebhook payload:\n{body}"));
+    }
+    if let Some(session_id) = spec.session_id.as_deref() {
+        let rows = crate::db::load(session_id);
+        let context = rows
+            .into_iter()
+            .rev()
+            .filter(|(role, _)| matches!(role.as_str(), "user" | "assistant" | "summary"))
+            .take(12)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .map(|(role, content)| format!("{role}: {content}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        if !context.trim().is_empty() {
+            let context: String = context.chars().take(12_000).collect();
+            prompt.push_str(&format!(
+                "\n\nBound thread context ({session_id}):\n{context}\n\nContinue this thread's intent; do not repeat already completed work."
+            ));
+        }
     }
     prompt
 }
@@ -570,6 +594,7 @@ mod tests {
             created_ms: 10,
             script: None,
             webhook_token: None,
+            session_id: None,
         }
     }
 
@@ -655,6 +680,7 @@ mod tests {
             created_ms: 1_000,
             script: None,
             webhook_token: None,
+            session_id: None,
         };
         let recent_run = AutomationRunSpec {
             id: "daily-review-10000".to_string(),
@@ -684,6 +710,7 @@ mod tests {
             created_ms: 1,
             script: None,
             webhook_token: None,
+            session_id: None,
         };
 
         assert!(!is_due(&spec, &[], 120_000));

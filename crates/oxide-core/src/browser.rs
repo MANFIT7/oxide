@@ -197,6 +197,7 @@ fn unique_browser_profile_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chromiumoxide::cdp::browser_protocol::emulation::{MediaFeature, SetEmulatedMediaParams};
     #[tokio::test]
     #[ignore] // needs an installed Chromium browser
     async fn smoke_navigate_read() {
@@ -225,6 +226,14 @@ mod tests {
         let s = BrowserSession::launch_with_viewport(true, Some((1280, 820)))
             .await
             .expect("launch browser");
+        s.page
+            .execute(
+                SetEmulatedMediaParams::builder()
+                    .feature(MediaFeature::new("prefers-reduced-motion", "no-preference"))
+                    .build(),
+            )
+            .await
+            .expect("emulate normal motion");
         let url = format!("file://{}", fixture.display());
         s.navigate(&url).await.expect("navigate visual fixture");
 
@@ -235,8 +244,10 @@ mod tests {
 (() => {
   const required = [
     '.agent-waiting .typing',
+    '.streaming-message .agent-md.live',
     '.thinking-box[open] .thinking-body',
-    '.activity-card.running',
+    '.activity-card.running .activity-status',
+    '.activity-card.has-out[open] .activity-out',
     '.review-actions .diff-kept',
     '.edits-row.pending .edits-rowcounts.shimmer',
     '.composer-live-changes .live-change-state.shimmer',
@@ -245,9 +256,19 @@ mod tests {
   const missing = required.filter((selector) => !document.querySelector(selector));
   const thinking = document.querySelector('.thinking-box')?.getBoundingClientRect();
   const answer = document.querySelector('.row.agent:not(.agent-waiting)')?.getBoundingClientRect();
+  const stream = document.querySelector('.agent-md.live');
+  const streamRow = document.querySelector('.streaming-message');
+  const runningSpinner = document.querySelector('.activity-card.running .activity-spin');
+  const runningResult = document.querySelector('.activity-card.running .activity-ic.ok');
+  const spinnerRect = runningSpinner?.getBoundingClientRect();
+  const resultRect = runningResult?.getBoundingClientRect();
   return JSON.stringify({
     missing,
     thinkingAboveAnswer: Boolean(thinking && answer && thinking.bottom <= answer.top),
+    streamAnimation: stream ? getComputedStyle(stream).animationName : '',
+    streamRailAnimation: streamRow ? getComputedStyle(streamRow, '::before').animationName : '',
+    toolSpinnerAnimation: runningSpinner ? getComputedStyle(runningSpinner).animationName : '',
+    statusSlotAligned: Boolean(spinnerRect && resultRect && Math.abs((spinnerRect.x + spinnerRect.width / 2) - (resultRect.x + resultRect.width / 2)) < 0.5 && Math.abs((spinnerRect.y + spinnerRect.height / 2) - (resultRect.y + resultRect.height / 2)) < 0.5),
     viewport: [window.innerWidth, window.innerHeight],
     text: document.body.innerText
   });
@@ -269,6 +290,26 @@ mod tests {
             report["thinkingAboveAnswer"].as_bool(),
             Some(true),
             "reasoning block should stay above the live answer: {report}"
+        );
+        assert_eq!(
+            report["streamAnimation"].as_str(),
+            Some("oxide-stream-first-token"),
+            "live answer should use the first-token entrance: {report}"
+        );
+        assert_eq!(
+            report["streamRailAnimation"].as_str(),
+            Some("oxide-stream-rail"),
+            "streaming rail should animate outside the live HTML: {report}"
+        );
+        assert_eq!(
+            report["toolSpinnerAnimation"].as_str(),
+            Some("dotspin"),
+            "running tool should animate its stable status slot: {report}"
+        );
+        assert_eq!(
+            report["statusSlotAligned"].as_bool(),
+            Some(true),
+            "tool spinner and result icon should occupy the same fixed slot: {report}"
         );
         let text = report["text"].as_str().unwrap_or_default();
         assert!(
@@ -313,5 +354,38 @@ mod tests {
             sampled,
             out.display()
         );
+
+        s.page
+            .execute(
+                SetEmulatedMediaParams::builder()
+                    .feature(MediaFeature::new("prefers-reduced-motion", "reduce"))
+                    .build(),
+            )
+            .await
+            .expect("emulate reduced motion");
+        let reduced = s
+            .page
+            .evaluate(
+                r#"
+JSON.stringify({
+  streamAnimation: getComputedStyle(document.querySelector('.agent-md.live')).animationName,
+  streamRailAnimation: getComputedStyle(document.querySelector('.streaming-message'), '::before').animationName,
+  toolHaloAnimation: getComputedStyle(document.querySelector('.activity-card.running .activity-status'), '::after').animationName,
+  toolSpinnerAnimation: getComputedStyle(document.querySelector('.activity-card.running .activity-spin')).animationName,
+  toolSpinnerDuration: getComputedStyle(document.querySelector('.activity-card.running .activity-spin')).animationDuration
+})
+"#,
+            )
+            .await
+            .expect("eval reduced-motion styles")
+            .into_value::<String>()
+            .expect("reduced-motion report string");
+        let reduced: serde_json::Value =
+            serde_json::from_str(&reduced).expect("reduced-motion report json");
+        assert_eq!(reduced["streamAnimation"].as_str(), Some("none"));
+        assert_eq!(reduced["streamRailAnimation"].as_str(), Some("none"));
+        assert_eq!(reduced["toolHaloAnimation"].as_str(), Some("none"));
+        assert_eq!(reduced["toolSpinnerAnimation"].as_str(), Some("dotspin"));
+        assert_eq!(reduced["toolSpinnerDuration"].as_str(), Some("2.4s"));
     }
 }

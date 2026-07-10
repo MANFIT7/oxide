@@ -226,6 +226,28 @@ jobs:
           fi
           bash scripts/make-dmg.sh
 
+      - name: Notarize and staple dmg
+        env:
+          APPLE_NOTARY_ID: ${{ secrets.APPLE_NOTARY_ID }}
+          APPLE_NOTARY_TEAM_ID: ${{ secrets.APPLE_NOTARY_TEAM_ID }}
+          APPLE_NOTARY_PASSWORD: ${{ secrets.APPLE_NOTARY_PASSWORD }}
+        run: |
+          if [ -z "$APPLE_NOTARY_ID" ] || [ -z "$APPLE_NOTARY_TEAM_ID" ] || [ -z "$APPLE_NOTARY_PASSWORD" ]; then
+            echo "::warning title=Notarization skipped::Configure APPLE_NOTARY_ID, APPLE_NOTARY_TEAM_ID, and APPLE_NOTARY_PASSWORD to notarize releases."
+            exit 0
+          fi
+          if [ "${{ steps.signing.outputs.available }}" != "true" ]; then
+            echo "Notarization credentials exist but the build has no signing identity." >&2
+            exit 1
+          fi
+          xcrun notarytool submit dist/Oxide.dmg \
+            --apple-id "$APPLE_NOTARY_ID" \
+            --team-id "$APPLE_NOTARY_TEAM_ID" \
+            --password "$APPLE_NOTARY_PASSWORD" \
+            --wait
+          xcrun stapler staple dist/Oxide.dmg
+          xcrun stapler validate dist/Oxide.dmg
+
       - name: Package OTA binaries (gzip)
         run: |
           gzip -9 -c target/release/oxide > oxide-macos-arm64.gz
@@ -236,6 +258,15 @@ jobs:
           shasum -a 256 dist/Oxide.dmg > dist/Oxide.dmg.sha256
           shasum -a 256 oxide-macos-arm64.gz > oxide-macos-arm64.gz.sha256
           shasum -a 256 oxide-term-macos-arm64.gz > oxide-term-macos-arm64.gz.sha256
+
+      - name: Verify packaged release assets
+        run: |
+          shasum -a 256 -c dist/Oxide.dmg.sha256
+          shasum -a 256 -c oxide-macos-arm64.gz.sha256
+          shasum -a 256 -c oxide-term-macos-arm64.gz.sha256
+          gzip -t oxide-macos-arm64.gz
+          gzip -t oxide-term-macos-arm64.gz
+          hdiutil verify dist/Oxide.dmg
 
       - name: Upload release assets artifact
         uses: actions/upload-artifact@v4

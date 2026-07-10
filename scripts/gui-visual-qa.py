@@ -27,6 +27,10 @@ DB = ROOT / "crates/oxide-core/src/db.rs"
 STORE = ROOT / "crates/oxide-core/src/store.rs"
 CHECKLIST = ROOT / "docs/gui-visual-qa-checklist.md"
 NATIVE_SMOKE = ROOT / "scripts/gui-native-visual-smoke.py"
+NATIVE_RECORD = ROOT / "scripts/gui-native-visual-record.py"
+UPDATE = ROOT / "crates/oxide-gui/src/update.rs"
+HOOKS = ROOT / "crates/oxide-core/src/hooks.rs"
+AUTOMATION = ROOT / "crates/oxide-core/src/automation.rs"
 OUT_DIR = ROOT / "target/gui-visual-qa"
 FIXTURE = OUT_DIR / "fixture.html"
 
@@ -71,24 +75,38 @@ def write_fixture(css: str) -> None:
 <div class="app" data-theme="dark">
   <main class="chat">
     <section class="col streaming">
-      <div class="row agent agent-waiting">
+      <div class="row agent agent-waiting streaming-message">
         <div class="avatar"></div>
-        <div class="typing"><span></span><span></span><span></span></div>
+        <div class="typing"><span class="typing-shimmer">Thinking…</span></div>
       </div>
       <details class="thinking-box" open>
         <summary class="thinking-sum live"><span class="thinking-glow">Reasoning</span><span class="thinking-secs">3s</span></summary>
         <div class="thinking-body">Inspecting harness routes, streamed tool args, and session metadata.</div>
       </details>
-      <div class="activity-card running activity-search">
-        <div class="activity-spin"></div>
-        <div class="activity-main">
-          <div class="activity-verb">Preparing browser_search</div>
-          <div class="activity-detail">{"query":"oxide gui visual qa"}</div>
-        </div>
+      <div class="row activity">
+        <details class="activity-card running activity-search no-out">
+          <summary class="activity-sum">
+            <span class="activity-status"><span class="activity-spin"></span><span class="activity-ic ok">✓</span><span class="activity-ic fail">×</span></span>
+            <span class="activity-verb">Preparing browser_search</span>
+            <span class="activity-text">{"query":"oxide gui visual qa"}</span>
+          </summary>
+        </details>
       </div>
-      <div class="row agent">
+      <div class="row activity">
+        <details class="activity-card done activity-command has-out" open>
+          <summary class="activity-sum">
+            <span class="activity-status"><span class="activity-spin"></span><span class="activity-ic ok">✓</span><span class="activity-ic fail">×</span></span>
+            <span class="activity-verb">Ran command</span>
+            <span class="activity-text">cargo check -p oxide-gui</span>
+            <span class="activity-out-n">2 lines</span><span class="activity-caret">⌃</span>
+          </summary>
+          <pre class="activity-out">Checking oxide-gui
+Finished dev profile</pre>
+        </details>
+      </div>
+      <div class="row agent streaming-message">
         <div class="avatar"></div>
-        <div class="agent-text agent-md live">Streaming answer text stays readable while the tail fades softly.</div>
+        <div class="agent-text agent-md live"><div class="live-tail">Streaming answer text stays readable while the tail fades softly.</div></div>
       </div>
       <div class="review-item">
         <details class="review-diff-d" open>
@@ -260,10 +278,14 @@ def main() -> int:
     store = read(STORE)
     checklist = read(CHECKLIST)
     native_smoke = read(NATIVE_SMOKE)
+    native_record = read(NATIVE_RECORD)
+    update = read(UPDATE)
+    hooks = read(HOOKS)
+    automation = read(AUTOMATION)
 
     require(
         "pre-token shimmer render",
-        contains_all(gui, ['class: "row agent agent-waiting"', 'class: "typing"', "if live"]) and ".typing" in css,
+        contains_all(gui, ['class: "row agent agent-waiting streaming-message"', 'class: "typing"', "if live"]) and ".typing" in css,
         f"{rel(GUI)} renders .agent-waiting/.typing for live empty agent rows",
     )
     require(
@@ -302,6 +324,69 @@ def main() -> int:
             ],
         ),
         f"{rel(CSS)} keeps spinner-shaped rings rotating while disabling shimmer text under Reduce Motion",
+    )
+    require(
+        "streaming lifecycle motion stays outside live HTML",
+        contains_all(
+            gui,
+            [
+                '"row agent streaming-message"',
+                '"agent-text agent-md live"',
+                'html.push_str("<div class=\\"live-tail\\">")',
+            ],
+        )
+        and contains_all(
+            css,
+            [
+                "@keyframes oxide-stream-first-token",
+                "@keyframes oxide-stream-rail",
+                ".row.agent.streaming-message::before",
+                ".agent-md.live .live-tail",
+                "will-change: opacity, transform;",
+            ],
+        ),
+        f"{rel(GUI)} and {rel(CSS)} keep chunk-stable streaming motion on the keyed row instead of reanimating markdown children",
+    )
+    require(
+        "tool lifecycle uses stable status and disclosure slots",
+        contains_all(
+            gui,
+            [
+                "fn ActivityStatus",
+                'class: "activity-status"',
+                'span { class: "activity-spin"',
+                'span { class: "activity-ic ok"',
+                'span { class: "activity-ic fail"',
+                'if has_output { "has-out" } else { "no-out" }',
+                'details { class: "{cls}", open: has_output && auto_open',
+                'class: "activity-caret"',
+            ],
+        )
+        and contains_all(
+            css,
+            [
+                "@keyframes oxide-tool-enter",
+                "@keyframes oxide-tool-halo",
+                ".activity-status",
+                ".activity-card.has-out::details-content",
+                ".activity-card.has-out[open] .activity-caret",
+            ],
+        ),
+        f"{rel(GUI)} and {rel(CSS)} cross-fade running/success/failure in a fixed slot and animate tool disclosure without layout measurement",
+    )
+    require(
+        "reduced-motion tames lifecycle polish",
+        contains_all(
+            css,
+            [
+                ".row.agent.streaming-message::before {",
+                ".agent-md.live {",
+                ".row.activity { animation: none; }",
+                ".activity-card.running .activity-status::after { animation: none;",
+                "animation: dotspin 2.4s steps(8) infinite !important;",
+            ],
+        ),
+        f"{rel(CSS)} freezes decorative stream/tool motion while preserving a slow semantic running spinner",
     )
     require(
         "reduced-motion freezes edit shimmer",
@@ -550,10 +635,56 @@ def main() -> int:
         ),
         "Environment card exposes local server status/actions without internal agent ports",
     )
+    require(
+        "selected workflow surfaces",
+        contains_all(
+            gui,
+            [
+                '"verify" => rsx!',
+                '"Fix feedback"',
+                '"Compare solutions"',
+                '"Hook Studio"',
+                '"Next Work"',
+                "fork_agent_tab",
+                "review_comments",
+            ],
+        )
+        and contains_all(css, [".verify-item", ".hunk-feedback", ".compare-modal", ".hook-editor"]),
+        "GUI exposes verification, inline feedback, fork comparison, Hook Studio, and Next Work",
+    )
+    require(
+        "automatic update and recovery hardening",
+        contains_all(
+            gui,
+            [
+                "15 * 60",
+                "ToastAction::InstallUpdate",
+                "show_native_notification",
+                "oxide:draft:",
+                "localStorage.setItem",
+            ],
+        )
+        and contains_all(update, ["release is missing a SHA-256 checksum", "oxide-term checksum mismatch"]),
+        "updates poll without reload, notify once, restore drafts, and require signed checksums",
+    )
+    require(
+        "hook and thread automation contracts",
+        contains_all(hooks, ["pub fn from_text", "pub fn commands_for"])
+        and contains_all(automation, ["pub session_id: Option<String>", "Bound thread context"]),
+        "Hook Studio validates real hook parsing and automations retain bound thread context",
+    )
+    require(
+        "native visual state recorder",
+        contains_all(native_record, ["STATES =", '"streaming"', '"review"', '"verification"', "compare_png", '"manifest.json"'])
+        and "scripts/gui-native-visual-record.py" in checklist,
+        f"{rel(NATIVE_RECORD)} records deterministic states and supports golden comparison",
+    )
     checklist_needles = [
         "pre-first-token shimmer",
+        "streaming rail",
         "Reasoning",
         "Preparing <tool>",
+        "status slot",
         "Reduce Motion",
         "Accept",
         "provider/model/harness/effort",
@@ -561,6 +692,9 @@ def main() -> int:
         "Agents Window",
         "Bugbot review",
         "Local Servers",
+        "Verification Center",
+        "Fix feedback",
+        "gui-native-visual-record.py",
     ]
     require(
         "manual checklist covers motion-critical states",

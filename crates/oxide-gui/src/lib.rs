@@ -1530,6 +1530,21 @@ struct AgentTab {
 }
 
 const SESSION_RENDER_MESSAGE_LIMIT: usize = 20;
+const HOOKS_STARTER: &str = r#"[auto]
+guard_dangerous_shell = true
+lint = false
+summarize = false
+
+[[hooks.PreToolUse]]
+matcher = "shell"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "./scripts/guard.sh"
+timeout = 30
+statusMessage = "Checking shell command"
+async = false
+"#;
 
 #[derive(Clone, PartialEq, Eq)]
 enum TabStatus {
@@ -1552,6 +1567,7 @@ struct DeletedSessionSpec {
 #[derive(Clone, PartialEq, Eq)]
 enum ToastAction {
     OpenTab(u64),
+    InstallUpdate(update::UpdateInfo),
     RestoreSessions(Vec<String>),
     RestoreDeletedSession(DeletedSessionSpec),
 }
@@ -1597,6 +1613,14 @@ struct TimelineItem {
     sub: String,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct VerificationItem {
+    kind: String,
+    title: String,
+    detail: String,
+    status: String,
+}
+
 #[derive(Clone, PartialEq)]
 struct SubagentCard {
     worker_id: String,
@@ -1622,19 +1646,23 @@ struct CommandLog {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum VisualFixtureMode {
     Streaming,
+    Review,
+    Verification,
 }
 
 impl VisualFixtureMode {
     fn from_env() -> Option<Self> {
         match std::env::var("OXIDE_GUI_VISUAL_FIXTURE").ok().as_deref() {
             Some("streaming") => Some(Self::Streaming),
+            Some("review") => Some(Self::Review),
+            Some("verification") => Some(Self::Verification),
             _ => None,
         }
     }
 }
 
 fn visual_fixture_messages(mode: Option<VisualFixtureMode>) -> Vec<ChatMsg> {
-    if !matches!(mode, Some(VisualFixtureMode::Streaming)) {
+    if mode.is_none() {
         return Vec::new();
     }
     vec![
@@ -1786,7 +1814,10 @@ fn visual_fixture_subagents(mode: Option<VisualFixtureMode>) -> Vec<SubagentCard
 fn visual_fixture_turn_edits(
     mode: Option<VisualFixtureMode>,
 ) -> Vec<(String, u32, u32, u64, String)> {
-    if !matches!(mode, Some(VisualFixtureMode::Streaming)) {
+    if !matches!(
+        mode,
+        Some(VisualFixtureMode::Streaming) | Some(VisualFixtureMode::Review)
+    ) {
         return Vec::new();
     }
     vec![
@@ -1821,6 +1852,32 @@ fn visual_fixture_todos(mode: Option<VisualFixtureMode>) -> Vec<(String, String)
             "Record remaining golden-diff follow-up".to_string(),
             "pending".to_string(),
         ),
+    ]
+}
+
+fn visual_fixture_verification(mode: Option<VisualFixtureMode>) -> Vec<VerificationItem> {
+    if !matches!(mode, Some(VisualFixtureMode::Verification)) {
+        return Vec::new();
+    }
+    vec![
+        VerificationItem {
+            kind: "verify".to_string(),
+            title: "Verification passed".to_string(),
+            detail: "cargo check -p oxide-gui".to_string(),
+            status: "done".to_string(),
+        },
+        VerificationItem {
+            kind: "lint".to_string(),
+            title: "Auto lint passed".to_string(),
+            detail: "cargo fmt --check".to_string(),
+            status: "done".to_string(),
+        },
+        VerificationItem {
+            kind: "verify".to_string(),
+            title: "Browser smoke".to_string(),
+            detail: "Waiting for the native visual capture".to_string(),
+            status: "running".to_string(),
+        },
     ]
 }
 
@@ -3620,6 +3677,61 @@ fn play_notification_sound(cfg: Signal<Config>, force: bool) {
     });
 }
 
+fn show_native_notification(cfg: Signal<Config>, title: &str, body: &str) {
+    if !cfg.peek().native_notifications {
+        return;
+    }
+    let title = title.to_string();
+    let body = body.to_string();
+    std::thread::spawn(move || {
+        #[cfg(target_os = "macos")]
+        {
+            let _ = std::process::Command::new("osascript")
+                .args([
+                    "-e",
+                    "on run argv",
+                    "-e",
+                    "display notification (item 2 of argv) with title (item 1 of argv)",
+                    "-e",
+                    "end run",
+                    "--",
+                    &title,
+                    &body,
+                ])
+                .status();
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let _ = std::process::Command::new("notify-send")
+                .args([&title, &body])
+                .status();
+        }
+    });
+}
+
+fn install_update(
+    info: update::UpdateInfo,
+    mut updating: Signal<bool>,
+    mut update_err: Signal<bool>,
+    mut update_pct: Signal<f32>,
+) {
+    if *updating.peek() {
+        return;
+    }
+    updating.set(true);
+    update_err.set(false);
+    update_pct.set(0.0);
+    spawn(async move {
+        match update::apply(&info, move |progress| update_pct.set(progress)).await {
+            Ok(()) => update::restart(),
+            Err(_) => {
+                updating.set(false);
+                update_err.set(true);
+            }
+        }
+    });
+}
+
 fn flash_restored_sessions(mut restored_sessions: Signal<HashSet<String>>, ids: Vec<String>) {
     if ids.is_empty() {
         return;
@@ -4442,7 +4554,12 @@ fn app() -> Element {
 
     // Panels.
     // Environment pane (right): one tabbed home for Files/Terminals/Preview/Diffs.
-    let mut show_env = use_signal(|| false);
+    let mut show_env = use_signal(move || {
+        matches!(
+            visual_fixture,
+            Some(VisualFixtureMode::Review) | Some(VisualFixtureMode::Verification)
+        )
+    });
     let mut env_tab = use_signal(|| "files".to_string());
     let env_tab_by_tab = use_signal(HashMap::<u64, String>::new);
     // Environment card: running-process dropdown (port, name, pid).
@@ -4559,6 +4676,7 @@ fn app() -> Element {
     let automation_schedule = use_signal(|| automation::DEFAULT_SCHEDULE.to_string());
     let automation_prompt = use_signal(|| automation::DEFAULT_PROMPT.to_string());
     let automation_script = use_signal(String::new);
+    let automation_bind_thread = use_signal(|| true);
     let automation_status = use_signal(|| "Automations idle".to_string());
     let automation_confirm_delete = use_signal(|| None::<String>);
     let hermes_ws = ws0.clone();
@@ -4652,14 +4770,21 @@ fn app() -> Element {
     let mut rename_text = use_signal(String::new);
     let next_tab_id = use_signal(|| 1u64);
     let mut show_newtab = use_signal(|| false);
+    let mut compare_pair = use_signal(|| None::<(u64, u64)>);
+    let mut show_compare = use_signal(|| false);
 
     // Composer modes (shared across both Composer instances).
     let plan_mode = use_signal(|| false);
     let pursue_goal = use_signal(|| false);
 
     // Inspector (right panel) state — ported from the desktop command center.
-    let mut inspector_tab = use_signal(|| "files".to_string());
+    let mut inspector_tab = use_signal(move || match visual_fixture {
+        Some(VisualFixtureMode::Review) => "review".to_string(),
+        Some(VisualFixtureMode::Verification) => "verify".to_string(),
+        _ => "files".to_string(),
+    });
     let mut timeline = use_signal(Vec::<TimelineItem>::new);
+    let mut verification = use_signal(move || visual_fixture_verification(visual_fixture));
     let mut subagent_cards = use_signal(move || visual_fixture_subagents(visual_fixture));
     let mut session_replay = use_signal(|| None::<SessionReplay>);
     let mut approvals = use_signal(Vec::<(u64, String, String)>::new);
@@ -4708,6 +4833,7 @@ fn app() -> Element {
     let mut accepted = use_signal(HashSet::<u64>::new);
     // Edits made this turn: (path, adds, dels, checkpoint).
     let mut turn_edits = use_signal(move || visual_fixture_turn_edits(visual_fixture));
+    let mut review_comments = use_signal(HashMap::<String, String>::new);
     let mut todos = use_signal(move || visual_fixture_todos(visual_fixture));
     let mut edits_expanded = use_signal(|| false);
     let mut edits_undone = use_signal(|| false);
@@ -4768,31 +4894,45 @@ fn app() -> Element {
         dirty,
     });
 
-    // OTA self-update — UX ala Synara: cek di background (launch + poll 4 jam),
-    // UI hanya muncul di sidebar saat ADA yang bisa dilakukan; install selalu
-    // klik eksplisit; gagal → state Retry, bukan banner error.
+    // OTA self-update: check immediately, then every 15 minutes without a
+    // reload. A version is announced once; installation remains explicit.
     let mut update_info = use_signal(|| None::<update::UpdateInfo>);
-    let mut updating = use_signal(|| false);
-    let mut update_pct = use_signal(|| 0.0f32);
-    let mut update_err = use_signal(|| false);
-    use_effect(move || {
-        let repo = {
-            let r = cfg.read().github_repo.clone();
-            if r.trim().is_empty() {
+    let mut update_notified = use_signal(|| None::<String>);
+    let updating = use_signal(|| false);
+    let update_pct = use_signal(|| 0.0f32);
+    let update_err = use_signal(|| false);
+    use_future(move || async move {
+        loop {
+            let current = cfg.peek();
+            let repo = if current.github_repo.trim().is_empty() {
                 "MANFIT7/oxide".to_string()
             } else {
-                r
-            }
-        };
-        let url = cfg.read().update_url.clone();
-        spawn(async move {
-            loop {
-                if let Some(info) = update::check(&repo, &url).await {
-                    update_info.set(Some(info));
+                current.github_repo.clone()
+            };
+            let url = current.update_url.clone();
+            drop(current);
+            if let Some(info) = update::check(&repo, &url).await {
+                let announce = update_notified.peek().as_deref() != Some(info.version.as_str());
+                update_info.set(Some(info.clone()));
+                if announce {
+                    update_notified.set(Some(info.version.clone()));
+                    push_action_toast(
+                        toasts,
+                        toast_seq,
+                        "info",
+                        &format!("Oxide v{} is ready", info.version),
+                        "Install",
+                        ToastAction::InstallUpdate(info.clone()),
+                    );
+                    show_native_notification(
+                        cfg,
+                        "Oxide update available",
+                        &format!("Version {} is ready to install", info.version),
+                    );
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(4 * 3600)).await;
             }
-        });
+            tokio::time::sleep(std::time::Duration::from_secs(15 * 60)).await;
+        }
     });
     // What's New (Synara): pill sekali-tampil setelah update berhasil; launch
     // pertama memajukan penanda diam-diam (silent bootstrap, tanpa pill).
@@ -5772,6 +5912,15 @@ fn app() -> Element {
                             messages.set(kept);
                         }
                         Some(EngineCmd::SwitchTab { id, conf, msgs }) => {
+                            if !handles.contains_key(&id) && !msgs.is_empty() {
+                                spawn_tab_engine!(id, conf.clone());
+                                if let Some(handle) = handles.get(&id) {
+                                    let history = chat_history(&msgs);
+                                    if !history.is_empty() {
+                                        let _ = handle.submit(Op::SetHistory { msgs: history }).await;
+                                    }
+                                }
+                            }
                             // VIEW switch only — the tab being left keeps its engine
                             // (and any in-flight turn) running in the background.
                             // Save the outgoing view first — deltas may have landed after
@@ -6102,6 +6251,15 @@ fn app() -> Element {
                                 Event::ApprovalRequested { request_id, tool, summary } => {
                                     parked_appr.entry(ev_tid).or_default().push((request_id, tool.clone(), summary));
                                     buf.push(ChatMsg::new(Author::Note, format!("Waiting for approval ({tool}) - open this tab to respond")));
+                                    push_action_toast(
+                                        toasts,
+                                        toast_seq,
+                                        "warn",
+                                        &format!("{tool} needs approval"),
+                                        "Open",
+                                        ToastAction::OpenTab(ev_tid),
+                                    );
+                                    show_native_notification(cfg, "Oxide needs approval", &tool);
                                 }
                                 Event::QuestionAsked { request_id, question, options } => {
                                     parked_q.entry(ev_tid).or_default().push((request_id, question.clone(), options));
@@ -6125,6 +6283,11 @@ fn app() -> Element {
                                             &format!("{title} — finished"),
                                             "Open",
                                             ToastAction::OpenTab(ev_tid),
+                                        );
+                                        show_native_notification(
+                                            cfg,
+                                            "Oxide turn finished",
+                                            &title,
                                         );
                                     }
                                     // Background tab done — you're looking elsewhere, always chime
@@ -6386,6 +6549,8 @@ fn app() -> Element {
                                 turn_start.set(Some(std::time::Instant::now()));
                                 elapsed_s.set(0);
                                 turn_edits.write().clear();
+                                review_comments.write().clear();
+                                verification.write().clear();
                                 bg_jobs.write().clear();
                                 todos.write().clear();
                                     subagent_cards.write().clear();
@@ -6405,6 +6570,14 @@ fn app() -> Element {
                                     title: format!("Audit · {kind} · {title}"),
                                     sub,
                                 });
+                                if matches!(kind.as_str(), "verify" | "lint") {
+                                    verification.write().push(VerificationItem {
+                                        kind,
+                                        title,
+                                        detail,
+                                        status,
+                                    });
+                                }
                             }
                             Event::UiSpec { spec, .. } => {
                                 finalize_ui_spec_preview(&mut messages.write(), ui_spec_message(*spec));
@@ -6506,6 +6679,7 @@ fn app() -> Element {
                             Event::ApprovalRequested { request_id, tool, summary } => {
                                 approvals.write().push((request_id, tool.clone(), summary.clone()));
                                 timeline.write().push(TimelineItem { title: format!("Approval needed · {tool}"), sub: summary });
+                                show_native_notification(cfg, "Oxide needs approval", &tool);
                             }
                             Event::ToolCallDelta { call_id, tool, accumulated, .. } => {
                                 // Guard like AgentMessageDelta: this fires per streamed
@@ -7780,16 +7954,7 @@ fn app() -> Element {
                                 title: "v{info.version} — {info.notes}",
                                 disabled: busy,
                                 onclick: move |_| {
-                                    updating.set(true);
-                                    update_err.set(false);
-                                    update_pct.set(0.0);
-                                    let info = info_run.clone();
-                                    spawn(async move {
-                                        match update::apply(&info, move |p| { let mut up = update_pct; up.set(p); }).await {
-                                            Ok(()) => update::restart(),
-                                            Err(_) => { updating.set(false); update_err.set(true); }
-                                        }
-                                    });
+                                    install_update(info_run.clone(), updating, update_err, update_pct);
                                 },
                                 span { class: "update-row-ic", Icon { name: "arrow-up" } }
                                 if busy { span { class: "update-row-label", "Updating… {pct}%" } }
@@ -8456,6 +8621,7 @@ fn app() -> Element {
                             h1 { class: "hero-title", "What should we build in {project}?" }
                             Composer { streaming, engine, cfg, model_label: model_label.clone(),
                                        bypass, project: project.clone(), branch: branch.clone(),
+                                       draft_key: format!("{}:{}", workspace.display(), tabs.read().get(*active_tab.read()).map(|tab| tab.id).unwrap_or(0)),
                                        context_used: ctx_used, context_limit: ctx_limit,
                                        workspace: workspace.clone(), plan_mode, pursue_goal, goal_text, queue, picked_element,
                                        on_settings: move |_| {
@@ -9281,6 +9447,7 @@ fn app() -> Element {
                             Composer { streaming, engine, cfg, model_label, bypass,
                                        followup: !messages.read().is_empty(),
                                        project: project.clone(), branch: branch.clone(),
+                                       draft_key: format!("{}:{}", workspace.display(), tabs.read().get(*active_tab.read()).map(|tab| tab.id).unwrap_or(0)),
                                        context_used: ctx_used, context_limit: ctx_limit,
                                        workspace: workspace.clone(), plan_mode, pursue_goal, goal_text, queue, picked_element,
                                        on_settings: move |_| {
@@ -9562,7 +9729,7 @@ fn app() -> Element {
                         }
                         aside { class: "files-panel",
                             div { class: "insp-tabs",
-                                for (key, label) in [("agents","Agents"),("review","Review"),("files","Files"),("timeline","Timeline"),("sessions","Sessions"),("git","Git"),("memory","Memory"),("goal","Goal"),("browser","Browser"),("approvals","Approvals"),("checkpoints","Checkpoints"),("usage","Usage")] {
+                                for (key, label) in [("agents","Agents"),("review","Review"),("verify","Verify"),("files","Files"),("timeline","Timeline"),("sessions","Sessions"),("git","Git"),("memory","Memory"),("goal","Goal"),("browser","Browser"),("approvals","Approvals"),("checkpoints","Checkpoints"),("usage","Usage")] {
                                     {
                                         let active = *inspector_tab.read() == key;
                                         let badge = match key {
@@ -9570,6 +9737,7 @@ fn app() -> Element {
                                             "approvals" => approvals.read().len(),
                                             "checkpoints" => checkpoints.read().len(),
                                             "review" => turn_edits.read().len(),
+                                            "verify" => verification.read().iter().filter(|item| item.status == "failed").count(),
                                             _ => 0,
                                         };
                                         let k = key.to_string();
@@ -9612,6 +9780,18 @@ fn app() -> Element {
                                                             button { class: "agent-action primary", onclick: move |_| {
                                                                 new_agent_tab(tabs, active_tab, messages, cfg, engine, next_tab_id, "codex", "", "Codex");
                                                             }, Icon { name: "plus" } span { "New Codex" } }
+                                                            button { class: "agent-action", onclick: move |_| {
+                                                                if let Some(pair) = fork_agent_tab(tabs, active_tab, messages, cfg, engine, next_tab_id) {
+                                                                    compare_pair.set(Some(pair));
+                                                                    show_compare.set(true);
+                                                                    push_toast(toasts, toast_seq, "ok", "Conversation forked");
+                                                                }
+                                                            }, Icon { name: "branch" } span { "Fork" } }
+                                                            if compare_pair.read().is_some() {
+                                                                button { class: "agent-action", onclick: move |_| {
+                                                                    show_compare.set(true);
+                                                                }, Icon { name: "eye" } span { "Compare" } }
+                                                            }
                                                             button { class: if *show_split.read() { "agent-action on" } else { "agent-action" }, onclick: move |_| {
                                                                 let v = *show_split.read();
                                                                 show_split.set(!v);
@@ -9739,6 +9919,21 @@ fn app() -> Element {
                                                                 span { class: "agents-work-sub", "local git diff" }
                                                             }
                                                             button { class: "agents-work-card", onclick: move |_| {
+                                                                let prompt = "Assess the current workspace and conversation, then propose the single most valuable next piece of work. Inspect git status, unfinished TODOs, recent verification/audit evidence, and saved automations. If a safe, scoped action is clearly ready, implement it and verify it; otherwise give a concise prioritized recommendation.".to_string();
+                                                                if *streaming.read() {
+                                                                    queue.write().push(prompt);
+                                                                } else {
+                                                                    engine.send(EngineCmd::Submit {
+                                                                        engine: prompt,
+                                                                        display: "Next Work".to_string(),
+                                                                    });
+                                                                }
+                                                            },
+                                                                Icon { name: "arrow-right" }
+                                                                span { class: "agents-work-title", "Next Work" }
+                                                                span { class: "agents-work-sub", "status + TODO + verify" }
+                                                            }
+                                                            button { class: "agents-work-card", onclick: move |_| {
                                                                 let ws = hermes_workspace.clone();
                                                                 let goal = hermes_goal.read().clone();
                                                                 let validation = hermes_validation.read().clone();
@@ -9848,6 +10043,26 @@ fn app() -> Element {
                                         } else {
                                             div { class: "review-head",
                                                 span { class: "review-count", "{turn_edits.read().len()} changed file(s)" }
+                                                if review_comments.read().values().any(|note| !note.trim().is_empty()) {
+                                                    button { class: "review-accept", onclick: move |_| {
+                                                        let notes = review_comments.read().iter()
+                                                            .filter(|(_, note)| !note.trim().is_empty())
+                                                            .map(|(location, note)| format!("- {location}: {}", note.trim()))
+                                                            .collect::<Vec<_>>()
+                                                            .join("\n");
+                                                        let prompt = format!(
+                                                            "Apply the inline review feedback below. Inspect each referenced file and hunk, make the smallest correct changes, then run the relevant verification.\n\n{notes}"
+                                                        );
+                                                        if *streaming.read() {
+                                                            queue.write().push(prompt);
+                                                        } else {
+                                                            engine.send(EngineCmd::Submit {
+                                                                engine: prompt,
+                                                                display: "Fix inline review feedback".to_string(),
+                                                            });
+                                                        }
+                                                    }, "Fix feedback" }
+                                                }
                                                 button { class: "ed-close", onclick: move |_| {
                                                     let edits = turn_edits.read().clone();
                                                     for (_, _, _, cp, _) in edits.iter().rev() { engine.send(EngineCmd::Rewind { id: *cp }); reverted.write().insert(*cp); }
@@ -9874,7 +10089,13 @@ fn app() -> Element {
                                                                     span { class: "diff-adds", "+{adds}" }
                                                                     span { class: "diff-dels", "−{dels}" }
                                                                 }
-                                                                HunkedDiff { ws: workspace.clone(), path: path.clone(), diff }
+                                                                HunkedDiff {
+                                                                    ws: workspace.clone(),
+                                                                    path: path.clone(),
+                                                                    diff,
+                                                                    checkpoint: cp,
+                                                                    comments: review_comments,
+                                                                }
                                                             }
                                                             div { class: "review-actions",
                                                                 if is_reverted {
@@ -9889,6 +10110,39 @@ fn app() -> Element {
                                                                         engine.send(EngineCmd::Rewind { id: cp });
                                                                         if cp != 0 { reverted.write().insert(cp); }
                                                                     }, SlotText { text: "Reject".to_string(), reverse: true } }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    },
+                                    "verify" => rsx! {
+                                        div { class: "verify-center",
+                                            div { class: "review-head",
+                                                span { class: "review-count", "Verification Center" }
+                                                span { class: "agents-section-meta", "current turn" }
+                                            }
+                                            if verification.read().is_empty() {
+                                                div { class: "insp-empty", "No verification evidence yet. Auto-verify and lint results appear here with their exact command and status." }
+                                            }
+                                            for item in verification.read().iter().cloned().rev() {
+                                                {
+                                                    let item_class = format!("verify-item {}", item.status);
+                                                    rsx! {
+                                                        div { class: "{item_class}",
+                                                            span { class: "verify-state",
+                                                                if item.status == "running" { span { class: "syn-spinner" } }
+                                                                else if item.status == "done" { Icon { name: "check" } }
+                                                                else if item.status == "failed" { Icon { name: "alert" } }
+                                                                else { Icon { name: "info" } }
+                                                            }
+                                                            div { class: "verify-copy",
+                                                                div { class: "verify-title", "{item.title}" }
+                                                                div { class: "verify-meta", "{item.kind} · {item.status}" }
+                                                                if !item.detail.trim().is_empty() {
+                                                                    pre { class: "verify-detail", "{item.detail}" }
                                                                 }
                                                             }
                                                         }
@@ -10327,6 +10581,64 @@ fn app() -> Element {
             // ── Right inspector (tabbed) ───────────────────────────────
 
             // ── Settings modal ─────────────────────────────────────────
+            if *show_compare.read() {
+                if let Some((left_id, right_id)) = *compare_pair.read() {
+                    {
+                        let active_id = tabs.read().get(*active_tab.read()).map(|tab| tab.id);
+                        let rows = tabs.read().clone();
+                        let left = rows.iter().find(|tab| tab.id == left_id).cloned();
+                        let right = rows.iter().find(|tab| tab.id == right_id).cloned();
+                        if let (Some(left), Some(right)) = (left, right) {
+                            let left_messages = if active_id == Some(left.id) { messages.read().clone() } else { left.messages.clone() };
+                            let right_messages = if active_id == Some(right.id) { messages.read().clone() } else { right.messages.clone() };
+                            let left_reply = latest_agent_reply(&left_messages);
+                            let right_reply = latest_agent_reply(&right_messages);
+                            let left_html = md_to_html(&left_reply, false);
+                            let right_html = md_to_html(&right_reply, false);
+                            let left_files = left_messages.iter().filter(|message| matches!(&message.author, Author::Diff(_, _))).count();
+                            let right_files = right_messages.iter().filter(|message| matches!(&message.author, Author::Diff(_, _))).count();
+                            rsx! {
+                                div { class: "modal-overlay", onclick: move |_| show_compare.set(false),
+                                    div { class: "modal compare-modal", onclick: move |event| event.stop_propagation(),
+                                        div { class: "modal-head",
+                                            h2 { "Compare solutions" }
+                                            button { class: "term-x", onclick: move |_| show_compare.set(false), Icon { name: "x" } }
+                                        }
+                                        div { class: "compare-grid",
+                                            div { class: "compare-pane",
+                                                div { class: "compare-head",
+                                                    div { span { class: "compare-title", "{left.title}" } span { class: "compare-meta", "{left.provider} · {left.model} · {left_files} changed file(s)" } }
+                                                    button { class: "agent-action", onclick: move |_| {
+                                                        if let Some(index) = tabs.peek().iter().position(|tab| tab.id == left_id) {
+                                                            switch_tab(tabs, active_tab, messages, cfg, engine, index);
+                                                        }
+                                                        show_compare.set(false);
+                                                    }, "Open" }
+                                                }
+                                                div { class: "compare-response md", dangerous_inner_html: "{left_html}" }
+                                            }
+                                            div { class: "compare-pane",
+                                                div { class: "compare-head",
+                                                    div { span { class: "compare-title", "{right.title}" } span { class: "compare-meta", "{right.provider} · {right.model} · {right_files} changed file(s)" } }
+                                                    button { class: "agent-action", onclick: move |_| {
+                                                        if let Some(index) = tabs.peek().iter().position(|tab| tab.id == right_id) {
+                                                            switch_tab(tabs, active_tab, messages, cfg, engine, index);
+                                                        }
+                                                        show_compare.set(false);
+                                                    }, "Open" }
+                                                }
+                                                div { class: "compare-response md", dangerous_inner_html: "{right_html}" }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            rsx! {}
+                        }
+                    }
+                }
+            }
             if *show_settings.read() {
                 SettingsModal {
                     cfg,
@@ -10341,6 +10653,8 @@ fn app() -> Element {
                     automation_schedule,
                     automation_prompt,
                     automation_script,
+                    automation_bind_thread,
+                    active_session: tabs.read().get(*active_tab.read()).and_then(|tab| tab.session.as_ref()).map(|path| sid(path)),
                     automation_status,
                     automation_confirm_delete,
                     hermes_profiles,
@@ -10423,6 +10737,10 @@ fn app() -> Element {
                                                             if let Some(idx) = tabs.peek().iter().position(|tab| tab.id == tab_id) {
                                                                 switch_tab(tabs, active_tab, messages, cfg, engine, idx);
                                                             }
+                                                            false
+                                                        }
+                                                        ToastAction::InstallUpdate(info) => {
+                                                            install_update(info, updating, update_err, update_pct);
                                                             false
                                                         }
                                                         ToastAction::RestoreSessions(ids) => {
@@ -10900,6 +11218,69 @@ fn switch_tab(
         );
         let _ = dioxus::document::eval(&js).await;
     });
+}
+
+fn chat_history(messages: &[ChatMsg]) -> Vec<(String, String)> {
+    messages
+        .iter()
+        .filter_map(|message| match &message.author {
+            Author::User => Some(("user".to_string(), strip_scaffold(&message.text))),
+            Author::Agent if !message.text.trim().is_empty() => {
+                Some(("assistant".to_string(), message.text.clone()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn latest_agent_reply(messages: &[ChatMsg]) -> String {
+    messages
+        .iter()
+        .rev()
+        .find(|message| matches!(&message.author, Author::Agent) && !message.text.trim().is_empty())
+        .map(|message| message.text.clone())
+        .unwrap_or_else(|| "No assistant response yet.".to_string())
+}
+
+fn fork_agent_tab(
+    mut tabs: Signal<Vec<AgentTab>>,
+    mut active_tab: Signal<usize>,
+    messages: Signal<Vec<ChatMsg>>,
+    mut cfg: Signal<Config>,
+    engine: Coroutine<EngineCmd>,
+    mut next_id: Signal<u64>,
+) -> Option<(u64, u64)> {
+    let current = *active_tab.read();
+    if let Some(tab) = tabs.write().get_mut(current) {
+        tab.messages = messages.read().clone();
+    }
+    let source = tabs.read().get(current)?.clone();
+    if source.mode != "gui" {
+        return None;
+    }
+    let id = *next_id.read();
+    next_id.set(id + 1);
+    let mut fork = source.clone();
+    fork.id = id;
+    fork.title = format!("Fork · {}", source.title);
+    fork.session = None;
+    fork.resume = None;
+    tabs.write().push(fork.clone());
+    active_tab.set(tabs.read().len() - 1);
+    let mut next = cfg.read().clone();
+    next.provider = fork.provider.clone();
+    next.model = fork.model.clone();
+    next.harness = fork.harness.clone();
+    next.reasoning_effort = fork.reasoning_effort.clone();
+    next.resume_path = None;
+    next.resume = false;
+    cfg.set(next.clone());
+    engine.send(EngineCmd::SwitchTab {
+        id,
+        conf: next,
+        msgs: fork.messages,
+    });
+    Some((source.id, id))
 }
 
 /// Open a fresh agent tab for `provider` and make it active.
@@ -11680,6 +12061,8 @@ fn SettingsModal(
     mut automation_schedule: Signal<String>,
     mut automation_prompt: Signal<String>,
     mut automation_script: Signal<String>,
+    mut automation_bind_thread: Signal<bool>,
+    active_session: Option<String>,
     mut automation_status: Signal<String>,
     mut automation_confirm_delete: Signal<Option<String>>,
     mut hermes_profiles: Signal<Vec<hermes::HermesProfile>>,
@@ -11718,12 +12101,21 @@ fn SettingsModal(
     let mut tab_mode = use_signal(|| base.default_tab_mode.clone());
     let mut browser_headless = use_signal(|| base.browser_headless);
     let mut notification_sound = use_signal(|| base.notification_sound);
+    let mut native_notifications = use_signal(|| base.native_notifications);
     let mut tool_detail_sel = use_signal(|| base.tool_detail.clone());
     let mut notification_volume = use_signal(|| base.notification_volume);
     // Archived-sessions manager: bump to re-query the list; confirm holds the
     // id awaiting a second click before a permanent delete.
     let mut arch_refresh = use_signal(|| 0u64);
     let mut arch_confirm = use_signal(|| None::<String>);
+    let hook_root = workspace_of(&base);
+    let mut hook_text = use_signal(move || {
+        std::fs::read_to_string(hook_root.join(".oxide/hooks.toml"))
+            .unwrap_or_else(|_| HOOKS_STARTER.to_string())
+    });
+    let mut hook_event = use_signal(|| "PreToolUse".to_string());
+    let mut hook_matcher = use_signal(|| "shell".to_string());
+    let mut hook_status = use_signal(|| "Hooks ready".to_string());
 
     // Oxide is a GUI wrapper around the user's logged-in agent CLIs + the ChatGPT
     // subscription — no raw API-key providers (openai/anthropic) in the picker.
@@ -11745,6 +12137,7 @@ fn SettingsModal(
         c.default_tab_mode = tab_mode.read().clone();
         c.browser_headless = *browser_headless.read();
         c.notification_sound = *notification_sound.read();
+        c.native_notifications = *native_notifications.read();
         c.tool_detail = tool_detail_sel.read().clone();
         c.notification_volume = *notification_volume.read();
         c.approval_policy = if *bypass.read() {
@@ -11779,7 +12172,7 @@ fn SettingsModal(
                     button { class: "term-x", onclick: move |_| on_close.call(()), Icon { name: "x" } }
                 }
                 div { class: "settings-tabs",
-                    for (key, label) in [("model", "Model"), ("access", "Access"), ("agents", "Agents"), ("hermes", "Hermes"), ("automations", "Automations"), ("memory", "Memory"), ("sessions", "Sessions"), ("updates", "Updates")] {
+                    for (key, label) in [("model", "Model"), ("access", "Access"), ("agents", "Agents"), ("hooks", "Hooks"), ("hermes", "Hermes"), ("automations", "Automations"), ("memory", "Memory"), ("sessions", "Sessions"), ("updates", "Updates")] {
                         button { class: if settings_tab.read().as_str() == key { "settings-tab active" } else { "settings-tab" },
                             onclick: move |_| settings_tab.set(key.to_string()), "{label}" }
                     }
@@ -11959,6 +12352,11 @@ fn SettingsModal(
                             onchange: move |e| notification_sound.set(e.checked()) }
                         span { class: "field-label", "Play sound when a turn finishes (only when the window isn't focused)" }
                     }
+                    label { class: "field toggle-field",
+                        input { r#type: "checkbox", checked: *native_notifications.read(),
+                            onchange: move |e| native_notifications.set(e.checked()) }
+                        span { class: "field-label", "Show native notifications for updates, approvals, and background turns" }
+                    }
                     if *notification_sound.read() {
                         label { class: "field",
                             span { class: "field-label", "Notification volume · {(*notification_volume.read() * 100.0).round() as i32}%" }
@@ -11998,6 +12396,57 @@ fn SettingsModal(
                         select { class: "field-input", onchange: move |e| tab_mode.set(e.value()),
                             option { value: "gui", selected: tab_mode.read().as_str() == "gui", "GUI (chat)" }
                             option { value: "tui", selected: tab_mode.read().as_str() == "tui", "TUI (terminal)" }
+                        }
+                    }
+                  }
+                  if settings_tab.read().as_str() == "hooks" {
+                    div { class: "field cgpt-field hook-studio",
+                        span { class: "field-label", "Hook Studio" }
+                        span { class: "settings-hint", "Edit `.oxide/hooks.toml`, validate it, and preview which commands match an event without executing them." }
+                        textarea {
+                            class: "field-input hook-editor",
+                            rows: "18",
+                            spellcheck: "false",
+                            value: "{hook_text}",
+                            oninput: move |event| hook_text.set(event.value()),
+                        }
+                        div { class: "hook-preview-row",
+                            select { class: "field-input", value: "{hook_event}", onchange: move |event| hook_event.set(event.value()),
+                                for event in ["PreToolUse", "PostToolUse", "Stop", "SubagentStart", "SubagentStop"] {
+                                    option { value: "{event}", selected: hook_event.read().as_str() == event, "{event}" }
+                                }
+                            }
+                            input { class: "field-input", value: "{hook_matcher}", placeholder: "matcher, e.g. shell", oninput: move |event| hook_matcher.set(event.value()) }
+                        }
+                        div { class: "field-folder",
+                            span { class: "folder-path", "{hook_status}" }
+                            button { class: "ed-close", onclick: move |_| {
+                                match oxide_core::hooks::Hooks::from_text(hook_text.read().as_str()) {
+                                    Ok(hooks) => {
+                                        let matches = hooks.commands_for(hook_event.read().as_str(), hook_matcher.read().as_str());
+                                        let summary = if matches.is_empty() {
+                                            "Valid · no matching commands".to_string()
+                                        } else {
+                                            format!("Valid · {} match(es): {}", matches.len(), matches.iter().map(|hook| hook.command.as_str()).collect::<Vec<_>>().join(" | "))
+                                        };
+                                        hook_status.set(summary);
+                                    }
+                                    Err(error) => hook_status.set(error),
+                                }
+                            }, "Validate + preview" }
+                            button { class: "ed-save", onclick: move |_| {
+                                match oxide_core::hooks::Hooks::from_text(hook_text.read().as_str()) {
+                                    Ok(_) => {
+                                        let root = workspace_of(&cfg.read());
+                                        let dir = root.join(".oxide");
+                                        match std::fs::create_dir_all(&dir).and_then(|_| write_atomic(&dir.join("hooks.toml"), hook_text.read().as_str())) {
+                                            Ok(()) => hook_status.set("Saved · active on the next lifecycle event".to_string()),
+                                            Err(error) => hook_status.set(format!("Save failed: {error}")),
+                                        }
+                                    }
+                                    Err(error) => hook_status.set(error),
+                                }
+                            }, "Save hooks" }
                         }
                     }
                   }
@@ -12346,6 +12795,18 @@ fn SettingsModal(
                                 oninput: move |e| automation_script.set(e.value())
                             }
                         }
+                        label { class: "field toggle-field",
+                            input {
+                                r#type: "checkbox",
+                                checked: *automation_bind_thread.read(),
+                                disabled: active_session.is_none(),
+                                onchange: move |event| automation_bind_thread.set(event.checked()),
+                            }
+                            span { class: "field-label", "Bind this automation to the current thread" }
+                        }
+                        if *automation_bind_thread.read() && active_session.is_none() {
+                            span { class: "settings-hint", "Send one message first so this thread has a persisted session." }
+                        }
                         div { class: "field-folder",
                             span { class: "folder-path", "{automation_status}" }
                             button { class: "ed-save", onclick: move |_| {
@@ -12365,6 +12826,9 @@ fn SettingsModal(
                                 let script = automation_script.read().trim().to_string();
                                 if !script.is_empty() {
                                     spec.script = Some(script);
+                                }
+                                if *automation_bind_thread.read() {
+                                    spec.session_id = active_session.clone();
                                 }
                                 match automation::write_spec(&root, &spec) {
                                     Ok(()) => {
@@ -12399,6 +12863,7 @@ fn SettingsModal(
                                                 div { class: "archived-folder-head", title: "{spec.prompt}",
                                                     Icon { name: "target" }
                                                     span { class: "archived-folder-name", "{spec.name}" }
+                                                    if spec.session_id.is_some() { span { class: "agents-chip", "thread" } }
                                                     span { class: "{status_class}", "{spec.status}" }
                                                 }
                                                 div { class: "archived-row",
@@ -12495,7 +12960,7 @@ fn SettingsModal(
                                 });
                             }, "Check for updates" }
                         }
-                        span { class: "field-hint", "Checked automatically on startup; a banner appears when a newer release is available." }
+                        span { class: "field-hint", "Checked on startup and every 15 minutes; a native notification and Install toast appear without reloading." }
                     }
                   }
                 }
@@ -12518,6 +12983,7 @@ fn Composer(
     bypass: bool,
     project: String,
     branch: String,
+    draft_key: String,
     context_used: u64,
     context_limit: u64,
     workspace: PathBuf,
@@ -12556,6 +13022,43 @@ fn Composer(
     // Full-screen image preview (lightbox) when a thumbnail is clicked.
     let mut preview_img = use_signal(|| None::<String>);
     let ws_paste = workspace.clone();
+    let draft_storage_key = format!("oxide:draft:{draft_key}");
+    use_future(move || {
+        let storage_key = serde_json::to_string(&draft_storage_key).unwrap_or_default();
+        async move {
+            let js = format!(
+                r#"
+                const key={storage_key};
+                const attachDraft=()=>{{
+                  const el=document.getElementById('ce-input');
+                  if(!el) return false;
+                  el.dataset.oxideDraftKey=key;
+                  if(!el.__oxideDraft){{
+                    el.__oxideDraft=true;
+                    el.addEventListener('input',()=>{{
+                      const k=el.dataset.oxideDraftKey;
+                      if(!k) return;
+                      const empty=el.textContent.replace(/ /g,'').trim()==='' && el.querySelectorAll('.ce-chip').length===0;
+                      if(empty) localStorage.removeItem(k); else localStorage.setItem(k,el.innerHTML);
+                    }});
+                  }}
+                  if(!el.dataset.oxideDraftRestored){{
+                    el.dataset.oxideDraftRestored='1';
+                    const draft=localStorage.getItem(key);
+                    if(draft && el.textContent.trim()===''){{
+                      el.innerHTML=draft;
+                      el.dispatchEvent(new InputEvent('input',{{bubbles:true}}));
+                    }}
+                  }}
+                  return true;
+                }};
+                for(let i=0;i<20;i++){{ if(attachDraft()) return true; await new Promise(r=>setTimeout(r,100)); }}
+                return false;
+                "#
+            );
+            let _ = dioxus::document::eval(&js).join::<bool>().await;
+        }
+    });
     // Intercept image paste into the composer as an attachment card (not inline).
     use_future(move || {
         let ws_paste = ws_paste.clone();
@@ -13416,7 +13919,7 @@ fn Message(
             if text.is_empty() {
                 if live {
                     return rsx! {
-                        div { class: "row agent agent-waiting",
+                        div { class: "row agent agent-waiting streaming-message",
                             img { class: "avatar", src: logo_uri() }
                             div { class: "typing", span { class: "typing-shimmer", "Thinking\u{2026}" } }
                         }
@@ -13438,7 +13941,7 @@ fn Message(
                 "agent-text agent-md"
             };
             rsx! {
-                div { class: "row agent",
+                div { class: if live { "row agent streaming-message" } else { "row agent" },
                     img { class: "avatar", src: logo_uri() }
                     div { class: "{body_cls}", dangerous_inner_html: md_to_html(&text, live) }
                     if !live {
@@ -14471,6 +14974,24 @@ fn ui_value_display(value: Option<&serde_json::Value>) -> String {
 }
 
 #[component]
+fn ActivityStatus(running: bool, ok: bool) -> Element {
+    let label = if running {
+        "Running"
+    } else if ok {
+        "Completed"
+    } else {
+        "Failed"
+    };
+    rsx! {
+        span { class: "activity-status", role: "img", aria_label: "{label}",
+            span { class: "activity-spin", aria_hidden: "true" }
+            span { class: "activity-ic ok", aria_hidden: "true", Icon { name: "check" } }
+            span { class: "activity-ic fail", aria_hidden: "true", Icon { name: "x" } }
+        }
+    }
+}
+
+#[component]
 fn ActivityRow(
     text: String,
     running: bool,
@@ -14492,26 +15013,26 @@ fn ActivityRow(
     } else {
         view.output.lines().count()
     };
+    let has_output = !view.output.is_empty();
+    let cls = format!("{cls} {}", if has_output { "has-out" } else { "no-out" });
     rsx! {
         div { class: "row activity",
-            if view.output.is_empty() {
-                div { class: "{cls}",
-                    span { class: "activity-tic", Icon { name: icon_static(&view.icon) } }
-                    if running { span { class: "activity-spin" } }
-                    else if ok { span { class: "activity-ic ok", Icon { name: "check" } } }
-                    else { span { class: "activity-ic fail", Icon { name: "x" } } }
+            details { class: "{cls}", open: has_output && auto_open,
+                summary {
+                    class: "activity-sum",
+                    aria_disabled: if has_output { "false" } else { "true" },
+                    onclick: move |event| {
+                        if !has_output {
+                            event.prevent_default();
+                        }
+                    },
+                    ActivityStatus { running, ok }
                     if running && secs >= 2 { span { class: "activity-secs", "{secs}s" } }
                     span { class: "activity-verb", "{view.verb}" }
                     if !view.detail.is_empty() { span { class: "activity-text", "{view.detail}" } }
-                }
-            } else {
-                details { class: "{cls} has-out", open: auto_open,
-                    summary { class: "activity-sum",
-                        span { class: "activity-tic", Icon { name: icon_static(&view.icon) } }
-                        if ok { span { class: "activity-ic ok", Icon { name: "check" } } } else { span { class: "activity-ic fail", Icon { name: "x" } } }
-                        span { class: "activity-verb", "{view.verb}" }
-                        if !view.detail.is_empty() { span { class: "activity-text", "{view.detail}" } }
+                    if has_output {
                         span { class: "activity-out-n", "{lines} lines" }
+                        span { class: "activity-caret", aria_hidden: "true", Icon { name: "chevron" } }
                         button { class: "copy-btn", title: "Copy output",
                             onclick: {
                                 let out = view.output.clone();
@@ -14524,6 +15045,8 @@ fn ActivityRow(
                             Icon { name: "copy" }
                         }
                     }
+                }
+                if has_output {
                     pre { class: "activity-out", "{view.output}" }
                 }
             }
@@ -14558,10 +15081,7 @@ fn EditActivityRow(
     rsx! {
         div { class: "row activity",
             div { class: "{cls}",
-                span { class: "activity-tic", Icon { name: icon_static(&view.icon) } }
-                if running { span { class: "activity-spin" } }
-                else if ok { span { class: "activity-ic ok", Icon { name: "check" } } }
-                else { span { class: "activity-ic fail", Icon { name: "x" } } }
+                ActivityStatus { running, ok }
                 if running && secs >= 2 { span { class: "activity-secs", "{secs}s" } }
                 span { class: "activity-verb", "{view.verb}" }
                 if !view.detail.is_empty() { span { class: "activity-text", "{view.detail}" } }
@@ -14575,20 +15095,6 @@ fn EditActivityRow(
                 }
             }
         }
-    }
-}
-
-/// Map a dynamic icon key to the static name the Icon component expects.
-fn icon_static(key: &str) -> &'static str {
-    match key {
-        "terminal" => "terminal",
-        "edit" => "edit",
-        "eye" => "eye",
-        "file" => "file",
-        "search" => "search",
-        "globe" => "globe",
-        "brain" => "brain",
-        _ => "spark",
     }
 }
 
@@ -15165,9 +15671,17 @@ fn revert_hunk(ws: &Path, path: &str, lines: &[String]) -> bool {
 }
 
 #[component]
-fn HunkedDiff(ws: PathBuf, path: String, diff: String, #[props(default)] split: bool) -> Element {
+fn HunkedDiff(
+    ws: PathBuf,
+    path: String,
+    diff: String,
+    #[props(default)] split: bool,
+    #[props(default)] checkpoint: u64,
+    #[props(default)] comments: Option<Signal<HashMap<String, String>>>,
+) -> Element {
     let hunks = split_hunks(&diff);
     let mut reverted = use_signal(std::collections::HashSet::<usize>::new);
+    let mut commenting = use_signal(std::collections::HashSet::<usize>::new);
     rsx! {
         div { class: "hunked",
             for (hi, (header, lines)) in hunks.into_iter().enumerate() {
@@ -15180,11 +15694,42 @@ fn HunkedDiff(ws: PathBuf, path: String, diff: String, #[props(default)] split: 
                         div { class: if done { "hunk reverted" } else { "hunk" },
                             div { class: "hunk-head",
                                 span { class: "hunk-hdr", "{header}" }
+                                if comments.is_some() {
+                                    button { class: "hunk-comment", title: "Add feedback to this hunk", onclick: move |_| {
+                                        if commenting.read().contains(&hi) {
+                                            commenting.write().remove(&hi);
+                                        } else {
+                                            commenting.write().insert(hi);
+                                        }
+                                    }, "Comment" }
+                                }
                                 if done {
                                     span { class: "hunk-done icon-slot", Icon { name: "undo" } "reverted" }
                                 } else {
                                     button { class: "hunk-revert", title: "Undo just this hunk in the file",
                                         onclick: move |_| { if revert_hunk(&ws2, &path2, &lines2) { reverted.write().insert(hi); } }, "Revert hunk" }
+                                }
+                            }
+                            if commenting.read().contains(&hi) {
+                                if let Some(mut comments_sig) = comments {
+                                    {
+                                        let key = format!("{} · checkpoint {} · hunk {}", path, checkpoint, hi + 1);
+                                        let value = comments_sig.read().get(&key).cloned().unwrap_or_default();
+                                        let key_input = key.clone();
+                                        rsx! {
+                                            div { class: "hunk-feedback",
+                                                span { class: "hunk-feedback-loc", "{header}" }
+                                                textarea {
+                                                    rows: "2",
+                                                    placeholder: "What should change in this hunk?",
+                                                    value: "{value}",
+                                                    oninput: move |event| {
+                                                        comments_sig.write().insert(key_input.clone(), event.value());
+                                                    },
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                             if split {
