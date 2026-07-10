@@ -1524,6 +1524,9 @@ struct AgentTab {
     /// For a "tui" tab: the originating CLI session id to resume (so a TUI tab
     /// opened from a codex/claude chat continues it instead of starting fresh).
     resume: Option<String>,
+    /// Workspace tempat tab ini dibuat — sidebar menampilkan baris tab hanya di
+    /// grup project miliknya (tab folder lain jangan nongol di project aktif).
+    ws: PathBuf,
 }
 
 const SESSION_RENDER_MESSAGE_LIMIT: usize = 20;
@@ -3890,6 +3893,11 @@ fn open_session_tab(
                 bin: String::new(),
                 session: Some(path.clone()),
                 resume: None,
+                ws: meta
+                    .as_ref()
+                    .map(|m| PathBuf::from(&m.workspace))
+                    .filter(|w| !w.as_os_str().is_empty())
+                    .unwrap_or_else(|| workspace_of(&base_cfg)),
             });
             let idx = tabs.peek().len() - 1;
             active_tab.set(idx);
@@ -3961,6 +3969,10 @@ fn open_session_tab(
         t.title = title;
         t.messages = loaded.clone();
         t.session = Some(path.clone());
+        // Tab ini sekarang memuat sesi tersebut — ikutkan grup project-nya.
+        if let Some(ws) = &c.workspace {
+            t.ws = ws.clone();
+        }
     }
     c.resume_path = Some(path);
     cfg.set(c.clone());
@@ -4618,6 +4630,7 @@ fn app() -> Element {
     let initial_model = cfg.read().model.clone();
     let initial_harness = cfg.read().harness.clone();
     let initial_effort = cfg.read().reasoning_effort.clone();
+    let initial_ws = workspace_of(&cfg.read());
     let mut tabs = use_signal(|| {
         vec![AgentTab {
             id: 0,
@@ -4631,6 +4644,7 @@ fn app() -> Element {
             bin: String::new(),
             session: None,
             resume: None,
+            ws: initial_ws,
         }]
     });
     let active_tab = use_signal(|| 0usize);
@@ -7498,7 +7512,9 @@ fn app() -> Element {
                                         }
                                     }
                                     if is_current && !collapsed {
-                                        for (i, t) in tabs.read().iter().enumerate() {
+                                        // Hanya tab milik project ini — tab yang dibuka dari
+                                        // folder lain tampil di grup folder itu, bukan di sini.
+                                        for (i, t) in tabs.read().iter().enumerate().filter(|(_, t)| t.ws == workspace) {
                                             {
                                                 let id = t.id;
                                                 let ttl = if t.title.is_empty() { "New chat".to_string() } else { t.title.clone() };
@@ -10917,6 +10933,7 @@ fn new_agent_tab(
         bin: String::new(),
         session: None,
         resume: None,
+        ws: workspace_of(&cfg.read()),
     });
     let idx = tabs.read().len() - 1;
     active_tab.set(idx);
@@ -10969,6 +10986,12 @@ fn new_tui_tab(
     };
     let id = *next_id.read();
     next_id.set(id + 1);
+    // TUI dibuka dari tab aktif — lanjutkan chat itu, jadi workspace-nya sama.
+    let ws = tabs
+        .read()
+        .get(cur)
+        .map(|t| t.ws.clone())
+        .unwrap_or_default();
     tabs.write().push(AgentTab {
         id,
         title: format!("{title} (TUI)"),
@@ -10981,6 +11004,7 @@ fn new_tui_tab(
         bin: bin.to_string(),
         session: None,
         resume,
+        ws,
     });
     let idx = tabs.read().len() - 1;
     active_tab.set(idx);

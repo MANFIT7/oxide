@@ -111,6 +111,27 @@ impl LocalDb {
                AND substr(id,1,13) GLOB '[0-9]*'
                AND ABS(created_ms - CAST(substr(id,1,13) AS INTEGER)) > 60000;",
         );
+        // Backfill: judul lama yang berupa scaffold slash-command
+        // ("<local-command-caveat>…") — hitung ulang dari pesan user pertama.
+        let stale = self.query_map(
+            "list scaffold titles",
+            "SELECT id, COALESCE((SELECT content FROM messages m
+                WHERE m.session_id = sessions.id AND m.role = 'user'
+                ORDER BY m.seq LIMIT 1), '')
+             FROM sessions WHERE title LIKE '<%'",
+            (),
+            |r| Ok((r.get::<String>(0)?, r.get::<String>(1)?)),
+        );
+        for (id, content) in stale {
+            let title = title_from_user_content(&content);
+            if !title.starts_with('<') {
+                self.execute(
+                    "backfill scaffold title",
+                    "UPDATE sessions SET title=?2 WHERE id=?1",
+                    turso::params![id, title],
+                );
+            }
+        }
         Ok(())
     }
 
@@ -311,24 +332,37 @@ pub fn exists(id: &str) -> bool {
 }
 
 fn title_from_user_content(content: &str) -> String {
-    let first = content
+    let first = content.lines().map(str::trim).find(|line| {
+        !line.is_empty()
+            && !line.starts_with("Context files")
+            && !line.starts_with('[')
+            && !line.starts_with('@')
+            // scaffold tags: <system-reminder>, <local-command-caveat>,
+            // <command-name>, <local-command-stdout>, …
+            && !line.starts_with('<')
+    });
+    if let Some(first) = first {
+        return first.chars().take(60).collect();
+    }
+    // Semua baris scaffold — sesi yang dibuka lewat slash command: pakai nama
+    // command-nya ("/theme") sebagai judul.
+    if let Some(cmd) = content
+        .split("<command-name>")
+        .nth(1)
+        .and_then(|rest| rest.split('<').next())
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+    {
+        return cmd.chars().take(60).collect();
+    }
+    content
         .lines()
         .map(str::trim)
-        .find(|line| {
-            !line.is_empty()
-                && !line.starts_with("Context files")
-                && !line.starts_with('[')
-                && !line.starts_with('@')
-                && !line.starts_with("<system-reminder>")
-        })
-        .unwrap_or_else(|| {
-            content
-                .lines()
-                .find(|line| !line.trim().is_empty())
-                .unwrap_or("")
-                .trim()
-        });
-    first.chars().take(60).collect()
+        .find(|line| !line.is_empty())
+        .unwrap_or("")
+        .chars()
+        .take(60)
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1478,6 +1512,23 @@ pub fn import_workspace(ws: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn title_skips_scaffold_and_uses_command_name() {
+        // Sesi yang dibuka lewat slash command: semua baris berupa tag scaffold.
+        let content = "<local-command-caveat>Caveat: The messages below…</local-command-caveat>\n\
+                       <command-name>/theme</command-name>\n\
+                       <command-message>theme</command-message>\n\
+                       <local-command-stdout>Theme set to dark</local-command-stdout>";
+        assert_eq!(title_from_user_content(content), "/theme");
+        // Baris scaffold di depan pesan asli tetap dilewati.
+        assert_eq!(
+            title_from_user_content("<system-reminder>x</system-reminder>\nperbaiki bug trail"),
+            "perbaiki bug trail"
+        );
+        // Pesan biasa tidak berubah perilaku.
+        assert_eq!(title_from_user_content("halo dunia"), "halo dunia");
+    }
 
     #[test]
     fn recall_snippet_centers_on_match_and_clip_respects_unicode() {
