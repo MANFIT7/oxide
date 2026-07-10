@@ -44,6 +44,14 @@ It focuses on states that compile tests cannot prove.
 - Confirm metrics, table rows, alerts, code blocks, and action buttons stay inside the chat width without horizontal page overflow.
 - Click an action button and confirm it copies the action payload instead of navigating or executing arbitrary model-provided code.
 
+## Toast Notifications
+
+- Trigger a compact toast such as `Copied` or `Changes committed`; confirm it appears at the top center with an icon and explicit dismiss button.
+- Archive a chat or project and confirm the expanded toast keeps its `Undo` action on a separate row without text overlap.
+- Stack two or more toasts and confirm they remain readable within the window width in dark, light, and system themes.
+- Confirm clicking the toast body does not dismiss it; only the dismiss button, action, or timeout should close it.
+- Enable Reduce Motion and confirm toast content remains readable without entrance/lifecycle animation.
+
 ## Agents Window
 
 - Open the `Agents` toolbar button and confirm the inspector switches to the local Agents Window.
@@ -77,6 +85,7 @@ It focuses on states that compile tests cannot prove.
 - No reasoning panel jumps below the answer on completion.
 - Edit/remove slot text freezes cleanly when Reduce Motion is enabled.
 - Structured UI artifacts render from the native catalog and never expose arbitrary HTML/JS.
+- Toasts use the top-center compact/expanded notification surface with semantic icons and explicit dismissal.
 - Agents Window controls stay local-only: no cloud sync/index/background execution dependency is required.
 - Local Servers controls work with local dev-server processes only.
 - No stale session opens with the wrong provider/model/harness/effort.

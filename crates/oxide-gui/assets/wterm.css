@@ -106,10 +106,9 @@
    rows, high-contrast vivid ANSI, and minimal chrome + a subtle scrollbar.
    These come after the vendored rules so equal-specificity selectors win. */
 .wterm {
-  /* High-contrast, vivid ANSI (Hyper-Snazzy) on a fixed dark surface. The
-     terminal stays dark in BOTH Oxide light and dark themes (like an editor's
-     integrated terminal) — the bright fg + vivid palette need a dark ground, and
-     following a light --composer made white text vanish on a light background. */
+  /* High-contrast, vivid ANSI (Hyper-Snazzy) fallback palette. Nilai di sini
+     hanya default standalone — di dalam .app, palet tema (light/dark) dari
+     style.css menang lewat spesifisitas (.app .wterm). */
   --term-bg: #16171a;
   --term-fg: #eff0eb;
   --term-cursor: #57c7ff;
@@ -142,7 +141,9 @@
   font-feature-settings: "liga" 0, "calt" 0;
 }
 
-/* Fill the panel edge-to-edge; drop the standalone card chrome. */
+/* Fill the panel edge-to-edge; drop the standalone card chrome.
+   background ikut --term-bg supaya host mengikuti tema light/dark dari
+   style.css — hardcode #16171a di sini membuat TUI selalu dark. */
 .wterm-host {
   width: 100%;
   height: 100%;
@@ -150,7 +151,7 @@
   padding: 6px 8px;
   border-radius: 0;
   box-shadow: none;
-  background: #16171a;
+  background: var(--term-bg);
 }
 
 /* Clear selection using the Oxide accent. */

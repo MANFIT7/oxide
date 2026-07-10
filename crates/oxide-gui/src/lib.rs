@@ -1548,6 +1548,7 @@ struct DeletedSessionSpec {
 
 #[derive(Clone, PartialEq, Eq)]
 enum ToastAction {
+    OpenTab(u64),
     RestoreSessions(Vec<String>),
     RestoreDeletedSession(DeletedSessionSpec),
 }
@@ -3504,6 +3505,31 @@ mod tests {
             .any(|&i| msgs[i].text.starts_with(DONE_NOTE_MARK))));
         assert!(turns[0].groups.last().unwrap().activity);
     }
+
+    #[test]
+    fn toast_kinds_use_semantic_icons_and_roles() {
+        assert_eq!(toast_icon_name("ok"), "circle-check");
+        assert_eq!(toast_icon_name("err"), "circle-alert");
+        assert_eq!(toast_icon_name("info"), "info");
+        assert_eq!(toast_aria_role("err"), "alert");
+        assert_eq!(toast_aria_role("ok"), "status");
+    }
+}
+
+fn toast_icon_name(kind: &str) -> &'static str {
+    match kind {
+        "ok" => "circle-check",
+        "err" => "circle-alert",
+        _ => "info",
+    }
+}
+
+fn toast_aria_role(kind: &str) -> &'static str {
+    if kind == "err" {
+        "alert"
+    } else {
+        "status"
+    }
 }
 
 /// Push a toast (kind: "ok" | "err" | "info") that auto-dismisses after 4s.
@@ -4556,7 +4582,7 @@ fn app() -> Element {
     // Suggested follow-up prompts shown above the composer after a turn.
     let mut followups = use_signal(Vec::<String>::new);
     let mut queue = use_signal(Vec::<String>::new);
-    // Toast notifications (bottom-right stack, auto-dismiss).
+    // Synara-style top-center toast stack (auto-dismiss).
     let toasts = use_signal(Vec::<ToastSpec>::new);
     let toast_seq = use_signal(|| 0u64);
     use_future(move || async move {
@@ -6078,7 +6104,14 @@ fn app() -> Element {
                                     let silent = turn_is_silent(buf);
                                     let title = tabs.peek().iter().find(|t| t.id == ev_tid).map(|t| t.title.clone()).unwrap_or_default();
                                     if !title.is_empty() && !silent {
-                                        push_toast(toasts, toast_seq, "ok", &format!("{title} — finished"));
+                                        push_action_toast(
+                                            toasts,
+                                            toast_seq,
+                                            "ok",
+                                            &format!("{title} — finished"),
+                                            "Open",
+                                            ToastAction::OpenTab(ev_tid),
+                                        );
                                     }
                                     // Background tab done — you're looking elsewhere, always chime
                                     // (unless the turn declared itself [SILENT]).
@@ -9120,7 +9153,13 @@ fn app() -> Element {
                             let trail: Vec<(usize, String)> = messages.read().iter().enumerate()
                                 .filter(|(_, m)| matches!(m.author, Author::User))
                                 .map(|(i, m)| {
-                                    let prev: String = strip_scaffold(&m.text).chars().take(90).collect();
+                                    let mut prev: String = strip_scaffold(&m.text).chars().take(90).collect();
+                                    if prev.is_empty() {
+                                        // pesan attachment-only: strip_scaffold menghapus semua
+                                        // teksnya — pill jangan tampil kosong
+                                        let n = m.text.split('\u{2}').skip(1).count();
+                                        prev = if n > 0 { format!("{n} attachment{}", if n == 1 { "" } else { "s" }) } else { "…".to_string() };
+                                    }
                                     (i, prev)
                                 })
                                 .collect();
@@ -10336,7 +10375,7 @@ fn app() -> Element {
                     }
                 }
             }
-            div { class: "toasts",
+            div { class: "toasts", aria_live: "polite",
                 for toast in toasts.read().iter().cloned() {
                     {
                         let tid = toast.id;
@@ -10344,41 +10383,64 @@ fn app() -> Element {
                         let text = toast.text.clone();
                         let action_label = toast.action_label.clone();
                         let action = toast.action.clone();
+                        let has_action = action_label.is_some();
                         let toast_class = if action_label.is_some() {
-                            format!("toast {kind} has-action")
+                            format!("toast {kind} expanded has-action")
                         } else {
-                            format!("toast {kind}")
+                            format!("toast {kind} compact")
                         };
+                        let icon = toast_icon_name(&kind);
+                        let role = toast_aria_role(&kind);
                         rsx! {
-                            div { key: "{tid}", class: "{toast_class}",
-                                onclick: move |_| { toasts.clone().write().retain(|t| t.id != tid); },
-                                span { class: "toast-dot" }
-                                span { "{text}" }
+                            div { key: "{tid}", class: "{toast_class}", role: "{role}",
+                                span { class: "toast-icon", Icon { name: icon } }
+                                div { class: "toast-copy",
+                                    div { class: "toast-title", "{text}" }
                                 if let (Some(label), Some(action)) = (action_label.clone(), action.clone()) {
-                                    button {
-                                        class: "toast-action",
-                                        onclick: move |e: dioxus::prelude::MouseEvent| {
-                                            e.stop_propagation();
-                                            match action.clone() {
-                                                ToastAction::RestoreSessions(ids) => {
-                                                    for id in &ids {
-                                                        oxide_core::db::restore(id);
+                                        div { class: "toast-actions",
+                                            button {
+                                                class: "toast-action",
+                                                onclick: move |e: dioxus::prelude::MouseEvent| {
+                                                    e.stop_propagation();
+                                                    let restored = match action.clone() {
+                                                        ToastAction::OpenTab(tab_id) => {
+                                                            if let Some(idx) = tabs.peek().iter().position(|tab| tab.id == tab_id) {
+                                                                switch_tab(tabs, active_tab, messages, cfg, engine, idx);
+                                                            }
+                                                            false
+                                                        }
+                                                        ToastAction::RestoreSessions(ids) => {
+                                                            for id in &ids {
+                                                                oxide_core::db::restore(id);
+                                                            }
+                                                            flash_restored_sessions(restored_sessions, ids);
+                                                            true
+                                                        }
+                                                        ToastAction::RestoreDeletedSession(spec) => {
+                                                            let restored_id = spec.id.clone();
+                                                            restore_deleted_session(&spec);
+                                                            flash_restored_sessions(restored_sessions, vec![restored_id]);
+                                                            true
+                                                        }
+                                                    };
+                                                    toasts.clone().write().retain(|t| t.id != tid);
+                                                    if restored {
+                                                        sessions_refresh.set(sessions_refresh() + 1);
+                                                        refresh_projects_list(projects_list, cfg);
+                                                        push_toast(toasts, toast_seq, "ok", "Restored");
                                                     }
-                                                    flash_restored_sessions(restored_sessions, ids);
-                                                }
-                                                ToastAction::RestoreDeletedSession(spec) => {
-                                                    let restored_id = spec.id.clone();
-                                                    restore_deleted_session(&spec);
-                                                    flash_restored_sessions(restored_sessions, vec![restored_id]);
-                                                }
+                                                },
+                                                "{label}"
                                             }
-                                            toasts.clone().write().retain(|t| t.id != tid);
-                                            sessions_refresh.set(sessions_refresh() + 1);
-                                            refresh_projects_list(projects_list, cfg);
-                                            push_toast(toasts, toast_seq, "ok", "Restored");
-                                        },
-                                        "{label}"
+                                        }
                                     }
+                                }
+                                button {
+                                    class: if has_action { "toast-close expanded" } else { "toast-close compact" },
+                                    title: "Dismiss toast",
+                                    aria_label: "Dismiss toast",
+                                    onclick: move |_| { toasts.clone().write().retain(|t| t.id != tid); },
+                                    Icon { name: "x" }
                                 }
                             }
                         }
@@ -15230,6 +15292,20 @@ fn Icon(name: &'static str) -> Element {
         "clock" => {
             rsx! { circle { cx: "12", cy: "12", r: "9" } polyline { points: "12 7 12 12 15 14" } }
         }
+        "circle-check" => rsx! {
+            circle { cx: "12", cy: "12", r: "9" }
+            polyline { points: "8 12 11 15 16 9" }
+        },
+        "circle-alert" => rsx! {
+            circle { cx: "12", cy: "12", r: "9" }
+            line { x1: "12", y1: "7", x2: "12", y2: "13" }
+            circle { cx: "12", cy: "17", r: ".35" }
+        },
+        "info" => rsx! {
+            circle { cx: "12", cy: "12", r: "9" }
+            line { x1: "12", y1: "11", x2: "12", y2: "17" }
+            circle { cx: "12", cy: "7", r: ".35" }
+        },
         "check" => rsx! { polyline { points: "20 6 9 17 4 12" } },
         "x" => rsx! {
             line { x1: "18", y1: "6", x2: "6", y2: "18" }

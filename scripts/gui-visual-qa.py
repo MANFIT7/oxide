@@ -183,6 +183,18 @@ def write_fixture(css: str) -> None:
       <div class="status-pill"><span class="status-spinner"></span><span class="status-shimmer">Running validation</span></div>
     </section>
   </main>
+  <div class="toasts" aria-live="polite">
+    <div class="toast ok compact" role="status">
+      <span class="toast-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><circle cx="12" cy="12" r="9"></circle><polyline points="8 12 11 15 16 9"></polyline></svg></span>
+      <div class="toast-copy"><div class="toast-title">Changes committed</div></div>
+      <button class="toast-close compact" aria-label="Dismiss toast">×</button>
+    </div>
+    <div class="toast info expanded has-action" role="status">
+      <span class="toast-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><circle cx="12" cy="12" r="9"></circle><line x1="12" y1="11" x2="12" y2="17"></line></svg></span>
+      <div class="toast-copy"><div class="toast-title">Chat archived</div><div class="toast-actions"><button class="toast-action">Undo</button></div></div>
+      <button class="toast-close expanded" aria-label="Dismiss toast">×</button>
+    </div>
+  </div>
 </div>
 """
     fixture = f"""<!doctype html>
@@ -217,7 +229,7 @@ def run_runtime_visual_qa() -> None:
         "--ignored",
         "--nocapture",
     ]
-    result = subprocess.run(command, check=False, capture_output=True, text=True, timeout=180)
+    result = subprocess.run(command, check=False, capture_output=True, text=True, timeout=360)
     if result.stdout:
         print(result.stdout, end="")
     if result.stderr:
@@ -434,6 +446,38 @@ def main() -> int:
         and contains_all(css, [".done-note", ".done-icon", ".done-label"])
         and '"check" => rsx!' in gui,
         "Done notes render with an SVG check icon and drop the already-shown turn duration",
+    )
+    require(
+        "synara-style toast surface",
+        contains_all(
+            gui,
+            [
+                'class: "toast-icon"',
+                'class: "toast-copy"',
+                'class: "toast-actions"',
+                'aria_label: "Dismiss toast"',
+                '"circle-check" => rsx!',
+                '"circle-alert" => rsx!',
+                '"info" => rsx!',
+                'ToastAction::OpenTab(ev_tid)',
+                '"Open"',
+                "switch_tab(tabs, active_tab, messages, cfg, engine, idx)",
+            ],
+        )
+        and contains_all(
+            css,
+            [
+                ".toasts {",
+                "top: 16px; left: 50%;",
+                "transform: translateX(-50%);",
+                ".toast.expanded {",
+                ".toast.compact .toast-title",
+                ".toast-close",
+                "backdrop-filter: blur(18px) saturate(140%);",
+                "background: color-mix(in srgb, var(--syn-accent) 10%, transparent);",
+            ],
+        ),
+        f"{rel(GUI)} and {rel(CSS)} render Synara-style centered compact/expanded toasts with semantic icons and explicit dismiss controls",
     )
     require(
         "session runtime metadata survives replay",
