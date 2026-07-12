@@ -36,6 +36,7 @@ const MERMAID_JS: &[u8] = include_bytes!("../assets/vendor/mermaid.min.js");
 const NERD_FONT: &[u8] = include_bytes!("../assets/fonts/JetBrainsMonoNerdFontMono-Regular.ttf");
 const LOGO_BYTES: &[u8] = include_bytes!("../assets/logo.png");
 const DONE_SOUND: &[u8] = include_bytes!("../../../sound/mixkit-software-interface-back-2575.wav");
+const UNICODE_SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 fn logo_uri() -> &'static str {
     static URI: OnceLock<String> = OnceLock::new();
@@ -4003,12 +4004,21 @@ fn open_session_tab(
             .and_then(|t| t.session.clone())
             .as_deref()
             == Some(path.as_path());
+        // A pristine "New chat" tab already carries an auto-bound session file
+        // (the engine emits SessionPath at spawn) — an EMPTY session is not
+        // content. Judge by the conversation itself (live view + stored copy),
+        // or a sidebar click leaves a dead empty tab behind.
+        let has_convo = |m: &[ChatMsg]| {
+            m.iter()
+                .any(|x| matches!(x.author, Author::User | Author::Agent))
+        };
         let cur_has_other_content = !cur_same_session
-            && tabs
-                .peek()
-                .get(cur)
-                .map(|t| t.session.is_some() || !t.messages.is_empty())
-                .unwrap_or(false);
+            && (has_convo(&messages.peek())
+                || tabs
+                    .peek()
+                    .get(cur)
+                    .map(|t| has_convo(&t.messages))
+                    .unwrap_or(false));
         if cur_busy || cur_non_gui || cur_has_other_content {
             // Save the live transcript into the busy tab before leaving it.
             if let Some(t) = tabs.write().get_mut(cur) {
@@ -4168,6 +4178,7 @@ fn replay_role_label(role: &str) -> &'static str {
         "meta" => "Meta",
         "tool" => "Tool",
         "system" => "System",
+        "bg_job" => "Background",
         _ => "Row",
     }
 }
@@ -14100,8 +14111,8 @@ fn StatusPill(
         .map(|(_, label)| label.as_str())
         .unwrap_or(label.as_str());
     rsx! {
-        div { class: "status-pill",
-            span { key: "status-spin", class: "status-spinner" }
+        div { class: "status-pill", role: "status", aria_atomic: "true",
+            UnicodeSpinner { class: "status-spinner" }
             if let Some((icon, _)) = icon_parts {
                 span { key: "status-icon", class: "status-icon", Icon { name: icon } }
             }
@@ -14155,7 +14166,10 @@ fn Message(
                     return rsx! {
                         div { class: "row agent agent-waiting streaming-message",
                             img { class: "avatar", src: logo_uri() }
-                            div { class: "typing", span { class: "typing-shimmer", "Thinking\u{2026}" } }
+                            div { class: "typing", role: "status", aria_atomic: "true",
+                                UnicodeSpinner { class: "typing-unicode" }
+                                span { class: "typing-shimmer", "Thinking\u{2026}" }
+                            }
                         }
                     };
                 }
@@ -15217,8 +15231,8 @@ fn ActivityStatus(running: bool, ok: bool) -> Element {
         "Failed"
     };
     rsx! {
-        span { class: "activity-status", role: "img", aria_label: "{label}",
-            span { class: "activity-spin", aria_hidden: "true" }
+        span { class: "activity-status", role: "status", aria_atomic: "true", aria_label: "{label}",
+            UnicodeSpinner { class: "activity-spin" }
             span { class: "activity-ic ok", aria_hidden: "true", Icon { name: "check" } }
             span { class: "activity-ic fail", aria_hidden: "true", Icon { name: "x" } }
         }
@@ -16033,6 +16047,21 @@ fn HunkedDiff(
                             }
                         }
                     }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn UnicodeSpinner(class: &'static str) -> Element {
+    rsx! {
+        span { class: "unicode-spinner {class}", aria_hidden: "true",
+            for (index, frame) in UNICODE_SPINNER_FRAMES.iter().enumerate() {
+                span {
+                    class: "unicode-spinner-frame",
+                    style: "--unicode-frame: {index}",
+                    "{frame}"
                 }
             }
         }

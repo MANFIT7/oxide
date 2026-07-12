@@ -259,6 +259,7 @@ mod tests {
   const stream = document.querySelector('.agent-md.live');
   const streamRow = document.querySelector('.streaming-message');
   const runningSpinner = document.querySelector('.activity-card.running .activity-spin');
+  const runningSpinnerFrame = runningSpinner?.querySelector('.unicode-spinner-frame');
   const runningResult = document.querySelector('.activity-card.running .activity-ic.ok');
   const spinnerRect = runningSpinner?.getBoundingClientRect();
   const resultRect = runningResult?.getBoundingClientRect();
@@ -267,7 +268,7 @@ mod tests {
     thinkingAboveAnswer: Boolean(thinking && answer && thinking.bottom <= answer.top),
     streamAnimation: stream ? getComputedStyle(stream).animationName : '',
     streamRailAnimation: streamRow ? getComputedStyle(streamRow, '::before').animationName : '',
-    toolSpinnerAnimation: runningSpinner ? getComputedStyle(runningSpinner).animationName : '',
+    toolSpinnerAnimation: runningSpinnerFrame ? getComputedStyle(runningSpinnerFrame).animationName : '',
     statusSlotAligned: Boolean(spinnerRect && resultRect && Math.abs((spinnerRect.x + spinnerRect.width / 2) - (resultRect.x + resultRect.width / 2)) < 0.5 && Math.abs((spinnerRect.y + spinnerRect.height / 2) - (resultRect.y + resultRect.height / 2)) < 0.5),
     viewport: [window.innerWidth, window.innerHeight],
     text: document.body.innerText
@@ -303,8 +304,8 @@ mod tests {
         );
         assert_eq!(
             report["toolSpinnerAnimation"].as_str(),
-            Some("dotspin"),
-            "running tool should animate its stable status slot: {report}"
+            Some("oxide-unicode-frame"),
+            "running tool should animate Braille frames inside its stable status slot: {report}"
         );
         assert_eq!(
             report["statusSlotAligned"].as_bool(),
@@ -371,8 +372,8 @@ JSON.stringify({
   streamAnimation: getComputedStyle(document.querySelector('.agent-md.live')).animationName,
   streamRailAnimation: getComputedStyle(document.querySelector('.streaming-message'), '::before').animationName,
   toolHaloAnimation: getComputedStyle(document.querySelector('.activity-card.running .activity-status'), '::after').animationName,
-  toolSpinnerAnimation: getComputedStyle(document.querySelector('.activity-card.running .activity-spin')).animationName,
-  toolSpinnerDuration: getComputedStyle(document.querySelector('.activity-card.running .activity-spin')).animationDuration
+  toolSpinnerAnimation: getComputedStyle(document.querySelector('.activity-card.running .unicode-spinner-frame')).animationName,
+  toolSpinnerStaticOpacity: getComputedStyle(document.querySelector('.activity-card.running .unicode-spinner-frame:first-child')).opacity
 })
 "#,
             )
@@ -385,7 +386,7 @@ JSON.stringify({
         assert_eq!(reduced["streamAnimation"].as_str(), Some("none"));
         assert_eq!(reduced["streamRailAnimation"].as_str(), Some("none"));
         assert_eq!(reduced["toolHaloAnimation"].as_str(), Some("none"));
-        assert_eq!(reduced["toolSpinnerAnimation"].as_str(), Some("dotspin"));
-        assert_eq!(reduced["toolSpinnerDuration"].as_str(), Some("2.4s"));
+        assert_eq!(reduced["toolSpinnerAnimation"].as_str(), Some("none"));
+        assert_eq!(reduced["toolSpinnerStaticOpacity"].as_str(), Some("1"));
     }
 }

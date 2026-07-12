@@ -68,6 +68,15 @@ def nearby(source: str, first: str, second: str, window: int = 700) -> bool:
     return second in source[start : start + window]
 
 
+def unicode_spinner_fixture(class_name: str) -> str:
+    frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    nodes = "".join(
+        f'<span class="unicode-spinner-frame" style="--unicode-frame: {index}">{frame}</span>'
+        for index, frame in enumerate(frames)
+    )
+    return f'<span class="unicode-spinner {class_name}" aria-hidden="true">{nodes}</span>'
+
+
 def write_fixture(css: str) -> None:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     escaped_css = css.replace("</style", "<\\/style")
@@ -77,7 +86,7 @@ def write_fixture(css: str) -> None:
     <section class="col streaming">
       <div class="row agent agent-waiting streaming-message">
         <div class="avatar"></div>
-        <div class="typing"><span class="typing-shimmer">Thinking…</span></div>
+        <div class="typing" role="status" aria-atomic="true"><!-- UNICODE_TYPING --><span class="typing-shimmer">Thinking…</span></div>
       </div>
       <details class="thinking-box" open>
         <summary class="thinking-sum live"><span class="thinking-glow">Reasoning</span><span class="thinking-secs">3s</span></summary>
@@ -86,7 +95,7 @@ def write_fixture(css: str) -> None:
       <div class="row activity">
         <details class="activity-card running activity-search no-out">
           <summary class="activity-sum">
-            <span class="activity-status"><span class="activity-spin"></span><span class="activity-ic ok">✓</span><span class="activity-ic fail">×</span></span>
+            <span class="activity-status" role="status" aria-atomic="true" aria-label="Running"><!-- UNICODE_ACTIVITY --><span class="activity-ic ok">✓</span><span class="activity-ic fail">×</span></span>
             <span class="activity-verb">Preparing browser_search</span>
             <span class="activity-text">{"query":"oxide gui visual qa"}</span>
           </summary>
@@ -95,7 +104,7 @@ def write_fixture(css: str) -> None:
       <div class="row activity">
         <details class="activity-card done activity-command has-out" open>
           <summary class="activity-sum">
-            <span class="activity-status"><span class="activity-spin"></span><span class="activity-ic ok">✓</span><span class="activity-ic fail">×</span></span>
+            <span class="activity-status" role="status" aria-atomic="true" aria-label="Completed"><!-- UNICODE_ACTIVITY --><span class="activity-ic ok">✓</span><span class="activity-ic fail">×</span></span>
             <span class="activity-verb">Ran command</span>
             <span class="activity-text">cargo check -p oxide-gui</span>
             <span class="activity-out-n">2 lines</span><span class="activity-caret">⌃</span>
@@ -198,7 +207,7 @@ Finished dev profile</pre>
         </div>
         <div class="agents-worker running"><span class="agents-worker-status"><span class="syn-spinner"></span></span><span class="agents-worker-copy"><span class="agents-worker-title">reviewer · GUI parity</span><span class="agents-worker-sub">Auditing local non-cloud controls.</span></span></div>
       </div>
-      <div class="status-pill"><span class="status-spinner"></span><span class="status-shimmer">Running validation</span></div>
+      <div class="status-pill" role="status" aria-atomic="true"><!-- UNICODE_STATUS --><span class="status-shimmer">Running validation</span></div>
     </section>
   </main>
   <div class="toasts" aria-live="polite">
@@ -215,6 +224,9 @@ Finished dev profile</pre>
   </div>
 </div>
 """
+    body = body.replace("<!-- UNICODE_TYPING -->", unicode_spinner_fixture("typing-unicode"))
+    body = body.replace("<!-- UNICODE_ACTIVITY -->", unicode_spinner_fixture("activity-spin"))
+    body = body.replace("<!-- UNICODE_STATUS -->", unicode_spinner_fixture("status-spinner"))
     fixture = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -294,6 +306,30 @@ def main() -> int:
         f"{rel(CSS)} defines glass-sweep typing skeleton",
     )
     require(
+        "unicode activity micro-motion",
+        contains_all(
+            gui,
+            [
+                "UNICODE_SPINNER_FRAMES",
+                "fn UnicodeSpinner",
+                'UnicodeSpinner { class: "status-spinner" }',
+                'UnicodeSpinner { class: "typing-unicode" }',
+                'UnicodeSpinner { class: "activity-spin" }',
+                'role: "status"',
+                'aria_atomic: "true"',
+            ],
+        )
+        and contains_all(
+            css,
+            [
+                ".unicode-spinner-frame",
+                "@keyframes oxide-unicode-frame",
+                "calc(var(--unicode-frame) * 80ms)",
+            ],
+        ),
+        f"{rel(GUI)} and {rel(CSS)} use one fixed-cell Braille lifecycle component for agent and tool status",
+    )
+    require(
         "reduced-motion collapses decorative waiting row",
         contains_all(
             css,
@@ -308,22 +344,18 @@ def main() -> int:
         f"{rel(CSS)} removes the empty pre-token skeleton and compacts the active status pill under Reduce Motion",
     )
     require(
-        "reduced-motion keeps spinner rings active",
+        "reduced-motion keeps status legible",
         contains_all(
             css,
             [
                 ".status-shimmer, .typing,",
                 "animation: none !important;",
-                "box-sizing: border-box;",
-                "border-top-color: var(--syn-accent);",
-                "background: transparent;",
-                "animation: spin .7s linear infinite !important;",
                 "animation: syn-spin 1.6s linear infinite !important;",
-                "-webkit-mask: none;",
+                ".unicode-spinner-frame:first-child { opacity: 1; }",
                 "-webkit-text-fill-color: currentColor;",
             ],
         ),
-        f"{rel(CSS)} keeps spinner-shaped rings rotating while disabling shimmer text under Reduce Motion",
+        f"{rel(CSS)} freezes Braille frame swapping while retaining a static glyph, text label, and generic process activity",
     )
     require(
         "streaming lifecycle motion stays outside live HTML",
@@ -354,7 +386,7 @@ def main() -> int:
             [
                 "fn ActivityStatus",
                 'class: "activity-status"',
-                'span { class: "activity-spin"',
+                'UnicodeSpinner { class: "activity-spin" }',
                 'span { class: "activity-ic ok"',
                 'span { class: "activity-ic fail"',
                 'if has_output { "has-out" } else { "no-out" }',
@@ -383,10 +415,11 @@ def main() -> int:
                 ".agent-md.live {",
                 ".row.activity { animation: none; }",
                 ".activity-card.running .activity-status::after { animation: none;",
-                "animation: dotspin 2.4s steps(8) infinite !important;",
+                ".unicode-spinner-frame { animation: none !important; opacity: 0; }",
+                ".unicode-spinner-frame:first-child { opacity: 1; }",
             ],
         ),
-        f"{rel(CSS)} freezes decorative stream/tool motion while preserving a slow semantic running spinner",
+        f"{rel(CSS)} freezes decorative stream/tool motion while preserving a static semantic Unicode status glyph",
     )
     require(
         "reduced-motion freezes edit shimmer",
@@ -746,7 +779,7 @@ def main() -> int:
         f"{rel(NATIVE_RECORD)} records deterministic states and supports golden comparison",
     )
     checklist_needles = [
-        "pre-first-token shimmer",
+        "Braille spinner",
         "streaming rail",
         "Reasoning",
         "Preparing <tool>",

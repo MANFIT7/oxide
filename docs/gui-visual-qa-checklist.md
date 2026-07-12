@@ -16,13 +16,14 @@ It focuses on states that compile tests cannot prove.
 
 ## Streaming And Motion
 
-- Submit a normal prompt and confirm the empty live agent row shows the subtle pre-first-token shimmer.
+- Submit a normal prompt and confirm the empty live agent row shows a compact Braille spinner beside the subtle `Thinking…` shimmer.
 - Confirm the streaming rail breathes beside the active assistant row without restarting or flickering as each text chunk arrives.
 - Confirm the first token rises in once, while subsequent tokens remain stable and only the live tail uses the soft readability fade.
 - While reasoning streams, confirm the `Reasoning` panel appears inside the current turn, above the live answer, and does not jump when the turn finishes.
 - Confirm the final `Thought for Ns` row stays in transcript order above the final assistant text.
 - Trigger a tool call with streamed arguments, then confirm the activity row first shows `Preparing <tool> ...`, updates as args stream, and settles into the final tool label when execution starts.
-- Confirm command/activity rows keep one fixed status slot: the spinner cross-fades to a check or failure icon without nudging the label horizontally.
+- Confirm command/activity rows keep one fixed status slot: the Braille spinner cross-fades to a check or failure icon without nudging the label horizontally.
+- Confirm the agent and tool Braille sequence advances one fixed-width cell at a time without rotating, resizing, or shifting adjacent text.
 - Expand and collapse a tool with output; confirm the content and caret transition smoothly without shifting neighboring transcript rows.
 - Stream an answer containing a very long unbroken code line (e.g. ask for a one-line shell pipeline over 200 chars); confirm the transcript never pans sideways — the code block scrolls internally while prose wraps.
 
@@ -30,7 +31,8 @@ It focuses on states that compile tests cannot prove.
 
 - Enable Reduce Motion and repeat a streaming prompt.
 - Confirm the pre-token shimmer row collapses so it does not leave a blank bar between the user message and the working status.
-- Confirm shimmer/sweep animations stop, while active status spinner rings still rotate and do not become solid dots.
+- Confirm shimmer/sweep animations stop, the Braille sequence freezes to one readable glyph, and the status label remains visible.
+- Confirm generic background-process rings may continue at their reduced cadence without moving surrounding content.
 - Confirm the streaming rail becomes static, tool halos stop pulsing, and disclosure content remains immediately readable.
 - Confirm status text still communicates the active state.
 - Confirm tab switch and panel transitions are instant and do not overlap content.

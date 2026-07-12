@@ -40,8 +40,11 @@
   --ease-enter: cubic-bezier(.16, 1, .3, 1);
   --ease-exit: cubic-bezier(.7, 0, .84, 0);
 }
-/* window is transparent; only the sidebar reveals the macOS vibrancy. */
-.app { background: transparent; }
+/* window is transparent; sidebar + shell gaps reveal the macOS vibrancy.
+   .mac-titlebar (macOS-only class) outranks the base `.app { … background:
+   var(--bg) }` below — a bare .app selector loses that cascade (the ara→default
+   consolidation did exactly that and silently killed the glass). */
+.app.mac-titlebar { background: transparent; }
 .app .main { background: var(--bg); }
 .sidebar {
   background: var(--sidebar);
@@ -3572,8 +3575,7 @@ details.bg-chip.bg-watch[open] { max-width: 100%; flex-basis: 100%; border-radiu
 
 @media (prefers-reduced-motion: reduce) {
   /* Reduce Motion keeps textual state visible, removes decorative loading
-     sweep rows, and keeps active loader rings spinning so Working does not
-     read as a frozen or stuck turn. */
+     sweep rows, and leaves only the generic background-process ring active. */
   .toast, .palette, .palette-list .palette-item, .env-panel, .env-body > *,
   .queue-chip, .tab-state, .palette-status, .thread-anchor.restored .thread,
   .tab-dot.busy, .diff-reverted, .diff-kept, .status-shimmer, .typing,
@@ -3583,7 +3585,7 @@ details.bg-chip.bg-watch[open] { max-width: 100%; flex-basis: 100%; border-radiu
   .status-pill {
     margin-top: 2px;
   }
-  .status-spinner, .activity-spin, .syn-spinner {
+  .syn-spinner {
     width: 13px;
     height: 13px;
     box-sizing: border-box;
@@ -3593,9 +3595,6 @@ details.bg-chip.bg-watch[open] { max-width: 100%; flex-basis: 100%; border-radiu
     -webkit-mask: none;
     mask: none;
     will-change: auto;
-  }
-  .status-spinner, .activity-spin {
-    animation: spin .7s linear infinite !important;
   }
   .syn-spinner {
     animation: syn-spin 1.6s linear infinite !important;
@@ -4531,7 +4530,7 @@ details.has-out .activity-out-n::after { content: none; }
   .activity-caret, .activity-card.has-out::details-content { transition: none; }
   .activity-card.running .activity-status::after { animation: none; opacity: .18; transform: none; }
   .activity-card.running .activity-status .activity-spin {
-    animation: dotspin 2.4s steps(8) infinite !important;
+    animation: none !important;
   }
 }
 
@@ -4550,4 +4549,81 @@ details.has-out .activity-out-n::after { content: none; }
   .modal-overlay, .palette-overlay, .modal, .palette,
   .logo-btn, .board-card, .board-btn { animation: none; transition: none; }
   .logo-btn:active, .board-btn:active { transform: none; }
+}
+
+/* Unicode micro-motion: a compact fixed-cell Braille sequence for agent and
+   tool lifecycle status. Frame nodes stay mounted so state changes never
+   nudge adjacent labels or restart the surrounding row animation. */
+.unicode-spinner {
+  position: relative;
+  display: inline-grid;
+  width: 1ch;
+  height: 1em;
+  flex: 0 0 1ch;
+  place-items: center;
+  overflow: visible;
+  color: var(--syn-accent);
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+  animation: none !important;
+  border: 0 !important;
+  border-radius: 0;
+  background: none !important;
+  -webkit-mask: none;
+  mask: none;
+  will-change: auto;
+}
+.unicode-spinner::before { content: none !important; box-shadow: none !important; }
+.unicode-spinner-frame {
+  grid-area: 1 / 1;
+  display: block;
+  width: 1ch;
+  opacity: 0;
+  text-align: center;
+  animation: oxide-unicode-frame .8s steps(1, end) infinite;
+  animation-delay: calc(var(--unicode-frame) * 80ms);
+}
+@keyframes oxide-unicode-frame {
+  0%, 9.999% { opacity: 1; }
+  10%, 100% { opacity: 0; }
+}
+
+/* Waiting stays compact: the Braille cell carries motion while the label keeps
+   the existing low-contrast shimmer. */
+.typing {
+  display: inline-flex;
+  width: auto;
+  min-width: 104px;
+  max-width: 100%;
+  height: 24px;
+  align-items: center;
+  gap: 7px;
+  padding: 0;
+  background: none;
+  animation: none;
+}
+.typing .typing-unicode { display: inline-grid; }
+.typing .typing-shimmer { display: inline; }
+
+.unicode-spinner.status-spinner {
+  width: 1ch;
+  height: 1em;
+  flex-basis: 1ch;
+}
+.activity-status .unicode-spinner.activity-spin {
+  width: 11px;
+  height: 11px;
+  flex-basis: 11px;
+  font-size: 12px;
+}
+.activity-card.running .activity-status .unicode-spinner.activity-spin {
+  animation: none !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .unicode-spinner-frame { animation: none !important; opacity: 0; }
+  .unicode-spinner-frame:first-child { opacity: 1; }
 }
