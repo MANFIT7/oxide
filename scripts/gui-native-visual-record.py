@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SMOKE = ROOT / "scripts/gui-native-visual-smoke.py"
 SMOKE_IMAGE = ROOT / "target/gui-native-visual-smoke/oxide-gui-native.png"
 DEFAULT_RECORD_DIR = ROOT / "target/gui-native-visual-states"
-STATES = ("streaming", "review", "verification")
+STATES = ("streaming", "review", "verification", "board", "settings")
 
 
 def load_smoke_module():

@@ -317,7 +317,7 @@ def main() -> int:
     parser.add_argument("--strict", action="store_true", help="treat permission/platform skips as failures")
     parser.add_argument(
         "--fixture-state",
-        choices=["streaming", "review", "verification", "off"],
+        choices=["streaming", "review", "verification", "board", "settings", "off"],
         default="streaming",
         help="seed deterministic GUI visual state before capture",
     )
@@ -327,6 +327,12 @@ def main() -> int:
         help="allow a nonblank fullscreen diagnostic to pass when window bounds are unavailable",
     )
     parser.add_argument("--timeout", type=float, default=35.0, help="seconds to wait for the native GUI window")
+    parser.add_argument(
+        "--settle",
+        type=float,
+        default=1.2,
+        help="seconds to let the native WebView finish its first paint before capture",
+    )
     args = parser.parse_args()
 
     if platform.system() != "Darwin":
@@ -377,6 +383,13 @@ def main() -> int:
                 if detail:
                     message = f"{message}; last error: {detail}"
                 return skip(message, args.strict)
+
+            # System Events reports a window before Dioxus/WebKit has painted the
+            # fixture. Capturing immediately records a backdrop-only transition
+            # frame, which can still satisfy the old nonblank pixel threshold.
+            time.sleep(max(0.0, min(args.settle, 5.0)))
+            if proc.poll() is not None:
+                return fail(f"oxide gui exited before native capture with code {proc.returncode}; see {LOG}")
 
             captured, capture_detail = capture_window(info, SCREENSHOT)
             if not captured:

@@ -12,7 +12,7 @@ It focuses on states that compile tests cannot prove.
 5. Run `python3 scripts/gui-visual-qa.py` before manual inspection. It checks the source-level visual-state contracts and writes `target/gui-visual-qa/fixture.html` for quick browser inspection.
 6. When a Chromium-compatible browser is available, run `python3 scripts/gui-visual-qa.py --runtime`. It opens the fixture through the existing CDP harness, checks required selectors/layout order, captures `target/gui-visual-qa/fixture-cdp.png`, and performs a PNG nonblank sanity check.
 7. For a native app/window smoke on macOS, run `python3 scripts/gui-native-visual-smoke.py --no-build --strict` after building. It launches `./target/debug/oxide gui` with `OXIDE_GUI_VISUAL_FIXTURE=streaming`, captures the Oxide window region to `target/gui-native-visual-smoke/oxide-gui-native.png`, and performs PNG pixel sanity. This requires Accessibility and Screen Recording permission for the host terminal/Codex app.
-8. Record all deterministic native states with `python3 scripts/gui-native-visual-record.py --no-build`. Add `--golden-dir docs/gui-goldens --accept` to establish baselines, then rerun without `--accept` to enforce the pixel-difference thresholds.
+8. Record all deterministic native states (`streaming`, `review`, `verification`, `board`, and `settings`) with `python3 scripts/gui-native-visual-record.py --no-build`. Add `--golden-dir docs/gui-goldens --accept` to establish baselines, then rerun without `--accept` to enforce the pixel-difference thresholds.
 
 ## Streaming And Motion
 
@@ -24,6 +24,7 @@ It focuses on states that compile tests cannot prove.
 - Trigger a tool call with streamed arguments, then confirm the activity row first shows `Preparing <tool> ...`, updates as args stream, and settles into the final tool label when execution starts.
 - Confirm command/activity rows keep one fixed status slot: the spinner cross-fades to a check or failure icon without nudging the label horizontally.
 - Expand and collapse a tool with output; confirm the content and caret transition smoothly without shifting neighboring transcript rows.
+- Stream an answer containing a very long unbroken code line (e.g. ask for a one-line shell pipeline over 200 chars); confirm the transcript never pans sideways — the code block scrolls internally while prose wraps.
 
 ## Reduced Motion
 
@@ -80,6 +81,30 @@ It focuses on states that compile tests cannot prove.
 - Click `Open dev server` and confirm it opens the same localhost URL in the system browser.
 - Click `Stop dev server` and confirm the process exits and the server list refreshes without leaving a stale running row.
 
+## Board And Compact Layout
+
+- Open Board with the Environment dock both open and closed at 1280×820, 1024×768, and the narrowest supported window width.
+- Confirm all four lanes retain a usable minimum width and scroll horizontally instead of compressing labels, cards, or actions.
+- Confirm the Board title, new-task field, `Run To-Do`, and `Sync issues` wrap without clipping.
+- With no cards, confirm every lane shows its count and a specific empty-state message instead of a blank slab.
+- Add a task and move it through the normal run/review flow; confirm the card settles once without replaying motion on unrelated renders.
+- Open the Environment dock below 900px and confirm it behaves as a deliberate right-side drawer with a visible close control, not an accidental overlap.
+
+## Settings Navigation
+
+- Open Settings at desktop width and confirm all nine destinations are visible in the left rail without scrolling horizontally.
+- At compact width, confirm the destination row scrolls horizontally with a visible scrollbar and `Sessions`/`Updates` remain reachable.
+- Switch between Model, Automations, Sessions, and Updates; confirm the modal body keeps its position and does not flash to a backdrop-only frame.
+- Confirm long forms scroll inside the body while the title, navigation, and Save/Cancel actions remain stable.
+
+## Theme Contrast And Keyboard
+
+- Repeat the Board, Settings, sidebar, and command palette checks in dark, light, and system themes.
+- Confirm tertiary labels, counts, timestamps, and empty-state copy remain readable at normal brightness; column boundaries must not disappear in light mode.
+- Navigate from the sidebar logo through Board, Settings, modal tabs, fields, and close actions using only Tab/Shift-Tab/Enter/Space.
+- Confirm every focused control has a visible accent ring and the sidebar logo behaves as a button.
+- With a screen reader or accessibility inspector, confirm Settings, Skills, and MCP surfaces expose dialog semantics and icon-only destructive controls have names.
+
 ## Tab And Session Replay
 
 - Switch model, harness, and effort in Settings.
@@ -91,7 +116,7 @@ It focuses on states that compile tests cannot prove.
 - `python3 scripts/gui-visual-qa.py` passes.
 - Optional runtime gate passes: `python3 scripts/gui-visual-qa.py --runtime`.
 - Optional native window smoke passes on macOS: `python3 scripts/gui-native-visual-smoke.py --no-build --strict`.
-- Native state recorder captures `streaming`, `review`, and `verification` with a manifest.
+- Native state recorder captures `streaming`, `review`, `verification`, `board`, and `settings` with a manifest.
 - No visible text overlap at the default 1280x820 window.
 - No activity row remains running after turn error/finish.
 - Streaming and tool status motion stays compositor-only and never restarts on every token update.

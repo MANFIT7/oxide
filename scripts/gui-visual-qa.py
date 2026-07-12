@@ -674,8 +674,74 @@ def main() -> int:
         "Hook Studio validates real hook parsing and automations retain bound thread context",
     )
     require(
+        "responsive board states",
+        contains_all(
+            gui,
+            [
+                'class: "board-col-count"',
+                'class: "board-col-empty"',
+                'aria_label: "New board task"',
+                'aria_label: "Remove task"',
+                'key: "{cid}-{col}"',
+                "&& !*show_board.read()",
+            ],
+        )
+        and contains_all(
+            css,
+            [
+                ".board-cols.four { grid-template-columns: repeat(4, minmax(238px, 1fr)); }",
+                "overflow-x: auto;",
+                ".board-col-empty",
+                "@media (max-width: 1180px)",
+                ".board-card { animation: none; transition: none; }",
+            ],
+        ),
+        "Board keeps four usable lanes through horizontal overflow, explicit empty states, counts, and reduced-motion-safe card transitions",
+    )
+    require(
+        "settings navigation scales to all destinations",
+        contains_all(gui, ['("sessions", "Sessions")', '("updates", "Updates")'])
+        and contains_all(
+            css,
+            [
+                "grid-template-columns: 158px minmax(0, 1fr);",
+                ".settings-modal .modal-body",
+                "@media (max-width: 660px)",
+                "overflow-x: auto;",
+            ],
+        ),
+        "Settings uses a desktop side rail and a discoverable compact horizontal fallback instead of a clipped hidden scrollbar",
+    )
+    require(
+        "accessible chrome and dialogs",
+        contains_all(
+            gui,
+            [
+                'class: "logo-btn"',
+                'aria_label: "Collapse or expand sidebar"',
+                'role: "dialog"',
+                'aria_modal: "true"',
+            ],
+        )
+        and contains_all(
+            css,
+            [
+                "button:focus-visible",
+                "input:focus-visible",
+                "[tabindex]:focus-visible",
+            ],
+        ),
+        "Primary icon controls are keyboard reachable, dialogs expose semantics, and interactive chrome has a shared focus ring",
+    )
+    require(
+        "theme contrast and responsive dock tokens",
+        contains_all(css, ["--faint: #858585;", "--faint: rgba(13, 13, 13, 0.58);", "--border: rgba(13, 13, 13, 0.13);"])
+        and contains_all(css, ["@media (max-width: 900px)", "position: absolute; inset: 0 0 0 auto; z-index: 20;"]),
+        "Small metadata text uses readable tokens and the Environment dock becomes an intentional compact drawer before it crushes content",
+    )
+    require(
         "native visual state recorder",
-        contains_all(native_record, ["STATES =", '"streaming"', '"review"', '"verification"', "compare_png", '"manifest.json"'])
+        contains_all(native_record, ["STATES =", '"streaming"', '"review"', '"verification"', '"board"', '"settings"', "compare_png", '"manifest.json"'])
         and "scripts/gui-native-visual-record.py" in checklist,
         f"{rel(NATIVE_RECORD)} records deterministic states and supports golden comparison",
     )
@@ -694,6 +760,8 @@ def main() -> int:
         "Local Servers",
         "Verification Center",
         "Fix feedback",
+        "Board And Compact Layout",
+        "Theme Contrast And Keyboard",
         "gui-native-visual-record.py",
     ]
     require(
@@ -712,7 +780,11 @@ def main() -> int:
                 "decode_png",
                 "window bounds",
                 "OXIDE_GUI_VISUAL_FIXTURE",
+                '"board"',
+                '"settings"',
                 "--strict",
+                "--settle",
+                "time.sleep(max(0.0, min(args.settle, 5.0)))",
             ],
         )
         and "scripts/gui-native-visual-smoke.py" in checklist,

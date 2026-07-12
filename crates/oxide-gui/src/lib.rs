@@ -1648,6 +1648,8 @@ enum VisualFixtureMode {
     Streaming,
     Review,
     Verification,
+    Board,
+    Settings,
 }
 
 impl VisualFixtureMode {
@@ -1656,13 +1658,18 @@ impl VisualFixtureMode {
             Some("streaming") => Some(Self::Streaming),
             Some("review") => Some(Self::Review),
             Some("verification") => Some(Self::Verification),
+            Some("board") => Some(Self::Board),
+            Some("settings") => Some(Self::Settings),
             _ => None,
         }
     }
 }
 
 fn visual_fixture_messages(mode: Option<VisualFixtureMode>) -> Vec<ChatMsg> {
-    if mode.is_none() {
+    if matches!(
+        mode,
+        None | Some(VisualFixtureMode::Board) | Some(VisualFixtureMode::Settings)
+    ) {
         return Vec::new();
     }
     vec![
@@ -4612,7 +4619,8 @@ fn app() -> Element {
     let mut terms = use_signal(|| vec![(1u64, "zsh 1".to_string(), Vec::<String>::new())]);
     let mut term_sel = use_signal(|| 0usize);
     let mut term_seq = use_signal(|| 1u64);
-    let mut show_settings = use_signal(|| false);
+    let mut show_settings =
+        use_signal(move || matches!(visual_fixture, Some(VisualFixtureMode::Settings)));
     let mut settings_initial_tab = use_signal(|| "model".to_string());
     let mut show_skills = use_signal(|| false);
     let mut show_mcp = use_signal(|| false);
@@ -4692,7 +4700,8 @@ fn app() -> Element {
     }
     let split_drag = use_signal(|| None::<u64>);
     let split_rects = use_signal(std::collections::HashMap::<u64, (f64, f64, f64, f64)>::new);
-    let mut show_board = use_signal(|| false);
+    let mut show_board =
+        use_signal(move || matches!(visual_fixture, Some(VisualFixtureMode::Board)));
     let mut board = use_signal(board::Board::default);
     let board_sync_status = use_signal(|| "Issue sync idle".to_string());
     let mut board_syncing = use_signal(|| false);
@@ -5745,19 +5754,15 @@ fn app() -> Element {
                 }};
             }
 
-            // The id of the tab currently shown — events from other tabs go to
-            // their buffered transcripts instead of the live view.
-            macro_rules! active_id {
-                () => {
-                    tabs.peek().get(*active_tab.peek()).map(|t| t.id)
-                };
-            }
-
             let first_id = tabs.peek().first().map(|t| t.id).unwrap_or(0);
             spawn_tab_engine!(first_id, initial);
             // The tab the VIEW is bound to. Updated when the SwitchTab command is
             // PROCESSED (not when the click lands) so events racing in between are
             // routed to the right transcript, never the outgoing one.
+            // Commands route by this too, NOT by the active_tab signal: commands
+            // drain FIFO, so at drain time view_tab is the tab whose UI issued the
+            // click — active_tab may already point at a tab clicked milliseconds
+            // later, and peeking it here sent approvals/answers to the wrong engine.
             let mut view_tab: u64 = first_id;
             let mut cur_ws = workspace_of(&{ cfg.peek().clone() });
             // Streaming text coalescing: appending the live agent bubble re-runs
@@ -5816,7 +5821,7 @@ fn app() -> Element {
                       match cmd {
                         Some(EngineCmd::Submit { engine: eng, display }) => {
                             followups.write().clear();
-                            let aid = active_id!().unwrap_or(0);
+                            let aid = view_tab;
                             if !handles.contains_key(&aid) {
                                 // Lazy spawn: a fresh tab / reopened session gets its
                                 // engine on first send (resuming its own transcript).
@@ -5930,7 +5935,7 @@ fn app() -> Element {
                             checkpoints.write().clear();
                             timeline.write().clear();
                             streaming.set(false);
-                            let aid = active_id!().unwrap_or(0);
+                            let aid = view_tab;
                             busy_tabs.write().remove(&aid);
                             tab_statuses.write().remove(&aid);
                             // Stale events from the replaced engine are dropped by the
@@ -5974,6 +5979,19 @@ fn app() -> Element {
                                 }
                                 if let Some(t) = tabs.write().iter_mut().find(|t| t.id == view_tab) {
                                     t.messages = snap;
+                                }
+                            }
+                            // Park the outgoing view's unanswered cards under their owning
+                            // tab — the blanket clear below would otherwise drop them for
+                            // good while that tab's engine keeps waiting on a response.
+                            {
+                                let vis: Vec<_> = approvals.write().drain(..).collect();
+                                if !vis.is_empty() {
+                                    parked_appr.entry(view_tab).or_default().extend(vis);
+                                }
+                                let visq: Vec<_> = questions.write().drain(..).collect();
+                                if !visq.is_empty() {
+                                    parked_q.entry(view_tab).or_default().extend(visq);
                                 }
                             }
                             view_tab = id;
@@ -6032,53 +6050,46 @@ fn app() -> Element {
                             tab_statuses.write().remove(&id);
                         }
                         Some(EngineCmd::Answer { id, text }) => {
-                            if let Some(tid) = active_id!() {
-                                if let Some(h) = handles.get(&tid) {
-                                    busy_tabs.write().insert(tid);
-                                    tab_statuses.write().insert(tid, TabStatus::Running);
-                                    let _ = h.submit(Op::QuestionAnswer { request_id: id, answer: text.clone() }).await;
-                                }
+                            if let Some(h) = handles.get(&view_tab) {
+                                busy_tabs.write().insert(view_tab);
+                                tab_statuses.write().insert(view_tab, TabStatus::Running);
+                                let _ = h.submit(Op::QuestionAnswer { request_id: id, answer: text.clone() }).await;
                             }
                             questions.write().retain(|(qid, _, _)| *qid != id);
                             messages.write().push(ChatMsg::new(Author::User, text));
                             scroll_chat_bottom();
                         }
                         Some(EngineCmd::Approve { id, decision }) => {
-                            if let Some(tid) = active_id!() {
-                                if let Some(h) = handles.get(&tid) {
-                                    busy_tabs.write().insert(tid);
-                                    tab_statuses.write().insert(tid, TabStatus::Running);
-                                    let _ = h.submit(Op::ApprovalResponse { request_id: id, decision }).await;
-                                }
+                            if let Some(h) = handles.get(&view_tab) {
+                                busy_tabs.write().insert(view_tab);
+                                tab_statuses.write().insert(view_tab, TabStatus::Running);
+                                let _ = h.submit(Op::ApprovalResponse { request_id: id, decision }).await;
                             }
                             approvals.write().retain(|(aid, _, _)| *aid != id);
                         }
                         Some(EngineCmd::Rewind { id }) => {
-                            if let Some(h) = active_id!().and_then(|t| handles.get(&t)) {
+                            if let Some(h) = handles.get(&view_tab) {
                                 let _ = h.submit(Op::Rewind { checkpoint_id: id }).await;
                             }
                         }
                         Some(EngineCmd::SubagentControl { worker_id, action }) => {
-                            if let Some(h) = active_id!().and_then(|t| handles.get(&t)) {
+                            if let Some(h) = handles.get(&view_tab) {
                                 let _ = h
                                     .submit(Op::SubagentControl { worker_id, action })
                                     .await;
                             }
                         }
                         Some(EngineCmd::SetHistory(msgs)) => {
-                            if let Some(h) = active_id!().and_then(|t| handles.get(&t)) {
+                            if let Some(h) = handles.get(&view_tab) {
                                 let _ = h.submit(Op::SetHistory { msgs }).await;
                             }
                         }
                         Some(EngineCmd::Interrupt) => {
-                            let aid = active_id!();
-                            if let Some(h) = aid.and_then(|t| handles.get(&t)) {
+                            if let Some(h) = handles.get(&view_tab) {
                                 let _ = h.submit(Op::Interrupt).await;
                             }
-                            if let Some(t) = aid {
-                                busy_tabs.write().remove(&t);
-                                tab_statuses.write().remove(&t);
-                            }
+                            busy_tabs.write().remove(&view_tab);
+                            tab_statuses.write().remove(&view_tab);
                             streaming.set(false);
                             status.set(String::new());
                             todos.write().clear();
@@ -7529,12 +7540,24 @@ fn app() -> Element {
                     onmousedown: {
                         let win = win.clone();
                         move |_| win.drag()
+                    },
+                    // Konvensi titlebar macOS: double-click = zoom (toggle maximize).
+                    ondoubleclick: {
+                        let win = win.clone();
+                        move |_| {
+                            let m = win.is_maximized();
+                            win.set_maximized(!m);
+                        }
                     }
                 }
                 div { class: "brand",
-                    img { class: "logo", src: logo_uri(),
-                          title: "Collapse/expand sidebar",
-                          onclick: move |_| { let v = *sidebar_collapsed.read(); sidebar_collapsed.set(!v); } }
+                    button {
+                        class: "logo-btn",
+                        title: "Collapse or expand sidebar",
+                        aria_label: "Collapse or expand sidebar",
+                        onclick: move |_| { let v = *sidebar_collapsed.read(); sidebar_collapsed.set(!v); },
+                        img { class: "logo", src: logo_uri(), alt: "" }
+                    }
                     span { class: "brand-name", "Oxide" }
                 }
                 // Synara-style segmented control: Threads (sessions) | Workspace (tools).
@@ -8156,7 +8179,11 @@ fn app() -> Element {
                 div { class: "main-body",
                     style: if *show_env.read() { format!("--rpanel:{}px", *rpanel_w.read()) } else { String::new() },
                 div { class: if *show_env.read() { "center with-preview" } else { "center" },
-                    if cfg.read().workspace.is_some() && !*show_env.read() && !active_is_tui {
+                    if cfg.read().workspace.is_some()
+                        && !*show_env.read()
+                        && !*show_board.read()
+                        && !active_is_tui
+                    {
                         {
                             let n_changed = changed_files.read().len();
                             let ta: u32 = changed_files.read().iter().map(|f| f.1).sum();
@@ -8532,7 +8559,7 @@ fn app() -> Element {
                             div { class: "board-head",
                                 h2 { "Board" }
                                 div { class: "board-actions",
-                                    input { class: "board-input", placeholder: "New task…", value: "{new_card_title}",
+                                    input { class: "board-input", placeholder: "New task…", aria_label: "New board task", value: "{new_card_title}",
                                         oninput: move |e| new_card_title.set(e.value()),
                                         onkeydown: move |e| {
                                             if e.key() == Key::Enter {
@@ -8545,7 +8572,7 @@ fn app() -> Element {
                                             }
                                         }
                                     }
-                                    button { class: "board-btn", onclick: move |_| { let _ = workspace_of(&cfg.read()); run_board(board, cfg, workspace_of(&cfg.read())); }, Icon { name: "play" } "Run To-Do" }
+                                    button { class: "board-btn", title: "Run all To Do tasks", onclick: move |_| { let _ = workspace_of(&cfg.read()); run_board(board, cfg, workspace_of(&cfg.read())); }, Icon { name: "play" } "Run To-Do" }
                                     button { class: "board-btn ghost", onclick: move |_| {
                                             let root = workspace_of(&cfg.read());
                                             sync_board_issues(board, root, board_sync_status, board_syncing);
@@ -8556,9 +8583,26 @@ fn app() -> Element {
                             }
                             div { class: "board-sync-status", "{board_sync_status}" }
                             div { class: "board-cols four",
-                                for (col, label) in [(board::TODO, "To Do"), (board::DOING, "In Progress"), (board::REVIEW, "Review"), (board::DONE, "Done")] {
-                                    div { class: "board-col",
-                                        div { class: "board-col-head", "{label}" }
+                                for (col, label, empty_copy) in [
+                                    (board::TODO, "To Do", "Add a task or sync an issue."),
+                                    (board::DOING, "In Progress", "Tasks appear here while an agent is working."),
+                                    (board::REVIEW, "Review", "Completed work waits here for review."),
+                                    (board::DONE, "Done", "Merged and finished tasks appear here."),
+                                ] {
+                                    {
+                                        let column_count = board.read().cards.iter().filter(|c| c.column == col).count();
+                                        rsx! {
+                                    section { class: "board-col", aria_label: "{label} tasks",
+                                        div { class: "board-col-head",
+                                            span { "{label}" }
+                                            span { class: "board-col-count", "{column_count}" }
+                                        }
+                                        if column_count == 0 {
+                                            div { class: "board-col-empty",
+                                                span { class: "board-col-empty-icon", Icon { name: "spark" } }
+                                                span { "{empty_copy}" }
+                                            }
+                                        }
                                         for card in board.read().cards.iter().filter(|c| c.column == col).cloned() {
                                             {
                                                 let cid = card.id;
@@ -8575,7 +8619,9 @@ fn app() -> Element {
                                                 .join(" · ");
                                                 let issue_url = card.source_url.clone();
                                                 rsx! {
-                                                    div { class: if col == board::DOING { "board-card doing" } else { "board-card" },
+                                                    article {
+                                                        key: "{cid}-{col}",
+                                                        class: if col == board::DOING { "board-card doing" } else { "board-card" },
                                                         if has_source {
                                                             div { class: "board-card-meta",
                                                                 span { class: if card.source == "Linear" { "board-source linear" } else { "board-source github" }, "{card.source}" }
@@ -8606,13 +8652,15 @@ fn app() -> Element {
                                                                 });
                                                             }, Icon { name: "check" } "Merge" }
                                                         }
-                                                        button { class: "board-card-x", onclick: move |_| {
+                                                        button { class: "board-card-x", title: "Remove task", aria_label: "Remove task", onclick: move |_| {
                                                             board.write().cards.retain(|c| c.id != cid);
                                                             let snap = board.read().clone(); snap.save(&workspace_of(&cfg.read()));
                                                         }, Icon { name: "x" } }
                                                     }
                                                 }
                                             }
+                                        }
+                                    }
                                         }
                                     }
                                 }
@@ -11081,7 +11129,7 @@ fn McpModal(
         .collect();
     rsx! {
         div { class: "modal-overlay", onclick: move |_| on_close.call(()),
-            div { class: "modal skills-modal", onclick: move |event| event.stop_propagation(),
+            div { class: "modal skills-modal", role: "dialog", aria_modal: "true", aria_label: "MCP servers", onclick: move |event| event.stop_propagation(),
                 div { class: "modal-head",
                     h2 { "MCP servers" }
                     button { class: "board-btn", onclick: move |_| engine.send(EngineCmd::Reconfigure(cfg.read().clone())), "Reconnect" }
@@ -11306,7 +11354,7 @@ fn SkillsModal(workspace: PathBuf, on_close: EventHandler<()>) -> Element {
 
     rsx! {
         div { class: "modal-overlay", onclick: move |_| on_close.call(()),
-            div { class: "modal skills-modal", onclick: move |e| e.stop_propagation(),
+            div { class: "modal skills-modal", role: "dialog", aria_modal: "true", aria_label: "Skills", onclick: move |e| e.stop_propagation(),
                 div { class: "modal-head",
                     h2 { "Skills · {total}" }
                     button { class: "term-x", onclick: move |_| on_close.call(()), Icon { name: "x" } }
@@ -12352,7 +12400,7 @@ fn SettingsModal(
     let mut memory_refresh = use_signal(|| 0u64);
     rsx! {
         div { class: "modal-overlay", onclick: move |_| on_close.call(()),
-            div { class: "modal settings-modal", onclick: move |e| e.stop_propagation(),
+            div { class: "modal settings-modal", role: "dialog", aria_modal: "true", aria_label: "Settings", onclick: move |e| e.stop_propagation(),
                 div { class: "modal-head",
                     h2 { "Settings" }
                     button { class: "term-x", onclick: move |_| on_close.call(()), Icon { name: "x" } }
