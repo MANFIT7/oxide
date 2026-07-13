@@ -20,6 +20,7 @@ mod commands;
 mod context;
 pub mod db;
 mod embed;
+mod git_tools;
 pub mod hooks;
 mod index;
 pub mod memory;
@@ -2494,6 +2495,7 @@ impl Engine {
             .params(design_review_tool_params()));
         tools.push(ToolSpec::new("design_propose_patch", "Convert a selected Design Workbench element and edits into a typed patch proposal. This does not edit files; use it before source-code changes.")
             .params(design_patch_tool_params()));
+        tools.extend(git_tools::specs());
         tools.retain(|tool| policy.allows(&tool.name, declared.contains(&tool.name)));
         let mut seen = std::collections::BTreeSet::new();
         tools.retain(|tool| seen.insert(tool.name.clone()));
@@ -6460,8 +6462,12 @@ Do NOT read it again. Proceed now: make the edits with the edit/write_file tools
             }
         }
 
-        // Browser automation, then memory tools, then MCP, then native sandbox.
-        let (output, ok) = if let Some(r) = self.handle_browser_tool(&name, &arguments).await {
+        // Structured Git broker, then browser automation, memory, MCP, and native sandbox.
+        let (output, ok) = if let Some(result) =
+            git_tools::execute(&self.workspace, &name, &arguments).await
+        {
+            result
+        } else if let Some(r) = self.handle_browser_tool(&name, &arguments).await {
             r
         } else if name == "remember" {
             let mem = memory::Memory::new(&self.workspace);

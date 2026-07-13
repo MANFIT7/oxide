@@ -91,6 +91,18 @@ impl ToolRouter {
                     self.workspace.display()
                 )
             }
+            "git_commit" => {
+                let paths = args["paths"].as_array().map_or(0, Vec::len);
+                format!(
+                    "Commit {paths} explicitly listed path(s):\n{}",
+                    args["message"].as_str().unwrap_or("?")
+                )
+            }
+            "git_push" => format!(
+                "Push branch '{}' to remote '{}' (force is not supported)",
+                args["branch"].as_str().unwrap_or("current"),
+                args["remote"].as_str().unwrap_or("origin")
+            ),
             "todo_write" => {
                 let n = args["todos"].as_array().map(|a| a.len()).unwrap_or(0);
                 format!("Update task checklist:\n{n} item(s)")
@@ -640,7 +652,7 @@ fn format_elapsed(d: std::time::Duration) -> String {
 /// "permission denied / not logged in" even under Full access. Prepend the
 /// common bin dirs and recover the launchd ssh-agent socket so auth works the
 /// same as it does from a terminal.
-fn augment_shell_env(cmd: &mut tokio::process::Command) {
+pub(crate) fn augment_shell_env(cmd: &mut tokio::process::Command) {
     let home = std::env::var("HOME").unwrap_or_default();
     let mut dirs = vec![
         format!("{home}/.local/bin"),
