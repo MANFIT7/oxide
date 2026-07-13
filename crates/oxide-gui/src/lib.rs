@@ -846,9 +846,14 @@ fn activity_view(text: &str) -> ActivityView {
 }
 
 fn build_transcript_turns(messages: &[ChatMsg]) -> Vec<TranscriptTurn> {
+    let is_internal = |message: &ChatMsg| is_internal_transcript_text(&message.text);
     let mut groups: Vec<TranscriptGroup> = Vec::new();
     let mut i = 0;
     while i < messages.len() {
+        if is_internal(&messages[i]) {
+            i += 1;
+            continue;
+        }
         if matches!(messages[i].author, Author::Activity { .. }) {
             let start = i;
             let mut live = false;
@@ -866,6 +871,9 @@ fn build_transcript_turns(messages: &[ChatMsg]) -> Vec<TranscriptTurn> {
                     // here, leaving ungroupable stray singles above the Done
                     // note. Let them pass through the run invisibly.
                     Author::Diff(..) => {
+                        i += 1;
+                    }
+                    _ if is_internal(&messages[i]) => {
                         i += 1;
                     }
                     _ => break,
@@ -938,26 +946,42 @@ fn activity_group_display(rows: &[(String, bool, bool)]) -> (&'static str, Strin
         }
     }
 
-    if running && edits > 0 {
-        (
-            "edit",
-            format!("Editing files… {n} action{}", if n == 1 { "" } else { "s" }),
-        )
-    } else if running {
+    if running {
         (
             "settings",
             format!("Working… {n} action{}", if n == 1 { "" } else { "s" }),
         )
     } else if edits > 0 && edits >= commands + searches + web {
-        ("edit", format!("{edits} file changes · {n} actions"))
+        (
+            "edit",
+            format!("Edited {edits} file{}", if edits == 1 { "" } else { "s" }),
+        )
     } else if commands > 0 && commands >= searches + web {
-        ("terminal", format!("{commands} commands · {n} actions"))
+        (
+            "terminal",
+            format!(
+                "Ran {commands} command{}",
+                if commands == 1 { "" } else { "s" }
+            ),
+        )
     } else if searches > 0 {
-        ("search", format!("{searches} searches · {n} actions"))
+        (
+            "search",
+            format!(
+                "Searched {searches} time{}",
+                if searches == 1 { "" } else { "s" }
+            ),
+        )
     } else if web > 0 {
-        ("browser", format!("{web} web actions · {n} actions"))
+        (
+            "browser",
+            format!("Used web {web} time{}", if web == 1 { "" } else { "s" }),
+        )
     } else {
-        ("settings", format!("{n} actions"))
+        (
+            "settings",
+            format!("Completed {n} action{}", if n == 1 { "" } else { "s" }),
+        )
     }
 }
 
@@ -1055,6 +1079,19 @@ fn icon_text(text: &str) -> Option<(&'static str, String)> {
 
 fn is_stage_status(text: &str) -> bool {
     prefixed_icon_text(text).is_some() || plain_status_icon_text(text).is_some()
+}
+
+/// Runtime diagnostics belong in logs/settings, not in the user conversation.
+/// Filtering at both ingestion and render time also cleans already-saved sessions.
+fn is_internal_transcript_text(text: &str) -> bool {
+    let text = text.trim();
+    text.starts_with("Harness ·")
+        || text.starts_with("Tool budget extended adaptively")
+        || text.starts_with("No new measurable progress justified")
+        || text.starts_with("queued op ignored")
+        || text.starts_with("You stopped, but the task may not be fully done")
+        || text.starts_with("Before finishing: did this task teach you anything durable")
+        || text.starts_with("<system-reminder>")
 }
 
 /// `(icon, verb, detail)` for a tool activity row, joined as "icon\tverb\tdetail".
@@ -1548,7 +1585,6 @@ struct AgentTab {
     ws: PathBuf,
 }
 
-const SESSION_RENDER_MESSAGE_LIMIT: usize = 20;
 const HOOKS_STARTER: &str = r#"[auto]
 guard_dangerous_shell = true
 lint = false
@@ -1800,7 +1836,7 @@ fn visual_fixture_ui_spec() -> UiSpec {
 
 fn visual_fixture_thinking(mode: Option<VisualFixtureMode>) -> String {
     if matches!(mode, Some(VisualFixtureMode::Streaming)) {
-        "Checking streamed tool arguments, reasoning placement, edit shimmer, and native window capture."
+        "**Inspecting streamed tool arguments****Checking reasoning placement****Verifying native window capture**"
             .to_string()
     } else {
         String::new()
@@ -3285,6 +3321,94 @@ mod tests {
     }
 
     #[test]
+    fn thought_duration_switches_to_minutes() {
+        assert_eq!(format_thought_duration(45), "45s");
+        assert_eq!(format_thought_duration(688), "11m");
+        assert_eq!(format_thought_duration(3780), "1h 3m");
+    }
+
+    #[test]
+    fn reasoning_markdown_separates_adjacent_summary_items() {
+        assert_eq!(
+            normalize_reasoning_markdown("**Inspecting spinner****Checking layout**"),
+            "**Inspecting spinner**\n\n**Checking layout**"
+        );
+        assert_eq!(
+            normalize_reasoning_markdown("Plain streamed reasoning"),
+            "Plain streamed reasoning"
+        );
+    }
+
+    #[test]
+    fn internal_runtime_notices_do_not_split_activity_groups() {
+        assert!(is_internal_transcript_text(
+            "No new measurable progress justified another tool-budget extension."
+        ));
+        assert!(is_internal_transcript_text(
+            "Before finishing: did this task teach you anything durable?"
+        ));
+        let messages = vec![
+            ChatMsg::new(
+                Author::Activity {
+                    running: false,
+                    ok: true,
+                    key: Some("a".into()),
+                },
+                "terminal\tRun\tcargo check",
+            ),
+            ChatMsg::new(
+                Author::Note,
+                "Tool budget extended adaptively to 52 rounds because the turn is still making measurable progress",
+            ),
+            ChatMsg::new(
+                Author::Activity {
+                    running: false,
+                    ok: true,
+                    key: Some("b".into()),
+                },
+                "terminal\tRun\tcargo test",
+            ),
+        ];
+
+        let turns = build_transcript_turns(&messages);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].groups.len(), 1);
+        assert!(turns[0].groups[0].activity);
+        assert_eq!(turns[0].groups[0].indices, vec![0, 2]);
+    }
+
+    #[test]
+    fn activity_group_labels_stay_cursor_compact() {
+        let commands = vec![
+            ("terminal\tRun\tcargo check".to_string(), false, true),
+            ("terminal\tRun\tcargo test".to_string(), false, true),
+        ];
+        assert_eq!(activity_group_display(&commands).1, "Ran 2 commands");
+
+        let running = vec![("edit\tEdit\tsrc/lib.rs".to_string(), true, true)];
+        assert_eq!(activity_group_display(&running).1, "Working… 1 action");
+    }
+
+    #[test]
+    fn persisted_session_keeps_full_scrollable_history() {
+        let mut rows: Vec<(String, String)> = (0..30)
+            .map(|i| ("user".to_string(), format!("message {i}")))
+            .collect();
+        rows.insert(
+            10,
+            (
+                "summary".to_string(),
+                "Harness · Default (default) · source: builtin".to_string(),
+            ),
+        );
+
+        let messages = session_rows_to_chat(rows);
+        assert_eq!(messages.len(), 30);
+        assert_eq!(messages.first().map(|m| m.text.as_str()), Some("message 0"));
+        assert_eq!(messages.last().map(|m| m.text.as_str()), Some("message 29"));
+    }
+
+    #[test]
     fn mcp_args_support_quotes_and_json_arrays() {
         assert_eq!(
             parse_mcp_args(r#"--root "/Volumes/Data/My Project""#).unwrap(),
@@ -4166,21 +4290,15 @@ fn open_session_tab(
     scroll_chat_bottom();
 }
 
-/// Load a session transcript into chat messages.
-fn load_session(path: &Path) -> Vec<ChatMsg> {
-    let mut rows = oxide_core::db::load(&sid(path));
-    // Long / repeatedly-compacted transcripts are expensive to paint (markdown +
-    // syntax highlight per message). Show only the tail — the engine still
-    // resumes the FULL history on continue, so nothing is lost from the model.
-    let total = rows.len();
-    let trimmed = total > SESSION_RENDER_MESSAGE_LIMIT;
-    if trimmed {
-        rows = rows.split_off(total - SESSION_RENDER_MESSAGE_LIMIT);
-    }
-    let mut out: Vec<ChatMsg> = rows
-        .into_iter()
+/// Convert every persisted conversation row into transcript messages. Rendering
+/// uses per-turn `content-visibility`, so long sessions stay scrollable without
+/// discarding their beginning.
+fn session_rows_to_chat(rows: Vec<(String, String)>) -> Vec<ChatMsg> {
+    rows.into_iter()
         .filter_map(|(role, content)| {
-            if !matches!(role.as_str(), "user" | "assistant" | "summary" | "ui_spec") {
+            if !matches!(role.as_str(), "user" | "assistant" | "summary" | "ui_spec")
+                || is_internal_transcript_text(&content)
+            {
                 return None;
             }
             let author = match role.as_str() {
@@ -4191,12 +4309,12 @@ fn load_session(path: &Path) -> Vec<ChatMsg> {
             };
             Some(ChatMsg::new(author, content))
         })
-        .collect();
-    if trimmed {
-        let hidden = total - SESSION_RENDER_MESSAGE_LIMIT;
-        out.insert(0, ChatMsg::new(Author::Note, format!("… {hidden} earlier messages hidden (long session) — the agent still resumes the full context")));
-    }
-    out
+        .collect()
+}
+
+/// Load a session transcript into chat messages.
+fn load_session(path: &Path) -> Vec<ChatMsg> {
+    session_rows_to_chat(oxide_core::db::load(&sid(path)))
 }
 
 fn replay_role_label(role: &str) -> &'static str {
@@ -4921,7 +5039,7 @@ fn app() -> Element {
     let mut chat_img = use_signal(|| None::<String>);
     // Long user prompts render clamped (the sticky header would otherwise eat
     // half the viewport); indices here are user-expanded.
-    let mut expanded_user = use_signal(HashSet::<usize>::new);
+    let mut expanded_user = use_signal(HashSet::<u64>::new);
     // User override for the thinking-box open state (None = follow streaming).
     let mut think_open = use_signal(|| None::<bool>);
     // Per activity-group open state (keyed by first row index). Defaults to the
@@ -5839,6 +5957,34 @@ fn app() -> Element {
                     }
                 }};
             }
+            macro_rules! flush_thinking {
+                () => {{
+                    let text = thinking.peek().clone();
+                    if !text.trim().is_empty() {
+                        let secs = (*think_started.peek())
+                            .map(|started| started.elapsed().as_secs())
+                            .unwrap_or(*think_secs.peek())
+                            .max(1);
+                        let mut m = messages.write();
+                        if m.last()
+                            .map(|row| row.author == Author::Agent && row.text.is_empty())
+                            .unwrap_or(false)
+                        {
+                            m.pop();
+                        }
+                        m.push(ChatMsg::new(
+                            Author::Note,
+                            format!("§thought\t{secs}\t{text}"),
+                        ));
+                        drop(m);
+                        thinking.set(String::new());
+                        think_started.set(None);
+                        think_secs.set(0);
+                        think_open.set(None);
+                    }
+                }};
+            }
+
             macro_rules! flush_agent {
                 () => {{
                     if !agent_buf.is_empty() {
@@ -6237,8 +6383,12 @@ fn app() -> Element {
                                     }
                                 }
                                 Event::Info { text } => {
-                                    if text.starts_with("session") || text.starts_with("mcp ") || text.starts_with("mcp '") {
-                                        // noise
+                                    if is_internal_transcript_text(&text)
+                                        || text.starts_with("session")
+                                        || text.starts_with("mcp ")
+                                        || text.starts_with("mcp '")
+                                    {
+                                        // internal runtime/MCP diagnostics stay out of the conversation
                                         } else if let Some(label) = text.strip_prefix('\u{2699}').or_else(|| text.strip_prefix('\u{23f3}')) {
                                             let label = label.trim().to_string();
                                             // Suppress the redundant "Running …" notice when a
@@ -6450,6 +6600,21 @@ fn app() -> Element {
                             }
                             _ => {}
                         }
+                        // Cursor keeps each reasoning pass next to the action it
+                        // motivated. Close the live pass before a tool/command or
+                        // answer starts instead of accumulating the whole turn in
+                        // one giant reasoning block.
+                        if matches!(
+                            &ev,
+                            Event::AgentMessageDelta { .. }
+                                | Event::ToolCallDelta { .. }
+                                | Event::ToolCallBegin { .. }
+                                | Event::CommandStarted { .. }
+                                | Event::ApprovalRequested { .. }
+                                | Event::QuestionAsked { .. }
+                        ) {
+                            flush_thinking!();
+                        }
                         match ev {
                             Event::AgentMessageDelta { text, .. } => {
                                 if status.peek().as_str() != "Writing…" {
@@ -6466,6 +6631,14 @@ fn app() -> Element {
                             Event::ReasoningDelta { text, .. } => {
                                 if thinking.peek().is_empty() {
                                     think_started.set(Some(std::time::Instant::now()));
+                                    let needs_anchor = messages
+                                        .peek()
+                                        .last()
+                                        .map(|row| !(row.author == Author::Agent && row.text.is_empty()))
+                                        .unwrap_or(true);
+                                    if needs_anchor {
+                                        messages.write().push(ChatMsg::new(Author::Agent, String::new()));
+                                    }
                                 }
                                 thinking.write().push_str(&text);
                                 if let Some(t) = *think_started.peek() {
@@ -6476,8 +6649,12 @@ fn app() -> Element {
                                 }
                             }
                             Event::Info { text } => {
-                                if text.starts_with("session") || text.starts_with("mcp ") || text.starts_with("mcp '") {
-                                    // internal/MCP noise — status shown in the MCP manager, not chat
+                                if is_internal_transcript_text(&text)
+                                    || text.starts_with("session")
+                                    || text.starts_with("mcp ")
+                                    || text.starts_with("mcp '")
+                                {
+                                    // internal runtime/MCP diagnostics stay out of the conversation
                                 } else if text.starts_with('\u{23f3}') {
                                     // Background task the agent started. Surface it as a
                                     // persistent chip + activity row so the user sees what's
@@ -7052,6 +7229,7 @@ fn app() -> Element {
                             Event::TurnFinished { .. } => {
                                 streaming.set(false);
                                 status.set(String::new());
+                                flush_thinking!();
                                 // Todo/task cards are turn-scoped progress, not durable transcript
                                 // content. Clear them at finish so an interrupted/aborted model turn
                                 // cannot leave a perpetual "Tasks 0/N" spinner in the composer area.
@@ -7077,18 +7255,6 @@ fn app() -> Element {
                                     let mut mw = messages.write();
                                     if mw.last().map(|m| m.author == Author::Agent && m.text.is_empty()).unwrap_or(false) {
                                         mw.pop();
-                                    }
-                                    // Persist the thinking as a collapsed "Thought for Ns"
-                                    // row above the reply (Cursor Glass style).
-                                    let th = thinking.peek().clone();
-                                    if !th.trim().is_empty() {
-                                        let secs = turn_start.peek().as_ref().map(|t| t.elapsed().as_secs()).unwrap_or(0).max(1);
-                                        let row = ChatMsg::new(Author::Note, format!("§thought\t{secs}\t{th}"));
-                                        if let Some(pos) = mw.iter().rposition(|m| m.author == Author::Agent && !m.text.is_empty()) {
-                                            mw.insert(pos, row);
-                                        } else {
-                                            mw.push(row);
-                                        }
                                     }
                                 }
                                 thinking.set(String::new());
@@ -8236,6 +8402,17 @@ fn app() -> Element {
                             let ta: u32 = changed_files.read().iter().map(|f| f.1).sum();
                             let td: u32 = changed_files.read().iter().map(|f| f.2).sum();
                             let n_terms = terms.read().len();
+                            let running_subagents = subagent_cards
+                                .read()
+                                .iter()
+                                .filter(|card| card.running)
+                                .count();
+                            let subagent_preview = subagent_cards
+                                .read()
+                                .iter()
+                                .find(|card| card.running)
+                                .map(|card| format!("{} · {}", card.profile, card.task))
+                                .unwrap_or_default();
                             let br = branch.clone();
                             rsx! {
                                 div { class: "env-card",
@@ -8249,6 +8426,19 @@ fn app() -> Element {
                                             "Environment"
                                         }
                                         button { class: "env-card-gear", title: "Open environment", onclick: move |_| select_env_tab(env_tab, show_env, env_tab_by_tab, tabs, active_tab, "files", false), Icon { name: "settings" } }
+                                    }
+                                    if running_subagents > 0 {
+                                        button { class: "env-card-row env-subagents-running", title: "Open running sub-agents", onclick: move |_| {
+                                                inspector_tab.set("agents".to_string());
+                                                select_env_tab(env_tab, show_env, env_tab_by_tab, tabs, active_tab, "files", false);
+                                            },
+                                            span { class: "env-subagent-status", span { class: "syn-spinner" } }
+                                            span { class: "env-subagent-copy",
+                                                span { class: "env-subagent-label", "Subagents" }
+                                                span { class: "env-subagent-preview", "{subagent_preview}" }
+                                            }
+                                            span { class: "env-card-badge nowrap", "{running_subagents} running" }
+                                        }
                                     }
                                     button { class: "env-card-row", onclick: move |_| select_env_tab(env_tab, show_env, env_tab_by_tab, tabs, active_tab, "changes", false),
                                         Icon { name: "changes" } span { "Changes" }
@@ -8903,12 +9093,13 @@ fn app() -> Element {
                                                                 let copy = serde_json::to_string(&strip_scaffold(&m.text)).unwrap_or_default();
                                                                 let edit_text = strip_scaffold(&m.text);
                                                                 let idx = i;
+                                                                let message_id = m.id;
                                                                 let _ = last_user_idx; let row_cls = "row user sticky-turn";
                                                                 // Clamp long prompts (esp. while sticky) — expandable. Clamp the
                                                                 // TEXT only (line-clamp), never the bubble itself; masking the
                                                                 // bubble fights its backdrop-filter and renders it blank.
                                                                 let long = edit_text.chars().count() > 240 || edit_text.lines().count() > 3;
-                                                                let expanded = expanded_user.read().contains(&idx);
+                                                                let expanded = expanded_user.read().contains(&message_id);
                                                                 let text_cls = if long && !expanded { "user-text clamped" } else { "user-text" };
                                                                 rsx! {
                                                                     div { key: "m-{m.id}", id: "msgrow-{idx}", class: "{row_cls}",
@@ -8940,7 +9131,7 @@ fn app() -> Element {
                                                                                 button { class: "bubble-more",
                                                                                     onclick: move |_| {
                                                                                         let mut e = expanded_user.write();
-                                                                                        if !e.insert(idx) { e.remove(&idx); }
+                                                                                        if !e.insert(message_id) { e.remove(&message_id); }
                                                                                     },
                                                                                     if expanded { "show less" } else { "show more" }
                                                                                 }
@@ -8984,12 +9175,13 @@ fn app() -> Element {
                                                             _ if m.author == Author::Note && m.text.starts_with("§thought\t") => {
                                                                 let mut parts = m.text.splitn(3, '\t');
                                                                 let _ = parts.next();
-                                                                let secs = parts.next().unwrap_or("1").to_string();
+                                                                let secs = parts.next().unwrap_or("1").parse().unwrap_or(1);
+                                                                let duration = format_thought_duration(secs);
                                                                 let body = parts.next().unwrap_or("").to_string();
                                                                 rsx! {
                                                                     details { key: "m-{m.id}", class: "thought-row",
-                                                                        summary { class: "thought-sum", "Thought for {secs}s" }
-                                                                        div { class: "thought-body", "{body}" }
+                                                                        summary { class: "thought-sum", "Thought for {duration}" }
+                                                                        div { class: "thought-body", dangerous_inner_html: reasoning_html(&body, false) }
                                                                     }
                                                                 }
                                                             }
@@ -9022,13 +9214,14 @@ fn app() -> Element {
                                                                                 {
                                                                                     let el = *think_secs.read();
                                                                                     if el >= 1 {
-                                                                                        rsx! { span { class: "thinking-secs", "{el}s" } }
+                                                                                        let duration = format_thought_duration(el);
+                                                                                        rsx! { span { class: "thinking-secs", "{duration}" } }
                                                                                     } else {
                                                                                         rsx! {}
                                                                                     }
                                                                                 }
                                                                             }
-                                                                            div { class: "thinking-body", "{thinking}" }
+                                                                            div { class: "thinking-body", dangerous_inner_html: reasoning_html(&thinking.read(), false) }
                                                                         }
                                                                     }
                                                                     div { id: "msg-{i}", class: "pinwrap",
@@ -9099,7 +9292,8 @@ fn app() -> Element {
                                                         {
                                                             let el = *think_secs.read();
                                                             if el >= 1 {
-                                                                rsx! { span { class: "thinking-secs", "{el}s" } }
+                                                                let duration = format_thought_duration(el);
+                                                                rsx! { span { class: "thinking-secs", "{duration}" } }
                                                             } else {
                                                                 rsx! {}
                                                             }
@@ -9108,14 +9302,15 @@ fn app() -> Element {
                                                         {
                                                             let t = *think_secs.read();
                                                             if t >= 1 {
-                                                                rsx! { "Thought for {t}s" }
+                                                                let duration = format_thought_duration(t);
+                                                                rsx! { "Thought for {duration}" }
                                                             } else {
                                                                 rsx! { "Reasoning" }
                                                             }
                                                         }
                                                     }
                                                 }
-                                                div { class: "thinking-body", "{thinking}" }
+                                                div { class: "thinking-body", dangerous_inner_html: reasoning_html(&thinking.read(), false) }
                                             }
                                         }
                                     }
@@ -9355,89 +9550,6 @@ fn app() -> Element {
                                                         Icon { name: "chevron" }
                                                     }
                                                 }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        if !subagent_cards.read().is_empty() {
-                            {
-                                let cards = subagent_cards.read().clone();
-                                let done = cards.iter().filter(|c| !c.running).count();
-                                let total = cards.len();
-                                let preview = cards
-                                    .iter()
-                                    .find(|c| c.running)
-                                    .or_else(|| cards.last())
-                                    .map(|c| format!("{} · {}", c.profile, c.task))
-                                    .unwrap_or_default();
-                                rsx! {
-                                    details { class: "subagents-card run-disclosure",
-                                        summary { class: "subagents-head run-summary",
-                                            span { class: "workflow-ic", Icon { name: "spark" } }
-                                            span { class: "run-label", "Subagents {done}/{total}" }
-                                            span { class: "run-preview", "{preview}" }
-                                            span { class: "run-caret", Icon { name: "chevron" } }
-                                        }
-                                        for card in cards {
-                                            {
-                                                let row_cls = if card.running { "subagent-row running" } else if card.ok { "subagent-row done" } else { "subagent-row fail" };
-                                                let child_session = card.session.clone();
-                                                let child_title = format!("{}: {}", card.profile, card.task);
-                                                rsx! {
-                                                    div { key: "sa-{card.worker_id}", class: "{row_cls}",
-                                                        span { class: "subagent-status",
-                                                            if card.running { span { class: "syn-spinner" } }
-                                                            else if card.ok { Icon { name: "check" } }
-                                                            else { Icon { name: "alert" } }
-                                                        }
-                                                        // Synara: thread anak first-class — buka transkripnya.
-                                                        if !child_session.is_empty() {
-                                                            button { class: "subagent-open", title: "Open subagent thread",
-                                                                onclick: move |_| {
-                                                                    show_board.set(false);
-                                                                    open_session_tab(tabs, active_tab, messages, next_tab_id, cfg, ui, engine, busy_tabs, PathBuf::from(child_session.clone()), child_title.clone());
-                                                                },
-                                                                Icon { name: "external-link" } span { "Open" }
-                                                            }
-                                                        }
-                                                        div { class: "subagent-copy",
-                                                            div { class: "subagent-title", "{card.profile} · {card.task}" }
-                                                                if !card.summary.trim().is_empty() {
-                                                                    div { class: "subagent-summary", "{card.summary}" }
-                                                                }
-                                                                if !card.logs.is_empty() {
-                                                                    div { class: "subagent-logs",
-                                                                        for log in card.logs {
-                                                                            {
-                                                                                let log_cls = if log.running { "subagent-log running" } else if log.ok { "subagent-log done" } else { "subagent-log fail" };
-                                                                                let lines = log.output.lines().count();
-                                                                                rsx! {
-                                                                                    details { class: "{log_cls}", open: log.running,
-                                                                                        summary { class: "subagent-log-head",
-                                                                                            span { class: "subagent-log-status",
-                                                                                                if log.running { span { class: "syn-spinner" } }
-                                                                                                else if log.ok { Icon { name: "check" } }
-                                                                                                else { Icon { name: "alert" } }
-                                                                                            }
-                                                                                            span { class: "subagent-log-command", "{log.command}" }
-                                                                                            if lines > 0 {
-                                                                                                span { class: "subagent-log-lines", "{lines} lines" }
-                                                                                            }
-                                                                                        }
-                                                                                        if !log.output.trim().is_empty() {
-                                                                                            pre { class: "subagent-log-output", "{log.output}" }
-                                                                                        }
-                                                                                    }
-                                                                                }
-                                                                            }
-                                                                        }
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                    }
                                             }
                                         }
                                     }
@@ -11939,6 +12051,27 @@ fn highlight_code(code: &str, lang: &str) -> String {
         }
     }
     gen.finalize()
+}
+
+fn format_thought_duration(secs: u64) -> String {
+    if secs >= 3600 {
+        format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+    } else if secs >= 60 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{secs}s")
+    }
+}
+
+/// Separate adjacent bold reasoning summaries emitted as independent provider
+/// items. Without a boundary, `**First**` + `**Second**` becomes `****` and the
+/// GUI shows one unreadable wall of literal Markdown.
+fn normalize_reasoning_markdown(src: &str) -> String {
+    src.replace("****", "**\n\n**")
+}
+
+fn reasoning_html(src: &str, live: bool) -> String {
+    md_to_html(&normalize_reasoning_markdown(src), live)
 }
 
 /// Render agent markdown to safe HTML: raw HTML in the source is escaped
@@ -15717,6 +15850,7 @@ fn ChatPane(
             };
             let mut agent_buf = String::new();
             let mut reasoning_buf = String::new();
+            let mut pane_think_started = None::<std::time::Instant>;
             let mut last_paint = std::time::Instant::now();
             macro_rules! flush_pane_streams {
                 () => {{
@@ -15743,10 +15877,37 @@ fn ChatPane(
                     }
                 }};
             }
+            macro_rules! settle_pane_thinking {
+                () => {{
+                    flush_pane_streams!();
+                    let text = thinking.peek().clone();
+                    if !text.trim().is_empty() {
+                        let secs = pane_think_started
+                            .map(|started| started.elapsed().as_secs())
+                            .unwrap_or(0)
+                            .max(1);
+                        let mut rows = messages.write();
+                        if rows
+                            .last()
+                            .map(|row| row.author == Author::Agent && row.text.is_empty())
+                            .unwrap_or(false)
+                        {
+                            rows.pop();
+                        }
+                        rows.push(ChatMsg::new(
+                            Author::Note,
+                            format!("§thought\t{secs}\t{text}"),
+                        ));
+                        drop(rows);
+                        thinking.set(String::new());
+                        pane_think_started = None;
+                    }
+                }};
+            }
             loop {
                 tokio::select! {
                         cmd = rx.next() => {
-                            flush_pane_streams!();
+                            settle_pane_thinking!();
                             match cmd {
                             Some(PaneCmd::Submit(t)) => {
                                 messages.write().push(ChatMsg::new(Author::User, t.clone()));
@@ -15765,11 +15926,19 @@ fn ChatPane(
                             flush_pane_streams!();
                         },
                         ev = ev_rx.recv() => {
-                            if !matches!(
+                            if matches!(
                                 &ev,
                                 Some(Event::AgentMessageDelta { .. })
-                                    | Some(Event::ReasoningDelta { .. })
+                                    | Some(Event::ToolCallDelta { .. })
+                                    | Some(Event::ToolCallBegin { .. })
+                                    | Some(Event::CommandStarted { .. })
+                                    | Some(Event::ApprovalRequested { .. })
+                                    | Some(Event::QuestionAsked { .. })
+                                    | Some(Event::TurnFinished { .. })
+                                    | Some(Event::Error { .. })
                             ) {
+                                settle_pane_thinking!();
+                            } else if !matches!(&ev, Some(Event::ReasoningDelta { .. })) {
                                 flush_pane_streams!();
                             }
                             match ev {
@@ -15782,6 +15951,17 @@ fn ChatPane(
                                 }
                             }
                             Some(Event::ReasoningDelta { text, .. }) => {
+                                if thinking.peek().is_empty() && reasoning_buf.is_empty() {
+                                    pane_think_started = Some(std::time::Instant::now());
+                                    let needs_anchor = messages
+                                        .peek()
+                                        .last()
+                                        .map(|row| !(row.author == Author::Agent && row.text.is_empty()))
+                                        .unwrap_or(true);
+                                    if needs_anchor {
+                                        messages.write().push(ChatMsg::new(Author::Agent, String::new()));
+                                    }
+                                }
                                 reasoning_buf.push_str(&text);
                                 if last_paint.elapsed() >= std::time::Duration::from_millis(33)
                                     || agent_buf.len() + reasoning_buf.len() > 800
@@ -15820,7 +16000,12 @@ fn ChatPane(
                             }
                             Some(Event::FileDiff { path, diff, checkpoint, .. }) => { messages.write().push(ChatMsg::new(Author::Diff(path, checkpoint), diff)); }
                             Some(Event::UiSpec { spec, .. }) => { messages.write().push(ui_spec_message(*spec)); }
-                            Some(Event::TurnStarted { .. }) => { thinking.set(String::new()); status.set("Working…".to_string()); }
+                            Some(Event::TurnStarted { .. }) => {
+                                thinking.set(String::new());
+                                reasoning_buf.clear();
+                                pane_think_started = None;
+                                status.set("Working…".to_string());
+                            }
                             Some(Event::TurnFinished { .. }) => { streaming.set(false); status.set(String::new()); pane_question.set(None); { let mut mm = messages.write(); for c in mm.iter_mut() { if let Author::Activity { running, .. } = &mut c.author { *running = false; } } } }
                             Some(Event::Info { text }) => { if is_stage_status(&text) { status.set(text); } }
                             Some(Event::Error { message }) => { messages.write().push(ChatMsg::new(Author::Note, format!("error: {message}"))); streaming.set(false); }
@@ -15865,6 +16050,19 @@ fn ChatPane(
                                     }
                                 }
                             }
+                            Author::Note if msg.text.starts_with("§thought\t") => {
+                                let mut parts = msg.text.splitn(3, '\t');
+                                let _ = parts.next();
+                                let secs = parts.next().unwrap_or("1").parse().unwrap_or(1);
+                                                                let duration = format_thought_duration(secs);
+                                let body = parts.next().unwrap_or("").to_string();
+                                rsx! {
+                                    details { key: "m-{msg.id}", class: "thought-row",
+                                        summary { class: "thought-sum", "Thought for {duration}" }
+                                        div { class: "thought-body", dangerous_inner_html: reasoning_html(&body, false) }
+                                    }
+                                }
+                            }
                             _ => rsx! { Message { key: "m-{msg.id}", author: msg.author.clone(), text: msg.text.clone() } }
                         }
                     }
@@ -15872,7 +16070,7 @@ fn ChatPane(
                 if !thinking.read().is_empty() {
                     details { class: "thinking-box", open: *streaming.read(),
                         summary { class: "thinking-sum", "Reasoning" }
-                        div { class: "thinking-body", "{thinking}" }
+                        div { class: "thinking-body", dangerous_inner_html: reasoning_html(&thinking.read(), false) }
                     }
                 }
                 if *streaming.read() && !status.read().is_empty() {

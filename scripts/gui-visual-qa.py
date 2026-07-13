@@ -156,10 +156,6 @@ Finished dev profile</pre>
           <span class="edits-rowcounts shimmer">editing...</span>
         </div>
       </div>
-      <details class="subagents-card run-disclosure">
-        <summary class="subagents-head run-summary"><span class="workflow-ic">✦</span><span class="run-label">Subagents 1/1</span><span class="run-preview">reviewer · GUI performance audit</span><span class="run-caret">⌄</span></summary>
-        <div class="subagent-row done"><span class="subagent-status">✓</span><div class="subagent-copy"><div class="subagent-title">reviewer · GUI performance audit</div><div class="subagent-summary">High-confidence findings stay available on demand.</div></div></div>
-      </details>
       <details class="todo-card run-disclosure">
         <summary class="todo-head run-summary"><span class="todo-ic">☷</span><span class="run-label">Tasks 2/5</span><span class="run-preview">Implement compact orchestration layout</span><span class="run-caret">⌄</span></summary>
         <div class="todo-row in_progress"><span class="todo-box"></span><span class="todo-text">Implement compact orchestration layout</span></div>
@@ -440,24 +436,26 @@ def main() -> int:
         contains_all(
             gui,
             [
-                'details { class: "subagents-card run-disclosure"',
                 'details { class: "todo-card run-disclosure"',
                 'class: "run-preview"',
                 'class: "composer-live-changes"',
+                'class: "env-card-row env-subagents-running"',
+                'inspector_tab.set("agents".to_string())',
                 'select_env_tab(env_tab, show_env, env_tab_by_tab, tabs, active_tab, "changes", false)',
             ],
         )
+        and 'details { class: "subagents-card run-disclosure"' not in gui
         and "live-changes-files" not in gui
         and contains_all(
             css,
             [
                 ".run-disclosure { overflow: hidden; }",
-                ".subagents-card { display: block; max-height: 40px;",
                 ".todo-card { width: 100%; max-width: 760px; max-height: 40px;",
                 ".live-changes-copy { min-width: 0; display: flex; align-items: baseline;",
+                ".env-subagent-copy { min-width: 0; flex: 1 1 auto;",
             ],
         ),
-        f"{rel(GUI)} and {rel(CSS)} collapse task/subagent detail and route file detail to the Diff environment tab",
+        f"{rel(GUI)} routes running sub-agents to Environment → Agents while composer task/change surfaces stay compact",
     )
     require(
         "streamed tool arguments wrap within transcript",

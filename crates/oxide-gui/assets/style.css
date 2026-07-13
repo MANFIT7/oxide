@@ -175,7 +175,7 @@ svg { width: 17px; height: 17px; flex-shrink: 0; }
 .settings-btn:hover { background: var(--surface); color: var(--text); }
 
 /* ── Main ────────────────────────────────────────────── */
-.main { flex: 1; display: flex; flex-direction: column; min-width: 0; background: var(--bg); }
+.main { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--bg); }
 
 /* top toolbar */
 .toolbar-top {
@@ -2422,7 +2422,12 @@ details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
 
 /* user message: quiet quoted block instead of a chat bubble */
 .row.user { justify-content: flex-start; }
-.turn { display: flex; flex-direction: column; }
+.turn {
+  display: flex;
+  flex-direction: column;
+  content-visibility: auto;
+  contain-intrinsic-size: auto 220px;
+}
 .row.user.sticky-turn {
   position: sticky; top: 6px; z-index: 3;
 }
@@ -2911,6 +2916,11 @@ details.bg-chip.bg-watch[open] { max-width: 100%; flex-basis: 100%; border-radiu
 .env-card-row.static:hover { background: none; }
 .env-card-row svg { width: 14px; height: 14px; color: var(--muted); flex-shrink: 0; }
 .env-card-badge { margin-left: auto; font-size: 11px; color: var(--faint); font-variant-numeric: tabular-nums; }
+.env-subagents-running { align-items: center; }
+.env-subagent-status { width: 14px; height: 14px; display: inline-flex; align-items: center; justify-content: center; flex: 0 0 14px; }
+.env-subagent-copy { min-width: 0; flex: 1 1 auto; display: flex; flex-direction: column; line-height: 1.25; }
+.env-subagent-label { color: var(--text); font-size: 12px; font-weight: 600; }
+.env-subagent-preview { color: var(--faint); font-size: 10.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .env-card-badge svg { width: 12px; height: 12px; }
 .env-card-badge.open svg { transform: rotate(180deg); }
 .env-card-sep { height: 1px; background: var(--border); margin: 8px 8px; }
@@ -3173,10 +3183,11 @@ details.bg-chip.bg-watch[open] { max-width: 100%; flex-basis: 100%; border-radiu
    Text feathers out at the cut ("blur kepotong") and never disappears. */
 .user-text {
   white-space: pre-wrap; word-break: break-word;
-  overflow: hidden; max-height: 4000px;
+  overflow: visible; max-height: none;
   transition: max-height .3s cubic-bezier(.4, 0, .2, 1);
 }
 .user-text.clamped {
+  overflow: hidden;
   max-height: 78px;
   -webkit-mask-image: linear-gradient(to bottom, #000 52%, transparent 100%);
   mask-image: linear-gradient(to bottom, #000 52%, transparent 100%);
@@ -3914,6 +3925,9 @@ details.activity-card.has-out .activity-sum { padding: 2px 4px; }
   border-radius: 0;
   position: relative;
   flex-shrink: 0;
+  background: transparent;
+  -webkit-mask: none;
+  mask: none;
   animation: dotspin 0.9s steps(8) infinite;
   will-change: transform;
 }
@@ -4479,18 +4493,10 @@ details.changes-file[open] .diff-body { animation: disclosure-in 220ms ease-out;
   justify-content: center;
 }
 .activity-status::after {
-  content: "";
-  position: absolute;
-  inset: -4px;
-  z-index: -1;
-  border-radius: 50%;
-  background: color-mix(in srgb, var(--syn-accent) 28%, transparent);
-  opacity: 0;
-  transform: scale(.72);
+  content: none;
 }
 .activity-card.running .activity-status::after {
-  animation: oxide-tool-halo 1.55s ease-in-out infinite;
-  will-change: opacity, transform;
+  animation: none;
 }
 .activity-status .activity-spin,
 .activity-status .activity-ic {
@@ -4654,4 +4660,87 @@ details.has-out .activity-out-n::after { content: none; }
 .activity-card.running .activity-status .unicode-spinner.activity-spin {
   animation: none !important;
 }
+
+/* Cursor-style reasoning: one quiet disclosure in document flow. Provider
+   summary items render as separate Markdown paragraphs instead of a single
+   concatenated text wall; no card, tint, or left rail competes with chat. */
+.thinking-box {
+  width: 100%;
+  max-width: 720px;
+  margin: 5px 0 10px;
+  padding: 0;
+  overflow: visible;
+  contain: layout style;
+}
+.thinking-sum,
+.thought-sum {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 24px;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.4;
+}
+.thinking-sum::before,
+.thought-sum::before {
+  content: "";
+  width: 5px;
+  height: 5px;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  transform: rotate(-45deg);
+  transition: transform var(--dur-med) var(--ease-standard);
+  opacity: .65;
+}
+.thinking-box[open] > .thinking-sum::before,
+.thought-row[open] > .thought-sum::before {
+  transform: rotate(45deg);
+}
+.thinking-sum.live::before {
+  border-color: var(--syn-accent);
+}
+.thinking-glow {
+  animation: ox-shimmer 1.7s linear infinite;
+}
+.thinking-secs {
+  font-size: 12px;
+  opacity: .72;
+}
+.thinking-body,
+.thought-body {
+  margin: 2px 0 0 12px;
+  padding: 1px 0 2px 12px;
+  border: 0;
+  color: color-mix(in srgb, var(--text) 49%, transparent);
+  font-size: 13px;
+  line-height: 1.55;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.thinking-body { max-height: 240px; overflow-y: auto; }
+.thought-body { max-height: 280px; overflow-y: auto; }
+.thinking-body p,
+.thought-body p { margin: 0 0 7px; }
+.thinking-body p:last-child,
+.thought-body p:last-child { margin-bottom: 0; }
+.thinking-body strong,
+.thought-body strong { color: color-mix(in srgb, var(--text) 62%, transparent); font-weight: 500; }
+.thought-row { margin: 3px 0 8px; }
+.thought-sum::after { content: none; }
+.thought-row[open] .thought-sum::after { content: none; }
+
+/* Every loading glyph is transparent. The only visible pixels belong to its
+   orbit/Braille frame; parent status slots must not add a tinted disc. */
+.syn-spinner,
+.unicode-spinner,
+.status-spinner,
+.activity-spin {
+  background: transparent !important;
+  -webkit-mask: none;
+  mask: none;
+  box-shadow: none;
+}
+.activity-status::after { content: none !important; }
 
