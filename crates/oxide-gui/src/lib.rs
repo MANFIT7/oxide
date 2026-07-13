@@ -36,7 +36,6 @@ const MERMAID_JS: &[u8] = include_bytes!("../assets/vendor/mermaid.min.js");
 const NERD_FONT: &[u8] = include_bytes!("../assets/fonts/JetBrainsMonoNerdFontMono-Regular.ttf");
 const LOGO_BYTES: &[u8] = include_bytes!("../assets/logo.png");
 const DONE_SOUND: &[u8] = include_bytes!("../../../sound/mixkit-software-interface-back-2575.wav");
-const UNICODE_SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 fn logo_uri() -> &'static str {
     static URI: OnceLock<String> = OnceLock::new();
@@ -60,35 +59,53 @@ const SVG_VSCODE: &str = include_str!("../assets/providers/vscode.svg");
 const SVG_ZED: &str = include_str!("../assets/providers/zed.svg");
 
 /// SVG markup from `<svg` onward (drops the `<?xml?>` prolog) for inline use.
-fn svg_inner(s: &str) -> String {
+fn svg_inner(s: &str) -> &str {
     match s.find("<svg") {
-        Some(i) => s[i..].to_string(),
-        None => s.to_string(),
+        Some(i) => &s[i..],
+        None => s,
     }
 }
 
-/// Brand logo markup for a provider, if it has one. The OpenAI mark is black,
-/// so it is recolored for the dark UI.
-fn provider_logo(provider: &str) -> Option<String> {
+/// Brand logo markup for a provider, if it has one. Transformed SVGs are
+/// cached because this function sits on many Dioxus render paths.
+fn provider_logo(provider: &str) -> Option<&'static str> {
+    static OPENAI: OnceLock<String> = OnceLock::new();
+    static MCP: OnceLock<String> = OnceLock::new();
+    static GITHUB: OnceLock<String> = OnceLock::new();
+
     match provider {
-        "chatgpt" | "codex" | "openai" => {
-            Some(svg_inner(SVG_OPENAI).replace("#000000", "currentColor"))
-        }
+        "chatgpt" | "codex" | "openai" => Some(
+            OPENAI
+                .get_or_init(|| svg_inner(SVG_OPENAI).replace("#000000", "currentColor"))
+                .as_str(),
+        ),
         "claude" | "claude_interactive" | "anthropic" => Some(svg_inner(SVG_CLAUDE)),
         "cursor" => Some(svg_inner(SVG_CURSOR)),
-        "mcp" => Some(svg_inner(SVG_MCP).replace("#000000", "currentColor")),
-        "github" => Some(svg_inner(SVG_GITHUB).replace("#181717", "currentColor")),
+        "mcp" => Some(
+            MCP.get_or_init(|| svg_inner(SVG_MCP).replace("#000000", "currentColor"))
+                .as_str(),
+        ),
+        "github" => Some(
+            GITHUB
+                .get_or_init(|| svg_inner(SVG_GITHUB).replace("#181717", "currentColor"))
+                .as_str(),
+        ),
         _ => None,
     }
 }
 
 /// Logo markup for an external editor button. The Zed mark ships black, so it
 /// is recolored to follow the UI text color.
-fn editor_logo(editor: &str) -> Option<String> {
+fn editor_logo(editor: &str) -> Option<&'static str> {
+    static ZED: OnceLock<String> = OnceLock::new();
+
     match editor {
         "vscode" => Some(svg_inner(SVG_VSCODE)),
         "cursor" => Some(svg_inner(SVG_CURSOR)),
-        "zed" => Some(svg_inner(SVG_ZED).replace("\"black\"", "\"currentColor\"")),
+        "zed" => Some(
+            ZED.get_or_init(|| svg_inner(SVG_ZED).replace("\"black\"", "\"currentColor\""))
+                .as_str(),
+        ),
         _ => None,
     }
 }
@@ -3252,6 +3269,19 @@ mod tests {
             .filter(|preset| preset.provider == provider)
             .map(|preset| preset.model)
             .collect()
+    }
+
+    #[test]
+    fn provider_and_editor_logos_reuse_static_markup() {
+        let first = provider_logo("openai").unwrap();
+        let second = provider_logo("chatgpt").unwrap();
+        assert!(std::ptr::eq(first.as_ptr(), second.as_ptr()));
+        assert!(first.starts_with("<svg"));
+
+        let first = editor_logo("zed").unwrap();
+        let second = editor_logo("zed").unwrap();
+        assert!(std::ptr::eq(first.as_ptr(), second.as_ptr()));
+        assert!(first.contains("currentColor"));
     }
 
     #[test]
@@ -9336,11 +9366,19 @@ fn app() -> Element {
                                 let cards = subagent_cards.read().clone();
                                 let done = cards.iter().filter(|c| !c.running).count();
                                 let total = cards.len();
+                                let preview = cards
+                                    .iter()
+                                    .find(|c| c.running)
+                                    .or_else(|| cards.last())
+                                    .map(|c| format!("{} · {}", c.profile, c.task))
+                                    .unwrap_or_default();
                                 rsx! {
-                                    div { class: "subagents-card",
-                                        div { class: "subagents-head",
+                                    details { class: "subagents-card run-disclosure",
+                                        summary { class: "subagents-head run-summary",
                                             span { class: "workflow-ic", Icon { name: "spark" } }
-                                            span { "Subagents {done}/{total}" }
+                                            span { class: "run-label", "Subagents {done}/{total}" }
+                                            span { class: "run-preview", "{preview}" }
+                                            span { class: "run-caret", Icon { name: "chevron" } }
                                         }
                                         for card in cards {
                                             {
@@ -9411,9 +9449,21 @@ fn app() -> Element {
                                 let items = todos.read().clone();
                                 let done = items.iter().filter(|(_, s)| s == "completed").count();
                                 let n = items.len();
+                                let preview = items
+                                    .iter()
+                                    .find(|(_, status)| status == "in_progress")
+                                    .or_else(|| items.iter().find(|(_, status)| status == "pending"))
+                                    .or_else(|| items.last())
+                                    .map(|(content, _)| content.clone())
+                                    .unwrap_or_default();
                                 rsx! {
-                                    div { class: "todo-card",
-                                        div { class: "todo-head", span { class: "todo-ic", Icon { name: "list" } } "Tasks {done}/{n}" }
+                                    details { class: "todo-card run-disclosure",
+                                        summary { class: "todo-head run-summary",
+                                            span { class: "todo-ic", Icon { name: "list" } }
+                                            span { class: "run-label", "Tasks {done}/{n}" }
+                                            span { class: "run-preview", "{preview}" }
+                                            span { class: "run-caret", Icon { name: "chevron" } }
+                                        }
                                         for (content, st) in items {
                                             div { class: "todo-row {st}",
                                                 span { class: "todo-box",
@@ -9467,12 +9517,10 @@ fn app() -> Element {
                                     let total_del: u32 = edits.iter().map(|e| e.2).sum();
                                     let pending = edits.iter().filter(|e| e.4.is_empty() && e.3 == 0).count();
                                     let plural = if n == 1 { "" } else { "s" };
-                                    let shown = n.min(3);
-                                    let more = n.saturating_sub(shown);
                                     let subtitle = if pending > 0 {
-                                        format!("{pending} live · diffs settle after the turn")
+                                        format!("{pending} editing · details in Diff")
                                     } else {
-                                        "Diffs ready for review".to_string()
+                                        "Ready in Diff".to_string()
                                     };
                                     rsx! {
                                         div { class: "composer-live-changes",
@@ -9499,28 +9547,6 @@ fn app() -> Element {
                                                         select_env_tab(env_tab, show_env, env_tab_by_tab, tabs, active_tab, "changes", false);
                                                     },
                                                     Icon { name: "branch" }
-                                                }
-                                            }
-                                            div { class: "live-changes-files",
-                                                for (path, a, d, cp, diff) in edits.iter().take(shown).cloned() {
-                                                    {
-                                                        let row_pending = diff.is_empty() && cp == 0;
-                                                        let row_cls = if row_pending { "live-change-file pending" } else { "live-change-file" };
-                                                        rsx! {
-                                                            div { class: "{row_cls}",
-                                                                if row_pending { span { class: "syn-spinner" } } else { span { class: "live-change-ready", Icon { name: "check" } } }
-                                                                span { class: "live-change-path", "{path}" }
-                                                                if row_pending {
-                                                                    span { class: "live-change-state shimmer slot-status", SlotText { text: "editing…".to_string() } }
-                                                                } else {
-                                                                    span { class: "live-change-state", span { class: "diff-adds", SlotText { text: format!("+{a}") } } " " span { class: "diff-dels", SlotText { text: format!("\u{2212}{d}") } } }
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                                if more > 0 {
-                                                    div { class: "live-change-more", "+{more} more" }
                                                 }
                                             }
                                         }
@@ -13845,7 +13871,7 @@ fn Composer(
                                 show_models.set(!v);
                                 show_effort.set(false);
                             },
-                            if let Some(svg) = pill_logo.clone() {
+                            if let Some(svg) = pill_logo {
                                 span { class: "prov-logo", dangerous_inner_html: svg }
                             } else {
                                 Icon { name: "spark" }
@@ -15689,72 +15715,126 @@ fn ChatPane(
                 }
                 Err(_) => return,
             };
+            let mut agent_buf = String::new();
+            let mut reasoning_buf = String::new();
+            let mut last_paint = std::time::Instant::now();
+            macro_rules! flush_pane_streams {
+                () => {{
+                    let mut painted = false;
+                    if !agent_buf.is_empty() {
+                        let chunk = std::mem::take(&mut agent_buf);
+                        let mut pane_messages = messages.write();
+                        match pane_messages.last_mut() {
+                            Some(last) if last.author == Author::Agent => {
+                                last.text.push_str(&chunk)
+                            }
+                            _ => pane_messages.push(ChatMsg::new(Author::Agent, chunk)),
+                        }
+                        painted = true;
+                    }
+                    if !reasoning_buf.is_empty() {
+                        thinking
+                            .write()
+                            .push_str(&std::mem::take(&mut reasoning_buf));
+                        painted = true;
+                    }
+                    if painted {
+                        last_paint = std::time::Instant::now();
+                    }
+                }};
+            }
             loop {
                 tokio::select! {
-                    cmd = rx.next() => match cmd {
-                        Some(PaneCmd::Submit(t)) => {
-                            messages.write().push(ChatMsg::new(Author::User, t.clone()));
-                            messages.write().push(ChatMsg::new(Author::Agent, String::new()));
-                            streaming.set(true);
-                            let _ = handle.submit(Op::UserTurn { text: t }).await;
-                        }
-                        Some(PaneCmd::Interrupt) => { let _ = handle.submit(Op::Interrupt).await; streaming.set(false); }
-                        None => break,
-                    },
-                    ev = ev_rx.recv() => match ev {
-                        Some(Event::AgentMessageDelta { text, .. }) => {
-                            let mut mm = messages.write();
-                            match mm.last_mut() {
-                                Some(l) if l.author == Author::Agent => l.text.push_str(&text),
-                                _ => mm.push(ChatMsg::new(Author::Agent, text)),
+                        cmd = rx.next() => {
+                            flush_pane_streams!();
+                            match cmd {
+                            Some(PaneCmd::Submit(t)) => {
+                                messages.write().push(ChatMsg::new(Author::User, t.clone()));
+                                messages.write().push(ChatMsg::new(Author::Agent, String::new()));
+                                streaming.set(true);
+                                let _ = handle.submit(Op::UserTurn { text: t }).await;
                             }
-                        }
-                        Some(Event::ReasoningDelta { text, .. }) => { thinking.write().push_str(&text); }
-                        Some(Event::ToolCallDelta { call_id, tool, accumulated, .. }) => {
-                            let mut m = messages.write();
-                            upsert_tool_input_preview(&mut m, call_id, tool, accumulated);
-                        }
-                        Some(Event::ToolCallBegin { call_id, tool, args, .. }) => {
-                            if tool != "ask_user" {
-                                let text = activity_label(&tool, &args);
+                            Some(PaneCmd::Interrupt) => { let _ = handle.submit(Op::Interrupt).await; streaming.set(false); }
+                            None => break,
+                            }
+                        },
+                        _ = tokio::time::sleep(
+                            std::time::Duration::from_millis(50)
+                                .saturating_sub(last_paint.elapsed()),
+                        ), if !agent_buf.is_empty() || !reasoning_buf.is_empty() => {
+                            flush_pane_streams!();
+                        },
+                        ev = ev_rx.recv() => {
+                            if !matches!(
+                                &ev,
+                                Some(Event::AgentMessageDelta { .. })
+                                    | Some(Event::ReasoningDelta { .. })
+                            ) {
+                                flush_pane_streams!();
+                            }
+                            match ev {
+                            Some(Event::AgentMessageDelta { text, .. }) => {
+                                agent_buf.push_str(&text);
+                                if last_paint.elapsed() >= std::time::Duration::from_millis(33)
+                                    || agent_buf.len() + reasoning_buf.len() > 800
+                                {
+                                    flush_pane_streams!();
+                                }
+                            }
+                            Some(Event::ReasoningDelta { text, .. }) => {
+                                reasoning_buf.push_str(&text);
+                                if last_paint.elapsed() >= std::time::Duration::from_millis(33)
+                                    || agent_buf.len() + reasoning_buf.len() > 800
+                                {
+                                    flush_pane_streams!();
+                                }
+                            }
+                            Some(Event::ToolCallDelta { call_id, tool, accumulated, .. }) => {
+                                let mut m = messages.write();
+                                upsert_tool_input_preview(&mut m, call_id, tool, accumulated);
+                            }
+                            Some(Event::ToolCallBegin { call_id, tool, args, .. }) => {
+                                if tool != "ask_user" {
+                                    let text = activity_label(&tool, &args);
+                                    let idx = { let g = messages.read(); activity_idx(&g, &call_id) };
+                                    if let Some(idx) = idx {
+                                        if let Some(c) = messages.write().get_mut(idx) {
+                                            c.text = text;
+                                            if let Author::Activity { running, ok, .. } = &mut c.author { *running = true; *ok = true; }
+                                        }
+                                    } else {
+                                        messages.write().push(ChatMsg::new(Author::Activity { running: true, ok: true, key: Some(call_id) }, text));
+                                    }
+                                }
+                            }
+                            Some(Event::ToolCallEnd { call_id, output, ok, .. }) => {
+                                let mut out = output.trim().to_string();
+                                if out.chars().count() > 4000 { out = out.chars().take(4000).collect::<String>() + "\n… (truncated)"; }
                                 let idx = { let g = messages.read(); activity_idx(&g, &call_id) };
                                 if let Some(idx) = idx {
                                     if let Some(c) = messages.write().get_mut(idx) {
-                                        c.text = text;
-                                        if let Author::Activity { running, ok, .. } = &mut c.author { *running = true; *ok = true; }
+                                        if let Author::Activity { running, ok: o, .. } = &mut c.author { *running = false; *o = ok; }
+                                        if !out.is_empty() { c.text.push('\t'); c.text.push_str(&out); }
                                     }
-                                } else {
-                                    messages.write().push(ChatMsg::new(Author::Activity { running: true, ok: true, key: Some(call_id) }, text));
                                 }
                             }
-                        }
-                        Some(Event::ToolCallEnd { call_id, output, ok, .. }) => {
-                            let mut out = output.trim().to_string();
-                            if out.chars().count() > 4000 { out = out.chars().take(4000).collect::<String>() + "\n… (truncated)"; }
-                            let idx = { let g = messages.read(); activity_idx(&g, &call_id) };
-                            if let Some(idx) = idx {
-                                if let Some(c) = messages.write().get_mut(idx) {
-                                    if let Author::Activity { running, ok: o, .. } = &mut c.author { *running = false; *o = ok; }
-                                    if !out.is_empty() { c.text.push('\t'); c.text.push_str(&out); }
-                                }
+                            Some(Event::FileDiff { path, diff, checkpoint, .. }) => { messages.write().push(ChatMsg::new(Author::Diff(path, checkpoint), diff)); }
+                            Some(Event::UiSpec { spec, .. }) => { messages.write().push(ui_spec_message(*spec)); }
+                            Some(Event::TurnStarted { .. }) => { thinking.set(String::new()); status.set("Working…".to_string()); }
+                            Some(Event::TurnFinished { .. }) => { streaming.set(false); status.set(String::new()); pane_question.set(None); { let mut mm = messages.write(); for c in mm.iter_mut() { if let Author::Activity { running, .. } = &mut c.author { *running = false; } } } }
+                            Some(Event::Info { text }) => { if is_stage_status(&text) { status.set(text); } }
+                            Some(Event::Error { message }) => { messages.write().push(ChatMsg::new(Author::Note, format!("error: {message}"))); streaming.set(false); }
+                            Some(Event::QuestionAsked { question, options, .. }) => {
+                                messages.write().push(ChatMsg::new(Author::Note, format!("Question: {question}")));
+                                pane_question.set(Some((question, options)));
                             }
+                            Some(Event::AuditLog { .. })
+                            | Some(Event::SubagentStarted { .. })
+                            | Some(Event::SubagentStatus { .. })
+                            | Some(Event::SubagentFinished { .. }) => {}
+                            Some(Event::Shutdown) | None => break,
+                            _ => {}
                         }
-                        Some(Event::FileDiff { path, diff, checkpoint, .. }) => { messages.write().push(ChatMsg::new(Author::Diff(path, checkpoint), diff)); }
-                        Some(Event::UiSpec { spec, .. }) => { messages.write().push(ui_spec_message(*spec)); }
-                        Some(Event::TurnStarted { .. }) => { thinking.set(String::new()); status.set("Working…".to_string()); }
-                        Some(Event::TurnFinished { .. }) => { streaming.set(false); status.set(String::new()); pane_question.set(None); { let mut mm = messages.write(); for c in mm.iter_mut() { if let Author::Activity { running, .. } = &mut c.author { *running = false; } } } }
-                        Some(Event::Info { text }) => { if is_stage_status(&text) { status.set(text); } }
-                        Some(Event::Error { message }) => { messages.write().push(ChatMsg::new(Author::Note, format!("error: {message}"))); streaming.set(false); }
-                        Some(Event::QuestionAsked { question, options, .. }) => {
-                            messages.write().push(ChatMsg::new(Author::Note, format!("Question: {question}")));
-                            pane_question.set(Some((question, options)));
-                        }
-                        Some(Event::AuditLog { .. })
-                        | Some(Event::SubagentStarted { .. })
-                        | Some(Event::SubagentStatus { .. })
-                        | Some(Event::SubagentFinished { .. }) => {}
-                        Some(Event::Shutdown) | None => break,
-                        _ => {}
                     }
                 }
             }
@@ -16077,17 +16157,7 @@ fn HunkedDiff(
 
 #[component]
 fn UnicodeSpinner(class: &'static str) -> Element {
-    rsx! {
-        span { class: "unicode-spinner {class}", aria_hidden: "true",
-            for (index, frame) in UNICODE_SPINNER_FRAMES.iter().enumerate() {
-                span {
-                    class: "unicode-spinner-frame",
-                    style: format!("animation-delay: {}ms", index * 80),
-                    "{frame}"
-                }
-            }
-        }
-    }
+    rsx! { span { class: "unicode-spinner {class}", aria_hidden: "true" } }
 }
 
 #[component]

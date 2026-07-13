@@ -27,15 +27,21 @@ It focuses on states that compile tests cannot prove.
 - Expand and collapse a tool with output; confirm the content and caret transition smoothly without shifting neighboring transcript rows.
 - Stream an answer containing a very long unbroken code line (e.g. ask for a one-line shell pipeline over 200 chars); confirm the transcript never pans sideways — the code block scrolls internally while prose wraps.
 
-## Reduced Motion
+## Compact Orchestration Surfaces
 
-- Enable Reduce Motion and repeat a streaming prompt.
-- Confirm the pre-token shimmer row collapses so it does not leave a blank bar between the user message and the working status.
-- Confirm shimmer/sweep animations stop, the Braille sequence freezes to one readable glyph, and the status label remains visible.
-- Confirm generic background-process rings may continue at their reduced cadence without moving surrounding content.
-- Confirm the streaming rail becomes static, tool halos stop pulsing, and disclosure content remains immediately readable.
-- Confirm status text still communicates the active state.
-- Confirm tab switch and panel transitions are instant and do not overlap content.
+- Start a turn that produces Subagents, Tasks, and several file edits at the same time.
+- Confirm each surface occupies one summary row by default and the three rows do not cover most of the transcript.
+- Confirm Subagents and Tasks show their current item in an ellipsized preview and disclose bounded, internally scrollable detail when clicked.
+- Confirm `Changing N files` stays one row and its branch button opens full file detail in the Environment `Diff` tab.
+- Confirm collapsing either disclosure returns it to approximately 40px without losing task or subagent state.
+
+## Host Reduce Motion Override
+
+- Enable macOS Reduce Motion and repeat a streaming prompt.
+- Confirm the pre-token shimmer, Braille sequence, status-label sweep, and background-process rings continue at their normal cadence.
+- Confirm the streaming rail, tool halo, disclosure, toast, tab-switch, and panel transitions remain active.
+- Confirm status text and animated glyphs remain aligned without shifting surrounding content.
+- Disable Reduce Motion again and confirm cadence and layout are unchanged; Oxide motion is intentionally independent of this host preference.
 
 ## Review Surface
 
@@ -64,7 +70,7 @@ It focuses on states that compile tests cannot prove.
 - Archive a chat or project and confirm the expanded toast keeps its `Undo` action on a separate row without text overlap.
 - Stack two or more toasts and confirm they remain readable within the window width in dark, light, and system themes.
 - Confirm clicking the toast body does not dismiss it; only the dismiss button, action, or timeout should close it.
-- Enable Reduce Motion and confirm toast content remains readable without entrance/lifecycle animation.
+- Enable Reduce Motion and confirm toast entrance/lifecycle animation remains active and its content stays readable.
 
 ## Agents Window
 
@@ -123,7 +129,7 @@ It focuses on states that compile tests cannot prove.
 - No activity row remains running after turn error/finish.
 - Streaming and tool status motion stays compositor-only and never restarts on every token update.
 - No reasoning panel jumps below the answer on completion.
-- Edit/remove slot text freezes cleanly when Reduce Motion is enabled.
+- Edit/remove slot text continues animating cleanly when Reduce Motion is enabled.
 - Structured UI artifacts render from the native catalog and never expose arbitrary HTML/JS.
 - Toasts use the top-center compact/expanded notification surface with semantic icons and explicit dismissal.
 - Agents Window controls stay local-only: no cloud sync/index/background execution dependency is required.

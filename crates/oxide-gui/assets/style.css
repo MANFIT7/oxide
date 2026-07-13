@@ -364,14 +364,14 @@ svg { width: 17px; height: 17px; flex-shrink: 0; }
 .composer-live-changes {
   width: 100%;
   max-width: 760px;
-  margin: 0 0 8px;
+  margin: 0 0 6px;
   border: 1px solid color-mix(in srgb, var(--text) 9%, transparent);
-  border-radius: 12px;
+  border-radius: 10px;
   background: color-mix(in srgb, var(--composer) 86%, transparent);
-  padding: 8px 10px;
+  padding: 6px 10px;
   box-shadow: 0 10px 28px -24px rgba(0,0,0,.55);
 }
-.live-changes-head { display: flex; align-items: center; gap: 10px; min-height: 28px; }
+.live-changes-head { display: flex; align-items: center; gap: 9px; min-height: 28px; }
 .live-changes-icon {
   display: inline-flex; align-items: center; justify-content: center;
   width: 26px; height: 26px; border-radius: 8px;
@@ -379,13 +379,14 @@ svg { width: 17px; height: 17px; flex-shrink: 0; }
   color: var(--syn-accent); flex-shrink: 0;
 }
 .live-changes-icon svg { width: 15px; height: 15px; }
-.live-changes-copy { min-width: 0; display: flex; flex-direction: column; gap: 1px; flex: 1 1 auto; }
-.live-changes-title { font-size: 12.5px; font-weight: 650; color: var(--text); }
-.live-changes-sub { font-size: 11.5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.live-changes-copy { min-width: 0; display: flex; align-items: baseline; gap: 6px; flex: 1 1 auto; overflow: hidden; }
+.live-changes-title { flex: 0 0 auto; font-size: 12.5px; font-weight: 650; color: var(--text); white-space: nowrap; }
+.live-changes-sub { min-width: 0; font-size: 11.5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.live-changes-sub::before { content: "· "; color: var(--faint); }
 /* tabular-nums: rolling digits keep a fixed advance width, so the counter
    doesn't jiggle horizontally while a digit slot-rolls to its new value. */
 .live-changes-counts { display: inline-flex; align-items: center; gap: 6px; flex-shrink: 0; font-size: 11.5px; font-variant-numeric: tabular-nums; }
-.live-change-state, .edits-rowcounts { font-variant-numeric: tabular-nums; }
+.edits-rowcounts { font-variant-numeric: tabular-nums; }
 .live-changes-review {
   width: 28px; height: 28px; display: inline-flex; align-items: center; justify-content: center;
   border: 1px solid color-mix(in srgb, var(--text) 10%, transparent);
@@ -393,20 +394,6 @@ svg { width: 17px; height: 17px; flex-shrink: 0; }
 }
 .live-changes-review:hover { color: var(--text); border-color: color-mix(in srgb, var(--syn-accent) 32%, transparent); }
 .live-changes-review svg { width: 14px; height: 14px; }
-.live-changes-files { display: grid; gap: 3px; margin-top: 6px; }
-.live-change-file { display: grid; grid-template-columns: 16px minmax(0, 1fr) auto; align-items: center; gap: 7px; min-height: 22px; font-size: 11.5px; color: var(--muted); }
-.live-change-path { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, Menlo, monospace; }
-.live-change-state { flex-shrink: 0; font-size: 11px; }
-.live-change-state.shimmer {
-  font-weight: 500;
-  background: linear-gradient(90deg, var(--muted) 30%, var(--text) 50%, var(--muted) 70%);
-  background-size: 200% 100%;
-  -webkit-background-clip: text; background-clip: text;
-  -webkit-text-fill-color: transparent;
-  /* 1.7s = same cadence as ox-shimmer, so pill + pending rows sweep in sync. */
-  animation: shimmer 1.7s linear infinite;
-}
-.live-change-state.shimmer .slot-char,
 .edits-row.pending .edits-rowcounts.shimmer .slot-char {
   background: inherit;
   background-size: inherit;
@@ -414,8 +401,6 @@ svg { width: 17px; height: 17px; flex-shrink: 0; }
   background-clip: text;
   -webkit-text-fill-color: transparent;
 }
-.live-change-ready { color: var(--ok); font-size: 11px; }
-.live-change-more { margin-left: 23px; color: var(--faint); font-size: 11.5px; }
 
 .row { display: flex; margin: 12px 0; }
 .row.user { justify-content: flex-end; }
@@ -1269,7 +1254,10 @@ svg { width: 17px; height: 17px; flex-shrink: 0; }
   font-size: 11px; font-weight: 500; color: var(--faint);
   font-variant-numeric: tabular-nums; opacity: .75;
 }
-@media (prefers-reduced-motion: reduce) {
+/* Oxide intentionally keeps interface motion enabled even when the host asks
+   for reduced motion. The contradictory query preserves the old fallbacks as
+   documentation while making them unreachable under every media state. */
+@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference) {
   .thinking-glow { animation: none; color: var(--muted); -webkit-text-fill-color: currentColor; }
 }
 
@@ -1625,7 +1613,7 @@ svg { width: 17px; height: 17px; flex-shrink: 0; }
   .board-actions { justify-content: flex-start; }
 }
 
-@media (prefers-reduced-motion: reduce) {
+@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference) {
   .board-card { animation: none; transition: none; }
   .board-card:hover { transform: none; }
   .board-btn { transition: none; }
@@ -1997,9 +1985,8 @@ details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
   color: transparent;
   animation: ox-shimmer 1.7s linear infinite;
 }
-@media (prefers-reduced-motion: reduce) {
-  .status-shimmer,
-  .live-change-state.shimmer { animation: none; color: var(--muted); -webkit-text-fill-color: currentColor; }
+@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference) {
+  .status-shimmer { animation: none; color: var(--muted); -webkit-text-fill-color: currentColor; }
 }
 
 
@@ -2179,7 +2166,7 @@ details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
   -webkit-mask-composite: xor; mask-composite: exclude;
   animation: ultrathink-rainbow 10s linear infinite;
 }
-@media (prefers-reduced-motion: reduce) { .composer.ultra::after { animation: none; } }
+@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference) { .composer.ultra::after { animation: none; } }
 
 /* ── Synara sidebar: dense rows, status spinner, hover actions ── */
 .thread { height: 28px; padding: 0 8px; gap: 8px; border-radius: 6px; display: flex; align-items: center; font-size: 13px; color: color-mix(in srgb, var(--text) 89%, transparent); }
@@ -2335,9 +2322,25 @@ details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
 .workflow-steps { display: grid; gap: 4px; margin-top: 7px; }
 .workflow-step { display: grid; grid-template-columns: 18px minmax(0, 1fr); gap: 8px; align-items: start; color: var(--muted); font-size: 12.5px; line-height: 1.35; }
 .workflow-num, .subagent-status { width: 18px; height: 18px; display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; border: 1px solid var(--border); border-radius: 6px; font-size: 10px; color: var(--muted); }
-/* Cap: several expanded running logs otherwise stack up inside this PINNED
-   card and squeeze the transcript / push the composer down mid-stream. */
-.subagents-card { display: grid; gap: 7px; max-height: 260px; overflow-y: auto; }
+/* Keep orchestration state near the composer without allowing it to consume the
+   transcript. Cards are one-line summaries until the user asks for details. */
+.run-disclosure { overflow: hidden; }
+.run-summary {
+  list-style: none; display: flex; align-items: center; gap: 8px;
+  min-height: 40px; padding: 8px 12px; margin: 0; cursor: pointer;
+  background: var(--surface); position: sticky; top: 0; z-index: 1;
+}
+.run-summary::-webkit-details-marker { display: none; }
+.run-label { flex: 0 0 auto; font-size: 12.5px; font-weight: 650; color: var(--text); }
+.run-preview { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 12px; font-weight: 450; }
+.run-caret { display: inline-flex; flex: 0 0 auto; color: var(--faint); transition: transform var(--dur-med) var(--ease-out); }
+.run-caret svg { width: 13px; height: 13px; }
+.run-disclosure[open] .run-caret { transform: rotate(180deg); }
+.run-disclosure[open] .run-summary { border-bottom: 1px solid var(--border); }
+.subagents-card { display: block; max-height: 40px; padding: 0; overflow: hidden; }
+.subagents-card[open] { max-height: min(280px, 36vh); overflow-y: auto; }
+.subagents-card > .subagent-row { margin: 0 12px; }
+.subagents-card > .subagent-row:last-child { padding-bottom: 10px; }
 .subagent-row { display: grid; grid-template-columns: 20px minmax(0, 1fr); gap: 9px; align-items: start; padding: 5px 0; }
 .subagent-row.done .subagent-status { color: #00c853; border-color: rgba(0,200,83,.55); background: rgba(0,200,83,.10); }
 .subagent-row.fail .subagent-status { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 60%, var(--border)); }
@@ -2354,9 +2357,12 @@ details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
 .subagent-copy { min-width: 0; }
 .subagent-title { color: var(--text); font-size: 12.5px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .subagent-summary { margin-top: 2px; color: var(--muted); font-size: 12px; line-height: 1.35; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
-.todo-card { width: 100%; max-width: 760px; margin: 0 auto 8px; background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 10px 14px; }
-.todo-head { display: flex; align-items: center; gap: 7px; font-size: 12.5px; font-weight: 600; color: var(--text); margin-bottom: 6px; }
+.todo-card { width: 100%; max-width: 760px; max-height: 40px; margin: 0 auto 8px; background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 0; overflow: hidden; }
+.todo-card[open] { max-height: min(260px, 34vh); overflow-y: auto; }
+.todo-head { font-size: 12.5px; font-weight: 600; color: var(--text); }
 .todo-head .todo-ic svg { width: 14px; height: 14px; color: var(--muted); }
+.todo-card > .todo-row { margin: 0 12px; }
+.todo-card > .todo-row:last-child { padding-bottom: 10px; }
 .todo-row { display: flex; align-items: center; gap: 9px; padding: 3px 0; font-size: 13px; }
 .todo-box { width: 16px; height: 16px; display: inline-flex; align-items: center; justify-content: center; border: 1px solid var(--border); border-radius: 5px; font-size: 11px; color: #00c853; flex-shrink: 0; }
 .todo-row.completed .todo-text { color: var(--muted); text-decoration: line-through; }
@@ -2380,7 +2386,7 @@ details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
 .msg-act.danger { color: #fff; background: var(--danger, #fa423e); border-color: var(--danger, #fa423e); width: auto; padding: 0 8px; font-size: 11px; }
 /* edits-card undone state */
 .edits-undone { margin-left: auto; font-size: 12px; color: var(--muted); }
-@media (prefers-reduced-motion: reduce) {
+@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference) {
   .model-menu, .effort-menu, .plus-menu, .sel-menu, .access-menu, .palette, .modal,
   .theme-menu, .mention-menu, .thread-menu, .newtab-menu,
   .question-card, .approval-card, .edits-card, .todo-card, .workflow-card, .subagents-card, .queue-bar, .status-pill,
@@ -2399,7 +2405,7 @@ details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
 /* side panels slide in */
 @keyframes panel-in { from { opacity: 0; transform: translateX(14px); } to { opacity: 1; transform: none; } }
 .files-panel, .preview-panel { animation: panel-in .18s ease-out; }
-@media (prefers-reduced-motion: reduce) {
+@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference) {
   .files-panel, .preview-panel, .col.streaming .row.agent:last-of-type .agent-text::after { animation: none; }
   .send, .composer:focus-within { transition: none; }
 }
@@ -2604,7 +2610,7 @@ svg { stroke-width: 1.6; }
 .todo-row.completed .todo-box { border-color: rgba(64,201,119,.6); background: rgba(64,201,119,.10); }
 /* status pill text changes crossfade slightly */
 .status-pill { transition: opacity .2s ease; }
-@media (prefers-reduced-motion: reduce) { .countup { transition: none; } .edits-row-d { animation: none; } }
+@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference) { .countup { transition: none; } .edits-row-d { animation: none; } }
 .activity-count { margin-left: 6px; font-size: 11px; opacity: .55; font-variant-numeric: tabular-nums; }
 .activity-editcounts { margin-left: 8px; display: inline-flex; align-items: center; gap: 6px; font-size: 11px; font-variant-numeric: tabular-nums; }
 
@@ -2679,7 +2685,7 @@ details::details-content { overflow: clip; }
 .app[data-theme="light"] .git-badge.d { color: var(--danger); }
 .app[data-theme="light"] .git-badge.m { color: #b3591f; }
 .app[data-theme="light"] .menu-badge.fast { color: var(--ok); }
-@media (prefers-reduced-motion: reduce) {
+@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference) {
   .modal-overlay, .palette-overlay, .pane-mode-menu, .agent-tab.active::after { animation: none; }
   details::details-content { transition: none; }
 }
@@ -2773,7 +2779,7 @@ details::details-content { overflow: clip; }
 /* composer grows smoothly with multi-line input (progressive enhancement) */
 .composer, #ce-input { interpolate-size: allow-keywords; transition: block-size .15s ease; }
 /* Rows animate only through the canonical motion layer at the end of the file. */
-@media (prefers-reduced-motion: reduce) {
+@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference) {
   .toast, .diff-card .dl, .row, .agent-tab, .col { animation: none; }
   .scroll.smooth { scroll-behavior: auto; }
   .agent-tab.closing { transition: none; }
@@ -2785,7 +2791,7 @@ details::details-content { overflow: clip; }
 .send { transition: opacity .12s ease, transform .16s cubic-bezier(.34,1.56,.64,1), border-radius .18s ease, background .12s ease; }
 .send.stop { border-radius: 9px; animation: stop-in .18s cubic-bezier(.22,1,.36,1); }
 @keyframes stop-in { from { transform: rotate(-90deg) scale(.7); } to { transform: none; } }
-@media (prefers-reduced-motion: reduce) { .send.stop { animation: none; } }
+@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference) { .send.stop { animation: none; } }
 
 /* follow-up prompt suggestions above the composer */
 .followups { position: relative; width: 100%; max-width: 760px; margin: 0 auto 6px; display: flex; flex-direction: column; animation: synara-msg-in .2s cubic-bezier(.22,1,.36,1); }
@@ -2832,7 +2838,7 @@ details::details-content { overflow: clip; }
 .app[data-theme="light"] .jump-bottom { box-shadow: 0 6px 18px rgba(20,20,20,.14); }
 .jump-bottom.show { pointer-events: auto; opacity: 1; transform: none; }
 .jump-bottom:hover { background: color-mix(in srgb, var(--text) 8%, var(--surface)); }
-@media (prefers-reduced-motion: reduce) { .jump-bottom { transition: none; } }
+@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference) { .jump-bottom { transition: none; } }
 
 /* steer-now button inside a queued chip */
 .queue-steer { background: none; border: none; color: var(--faint); cursor: pointer; font-size: 12px; padding: 0 2px; border-radius: 4px; }
@@ -3017,7 +3023,7 @@ details.bg-chip.bg-watch[open] { max-width: 100%; flex-basis: 100%; border-radiu
 .thought-body { margin-top: 6px; padding: 8px 12px; color: color-mix(in srgb, var(--text) 45%, transparent);
   font-size: 13px; line-height: 1.6; border-left: 2px solid color-mix(in srgb, var(--text) 20%, transparent);
   white-space: pre-wrap; max-height: 280px; overflow-y: auto; }
-@media (prefers-reduced-motion: reduce) {
+@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference) {
   .row.agent.agent-waiting {
     display: none;
     margin: 0;
@@ -3159,7 +3165,7 @@ details.bg-chip.bg-watch[open] { max-width: 100%; flex-basis: 100%; border-radiu
    reduce-motion (a frozen spinner reads as a hung task). */
 .bg-x { background: none; border: 0; color: var(--faint); cursor: pointer; font-size: 11px; padding: 0 2px; }
 .bg-x:hover { color: var(--text); }
-@media (prefers-reduced-motion: reduce) { .bg-dot { animation: none; } }
+@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference) { .bg-dot { animation: none; } }
 
 /* Long user prompts collapse (the sticky header stays small). Clamp the INNER
    text div with max-height + a fade mask — the mask is safe here (no
@@ -3175,7 +3181,7 @@ details.bg-chip.bg-watch[open] { max-width: 100%; flex-basis: 100%; border-radiu
   -webkit-mask-image: linear-gradient(to bottom, #000 52%, transparent 100%);
   mask-image: linear-gradient(to bottom, #000 52%, transparent 100%);
 }
-@media (prefers-reduced-motion: reduce) { .user-text { transition: none; } }
+@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference) { .user-text { transition: none; } }
 /* show more / less — centered under the faded cut. */
 .bubble-more {
   display: block; margin: 1px auto 0; padding: 2px 10px;
@@ -3217,7 +3223,7 @@ details.bg-chip.bg-watch[open] { max-width: 100%; flex-basis: 100%; border-radiu
   50% { box-shadow: 0 0 0 #fff; margin-top: -8px; transform: translate(6px, 6px); }
   100% { box-shadow: 12px 0 0 #fff; margin-top: 0; }
 }
-@media (prefers-reduced-motion: reduce) {
+@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference) {
   .side-loader, .side-loader::before, .side-loader::after { animation: none; }
 }
 
@@ -3250,7 +3256,7 @@ details.bg-chip.bg-watch[open] { max-width: 100%; flex-basis: 100%; border-radiu
   -webkit-text-fill-color: transparent;
   animation: shimmer 1.7s linear infinite;
 }
-@media (prefers-reduced-motion: reduce) { .edits-row.pending .edits-rowcounts.shimmer { animation: none; } }
+@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference) { .edits-row.pending .edits-rowcounts.shimmer { animation: none; } }
 
 /* Rust-native json-render-style artifacts. These are constrained UiSpec nodes
    rendered by Dioxus, not arbitrary HTML from the model. */
@@ -3273,7 +3279,7 @@ details.bg-chip.bg-watch[open] { max-width: 100%; flex-basis: 100%; border-radiu
 .ui-table-skel-head { display: flex; gap: 12px; font-size: 12px; color: var(--muted); font-weight: 600; }
 .ui-table-skel-rows { font-size: 12px; color: var(--faint); padding-top: 4px; }
 @keyframes ui-skel-pulse { 0%, 100% { opacity: .35; } 50% { opacity: .8; } }
-@media (prefers-reduced-motion: reduce) {
+@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference) {
   .ui-skel { animation: none; opacity: .5; }
 }
 .ui-spec-title {
@@ -3476,7 +3482,7 @@ details.bg-chip.bg-watch[open] { max-width: 100%; flex-basis: 100%; border-radiu
   -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 16px), rgba(0,0,0,.62));
   mask-image: linear-gradient(to bottom, #000 calc(100% - 16px), rgba(0,0,0,.62));
 }
-@media (prefers-reduced-motion: reduce) {
+@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference) {
   .agent-md.live { -webkit-mask-image: none; mask-image: none; }
 }
 
@@ -3484,7 +3490,7 @@ details.bg-chip.bg-watch[open] { max-width: 100%; flex-basis: 100%; border-radiu
 .diff-adds, .diff-dels, .status-elapsed, .usage-v, .edits-counts, .live-changes-counts,
 .bg-chip-text, .thread-time { font-variant-numeric: tabular-nums; }
 
-@media (prefers-reduced-motion: reduce) {
+@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference) {
   .row, .col > .row:last-child, .agent-md pre, .col.streaming .row.agent:last-of-type .agent-md,
   .question-card, .approval-card, .edits-card, .todo-card, .queue-bar, .ui-spec,
   .thinking-box, .attach-card, .elem-chip, .bg-bar, .composer-live-changes { animation: none; }
@@ -3594,7 +3600,7 @@ details.bg-chip.bg-watch[open] { max-width: 100%; flex-basis: 100%; border-radiu
   border-color: color-mix(in srgb, var(--syn-accent) 55%, transparent);
 }
 
-@media (prefers-reduced-motion: reduce) {
+@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference) {
   /* Reduce Motion keeps textual state visible, removes decorative loading
      sweep rows, and leaves only the generic background-process ring active. */
   .toast, .palette, .palette-list .palette-item, .env-panel, .env-body > *,
@@ -3691,7 +3697,7 @@ details.bg-chip.bg-watch[open] { max-width: 100%; flex-basis: 100%; border-radiu
 .activity-card.has-out[open] .activity-out { animation: oxide-reveal-down .2s var(--ease-out) both; }
 .act-group[open] > .row.activity { animation: oxide-reveal-down .18s var(--ease-out) both; }
 
-@media (prefers-reduced-motion: reduce) {
+@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference) {
   .activity-card.has-out[open] .activity-out,
   .act-group[open] > .row.activity { animation: none; }
 }
@@ -3706,7 +3712,7 @@ textarea:focus-visible, select:focus-visible, [tabindex]:focus-visible {
   outline-offset: 2px;
 }
 
-@media (prefers-reduced-motion: reduce) {
+@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference) {
   .activity-ic.ok, .activity-ic.fail { animation: none; }
   .pill:active, .row-act-btn:active, .copy-btn:active,
   .msg-copy:active, .followups-x:active, .queue-steer:active { transform: none; }
@@ -3741,7 +3747,7 @@ textarea:focus-visible, select:focus-visible, [tabindex]:focus-visible {
 }
 .native-term-reopen:hover { border-color: color-mix(in srgb, var(--syn-accent) 40%, var(--border)); }
 .native-term-reopen:active { transform: scale(.97); }
-@media (prefers-reduced-motion: reduce) { .native-term-reopen:active { transform: none; } }
+@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference) { .native-term-reopen:active { transform: none; } }
 .native-term-err { margin-top: 10px; font-size: 12px; line-height: 1.45; color: var(--danger, #c0392b); word-break: break-word; }
 
 /* ── Open-in-external-editor buttons (Files tab header + Editor head) ───── */
@@ -3786,7 +3792,7 @@ textarea:focus-visible, select:focus-visible, [tabindex]:focus-visible {
   animation: chunk-in .18s ease-out;
 }
 @keyframes chunk-in { from { opacity: 0; transform: translateY(2px); } to { opacity: 1; transform: none; } }
-@media (prefers-reduced-motion: reduce) {
+@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference) {
   .row.activity, .thinking-box, .queue-chip, .bg-chip, .agent-md:not(.live) > * { animation: none; }
 }
 
@@ -3845,7 +3851,7 @@ textarea:focus-visible, select:focus-visible, [tabindex]:focus-visible {
   -webkit-text-fill-color: transparent;
   animation: ox-shimmer 1.7s linear infinite;
 }
-@media (prefers-reduced-motion: reduce) {
+@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference) {
   .typing .typing-shimmer { animation: none; -webkit-text-fill-color: currentColor; color: var(--muted); }
 }
 
@@ -3858,7 +3864,7 @@ textarea:focus-visible, select:focus-visible, [tabindex]:focus-visible {
   -webkit-mask-image: linear-gradient(180deg, #000 calc(100% - 26px), rgba(0, 0, 0, 0.35) 100%);
   mask-image: linear-gradient(180deg, #000 calc(100% - 26px), rgba(0, 0, 0, 0.35) 100%);
 }
-@media (prefers-reduced-motion: reduce) {
+@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference) {
   .agent-md.live { -webkit-mask-image: none; mask-image: none; }
 }
 
@@ -3940,7 +3946,7 @@ details.activity-card.has-out .activity-sum { padding: 2px 4px; }
 /* Spinner alone while a tool runs — the tool icon next to it was redundant. */
 .activity-card.running .activity-tic { display: none; }
 @keyframes dotspin { from { transform: rotate(0); } to { transform: rotate(360deg); } }
-@media (prefers-reduced-motion: reduce) {
+@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference) {
   .activity-spin, .syn-spinner { animation: dotspin 2.4s steps(8) infinite; }
 }
 
@@ -4179,7 +4185,7 @@ details.activity-card.has-out .activity-sum { padding: 2px 4px; }
 .scroll, .hero { animation: chat-pane-enter 140ms ease-out; }
 /* shimmer "working": cadence skeleton Synara (2s linear, offset -1s) */
 .status-shimmer,
-.live-change-state.shimmer, .edits-row.pending .edits-rowcounts.shimmer {
+.edits-row.pending .edits-rowcounts.shimmer {
   animation-duration: 2s; animation-delay: -1s;
 }
 /* tool rows ala Synara: statis & tenang — muted, terang saat hover; tanpa shimmer per-row */
@@ -4192,7 +4198,7 @@ details.activity-card.has-out .activity-sum { padding: 2px 4px; }
 .edits-row-d[open] .diff-body, .review-diff-d[open] .diff-body,
 details.changes-file[open] .diff-body { animation: disclosure-in 220ms ease-out; }
 
-@media (prefers-reduced-motion: reduce) {
+@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference) {
   .col > .row.user:last-child, .scroll, .hero,
   .edits-row-d[open] .diff-body, .review-diff-d[open] .diff-body,
   details.changes-file[open] .diff-body { animation: none; }
@@ -4223,7 +4229,7 @@ details.changes-file[open] .diff-body { animation: disclosure-in 220ms ease-out;
 .tab-agent-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; display: inline-block; }
 .tab-agent-dot.attention { background: var(--warn, #d9a35c); animation: terminal-run-pulse 640ms ease-in-out infinite; }
 .tab-agent-dot.review { background: var(--ok-strong, #00c853); }
-@media (prefers-reduced-motion: reduce) { .tab-agent-dot.attention { animation: none; } }
+@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference) { .tab-agent-dot.attention { animation: none; } }
 
 /* toggle lipat anak sub-agent di baris induk (Synara childCount + chevron) */
 .sub-toggle {
@@ -4500,10 +4506,13 @@ details.changes-file[open] .diff-body { animation: disclosure-in 220ms ease-out;
   transition: opacity .15s ease, transform .24s var(--ease-spring);
 }
 .activity-status .activity-spin { animation: none; }
+.activity-status .activity-spin::after { animation: none; }
 .activity-card.running .activity-status .activity-spin {
   opacity: 1;
   transform: scale(1);
-  animation: dotspin .9s steps(8) infinite;
+}
+.activity-card.running .activity-status .activity-spin::after {
+  animation: oxide-unicode-frame .8s steps(10, end) infinite;
 }
 .activity-status .activity-ic { animation: none; }
 .activity-status .activity-ic svg { width: 11px; height: 11px; }
@@ -4534,7 +4543,7 @@ details.changes-file[open] .diff-body { animation: disclosure-in 220ms ease-out;
 .activity-card.has-out[open] .activity-caret { transform: rotate(180deg); color: var(--muted); }
 details.has-out .activity-out-n::after { content: none; }
 
-@media (prefers-reduced-motion: reduce) {
+@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference) {
   .row.agent.streaming-message::before {
     animation: none;
     opacity: .42;
@@ -4566,7 +4575,7 @@ details.has-out .activity-out-n::after { content: none; }
   border-color: color-mix(in srgb, var(--text) 16%, transparent);
 }
 
-@media (prefers-reduced-motion: reduce) {
+@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference) {
   .modal-overlay, .palette-overlay, .modal, .palette,
   .logo-btn, .board-card, .board-btn { animation: none; transition: none; }
   .logo-btn:active, .board-btn:active { transform: none; }
@@ -4582,7 +4591,7 @@ details.has-out .activity-out-n::after { content: none; }
   height: 1em;
   flex: 0 0 1ch;
   place-items: center;
-  overflow: visible;
+  overflow: hidden;
   color: var(--syn-accent);
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
   font-size: 12px;
@@ -4598,17 +4607,20 @@ details.has-out .activity-out-n::after { content: none; }
   will-change: auto;
 }
 .unicode-spinner::before { content: none !important; box-shadow: none !important; }
-.unicode-spinner-frame {
-  grid-area: 1 / 1;
+.unicode-spinner::after {
+  content: "⠋\A⠙\A⠹\A⠸\A⠼\A⠴\A⠦\A⠧\A⠇\A⠏";
+  position: absolute;
+  inset: 0 auto auto 0;
   display: block;
   width: 1ch;
-  opacity: 0;
+  white-space: pre;
   text-align: center;
-  animation: oxide-unicode-frame .8s steps(1, end) infinite;
+  line-height: 1em;
+  animation: oxide-unicode-frame .8s steps(10, end) infinite;
+  will-change: transform;
 }
 @keyframes oxide-unicode-frame {
-  0%, 9.999% { opacity: 1; }
-  10%, 100% { opacity: 0; }
+  to { transform: translateY(-10em); }
 }
 
 /* Waiting stays compact: the Braille cell carries motion while the label keeps
@@ -4643,7 +4655,3 @@ details.has-out .activity-out-n::after { content: none; }
   animation: none !important;
 }
 
-@media (prefers-reduced-motion: reduce) {
-  .unicode-spinner-frame { animation: none !important; opacity: 0; }
-  .unicode-spinner-frame:first-child { opacity: 1; }
-}

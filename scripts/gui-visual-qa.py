@@ -69,12 +69,7 @@ def nearby(source: str, first: str, second: str, window: int = 700) -> bool:
 
 
 def unicode_spinner_fixture(class_name: str) -> str:
-    frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
-    nodes = "".join(
-        f'<span class="unicode-spinner-frame" style="animation-delay: {index * 80}ms">{frame}</span>'
-        for index, frame in enumerate(frames)
-    )
-    return f'<span class="unicode-spinner {class_name}" aria-hidden="true">{nodes}</span>'
+    return f'<span class="unicode-spinner {class_name}" aria-hidden="true"></span>'
 
 
 def write_fixture(css: str) -> None:
@@ -161,6 +156,14 @@ Finished dev profile</pre>
           <span class="edits-rowcounts shimmer">editing...</span>
         </div>
       </div>
+      <details class="subagents-card run-disclosure">
+        <summary class="subagents-head run-summary"><span class="workflow-ic">✦</span><span class="run-label">Subagents 1/1</span><span class="run-preview">reviewer · GUI performance audit</span><span class="run-caret">⌄</span></summary>
+        <div class="subagent-row done"><span class="subagent-status">✓</span><div class="subagent-copy"><div class="subagent-title">reviewer · GUI performance audit</div><div class="subagent-summary">High-confidence findings stay available on demand.</div></div></div>
+      </details>
+      <details class="todo-card run-disclosure">
+        <summary class="todo-head run-summary"><span class="todo-ic">☷</span><span class="run-label">Tasks 2/5</span><span class="run-preview">Implement compact orchestration layout</span><span class="run-caret">⌄</span></summary>
+        <div class="todo-row in_progress"><span class="todo-box"></span><span class="todo-text">Implement compact orchestration layout</span></div>
+      </details>
       <div class="composer-live-changes">
         <div class="live-changes-head">
           <span class="live-changes-icon">~</span>
@@ -169,10 +172,6 @@ Finished dev profile</pre>
             <span class="live-changes-sub">Streaming edits into the review surface</span>
           </div>
           <span class="live-changes-counts"><span class="diff-adds">+18</span><span class="diff-dels">-4</span></span>
-        </div>
-        <div class="live-changes-files">
-          <div class="live-change-row"><span class="live-change-path">crates/oxide-gui/src/lib.rs</span><span class="live-change-state shimmer">editing...</span></div>
-          <div class="live-change-row"><span class="live-change-path">scripts/gui-visual-qa.py</span><span class="live-change-state"><span class="diff-adds">+44</span></span></div>
         </div>
       </div>
       <div class="agents-window">
@@ -306,16 +305,15 @@ def main() -> int:
         f"{rel(CSS)} defines glass-sweep typing skeleton",
     )
     require(
-        "unicode activity micro-motion",
+        "unicode activity micro-motion stays single-node",
         contains_all(
             gui,
             [
-                "UNICODE_SPINNER_FRAMES",
                 "fn UnicodeSpinner",
+                'rsx! { span { class: "unicode-spinner {class}", aria_hidden: "true" } }',
                 'UnicodeSpinner { class: "status-spinner" }',
                 'UnicodeSpinner { class: "typing-unicode" }',
                 'UnicodeSpinner { class: "activity-spin" }',
-                'style: format!("animation-delay: {}ms", index * 80)',
                 'role: "status"',
                 'aria_atomic: "true"',
             ],
@@ -323,40 +321,27 @@ def main() -> int:
         and contains_all(
             css,
             [
-                ".unicode-spinner-frame",
+                ".unicode-spinner::after",
                 "@keyframes oxide-unicode-frame",
+                "steps(10, end)",
+                "transform: translateY(-10em)",
+                "will-change: transform",
+                '.activity-status .activity-spin::after { animation: none; }',
+                '.activity-card.running .activity-status .activity-spin::after {',
             ],
         )
-        and "calc(var(--unicode-frame)" not in css,
-        f"{rel(GUI)} and {rel(CSS)} use one fixed-cell Braille lifecycle component for agent and tool status",
+        and "UNICODE_SPINNER_FRAMES" not in gui
+        and "unicode-spinner-frame" not in gui
+        and "unicode-spinner-frame" not in css,
+        f"{rel(GUI)} and {rel(CSS)} render each Braille spinner as one DOM node and only animate active lifecycle states",
     )
+    motion_override = "@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference)"
     require(
-        "reduced-motion collapses decorative waiting row",
-        contains_all(
-            css,
-            [
-                "@media (prefers-reduced-motion: reduce)",
-                ".row.agent.agent-waiting",
-                "display: none;",
-                ".status-pill",
-                "margin-top: 2px;",
-            ],
-        ),
-        f"{rel(CSS)} removes the empty pre-token skeleton and compacts the active status pill under Reduce Motion",
-    )
-    require(
-        "reduced-motion keeps status legible",
-        contains_all(
-            css,
-            [
-                ".status-shimmer, .typing,",
-                "animation: none !important;",
-                "animation: syn-spin 1.6s linear infinite !important;",
-                ".unicode-spinner-frame:first-child { opacity: 1; }",
-                "-webkit-text-fill-color: currentColor;",
-            ],
-        ),
-        f"{rel(CSS)} freezes Braille frame swapping while retaining a static glyph, text label, and generic process activity",
+        "host motion preference does not disable Oxide motion",
+        css.count("@media (prefers-reduced-motion: reduce)") == css.count(motion_override)
+        and css.count(motion_override) > 0
+        and "Oxide intentionally keeps interface motion enabled" in css,
+        f"{rel(CSS)} makes every legacy reduced-motion fallback unreachable so host settings cannot freeze the UI",
     )
     require(
         "streaming lifecycle motion stays outside live HTML",
@@ -379,6 +364,21 @@ def main() -> int:
             ],
         ),
         f"{rel(GUI)} and {rel(CSS)} keep chunk-stable streaming motion on the keyed row instead of reanimating markdown children",
+    )
+    require(
+        "detached pane streaming coalesces deltas",
+        contains_all(
+            gui,
+            [
+                "let mut reasoning_buf = String::new();",
+                "macro_rules! flush_pane_streams",
+                "if !agent_buf.is_empty() || !reasoning_buf.is_empty()",
+                "agent_buf.len() + reasoning_buf.len() > 800",
+                "std::time::Duration::from_millis(50)",
+            ],
+        )
+        and nearby(gui, "fn ChatPane(", "macro_rules! flush_pane_streams", 9000),
+        f"{rel(GUI)} batches pane answer/reasoning deltas at frame cadence and flushes before structural events",
     )
     require(
         "tool lifecycle uses stable status and disclosure slots",
@@ -408,39 +408,56 @@ def main() -> int:
         f"{rel(GUI)} and {rel(CSS)} cross-fade running/success/failure in a fixed slot and animate tool disclosure without layout measurement",
     )
     require(
-        "reduced-motion tames lifecycle polish",
+        "motion policy keeps lifecycle polish active",
         contains_all(
             css,
             [
-                ".row.agent.streaming-message::before {",
-                ".agent-md.live {",
-                ".row.activity { animation: none; }",
-                ".activity-card.running .activity-status::after { animation: none;",
-                ".unicode-spinner-frame { animation: none !important; opacity: 0; }",
-                ".unicode-spinner-frame:first-child { opacity: 1; }",
+                "@keyframes oxide-stream-first-token",
+                "@keyframes oxide-stream-rail",
+                "@keyframes oxide-tool-halo",
+                "@keyframes oxide-unicode-frame",
+                motion_override,
             ],
         ),
-        f"{rel(CSS)} freezes decorative stream/tool motion while preserving a static semantic Unicode status glyph",
+        f"{rel(CSS)} keeps stream, tool, and Unicode lifecycle motion active under every host motion preference",
     )
     require(
-        "reduced-motion freezes edit shimmer",
+        "pending edit shimmer remains active",
         contains_all(
             css,
             [
-                ".live-change-state.shimmer { animation: none;",
-                ".edits-row.pending .edits-rowcounts.shimmer { animation: none; }",
+                ".edits-row.pending .edits-rowcounts.shimmer {",
+                "animation: shimmer 1.7s linear infinite;",
                 ".slot-char",
+                motion_override,
             ],
         )
-        and contains_all(
+        and 'class: "edits-rowcounts shimmer slot-status"' in gui,
+        f"{rel(CSS)} and {rel(GUI)} keep the transcript edit state animated regardless of host motion preference",
+    )
+    require(
+        "composer orchestration surfaces stay compact",
+        contains_all(
             gui,
             [
-                'class: "edits-rowcounts shimmer slot-status"',
-                'class: "live-change-state shimmer slot-status"',
+                'details { class: "subagents-card run-disclosure"',
+                'details { class: "todo-card run-disclosure"',
+                'class: "run-preview"',
                 'class: "composer-live-changes"',
+                'select_env_tab(env_tab, show_env, env_tab_by_tab, tabs, active_tab, "changes", false)',
+            ],
+        )
+        and "live-changes-files" not in gui
+        and contains_all(
+            css,
+            [
+                ".run-disclosure { overflow: hidden; }",
+                ".subagents-card { display: block; max-height: 40px;",
+                ".todo-card { width: 100%; max-width: 760px; max-height: 40px;",
+                ".live-changes-copy { min-width: 0; display: flex; align-items: baseline;",
             ],
         ),
-        f"{rel(CSS)} and {rel(GUI)} cover live-edit and pending-edit shimmer states",
+        f"{rel(GUI)} and {rel(CSS)} collapse task/subagent detail and route file detail to the Diff environment tab",
     )
     require(
         "streamed tool arguments wrap within transcript",
@@ -744,10 +761,12 @@ def main() -> int:
                 "overflow-x: auto;",
                 ".board-col-empty",
                 "@media (max-width: 1180px)",
-                ".board-card { animation: none; transition: none; }",
+                ".board-card { position: relative;",
+                "animation: oxide-rise var(--dur-med) var(--ease-enter) both;",
+                "transition: border-color var(--dur-fast)",
             ],
         ),
-        "Board keeps four usable lanes through horizontal overflow, explicit empty states, counts, and reduced-motion-safe card transitions",
+        "Board keeps four usable lanes through horizontal overflow, explicit empty states, counts, and host-invariant card transitions",
     )
     require(
         "settings navigation scales to all destinations",

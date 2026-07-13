@@ -250,7 +250,9 @@ mod tests {
     '.activity-card.has-out[open] .activity-out',
     '.review-actions .diff-kept',
     '.edits-row.pending .edits-rowcounts.shimmer',
-    '.composer-live-changes .live-change-state.shimmer',
+    '.subagents-card.run-disclosure:not([open]) .run-preview',
+    '.todo-card.run-disclosure:not([open]) .run-preview',
+    '.composer-live-changes .live-changes-head',
     '.status-pill .status-shimmer'
   ];
   const missing = required.filter((selector) => !document.querySelector(selector));
@@ -258,8 +260,11 @@ mod tests {
   const answer = document.querySelector('.row.agent:not(.agent-waiting)')?.getBoundingClientRect();
   const stream = document.querySelector('.agent-md.live');
   const streamRow = document.querySelector('.streaming-message');
+  const subagentsCard = document.querySelector('.subagents-card.run-disclosure');
+  const todoCard = document.querySelector('.todo-card.run-disclosure');
+  const liveChangesCard = document.querySelector('.composer-live-changes');
   const runningSpinner = document.querySelector('.activity-card.running .activity-spin');
-  const runningSpinnerFrame = runningSpinner?.querySelector('.unicode-spinner-frame');
+  const settledSpinner = document.querySelector('.activity-card.done .activity-spin');
   const runningResult = document.querySelector('.activity-card.running .activity-ic.ok');
   const spinnerRect = runningSpinner?.getBoundingClientRect();
   const resultRect = runningResult?.getBoundingClientRect();
@@ -268,7 +273,12 @@ mod tests {
     thinkingAboveAnswer: Boolean(thinking && answer && thinking.bottom <= answer.top),
     streamAnimation: stream ? getComputedStyle(stream).animationName : '',
     streamRailAnimation: streamRow ? getComputedStyle(streamRow, '::before').animationName : '',
-    toolSpinnerAnimation: runningSpinnerFrame ? getComputedStyle(runningSpinnerFrame).animationName : '',
+    toolSpinnerAnimation: runningSpinner ? getComputedStyle(runningSpinner, '::after').animationName : '',
+    spinnerHasFrames: runningSpinner ? getComputedStyle(runningSpinner, '::after').content.includes('⠋') && getComputedStyle(runningSpinner, '::after').content.includes('⠏') : false,
+    spinnerChildCount: runningSpinner?.childElementCount ?? -1,
+    runningSpinnerAnimationCount: runningSpinner?.getAnimations({subtree: true}).filter(a => a.animationName === 'oxide-unicode-frame').length ?? -1,
+    settledSpinnerAnimationCount: settledSpinner?.getAnimations({subtree: true}).filter(a => a.animationName === 'oxide-unicode-frame').length ?? -1,
+    compactOrchestrationCards: [subagentsCard, todoCard, liveChangesCard].every(card => card && card.getBoundingClientRect().height <= 48),
     statusSlotAligned: Boolean(spinnerRect && resultRect && Math.abs((spinnerRect.x + spinnerRect.width / 2) - (resultRect.x + resultRect.width / 2)) < 0.5 && Math.abs((spinnerRect.y + spinnerRect.height / 2) - (resultRect.y + resultRect.height / 2)) < 0.5),
     viewport: [window.innerWidth, window.innerHeight],
     text: document.body.innerText
@@ -308,6 +318,31 @@ mod tests {
             "running tool should animate Braille frames inside its stable status slot: {report}"
         );
         assert_eq!(
+            report["spinnerHasFrames"].as_bool(),
+            Some(true),
+            "Braille spinner pseudo-element should contain the complete frame strip: {report}"
+        );
+        assert_eq!(
+            report["spinnerChildCount"].as_i64(),
+            Some(0),
+            "Braille spinner should not allocate per-frame DOM children: {report}"
+        );
+        assert_eq!(
+            report["runningSpinnerAnimationCount"].as_i64(),
+            Some(1),
+            "running Braille spinner should use exactly one animation timeline: {report}"
+        );
+        assert_eq!(
+            report["settledSpinnerAnimationCount"].as_i64(),
+            Some(0),
+            "settled Braille spinner must not retain hidden animation timelines: {report}"
+        );
+        assert_eq!(
+            report["compactOrchestrationCards"].as_bool(),
+            Some(true),
+            "Subagents, Tasks, and Changing files should stay one-line until expanded: {report}"
+        );
+        assert_eq!(
             report["statusSlotAligned"].as_bool(),
             Some(true),
             "tool spinner and result icon should occupy the same fixed slot: {report}"
@@ -315,7 +350,8 @@ mod tests {
         let text = report["text"].as_str().unwrap_or_default();
         assert!(
             text.contains("Reasoning")
-                && text.contains("Preparing browser_search")
+                && text.contains("Preparing")
+                && text.contains("ask_user")
                 && text.contains("Kept"),
             "fixture text did not render expected labels: {text}"
         );
@@ -372,21 +408,38 @@ JSON.stringify({
   streamAnimation: getComputedStyle(document.querySelector('.agent-md.live')).animationName,
   streamRailAnimation: getComputedStyle(document.querySelector('.streaming-message'), '::before').animationName,
   toolHaloAnimation: getComputedStyle(document.querySelector('.activity-card.running .activity-status'), '::after').animationName,
-  toolSpinnerAnimation: getComputedStyle(document.querySelector('.activity-card.running .unicode-spinner-frame')).animationName,
-  toolSpinnerStaticOpacity: getComputedStyle(document.querySelector('.activity-card.running .unicode-spinner-frame:first-child')).opacity
+  toolSpinnerAnimation: getComputedStyle(document.querySelector('.activity-card.running .activity-spin'), '::after').animationName,
+  statusShimmerAnimation: getComputedStyle(document.querySelector('.status-pill .status-shimmer')).animationName,
+  editShimmerAnimation: getComputedStyle(document.querySelector('.edits-row.pending .edits-rowcounts.shimmer')).animationName
 })
 "#,
             )
             .await
-            .expect("eval reduced-motion styles")
+            .expect("eval host motion-preference styles")
             .into_value::<String>()
-            .expect("reduced-motion report string");
+            .expect("host motion-preference report string");
         let reduced: serde_json::Value =
-            serde_json::from_str(&reduced).expect("reduced-motion report json");
-        assert_eq!(reduced["streamAnimation"].as_str(), Some("none"));
-        assert_eq!(reduced["streamRailAnimation"].as_str(), Some("none"));
-        assert_eq!(reduced["toolHaloAnimation"].as_str(), Some("none"));
-        assert_eq!(reduced["toolSpinnerAnimation"].as_str(), Some("none"));
-        assert_eq!(reduced["toolSpinnerStaticOpacity"].as_str(), Some("1"));
+            serde_json::from_str(&reduced).expect("host motion-preference report json");
+        assert_eq!(
+            reduced["streamAnimation"].as_str(),
+            Some("oxide-stream-first-token")
+        );
+        assert_eq!(
+            reduced["streamRailAnimation"].as_str(),
+            Some("oxide-stream-rail")
+        );
+        assert_eq!(
+            reduced["toolHaloAnimation"].as_str(),
+            Some("oxide-tool-halo")
+        );
+        assert_eq!(
+            reduced["toolSpinnerAnimation"].as_str(),
+            Some("oxide-unicode-frame")
+        );
+        assert_eq!(
+            reduced["statusShimmerAnimation"].as_str(),
+            Some("ox-shimmer")
+        );
+        assert_eq!(reduced["editShimmerAnimation"].as_str(), Some("shimmer"));
     }
 }
