@@ -1478,6 +1478,7 @@ enum EngineCmd {
         display: String,
     },
     Reconfigure(Config),
+    ReloadHarnesses,
     /// Activate tab `id`: swap the VIEW to its transcript/config. Engines are
     /// per-tab — the tab being left keeps its turn running in the background.
     SwitchTab {
@@ -5858,6 +5859,11 @@ fn app() -> Element {
                                 messages.write().push(ChatMsg::new(Author::User, display));
                                 messages.write().push(ChatMsg::new(Author::Note, format!("{} engine not running — check provider/settings, or switch model to restart it", '\u{26a0}')));
                                 scroll_chat_bottom();
+                            }
+                        }
+                        Some(EngineCmd::ReloadHarnesses) => {
+                            if let Some(handle) = handles.get(&view_tab) {
+                                let _ = handle.submit(Op::ReloadHarnesses).await;
                             }
                         }
                         Some(EngineCmd::Reconfigure(conf)) => {
@@ -12324,6 +12330,8 @@ fn SettingsModal(
     let base = cfg.read().clone();
     let mut provider = use_signal(|| base.provider.clone());
     let mut harness = use_signal(|| base.harness.clone());
+    let mut harness_refresh = use_signal(|| 0u64);
+    let _ = *harness_refresh.read();
     let harness_opts = list_harnesses(&base);
     let mut model = use_signal(|| base.model.clone());
     let mut effort = use_signal(|| base.reasoning_effort.clone());
@@ -12450,6 +12458,15 @@ fn SettingsModal(
                                 option { value: "{h}", selected: harness.read().as_str() == h.as_str(), "{h}" }
                             }
                         }
+                    }
+                    button {
+                        class: "ed-close",
+                        onclick: move |_| {
+                            engine.send(EngineCmd::ReloadHarnesses);
+                            let next = harness_refresh.peek().saturating_add(1);
+                            harness_refresh.set(next);
+                        },
+                        "Reload harnesses"
                     }
                     label { class: "field",
                         span { class: "field-label", "Provider" }
@@ -15256,6 +15273,11 @@ fn ActivityRow(
         "fail"
     };
     let cls = format!("activity-card {state} activity-{}", view.kind.class_name());
+    let cls = if view.verb == "Preparing" {
+        format!("{cls} activity-preparing")
+    } else {
+        cls
+    };
     let lines = if view.output.is_empty() {
         0
     } else {
@@ -16060,7 +16082,7 @@ fn UnicodeSpinner(class: &'static str) -> Element {
             for (index, frame) in UNICODE_SPINNER_FRAMES.iter().enumerate() {
                 span {
                     class: "unicode-spinner-frame",
-                    style: "--unicode-frame: {index}",
+                    style: format!("animation-delay: {}ms", index * 80),
                     "{frame}"
                 }
             }

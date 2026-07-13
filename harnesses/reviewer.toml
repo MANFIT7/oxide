@@ -15,6 +15,12 @@ numbered list with file:line references. Verify each finding before reporting it
 """
 max_steps = 32
 temperature = 0.0
+cli_system_append = "Act as a read-only code reviewer. Never edit files or run mutating commands. Report only verified findings with file references."
+
+[tool_policy]
+mode = "allowlist"
+allow = ["codebase_search", "session_search"]
+allow_mcp = false
 
 [[tools]]
 name = "read_file"

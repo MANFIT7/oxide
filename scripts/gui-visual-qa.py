@@ -71,7 +71,7 @@ def nearby(source: str, first: str, second: str, window: int = 700) -> bool:
 def unicode_spinner_fixture(class_name: str) -> str:
     frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
     nodes = "".join(
-        f'<span class="unicode-spinner-frame" style="--unicode-frame: {index}">{frame}</span>'
+        f'<span class="unicode-spinner-frame" style="animation-delay: {index * 80}ms">{frame}</span>'
         for index, frame in enumerate(frames)
     )
     return f'<span class="unicode-spinner {class_name}" aria-hidden="true">{nodes}</span>'
@@ -93,11 +93,11 @@ def write_fixture(css: str) -> None:
         <div class="thinking-body">Inspecting harness routes, streamed tool args, and session metadata.</div>
       </details>
       <div class="row activity">
-        <details class="activity-card running activity-search no-out">
+        <details class="activity-card running activity-search activity-preparing no-out">
           <summary class="activity-sum">
             <span class="activity-status" role="status" aria-atomic="true" aria-label="Running"><!-- UNICODE_ACTIVITY --><span class="activity-ic ok">✓</span><span class="activity-ic fail">×</span></span>
-            <span class="activity-verb">Preparing browser_search</span>
-            <span class="activity-text">{"query":"oxide gui visual qa"}</span>
+            <span class="activity-verb">Preparing</span>
+            <span class="activity-text">ask_user · {"question":"This intentionally long streamed JSON argument must wrap inside the transcript instead of forcing a horizontal scrollbar across the entire chat surface."}</span>
           </summary>
         </details>
       </div>
@@ -315,6 +315,7 @@ def main() -> int:
                 'UnicodeSpinner { class: "status-spinner" }',
                 'UnicodeSpinner { class: "typing-unicode" }',
                 'UnicodeSpinner { class: "activity-spin" }',
+                'style: format!("animation-delay: {}ms", index * 80)',
                 'role: "status"',
                 'aria_atomic: "true"',
             ],
@@ -324,9 +325,9 @@ def main() -> int:
             [
                 ".unicode-spinner-frame",
                 "@keyframes oxide-unicode-frame",
-                "calc(var(--unicode-frame) * 80ms)",
             ],
-        ),
+        )
+        and "calc(var(--unicode-frame)" not in css,
         f"{rel(GUI)} and {rel(CSS)} use one fixed-cell Braille lifecycle component for agent and tool status",
     )
     require(
@@ -440,6 +441,23 @@ def main() -> int:
             ],
         ),
         f"{rel(CSS)} and {rel(GUI)} cover live-edit and pending-edit shimmer states",
+    )
+    require(
+        "streamed tool arguments wrap within transcript",
+        contains_all(
+            gui,
+            ['activity-preparing', 'view.verb == "Preparing"'],
+        )
+        and contains_all(
+            css,
+            [
+                "overflow-x: hidden;",
+                ".activity-card.activity-preparing .activity-text",
+                "overflow-wrap: anywhere;",
+                "word-break: break-word;",
+            ],
+        ),
+        f"{rel(GUI)} and {rel(CSS)} keep long streamed JSON inside the transcript width",
     )
     require(
         "tool input delta protocol",

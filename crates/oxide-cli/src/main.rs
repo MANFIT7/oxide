@@ -847,7 +847,15 @@ fn list_harnesses(config: &Config) -> Result<()> {
         } else {
             ""
         };
-        println!("  {:<12} {}{}", id, h.display_name(), active);
+        println!(
+            "  {:<12} {:<18} tools={:<3} policy={:?} source={}{}",
+            id,
+            h.display_name(),
+            h.tools().len(),
+            h.tool_policy().mode,
+            h.source(),
+            active
+        );
     }
     Ok(())
 }

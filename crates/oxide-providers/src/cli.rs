@@ -169,6 +169,18 @@ fn last_user_prompt(req: &TurnRequest) -> String {
         .unwrap_or_default()
 }
 
+fn prepend_cli_system(prompt: String, req: &TurnRequest) -> String {
+    let Some(system) = req
+        .system_append
+        .as_deref()
+        .map(str::trim)
+        .filter(|system| !system.is_empty())
+    else {
+        return prompt;
+    };
+    format!("<oxide_harness>\n{system}\n</oxide_harness>\n\n{prompt}")
+}
+
 /// Split the latest user prompt into clean text + absolute image paths. Pasted
 /// images ride as `\u{2}wsimg:<relpath>` markers (relative to the workspace);
 /// the "(user attached … NOT visible)" note that API providers get is dropped
@@ -499,6 +511,7 @@ impl Provider for CodexCliProvider {
 
     async fn stream(&self, req: TurnRequest, sink: mpsc::Sender<StreamItem>) -> anyhow::Result<()> {
         let (mut prompt, images) = extract_cli_images(&req);
+        prompt = prepend_cli_system(prompt, &req);
         if prompt.trim().is_empty() && !images.is_empty() {
             prompt = "Inspect the attached image(s).".to_string();
         }
@@ -2074,6 +2087,26 @@ mod cli_driver_tests {
 
         assert_eq!(prompt, "Cek struktur tim di schema");
         assert_eq!(images.len(), 1);
+    }
+
+    #[test]
+    fn codex_prompt_prefix_carries_harness_policy() {
+        let req = TurnRequest {
+            model: String::new(),
+            reasoning_effort: String::new(),
+            temperature: 0.0,
+            messages: vec![Message::new(Role::User, "Fix the bug")],
+            tools: Vec::new(),
+            cwd: String::new(),
+            conversation_id: String::new(),
+            cli_resume: None,
+            system_append: Some("Review before editing.".to_string()),
+            claude_agents: None,
+        };
+
+        let prompt = prepend_cli_system(last_user_prompt(&req), &req);
+        assert!(prompt.starts_with("<oxide_harness>\nReview before editing."));
+        assert!(prompt.ends_with("Fix the bug"));
     }
 
     #[tokio::test]

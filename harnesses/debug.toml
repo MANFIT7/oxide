@@ -23,6 +23,11 @@ Capture the non-obvious gotcha you found with `save_skill` so the next run start
 """
 max_steps = 48
 temperature = 0.0
+cli_system_append = "Follow the Deep Debugging harness: reproduce first, diagnose the root cause, make the smallest fix, and prove it with the original reproduction and checks."
+
+[tool_policy]
+mode = "extend"
+allow_mcp = true
 
 [[tools]]
 name = "read_file"
@@ -33,6 +38,11 @@ mutating = false
 name = "search"
 description = "Search the workspace for a pattern."
 mutating = false
+
+[[tools]]
+name = "edit"
+description = "Surgically replace exact text in an existing file."
+mutating = true
 
 [[tools]]
 name = "write_file"

@@ -346,6 +346,7 @@ svg { width: 17px; height: 17px; flex-shrink: 0; }
   flex: 1;
   min-height: 0;
   overflow-y: auto;
+  overflow-x: hidden;
   overscroll-behavior: contain;
   overflow-anchor: none;
   scroll-padding-bottom: 28px;
@@ -1685,11 +1686,31 @@ svg { width: 17px; height: 17px; flex-shrink: 0; }
 .question-input { width: 100%; background: var(--composer); border: 1px solid var(--border); border-radius: 9px; color: var(--text); padding: 9px 12px; font-size: 13px; font-family: inherit; }
 
 /* ── Tool activity rows (terminal/edit/read/…) ───────── */
-.row.activity { margin: 5px 0; }
-.activity-card { display: inline-flex; align-items: center; gap: 9px; margin-left: 40px; max-width: min(720px, calc(100% - 56px)); background: var(--surface); border: 1px solid var(--border); border-radius: 9px; padding: 7px 13px; font-size: 12.5px; }
+.row.activity { margin: 5px 0; min-width: 0; width: 100%; }
+.activity-card { display: inline-flex; align-items: center; gap: 9px; margin-left: 40px; max-width: min(720px, calc(100% - 56px)); min-width: 0; background: var(--surface); border: 1px solid var(--border); border-radius: 9px; padding: 7px 13px; font-size: 12.5px; }
 .activity-card.running { border-color: rgba(224,145,58,.4); }
 .activity-card.fail { border-color: rgba(239,93,93,.4); }
 .activity-text { font-family: ui-monospace, Menlo, monospace; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; flex: 1 1 auto; }
+/* Streamed tool arguments can contain long JSON/string tokens. Preparing rows
+   use the transcript width and wrap anywhere instead of growing the scroll area. */
+.activity-card.activity-preparing {
+  display: block;
+  width: min(720px, calc(100% - 56px));
+  overflow: hidden;
+}
+.activity-card.activity-preparing .activity-sum {
+  min-width: 0;
+  width: 100%;
+  align-items: flex-start;
+}
+.activity-card.activity-preparing .activity-text {
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  line-height: 1.45;
+}
 .activity-card.running .activity-text { color: var(--text); }
 .activity-spin { width: 12px; height: 12px; border-radius: 50%; border: 2px solid #3a3a42; border-top-color: var(--accent); animation: spin .7s linear infinite; flex-shrink: 0; will-change: transform; }
 .activity-ic { font-size: 11px; font-weight: 700; flex-shrink: 0; }
@@ -4584,7 +4605,6 @@ details.has-out .activity-out-n::after { content: none; }
   opacity: 0;
   text-align: center;
   animation: oxide-unicode-frame .8s steps(1, end) infinite;
-  animation-delay: calc(var(--unicode-frame) * 80ms);
 }
 @keyframes oxide-unicode-frame {
   0%, 9.999% { opacity: 1; }

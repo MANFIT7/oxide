@@ -42,6 +42,8 @@ pub enum Op {
     },
     /// Switch the active harness (e.g. "default" -> "hermes").
     SetHarness { id: String },
+    /// Rescan external harness manifests without restarting the engine.
+    ReloadHarnesses,
     /// Approve or reject a pending tool call (see [`Event::ApprovalRequested`]).
     ApprovalResponse {
         request_id: u64,

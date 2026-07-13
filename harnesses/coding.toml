@@ -31,6 +31,11 @@ When you discover a non-obvious gotcha, command, or convention, record it with `
 """
 max_steps = 24
 temperature = 0.1
+cli_system_append = "Follow the Focused Coding harness: inspect first, make the smallest complete change, verify it, and do not claim unrun checks passed."
+
+[tool_policy]
+mode = "extend"
+allow_mcp = true
 
 [[tools]]
 name = "read_file"
@@ -41,6 +46,11 @@ mutating = false
 name = "search"
 description = "Search the workspace for a pattern."
 mutating = false
+
+[[tools]]
+name = "edit"
+description = "Surgically replace exact text in an existing file."
+mutating = true
 
 [[tools]]
 name = "write_file"

@@ -16,7 +16,7 @@
 
 use anyhow::{Context, Result};
 use oxide_protocol::ToolSpec;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// Tunables that shape a single turn's loop.
@@ -27,6 +27,53 @@ pub struct LoopPolicy {
     pub temperature: f32,
     /// Optional model override; falls back to config when `None`.
     pub model: Option<String>,
+}
+
+/// Whether a harness extends Oxide's global tool catalog or strictly allowlists it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolPolicyMode {
+    #[default]
+    Extend,
+    Allowlist,
+}
+
+/// Capability policy applied both to model-visible schemas and router dispatch.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct ToolPolicy {
+    pub mode: ToolPolicyMode,
+    pub allow: Vec<String>,
+    pub deny: Vec<String>,
+    pub allow_mcp: bool,
+}
+
+impl Default for ToolPolicy {
+    fn default() -> Self {
+        Self {
+            mode: ToolPolicyMode::Extend,
+            allow: Vec::new(),
+            deny: Vec::new(),
+            allow_mcp: true,
+        }
+    }
+}
+
+impl ToolPolicy {
+    pub fn allows(&self, name: &str, declared_by_harness: bool) -> bool {
+        if name.starts_with("mcp__") && !self.allow_mcp {
+            return false;
+        }
+        if self.deny.iter().any(|denied| denied == name) {
+            return false;
+        }
+        match self.mode {
+            ToolPolicyMode::Extend => true,
+            ToolPolicyMode::Allowlist => {
+                declared_by_harness || self.allow.iter().any(|allowed| allowed == name)
+            }
+        }
+    }
 }
 
 /// Lightweight workflow hint a harness can auto-select from user intent.
@@ -142,17 +189,12 @@ pub trait Harness: Send + Sync {
     fn display_name(&self) -> &str;
     /// System prompt prepended to every turn (stable-prefix for prompt caching).
     fn system_prompt(&self) -> String;
-    /// Extra system-prompt text to APPEND when driving an external agent CLI
-    /// (claude `--append-system-prompt`) — the CLI analog of a Managed-Agents
-    /// `agent_with_overrides` `system` field. Distinct from [`system_prompt`]:
-    /// that is the full prompt for API providers, but CLI agents (Claude Code)
-    /// carry their own tuned base prompt and gather the workspace themselves, so
-    /// injecting the full `system_prompt()` would bloat every turn (busting the
-    /// CLI's prompt cache) and fight its base behavior. Return only the
-    /// harness-specific persona/policy to layer on top. `None` (default) leaves
-    /// the CLI agent's own prompt untouched.
+    /// Extra system-prompt text for native CLI providers. Claude receives this
+    /// through `--append-system-prompt`; CLIs without a system-prompt flag get
+    /// it as a clearly delimited prefix on the first user prompt.
     fn cli_system_append(&self) -> Option<String> {
-        None
+        let prompt = self.system_prompt();
+        (!prompt.trim().is_empty()).then_some(prompt)
     }
     /// Custom subagents to hand an external agent CLI (claude `--agents <json>`)
     /// — a JSON object mapping agent name → definition (`description`, `prompt`,
@@ -163,6 +205,14 @@ pub trait Harness: Send + Sync {
     }
     /// Tools this harness exposes to the model.
     fn tools(&self) -> Vec<ToolSpec>;
+    /// Controls which harness/global/MCP tools remain visible and dispatchable.
+    fn tool_policy(&self) -> ToolPolicy {
+        ToolPolicy::default()
+    }
+    /// Human-readable origin used by diagnostics and UI status.
+    fn source(&self) -> String {
+        "builtin".to_string()
+    }
     /// Per-turn loop tunables.
     fn loop_policy(&self) -> LoopPolicy {
         LoopPolicy::default()
@@ -196,8 +246,16 @@ pub struct ManifestHarness {
     pub system_prompt: String,
     #[serde(default)]
     pub system_prompt_file: Option<String>,
+    /// Optional concise native-CLI persona. Defaults to the resolved system prompt.
+    #[serde(default)]
+    pub cli_system_append: Option<String>,
+    /// Optional Claude Code subagent roster passed through `--agents`.
+    #[serde(default)]
+    pub claude_agents: Option<serde_json::Value>,
     #[serde(default)]
     pub tools: Vec<ManifestTool>,
+    #[serde(default)]
+    pub tool_policy: ToolPolicy,
     /// Preferred future shape for local-first skill manifests.
     #[serde(default)]
     pub skill_bundle: Option<SkillBundle>,
@@ -213,6 +271,8 @@ pub struct ManifestHarness {
     /// Resolved at load time from `system_prompt_file`.
     #[serde(skip)]
     resolved_prompt: Option<String>,
+    #[serde(skip)]
+    source_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -247,8 +307,56 @@ impl ManifestHarness {
         if m.id.trim().is_empty() {
             anyhow::bail!("harness manifest {} has empty id", path.display());
         }
-        if m.name.is_empty() {
+        if m.name.trim().is_empty() {
             m.name = m.id.clone();
+        }
+        if let Some(steps) = m.max_steps {
+            if !(1..=60).contains(&steps) {
+                anyhow::bail!(
+                    "harness manifest {} max_steps must be between 1 and 60",
+                    path.display()
+                );
+            }
+        }
+        if let Some(temperature) = m.temperature {
+            if !temperature.is_finite() || !(0.0..=2.0).contains(&temperature) {
+                anyhow::bail!(
+                    "harness manifest {} temperature must be between 0 and 2",
+                    path.display()
+                );
+            }
+        }
+        if m.claude_agents
+            .as_ref()
+            .is_some_and(|agents| !agents.is_object())
+        {
+            anyhow::bail!(
+                "harness manifest {} claude_agents must be a JSON object",
+                path.display()
+            );
+        }
+        let mut tool_names = BTreeSet::new();
+        for tool in &m.tools {
+            let name = tool.name.trim();
+            if name.is_empty() {
+                anyhow::bail!("harness manifest {} has an empty tool name", path.display());
+            }
+            if !tool_names.insert(name) {
+                anyhow::bail!(
+                    "harness manifest {} declares duplicate tool '{name}'",
+                    path.display()
+                );
+            }
+            if tool
+                .parameters
+                .as_ref()
+                .is_some_and(|parameters| !parameters.is_object())
+            {
+                anyhow::bail!(
+                    "harness manifest {} tool '{name}' parameters must be a JSON object",
+                    path.display()
+                );
+            }
         }
         if let Some(rel) = &m.system_prompt_file {
             let base = path.parent().unwrap_or_else(|| Path::new("."));
@@ -256,6 +364,13 @@ impl ManifestHarness {
             m.resolved_prompt = Some(
                 std::fs::read_to_string(&p)
                     .with_context(|| format!("reading system_prompt_file {}", p.display()))?,
+            );
+        }
+        m.source_path = Some(path.to_path_buf());
+        if m.system_prompt().trim().is_empty() {
+            anyhow::bail!(
+                "harness manifest {} must define system_prompt or system_prompt_file",
+                path.display()
             );
         }
         Ok(m)
@@ -322,17 +437,43 @@ impl Harness for ManifestHarness {
             .clone()
             .unwrap_or_else(|| self.system_prompt.clone())
     }
+    fn cli_system_append(&self) -> Option<String> {
+        self.cli_system_append
+            .clone()
+            .or_else(|| Some(self.system_prompt()))
+    }
+    fn claude_agents(&self) -> Option<serde_json::Value> {
+        self.claude_agents.clone()
+    }
     fn tools(&self) -> Vec<ToolSpec> {
+        let canonical = builtin::core_tools();
         self.tools
             .iter()
-            .map(|t| {
-                let mut spec = ToolSpec::new(&t.name, &t.description).mutating(t.mutating);
-                if let Some(p) = &t.parameters {
-                    spec = spec.params(p.clone());
+            .map(|tool| {
+                let mut spec = canonical
+                    .iter()
+                    .find(|candidate| candidate.name == tool.name)
+                    .cloned()
+                    .unwrap_or_else(|| ToolSpec::new(&tool.name, &tool.description));
+                if !tool.description.trim().is_empty() {
+                    spec.description = tool.description.clone();
+                }
+                spec.mutating |= tool.mutating;
+                if let Some(parameters) = &tool.parameters {
+                    spec.parameters = parameters.clone();
                 }
                 spec
             })
             .collect()
+    }
+    fn tool_policy(&self) -> ToolPolicy {
+        self.tool_policy.clone()
+    }
+    fn source(&self) -> String {
+        self.source_path
+            .as_deref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "manifest".to_string())
     }
     fn loop_policy(&self) -> LoopPolicy {
         let d = LoopPolicy::default();
@@ -386,20 +527,30 @@ impl Registry {
             return Ok(0);
         }
         let mut n = 0;
-        for entry in std::fs::read_dir(dir)
+        let mut paths = std::fs::read_dir(dir)
             .with_context(|| format!("scanning harness dir {}", dir.display()))?
-        {
-            let path = entry?.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("toml") {
-                continue;
-            }
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("toml"))
+            .collect::<Vec<_>>();
+        paths.sort();
+        for path in paths {
             match ManifestHarness::from_file(&path) {
-                Ok(m) => {
-                    tracing::info!(id = %m.id, "loaded harness manifest");
-                    self.insert(Box::new(m));
+                Ok(manifest) => {
+                    if self.harnesses.contains_key(&manifest.id) {
+                        tracing::warn!(
+                            id = %manifest.id,
+                            path = %path.display(),
+                            "skipping duplicate harness id"
+                        );
+                        continue;
+                    }
+                    tracing::info!(id = %manifest.id, path = %path.display(), "loaded harness manifest");
+                    self.insert(Box::new(manifest));
                     n += 1;
                 }
-                Err(e) => tracing::warn!(error = %e, "skipping bad harness manifest"),
+                Err(error) => {
+                    tracing::warn!(path = %path.display(), error = %error, "skipping bad harness manifest")
+                }
             }
         }
         Ok(n)
@@ -425,7 +576,7 @@ mod builtin {
     use super::{Harness, LoopPolicy, SkillBundle, SkillRoute};
     use oxide_protocol::ToolSpec;
 
-    fn core_tools() -> Vec<ToolSpec> {
+    pub(super) fn core_tools() -> Vec<ToolSpec> {
         vec![
             ToolSpec::new("read_file", "Read a whole file from the workspace (large files are truncated — use `search`/`codebase_search` to locate the region instead of slicing). Read with a clear purpose that informs your next step; do NOT re-read a file you already read this turn — its content is in context. Call in parallel for multiple files.").params(
                 serde_json::json!({
@@ -749,6 +900,7 @@ mod builtin {
 mod tests {
     use super::{
         manifest_dirs, Harness, ManifestHarness, Registry, SkillBundle, SkillBundleSource,
+        ToolPolicyMode,
     };
     use std::path::{Path, PathBuf};
 
@@ -816,6 +968,90 @@ mod tests {
             .iter()
             .any(|route| route.id == "design-workbench"));
         assert!(design.system_prompt().contains("Design Workbench"));
+    }
+
+    #[test]
+    fn manifest_tool_policy_is_strict_and_reuses_canonical_schema() {
+        let manifest: ManifestHarness = toml::from_str(
+            r#"
+id = "reviewer"
+system_prompt = "Review only."
+
+[tool_policy]
+mode = "allowlist"
+allow = ["codebase_search"]
+allow_mcp = false
+
+[[tools]]
+name = "read_file"
+"#,
+        )
+        .unwrap();
+
+        let policy = manifest.tool_policy();
+        assert_eq!(policy.mode, ToolPolicyMode::Allowlist);
+        assert!(policy.allows("read_file", true));
+        assert!(policy.allows("codebase_search", false));
+        assert!(!policy.allows("edit", false));
+        assert!(!policy.allows("mcp__github__issue", false));
+
+        let read = manifest
+            .tools()
+            .into_iter()
+            .find(|tool| tool.name == "read_file")
+            .unwrap();
+        assert_eq!(read.parameters["required"][0], "path");
+    }
+
+    #[test]
+    fn manifest_file_validation_rejects_invalid_limits_and_duplicate_tools() {
+        let root = std::env::temp_dir().join(format!(
+            "oxide-harness-validation-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("bad.toml");
+        std::fs::write(
+            &path,
+            r#"
+id = "bad"
+system_prompt = "Bad harness."
+max_steps = 0
+
+[[tools]]
+name = "read_file"
+
+[[tools]]
+name = "read_file"
+"#,
+        )
+        .unwrap();
+
+        let error = ManifestHarness::from_file(&path).unwrap_err().to_string();
+        assert!(error.contains("max_steps"));
+
+        std::fs::write(
+            &path,
+            r#"
+id = "bad"
+system_prompt = "Bad harness."
+max_steps = 24
+
+[[tools]]
+name = "read_file"
+
+[[tools]]
+name = "read_file"
+"#,
+        )
+        .unwrap();
+        let error = ManifestHarness::from_file(&path).unwrap_err().to_string();
+        assert!(error.contains("duplicate tool"));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

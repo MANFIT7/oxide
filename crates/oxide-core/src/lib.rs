@@ -1190,7 +1190,7 @@ fn resolve_external_mcp_reference(
 }
 
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
-use oxide_harness::{Harness, Registry, SkillRoute};
+use oxide_harness::{Harness, Registry, SkillRoute, ToolPolicyMode};
 use oxide_mcp::{is_mcp_tool, server_of, HttpOptions, McpClient, StdioSpawnOptions};
 use oxide_protocol::{
     ApprovalDecision, Event, Op, SubagentControlAction, ToolSpec, TurnId, UiSpec,
@@ -1506,6 +1506,8 @@ pub fn spawn(config: Config) -> anyhow::Result<(EngineHandle, mpsc::Receiver<Eve
         turn_reads: std::collections::HashSet::new(),
         last_tool_sig: String::new(),
         last_tool_reps: 0,
+        turn_tool_signatures: std::collections::HashSet::new(),
+        turn_todos: Vec::new(),
         user_interrupted: false,
         event_tx,
         bus: bus.clone(),
@@ -1541,6 +1543,47 @@ fn role_from_str(s: &str) -> Role {
 
 fn model_history_role(role: &str) -> bool {
     matches!(role, "system" | "user" | "assistant" | "tool")
+}
+
+/// Background jobs recorded in a session's rows, `(id, command, path)` —
+/// last occurrence per id, kept only while the output file's mtime is within
+/// `max_age`. These jobs carry no exit status (the process belongs to the CLI
+/// driver), so a stale file is the only "it's over" signal.
+/// ponytail: the mtime bound is the resurrection ceiling — a dismissed chip
+/// comes back on reopen until the file goes stale; persist dismissals if that
+/// ever annoys.
+fn replayable_bg_jobs(
+    rows: Vec<(String, String)>,
+    max_age: std::time::Duration,
+) -> Vec<(String, String, String)> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for (role, content) in rows.into_iter().rev() {
+        if role != "bg_job" {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) else {
+            continue;
+        };
+        let (Some(id), Some(command), Some(path)) =
+            (v["id"].as_str(), v["command"].as_str(), v["path"].as_str())
+        else {
+            continue;
+        };
+        if !seen.insert(id.to_string()) {
+            continue;
+        }
+        let fresh = std::fs::metadata(path)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.elapsed().ok())
+            .map(|age| age < max_age)
+            .unwrap_or(false);
+        if fresh {
+            out.push((id.to_string(), command.to_string(), path.to_string()));
+        }
+    }
+    out
 }
 
 fn compact_chars(text: &str, limit: usize) -> String {
@@ -1732,6 +1775,72 @@ fn review_line_has_blocking_marker(line: &str) -> bool {
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolBudgetDecision {
+    Continue,
+    Extended { new_limit: usize },
+    Stop,
+}
+
+#[derive(Debug, Clone)]
+struct AdaptiveToolBudget {
+    current_limit: usize,
+    emergency_limit: usize,
+    progress_checkpoint: usize,
+}
+
+impl AdaptiveToolBudget {
+    fn new(configured: usize) -> Self {
+        let current_limit = configured.clamp(1, 60);
+        let emergency_limit = current_limit.saturating_mul(3).min(96);
+        Self {
+            current_limit,
+            emergency_limit,
+            progress_checkpoint: 0,
+        }
+    }
+
+    fn after_tool_round(
+        &mut self,
+        rounds: usize,
+        progress_score: usize,
+        pending_todos: bool,
+        edited_unverified: bool,
+    ) -> ToolBudgetDecision {
+        if rounds < self.current_limit {
+            return ToolBudgetDecision::Continue;
+        }
+        if self.current_limit >= self.emergency_limit || progress_score <= self.progress_checkpoint
+        {
+            return ToolBudgetDecision::Stop;
+        }
+
+        let bonus = 8 + usize::from(pending_todos) * 4 + usize::from(edited_unverified) * 4;
+        self.current_limit = self
+            .current_limit
+            .saturating_add(bonus)
+            .min(self.emergency_limit);
+        self.progress_checkpoint = progress_score;
+        ToolBudgetDecision::Extended {
+            new_limit: self.current_limit,
+        }
+    }
+}
+
+fn tool_progress_score(
+    unique_tools: usize,
+    unique_reads: usize,
+    edited_paths: usize,
+    completed_todos: usize,
+    verified: bool,
+) -> usize {
+    unique_tools
+        .saturating_add(unique_reads.saturating_mul(2))
+        .saturating_add(edited_paths.saturating_mul(4))
+        .saturating_add(completed_todos.saturating_mul(3))
+        .saturating_add(usize::from(verified).saturating_mul(6))
+}
+
 fn review_passes_gate(review: &str) -> bool {
     let mut lines = review.trim_start().lines();
     let Some(first_line) = lines.next() else {
@@ -1855,6 +1964,9 @@ struct Engine {
     /// Doom-loop guard: last tool call signature + consecutive repeat count.
     last_tool_sig: String,
     last_tool_reps: u8,
+    /// Distinct tool calls and latest checklist, used by the adaptive turn budget.
+    turn_tool_signatures: std::collections::HashSet<String>,
+    turn_todos: Vec<(String, String)>,
     /// Set when the user interrupts a turn. The next turn prepends a notice so
     /// the model (esp. resumed CLI drivers, which carry their own todo/plan
     /// state) abandons the aborted work instead of finishing it over the new
@@ -2261,7 +2373,13 @@ impl Engine {
     /// model sees and what the [`ToolRouter`] gates — MCP tools flow through the
     /// same approval/sandbox chokepoint as built-ins.
     fn all_tools(&self) -> Vec<ToolSpec> {
-        let mut tools = self.active_harness().tools();
+        let harness = self.active_harness();
+        let policy = harness.tool_policy();
+        let mut tools = harness.tools();
+        let declared = tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect::<std::collections::BTreeSet<_>>();
         tools.extend(self.mcp_tools.iter().cloned());
         // Hermes-style persistent memory + self-improvement tools.
         tools.push(
@@ -2376,6 +2494,9 @@ impl Engine {
             .params(design_review_tool_params()));
         tools.push(ToolSpec::new("design_propose_patch", "Convert a selected Design Workbench element and edits into a typed patch proposal. This does not edit files; use it before source-code changes.")
             .params(design_patch_tool_params()));
+        tools.retain(|tool| policy.allows(&tool.name, declared.contains(&tool.name)));
+        let mut seen = std::collections::BTreeSet::new();
+        tools.retain(|tool| seen.insert(tool.name.clone()));
         tools
     }
 
@@ -3157,6 +3278,21 @@ Rules:
                 text: format!("session {}{}", store.id, resumed),
             })
             .await;
+            // Background jobs a previous run of this session left behind: their
+            // processes outlive the app, so re-surface any whose output file is
+            // still fresh — the frontend re-attaches its tailer off this event.
+            for (command_id, command, path) in replayable_bg_jobs(
+                db::load(&store.id),
+                std::time::Duration::from_secs(6 * 3600),
+            ) {
+                self.emit(Event::BackgroundJob {
+                    turn: TurnId(0),
+                    command_id,
+                    command,
+                    path,
+                })
+                .await;
+            }
         }
         self.connect_mcp_servers().await;
 
@@ -3281,6 +3417,7 @@ Rules:
                         }
                     }
                     Op::SetHarness { id } => self.set_harness(id).await,
+                    Op::ReloadHarnesses => self.reload_harnesses().await,
                     Op::Interrupt => {
                         // No turn in flight here; nothing to interrupt.
                         self.emit(Event::Info {
@@ -3347,6 +3484,31 @@ Rules:
             }
         }
         self.emit(Event::Shutdown).await;
+    }
+
+    async fn reload_harnesses(&mut self) {
+        match registry_from_config(&self.config) {
+            Ok(registry) => {
+                let count = registry.ids().len();
+                self.registry = registry;
+                let harness = self.active_harness();
+                self.emit(Event::Info {
+                    text: format!(
+                        "Harness registry reloaded · {count} available · active: {} ({}) · source: {}",
+                        harness.display_name(),
+                        harness.id(),
+                        harness.source()
+                    ),
+                })
+                .await;
+            }
+            Err(error) => {
+                self.emit(Event::Error {
+                    message: format!("failed to reload harnesses: {error:#}"),
+                })
+                .await;
+            }
+        }
     }
 
     async fn set_harness(&mut self, id: String) {
@@ -3667,6 +3829,8 @@ Rules:
         let saved_turn_edited = self.turn_edited;
         let saved_last_tool_sig = std::mem::take(&mut self.last_tool_sig);
         let saved_last_tool_reps = self.last_tool_reps;
+        let saved_tool_signatures = std::mem::take(&mut self.turn_tool_signatures);
+        let saved_todos = std::mem::take(&mut self.turn_todos);
 
         self.turn_edited = false;
         self.last_tool_reps = 0;
@@ -3703,10 +3867,11 @@ Rules:
             cfg.provider = profile.provider.clone();
             cfg.effective_model()
         });
-        let max_steps = profile
+        let configured_steps = profile
             .max_steps
             .min(policy.max_steps as usize)
             .clamp(1, 24);
+        let mut tool_budget = AdaptiveToolBudget::new(configured_steps);
         let tools = self.tools_for_worker_profile(&profile);
         let cli_driver = matches!(
             profile.provider.as_str(),
@@ -3726,7 +3891,7 @@ Rules:
         let mut interrupted = false;
         let mut step = 0usize;
         let mut overflow_retries = 0u8;
-        let mut wrapped_up = false;
+        let mut budget_stop_reminded = false;
 
         loop {
             context::sanitize_tool_pairs(&mut self.session);
@@ -3818,6 +3983,14 @@ Rules:
                                     }).await;
                                 }
                                 Some(StreamItem::BackgroundJob { id, command, path }) => {
+                                    // Persisted so reopening this session re-surfaces the
+                                    // job — its process outlives this app run.
+                                    if let Some(store) = &self.session_store {
+                                        let _ = store.append(
+                                            "bg_job",
+                                            &serde_json::json!({"id": &id, "command": &command, "path": &path}).to_string(),
+                                        );
+                                    }
                                     self.emit(Event::BackgroundJob { turn, command_id: id, command, path }).await;
                                 }
                                 Some(StreamItem::CommandOutput { id, stream, chunk }) => {
@@ -3915,19 +4088,56 @@ Rules:
                 self.session.push(msg);
             }
 
-            step += 1;
+            if did_tool {
+                step += 1;
+            }
             if interrupted {
                 break;
             }
-            if step >= max_steps {
-                if !wrapped_up {
-                    wrapped_up = true;
-                    self.session.push(Message::new(Role::User,
-                        "<system-reminder>\nMaximum worker tool steps reached. Do NOT call any more tools. \
-Reply with text only: summarize what you changed, what you verified, and what remains.\n</system-reminder>"));
-                    continue;
+            if did_tool {
+                let completed_todos = self
+                    .turn_todos
+                    .iter()
+                    .filter(|(_, status)| status == "completed")
+                    .count();
+                let pending_todos = self
+                    .turn_todos
+                    .iter()
+                    .any(|(_, status)| status != "completed");
+                let progress = tool_progress_score(
+                    self.turn_tool_signatures.len(),
+                    self.turn_reads.len(),
+                    self.turn_edit_paths.len(),
+                    completed_todos,
+                    self.turn_verify_passed,
+                );
+                match tool_budget.after_tool_round(
+                    step,
+                    progress,
+                    pending_todos,
+                    self.turn_edited && !self.turn_verify_passed,
+                ) {
+                    ToolBudgetDecision::Continue => {}
+                    ToolBudgetDecision::Extended { new_limit } => {
+                        budget_stop_reminded = false;
+                        self.session.push(Message::new(
+                            Role::User,
+                            format!(
+                                "<system-reminder>\nTool budget extended adaptively to {new_limit} rounds because measurable progress is continuing. Finish only the remaining assignment and verification; avoid repeated exploration.\n</system-reminder>"
+                            ),
+                        ));
+                        continue;
+                    }
+                    ToolBudgetDecision::Stop if !budget_stop_reminded => {
+                        budget_stop_reminded = true;
+                        self.session.push(Message::new(
+                            Role::User,
+                            "<system-reminder>\nNo new measurable progress justified another tool-budget extension. Do not call more tools. Summarize completed work, verification, and remaining gaps.\n</system-reminder>",
+                        ));
+                        continue;
+                    }
+                    ToolBudgetDecision::Stop => break,
                 }
-                break;
             }
             if cli_driver && !steered {
                 break;
@@ -3998,6 +4208,8 @@ Reply with text only: summarize what you changed, what you verified, and what re
         self.turn_edited = saved_turn_edited || worker_edited;
         self.last_tool_sig = saved_last_tool_sig;
         self.last_tool_reps = saved_last_tool_reps;
+        self.turn_tool_signatures = saved_tool_signatures;
+        self.turn_todos = saved_todos;
 
         if interrupted {
             self.emit(Event::Info {
@@ -4285,6 +4497,8 @@ Produce a compact, self-contained answer (read files only when needed; do NOT ed
             turn_reads: HashSet::new(),
             last_tool_sig: String::new(),
             last_tool_reps: 0,
+            turn_tool_signatures: HashSet::new(),
+            turn_todos: Vec::new(),
             user_interrupted: self.user_interrupted,
             event_tx: self.event_tx.clone(),
             // Subagent shares the parent's bus so its events land in the same
@@ -4540,18 +4754,66 @@ Treat the following as the only current, top-priority instruction:]\n\n{user_tex
             }
         };
         let mem_block = memory::Memory::new(&self.workspace).load_block();
-        let harness = self.active_harness();
-        let policy = harness.loop_policy();
-        let mut sys = harness.system_prompt();
-        // Harness persona/policy to append to a CLI agent's own prompt (claude
-        // `--append-system-prompt`). Captured once here — owned, so it doesn't
-        // extend the `harness` borrow into the turn loop. None unless the harness
-        // opts in; deliberately NOT `sys` (that carries the workspace tree etc.).
-        let cli_system_append = harness.cli_system_append();
-        let cli_claude_agents = harness.claude_agents();
-        if let Some(route) = selected_skill_route(harness, &user_text) {
-            sys.push_str(&render_skill_route(&route));
+        let (
+            policy,
+            tool_policy,
+            mut sys,
+            mut cli_system_append,
+            cli_claude_agents,
+            harness_status,
+            route,
+        ) = {
+            let harness = self.active_harness();
+            let route = selected_skill_route(harness, &user_text);
+            let tool_policy = harness.tool_policy();
+            let status = format!(
+                "Harness · {} ({}) · source: {} · tools: {} · policy: {:?}",
+                harness.display_name(),
+                harness.id(),
+                harness.source(),
+                tools.len(),
+                tool_policy.mode
+            );
+            (
+                harness.loop_policy(),
+                tool_policy,
+                harness.system_prompt(),
+                harness.cli_system_append(),
+                harness.claude_agents(),
+                status,
+                route,
+            )
+        };
+        if let Some(route) = &route {
+            let rendered = render_skill_route(route);
+            sys.push_str(&rendered);
+            let cli = cli_system_append.get_or_insert_with(String::new);
+            cli.push_str(&rendered);
         }
+        if tool_policy.mode == ToolPolicyMode::Allowlist || !tool_policy.deny.is_empty() {
+            let allowed = tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let denied = tool_policy.deny.join(", ");
+            let cli = cli_system_append.get_or_insert_with(String::new);
+            cli.push_str("\n\n# Oxide harness tool policy\nUse only these allowed capabilities: ");
+            cli.push_str(&allowed);
+            if !denied.is_empty() {
+                cli.push_str(". Explicitly forbidden: ");
+                cli.push_str(&denied);
+            }
+            cli.push('.');
+        }
+        let route_status = route
+            .as_ref()
+            .map(|route| format!(" · route: {}", route.id))
+            .unwrap_or_default();
+        self.emit(Event::Info {
+            text: format!("{harness_status}{route_status}"),
+        })
+        .await;
         // Mirror the user's language. The codex/chatgpt backend (and most models)
         // default to English without this; the user's prompt language should win.
         sys.push_str(
@@ -4957,7 +5219,7 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
             .model
             .clone()
             .unwrap_or_else(|| self.config.effective_model());
-        let max_steps = (policy.max_steps as usize).clamp(1, 60);
+        let mut tool_budget = AdaptiveToolBudget::new(policy.max_steps as usize);
         let mut step = 0usize;
         let mut overflow_retries = 0u8;
         // Bounded re-requests for a round that died on a transient stream hiccup
@@ -4987,7 +5249,7 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
             None
         };
         let mut verifies = 0u8;
-        let mut wrapped_up = false;
+        let mut budget_stop_reminded = false;
         self.turn_edited = false;
         self.turn_reads.clear();
         self.turn_edit_paths.clear();
@@ -4995,6 +5257,8 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
         self.pending_verify_cmds.clear();
         self.last_tool_sig.clear();
         self.last_tool_reps = 0;
+        self.turn_tool_signatures.clear();
+        self.turn_todos.clear();
         loop {
             // Keep the running history under budget on EVERY request — long
             // agentic turns accumulate tool output and would otherwise overflow.
@@ -5117,6 +5381,14 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                                     }).await;
                                 }
                                 Some(StreamItem::BackgroundJob { id, command, path }) => {
+                                    // Persisted so reopening this session re-surfaces the
+                                    // job — its process outlives this app run.
+                                    if let Some(store) = &self.session_store {
+                                        let _ = store.append(
+                                            "bg_job",
+                                            &serde_json::json!({"id": &id, "command": &command, "path": &path}).to_string(),
+                                        );
+                                    }
                                     self.emit(Event::BackgroundJob { turn, command_id: id, command, path }).await;
                                 }
                                 Some(StreamItem::CommandOutput { id, stream, chunk }) => {
@@ -5337,23 +5609,62 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                 msg.reasoning_item = pending_reasoning.take();
                 self.session.push(msg);
             }
-            step += 1;
+            if did_tool {
+                step += 1;
+            }
             if interrupted {
                 break;
             }
-            if step >= max_steps {
-                // Force a text-only wrap-up instead of silently stopping
-                // (opencode-style). One extra round so the model actually SEES
-                // the reminder — pushing it and breaking sent nothing.
-                if !wrapped_up {
-                    wrapped_up = true;
-                    self.session.push(Message::new(Role::User,
-                        "<system-reminder>\nMaximum tool steps reached. Do NOT call any more tools. \
-Reply with text only: summarize what you changed (with file paths and how you verified), and list \
-any remaining tasks and the recommended next step.\n</system-reminder>"));
-                    continue;
+            if did_tool {
+                let completed_todos = self
+                    .turn_todos
+                    .iter()
+                    .filter(|(_, status)| status == "completed")
+                    .count();
+                let pending_todos = self
+                    .turn_todos
+                    .iter()
+                    .any(|(_, status)| status != "completed");
+                let progress = tool_progress_score(
+                    self.turn_tool_signatures.len(),
+                    self.turn_reads.len(),
+                    self.turn_edit_paths.len(),
+                    completed_todos,
+                    self.turn_verify_passed,
+                );
+                match tool_budget.after_tool_round(
+                    step,
+                    progress,
+                    pending_todos,
+                    self.turn_edited && !self.turn_verify_passed,
+                ) {
+                    ToolBudgetDecision::Continue => {}
+                    ToolBudgetDecision::Extended { new_limit } => {
+                        budget_stop_reminded = false;
+                        self.emit(Event::Info {
+                            text: format!(
+                                "Tool budget extended adaptively to {new_limit} rounds because the turn is still making measurable progress"
+                            ),
+                        })
+                        .await;
+                        self.session.push(Message::new(
+                            Role::User,
+                            format!(
+                                "<system-reminder>\nTool budget extended adaptively to {new_limit} rounds because measurable progress is continuing. Finish the remaining checklist and promised verification; avoid repeated exploration.\n</system-reminder>"
+                            ),
+                        ));
+                        continue;
+                    }
+                    ToolBudgetDecision::Stop if !budget_stop_reminded => {
+                        budget_stop_reminded = true;
+                        self.session.push(Message::new(
+                            Role::User,
+                            "<system-reminder>\nNo new measurable progress justified another tool-budget extension. Do not call more tools. Reply with completed work, verification evidence, and genuinely unfinished items.\n</system-reminder>",
+                        ));
+                        continue;
+                    }
+                    ToolBudgetDecision::Stop => break,
                 }
-                break;
             }
             if cli_driver && !steered {
                 // One CLI run per turn — it finished, we're done.
@@ -6078,6 +6389,7 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
         // change of approach instead of burning the turn.
         {
             let sig = format!("{name}:{arguments}");
+            self.turn_tool_signatures.insert(sig.clone());
             if sig == self.last_tool_sig {
                 self.last_tool_reps += 1;
             } else {
@@ -6179,6 +6491,7 @@ Do NOT read it again. Proceed now: make the edits with the edit/write_file tools
                         .collect()
                 })
                 .unwrap_or_default();
+            self.turn_todos = items.clone();
             self.emit(Event::Todos {
                 items: items.clone(),
             })
@@ -6896,6 +7209,32 @@ mod map_test {
     }
 
     #[test]
+    fn bg_jobs_replay_last_row_per_id_and_only_fresh_files() {
+        let fresh = std::env::temp_dir().join(format!("oxide-bgjob-{}.out", std::process::id()));
+        std::fs::write(&fresh, "tick").unwrap();
+        let fresh_s = fresh.display().to_string();
+        let row = |id: &str, path: &str| {
+            (
+                "bg_job".to_string(),
+                serde_json::json!({"id": id, "command": "watch ci", "path": path}).to_string(),
+            )
+        };
+        let rows = vec![
+            ("user".to_string(), "hi".to_string()),
+            row("a", "/nonexistent/old.out"), // superseded by the later "a" row
+            row("b", "/nonexistent/gone.out"), // file missing → dropped
+            row("a", &fresh_s),
+            ("bg_job".to_string(), "not-json".to_string()), // malformed → skipped
+        ];
+        let jobs = super::replayable_bg_jobs(rows, std::time::Duration::from_secs(3600));
+        assert_eq!(
+            jobs,
+            vec![("a".to_string(), "watch ci".to_string(), fresh_s)]
+        );
+        std::fs::remove_file(&fresh).ok();
+    }
+
+    #[test]
     fn self_improvement_capture_parses_plain_and_fenced_json() {
         let plain = r#"{"facts":["Oxide CLI edits are reconstructed from git diff"],"skills":[]}"#;
         let parsed = super::parse_self_improvement_capture(plain).unwrap();
@@ -7282,6 +7621,35 @@ mutating = false
         assert!(registry.get("coding").is_some());
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn adaptive_tool_budget_extends_only_for_new_progress() {
+        let mut budget = super::AdaptiveToolBudget::new(4);
+
+        assert_eq!(
+            budget.after_tool_round(3, 1, false, false),
+            super::ToolBudgetDecision::Continue
+        );
+        assert_eq!(
+            budget.after_tool_round(4, 2, false, false),
+            super::ToolBudgetDecision::Extended { new_limit: 12 }
+        );
+        assert_eq!(
+            budget.after_tool_round(12, 2, false, false),
+            super::ToolBudgetDecision::Stop
+        );
+    }
+
+    #[test]
+    fn adaptive_tool_budget_rewards_pending_completion_work_but_keeps_ceiling() {
+        let mut budget = super::AdaptiveToolBudget::new(24);
+
+        assert_eq!(
+            budget.after_tool_round(24, 5, true, true),
+            super::ToolBudgetDecision::Extended { new_limit: 40 }
+        );
+        assert_eq!(budget.emergency_limit, 72);
     }
 
     #[test]

@@ -548,7 +548,7 @@ pub fn message_count(id: &str) -> usize {
         db.query_one(
             "count session messages",
             "SELECT COUNT(*) FROM messages
-             WHERE session_id=?1 AND role NOT IN ('meta', 'tool', 'system', 'event', 'summary')",
+             WHERE session_id=?1 AND role NOT IN ('meta', 'tool', 'system', 'event', 'summary', 'bg_job')",
             turso::params![id],
             |r| r.get::<i64>(0),
         )
