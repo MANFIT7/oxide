@@ -2369,13 +2369,18 @@ fn mention_label(token: &str) -> String {
 async fn submit_ce(
     streaming: Signal<bool>,
     engine: Coroutine<EngineCmd>,
-    plan_mode: Signal<bool>,
-    pursue_goal: Signal<bool>,
-    goal_text: Signal<String>,
+    mut plan_mode: Signal<bool>,
+    mut pursue_goal: Signal<bool>,
+    mut goal_text: Signal<String>,
     mut queue: Signal<Vec<String>>,
     mut attachments: Signal<Vec<String>>,
     mut text_attachments: Signal<Vec<TextAttachment>>,
     mut picked_element: Signal<Option<String>>,
+    on_mcp: EventHandler<()>,
+    on_model: EventHandler<()>,
+    on_status: EventHandler<()>,
+    on_goal: EventHandler<()>,
+    on_new: EventHandler<()>,
     steer: bool,
     ws: PathBuf,
 ) {
@@ -2384,7 +2389,7 @@ async fn submit_ce(
         .await
         .unwrap_or_default();
     let v: serde_json::Value = serde_json::from_str(&json).unwrap_or(serde_json::Value::Null);
-    let body = v["body"].as_str().unwrap_or("").trim().to_string();
+    let mut body = v["body"].as_str().unwrap_or("").trim().to_string();
     let tokens: Vec<String> = v["tokens"]
         .as_array()
         .map(|a| {
@@ -2401,32 +2406,84 @@ async fn submit_ce(
     {
         return;
     }
-    // Built-in /review (Bugbot): review the working diff for bugs.
-    if body.trim_start().starts_with("/review") {
-        let _ = dioxus::document::eval("const e=document.getElementById('ce-input'); if(e){ e.innerHTML=''; e.dispatchEvent(new InputEvent('input',{bubbles:true})); }").join::<bool>().await;
-        let extra = body.trim_start().trim_start_matches("/review").trim();
-        let diff = run_cmd(&ws, "git", &["diff"]).await;
-        let diff: String = diff.chars().take(12000).collect();
-        let prompt = format!(
-            "Act as Bugbot. Review the current working changes for bugs, security issues, \
+    let slash = slash_invocation(&body).map(|(name, args)| (name.to_string(), args.to_string()));
+    if let Some((name, args)) = slash {
+        let clear = || async {
+            let _ = dioxus::document::eval("const e=document.getElementById('ce-input'); if(e){ e.innerHTML=''; e.dispatchEvent(new InputEvent('input',{bubbles:true})); }")
+                .join::<bool>()
+                .await;
+        };
+        match name.as_str() {
+            "mcp" => {
+                clear().await;
+                on_mcp.call(());
+                return;
+            }
+            "model" => {
+                clear().await;
+                on_model.call(());
+                return;
+            }
+            "status" => {
+                clear().await;
+                on_status.call(());
+                return;
+            }
+            "new" => {
+                clear().await;
+                on_new.call(());
+                return;
+            }
+            "goal" => {
+                clear().await;
+                match args.as_str() {
+                    "" => on_goal.call(()),
+                    "clear" | "stop" | "off" => {
+                        goal_text.set(String::new());
+                        pursue_goal.set(false);
+                    }
+                    _ => {
+                        goal_text.set(args);
+                        pursue_goal.set(true);
+                    }
+                }
+                return;
+            }
+            "plan" => {
+                plan_mode.set(true);
+                if args.is_empty() {
+                    clear().await;
+                    return;
+                }
+                body = args;
+            }
+            "review" => {
+                clear().await;
+                let diff = run_cmd(&ws, "git", &["diff"]).await;
+                let diff: String = diff.chars().take(12000).collect();
+                let prompt = format!(
+                    "Act as Bugbot. Review the current working changes for bugs, security issues, \
 logic errors, and regressions. For each finding give: file:line, severity (high/med/low), \
 why it's wrong, and the concrete fix. If the diff is clean, say so plainly.{}\n\n```diff\n{}\n```",
-            if extra.is_empty() {
-                String::new()
-            } else {
-                format!(" Extra focus: {extra}.")
-            },
-            diff
-        );
-        if *streaming.read() {
-            queue.write().push(prompt);
-        } else {
-            engine.send(EngineCmd::Submit {
-                engine: prompt,
-                display: "/review (Bugbot)".into(),
-            });
+                    if args.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" Extra focus: {args}.")
+                    },
+                    diff
+                );
+                if *streaming.read() {
+                    queue.write().push(prompt);
+                } else {
+                    engine.send(EngineCmd::Submit {
+                        engine: prompt,
+                        display: "/review (Bugbot)".into(),
+                    });
+                }
+                return;
+            }
+            _ => {}
         }
-        return;
     }
     // Clear the editor immediately so a rapid second Enter can't double-submit
     // (the next serialize reads an empty body and returns).
@@ -2966,46 +3023,64 @@ fn list_harnesses(config: &Config) -> Vec<String> {
 /// Available slash commands `(name, description)` matching `query`.
 fn slash_commands(ws: &Path, query: &str) -> Vec<(String, String)> {
     let q = query.to_ascii_lowercase();
-    // Built-in commands handled by the composer itself.
-    let builtins = [("review", "Bugbot — review the working git diff for bugs")];
+    let builtins = [
+        ("mcp", "Manage connected MCP servers"),
+        ("plan", "Plan a task before implementation"),
+        ("goal", "Set or manage the active agent goal"),
+        ("review", "Bugbot — review the working git diff for bugs"),
+        ("model", "Change model and reasoning effort"),
+        ("status", "Show context and usage status"),
+        ("new", "Start a new chat"),
+        ("init", "Initialize repository agent instructions"),
+    ];
     let mut v: Vec<(String, String)> = builtins
         .iter()
         .filter(|(n, _)| q.is_empty() || n.contains(&q))
         .map(|(n, d)| (n.to_string(), d.to_string()))
         .collect();
     let dir = ws.join(".oxide/commands");
-    v.extend(
-        std::fs::read_dir(&dir)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("md"))
-            .filter_map(|p| {
-                let name = p.file_stem()?.to_string_lossy().to_string();
-                if !q.is_empty() && !name.to_ascii_lowercase().contains(&q) {
-                    return None;
-                }
-                let desc = std::fs::read_to_string(&p)
-                    .ok()
-                    .and_then(|t| {
-                        t.strip_prefix("---")
-                            .and_then(|r| r.find("\n---").map(|e| r[..e].to_string()))
-                            .and_then(|fm| {
-                                fm.lines().find_map(|l| {
-                                    l.trim()
-                                        .strip_prefix("description:")
-                                        .map(|d| d.trim().trim_matches('"').to_string())
-                                })
+    for (name, desc) in std::fs::read_dir(&dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("md"))
+        .filter_map(|p| {
+            let name = p.file_stem()?.to_string_lossy().to_string();
+            if !q.is_empty() && !name.to_ascii_lowercase().contains(&q) {
+                return None;
+            }
+            let desc = std::fs::read_to_string(&p)
+                .ok()
+                .and_then(|t| {
+                    t.strip_prefix("---")
+                        .and_then(|r| r.find("\n---").map(|e| r[..e].to_string()))
+                        .and_then(|fm| {
+                            fm.lines().find_map(|l| {
+                                l.trim()
+                                    .strip_prefix("description:")
+                                    .map(|d| d.trim().trim_matches('"').to_string())
                             })
-                    })
-                    .unwrap_or_default();
-                Some((name, desc))
-            }),
-    );
-    v.sort();
-    v.dedup();
+                        })
+                })
+                .unwrap_or_default();
+            Some((name, desc))
+        })
+    {
+        if let Some(existing) = v.iter_mut().find(|(n, _)| n == &name) {
+            *existing = (name, desc);
+        } else {
+            v.push((name, desc));
+        }
+    }
+    v.sort_by(|a, b| a.0.cmp(&b.0));
     v
+}
+
+fn slash_invocation(text: &str) -> Option<(&str, &str)> {
+    let rest = text.trim().strip_prefix('/')?;
+    let (name, args) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+    (!name.is_empty()).then_some((name, args.trim()))
 }
 
 /// Combined `@` menu: skills first, then files/folders.
@@ -3746,6 +3821,34 @@ mod tests {
             .iter()
             .any(|&i| msgs[i].text.starts_with(DONE_NOTE_MARK))));
         assert!(turns[0].groups.last().unwrap().activity);
+    }
+
+    #[test]
+    fn slash_palette_exposes_native_commands_and_parses_arguments() {
+        let root = std::env::temp_dir().join(format!("oxide-gui-slash-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".oxide/commands")).unwrap();
+        std::fs::write(
+            root.join(".oxide/commands/deploy.md"),
+            "---\ndescription: Deploy preview\n---\nDeploy $ARGUMENTS",
+        )
+        .unwrap();
+
+        let commands = slash_commands(&root, "");
+        assert!(commands.iter().any(|(name, _)| name == "mcp"));
+        assert!(commands.iter().any(|(name, _)| name == "plan"));
+        assert!(commands.iter().any(|(name, _)| name == "goal"));
+        assert!(commands
+            .iter()
+            .any(|(name, desc)| name == "deploy" && desc == "Deploy preview"));
+        assert_eq!(
+            slash_invocation(" /goal finish slash commands "),
+            Some(("goal", "finish slash commands"))
+        );
+        assert_eq!(slash_invocation("/"), None);
+        assert_eq!(slash_invocation("plain text"), None);
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -8941,6 +9044,20 @@ fn app() -> Element {
                                        draft_key: format!("{}:{}", workspace.display(), tabs.read().get(*active_tab.read()).map(|tab| tab.id).unwrap_or(0)),
                                        context_used: ctx_used, context_limit: ctx_limit,
                                        workspace: workspace.clone(), plan_mode, pursue_goal, goal_text, queue, picked_element,
+                                       on_mcp: move |_| show_mcp.set(true),
+                                       on_model: move |_| {
+                                           settings_initial_tab.set("model".to_string());
+                                           show_settings.set(true);
+                                       },
+                                       on_status: move |_| select_env_tab(env_tab, show_env, env_tab_by_tab, tabs, active_tab, "usage", false),
+                                       on_goal: move |_| select_env_tab(env_tab, show_env, env_tab_by_tab, tabs, active_tab, "goal", false),
+                                       on_new: move |_| {
+                                           let (provider, model) = {
+                                               let c = cfg.read();
+                                               (c.provider.clone(), c.model.clone())
+                                           };
+                                           new_agent_tab(tabs, active_tab, messages, cfg, engine, next_tab_id, &provider, &model, "New chat");
+                                       },
                                        on_settings: move |_| {
                                            settings_initial_tab.set("model".to_string());
                                            show_settings.set(true);
@@ -9685,6 +9802,20 @@ fn app() -> Element {
                                        draft_key: format!("{}:{}", workspace.display(), tabs.read().get(*active_tab.read()).map(|tab| tab.id).unwrap_or(0)),
                                        context_used: ctx_used, context_limit: ctx_limit,
                                        workspace: workspace.clone(), plan_mode, pursue_goal, goal_text, queue, picked_element,
+                                       on_mcp: move |_| show_mcp.set(true),
+                                       on_model: move |_| {
+                                           settings_initial_tab.set("model".to_string());
+                                           show_settings.set(true);
+                                       },
+                                       on_status: move |_| select_env_tab(env_tab, show_env, env_tab_by_tab, tabs, active_tab, "usage", false),
+                                       on_goal: move |_| select_env_tab(env_tab, show_env, env_tab_by_tab, tabs, active_tab, "goal", false),
+                                       on_new: move |_| {
+                                           let (provider, model) = {
+                                               let c = cfg.read();
+                                               (c.provider.clone(), c.model.clone())
+                                           };
+                                           new_agent_tab(tabs, active_tab, messages, cfg, engine, next_tab_id, &provider, &model, "New chat");
+                                       },
                                        on_settings: move |_| {
                                            settings_initial_tab.set("model".to_string());
                                            show_settings.set(true);
@@ -12528,6 +12659,7 @@ fn SettingsModal(
     let mut hook_event = use_signal(|| "PreToolUse".to_string());
     let mut hook_matcher = use_signal(|| "shell".to_string());
     let mut hook_status = use_signal(|| "Hooks ready".to_string());
+    let dcg_bin = use_hook(oxide_core::hooks::dcg_binary);
 
     // Oxide is a GUI wrapper around the user's logged-in agent CLIs + the ChatGPT
     // subscription — no raw API-key providers (openai/anthropic) in the picker.
@@ -12721,6 +12853,17 @@ fn SettingsModal(
                             option { value: "full", selected: *bypass.read(), "Full access (bypass)" }
                             option { value: "ask", selected: !*bypass.read(), "Ask first" }
                         }
+                    }
+                    div { class: "field",
+                        span { class: "field-label", "Destructive command guard" }
+                        div { class: "field-folder",
+                            if let Some(path) = dcg_bin.as_ref() {
+                                span { class: "folder-path", "DCG active · {path.display()}" }
+                            } else {
+                                span { class: "folder-path", "Built-in guard active · DCG not found" }
+                            }
+                        }
+                        span { class: "field-hint", "Enabled by default for Oxide shell tools, including ChatGPT Subscription. Install DCG yourself; Codex and Claude CLI commands require their own DCG hooks." }
                     }
                     div { class: "field",
                         span { class: "field-label", "Workspace folder" }
@@ -13413,6 +13556,11 @@ fn Composer(
     goal_text: Signal<String>,
     queue: Signal<Vec<String>>,
     mut picked_element: Signal<Option<String>>,
+    on_mcp: EventHandler<()>,
+    on_model: EventHandler<()>,
+    on_status: EventHandler<()>,
+    on_goal: EventHandler<()>,
+    on_new: EventHandler<()>,
     on_settings: EventHandler<()>,
     on_open_folder: EventHandler<()>,
     on_pick_workspace: EventHandler<PathBuf>,
@@ -13433,6 +13581,7 @@ fn Composer(
     let mut mention_q = use_signal(|| None::<String>);
     // Leading `/query` in the contenteditable — drives the slash-command menu.
     let mut slash_q = use_signal(|| None::<String>);
+    let mut slash_sel = use_signal(|| 0usize);
     // Cached @mention results — computed off-thread on query change, NOT per keystroke in render.
     let mut mention_items_sig = use_signal(Vec::<String>::new);
     // Branch-menu data loaded async on open (sync git subprocesses in render froze the UI).
@@ -13565,6 +13714,11 @@ fn Composer(
         Some(q) => slash_commands(&workspace, q),
         None => Vec::new(),
     };
+    let ssel = if slash_items.is_empty() {
+        0
+    } else {
+        (*slash_sel.read()).min(slash_items.len() - 1)
+    };
     let ws_kd = workspace.clone();
     let ws_oninput = workspace.clone();
     let ws_branch_load = workspace.clone();
@@ -13631,11 +13785,13 @@ fn Composer(
             if !slash_items.is_empty() {
                 div { class: "mention-menu",
                     div { class: "menu-label", "Commands" }
-                    for (name, desc) in slash_items.iter().cloned() {
+                    for (i, (name, desc)) in slash_items.iter().cloned().enumerate() {
                         {
                             let n = name.clone();
                             rsx! {
-                                button { class: "menu-item",
+                                button {
+                                    class: if i == ssel { "menu-item sel" } else { "menu-item" },
+                                    onmouseenter: move |_| slash_sel.set(i),
                                     onclick: move |_| {
                                         // Replace the editor content with "/cmd " (the editor is
                                         // a contenteditable — writing a signal would do nothing).
@@ -13645,6 +13801,7 @@ fn Composer(
                                         );
                                         spawn(async move { let _ = dioxus::document::eval(&js).join::<bool>().await; });
                                         slash_q.set(None);
+                                        slash_sel.set(0);
                                         ce_empty.set(false);
                                     },
                                     Icon { name: "spark" }
@@ -13803,6 +13960,7 @@ fn Composer(
                         let new_slash = v["slash"].as_str().map(|s| s.to_string());
                         if *slash_q.read() != new_slash {
                             slash_q.set(new_slash);
+                            slash_sel.set(0);
                         }
                     });
                 },
@@ -13835,21 +13993,42 @@ fn Composer(
                             return;
                         }
                     }
-                    // Slash menu: Esc closes, Enter inserts the top match.
+                    // Slash menu: arrows select, Enter/Tab inserts, Esc closes.
                     if slash_q.read().is_some() {
-                        if e.key() == Key::Escape { e.prevent_default(); slash_q.set(None); return; }
-                        if e.key() == Key::Enter && !e.modifiers().shift() {
-                            let items = slash_commands(&ws_kd, &slash_q.read().clone().unwrap_or_default());
-                            if let Some((name, _)) = items.first() {
+                        let items = slash_commands(&ws_kd, &slash_q.read().clone().unwrap_or_default());
+                        match e.key() {
+                            Key::Escape => {
                                 e.prevent_default();
+                                slash_q.set(None);
+                                slash_sel.set(0);
+                                return;
+                            }
+                            Key::ArrowDown if !items.is_empty() => {
+                                e.prevent_default();
+                                let cur = *slash_sel.read();
+                                slash_sel.set((cur + 1) % items.len());
+                                return;
+                            }
+                            Key::ArrowUp if !items.is_empty() => {
+                                e.prevent_default();
+                                let cur = *slash_sel.read();
+                                slash_sel.set((cur + items.len() - 1) % items.len());
+                                return;
+                            }
+                            Key::Enter | Key::Tab if !e.modifiers().shift() && !items.is_empty() => {
+                                e.prevent_default();
+                                let selected = (*slash_sel.read()).min(items.len() - 1);
+                                let name = &items[selected].0;
                                 let js = format!(
                                     "const e=document.getElementById('ce-input'); if(e){{ e.textContent={}; e.focus(); const r=document.createRange(); r.selectNodeContents(e); r.collapse(false); const s=window.getSelection(); s.removeAllRanges(); s.addRange(r); }} return true;",
                                     serde_json::to_string(&format!("/{name} ")).unwrap_or_default()
                                 );
                                 spawn(async move { let _ = dioxus::document::eval(&js).join::<bool>().await; });
                                 slash_q.set(None);
+                                slash_sel.set(0);
                                 return;
                             }
+                            _ => {}
                         }
                     }
                     if e.key() == Key::Enter && !e.modifiers().shift() {
@@ -13859,7 +14038,7 @@ fn Composer(
                         }
                         e.prevent_default();
                         let ws = ws_kd2.clone();
-                        spawn(async move { submit_ce(streaming, engine, plan_mode, pursue_goal, goal_text, queue, attachments, text_attachments, picked_element, false, ws).await; });
+                        spawn(async move { submit_ce(streaming, engine, plan_mode, pursue_goal, goal_text, queue, attachments, text_attachments, picked_element, on_mcp, on_model, on_status, on_goal, on_new, false, ws).await; });
                     } else if e.key() == Key::Tab && e.modifiers().shift() {
                         e.prevent_default();
                         let v = *plan_mode.read();
@@ -13940,6 +14119,14 @@ fn Composer(
                     }
                     if *plan_mode.read() {
                         span { class: "pill plan", Icon { name: "list" } "Plan" }
+                    }
+                    if *pursue_goal.read() {
+                        span {
+                            class: "pill plan",
+                            title: "Active goal: {goal_text.read()}",
+                            Icon { name: "target" }
+                            "Goal"
+                        }
                     }
                     div { class: "access-anchor",
                         button { class: "{access_cls}", onclick: move |_| { let v = *show_access.read(); show_access.set(!v); },
@@ -14125,10 +14312,10 @@ fn Composer(
                         }
                     }
                     if *streaming.read() {
-                        button { class: "send steer", title: "Steer (inject into the running turn)", onclick: move |_| { let ws = ws_steer.clone(); spawn(async move { submit_ce(streaming, engine, plan_mode, pursue_goal, goal_text, queue, attachments, text_attachments, picked_element, true, ws).await; }); }, Icon { name: "corner-up-right" } }
+                        button { class: "send steer", title: "Steer (inject into the running turn)", onclick: move |_| { let ws = ws_steer.clone(); spawn(async move { submit_ce(streaming, engine, plan_mode, pursue_goal, goal_text, queue, attachments, text_attachments, picked_element, on_mcp, on_model, on_status, on_goal, on_new, true, ws).await; }); }, Icon { name: "corner-up-right" } }
                         button { class: "send stop", title: "Stop", onclick: move |_| { engine.send(EngineCmd::Interrupt); }, Icon { name: "stop" } }
                     } else {
-                        button { class: "send", onclick: move |_| { let ws = ws_btn.clone(); spawn(async move { submit_ce(streaming, engine, plan_mode, pursue_goal, goal_text, queue, attachments, text_attachments, picked_element, false, ws).await; }); }, Icon { name: "arrow-up" } }
+                        button { class: "send", onclick: move |_| { let ws = ws_btn.clone(); spawn(async move { submit_ce(streaming, engine, plan_mode, pursue_goal, goal_text, queue, attachments, text_attachments, picked_element, on_mcp, on_model, on_status, on_goal, on_new, false, ws).await; }); }, Icon { name: "arrow-up" } }
                     }
                 }
             }

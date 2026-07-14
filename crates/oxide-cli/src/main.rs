@@ -26,7 +26,7 @@ struct Cli {
     #[arg(long, global = true)]
     resume: bool,
 
-    /// Require permission prompts. Kept for compatibility; safe mode is now the default.
+    /// Require permission prompts for this launch, overriding a saved Full access preference.
     #[arg(long, global = true)]
     safe: bool,
 
@@ -191,23 +191,8 @@ fn apply_permission_mode(config: &mut Config, safe: bool, skip_permissions: bool
     if skip_permissions {
         config.approval_policy = oxide_protocol::ApprovalPolicy::Never;
         config.sandbox = oxide_protocol::SandboxPolicy::DangerFullAccess;
-        return;
-    }
-    // Old releases overwrote and then persisted `Never` on every GUI launch.
-    // Treat that legacy state as unsafe-by-default unless the user explicitly
-    // opts into the bypass flag for this process.
-    if safe
-        || matches!(
-            config.approval_policy,
-            oxide_protocol::ApprovalPolicy::Never
-        )
-    {
+    } else if safe {
         config.approval_policy = oxide_protocol::ApprovalPolicy::OnRequest;
-    }
-    if matches!(
-        config.sandbox,
-        oxide_protocol::SandboxPolicy::DangerFullAccess
-    ) {
         config.sandbox = oxide_protocol::SandboxPolicy::WorkspaceWrite;
     }
 }
@@ -217,7 +202,7 @@ mod permission_tests {
     use super::*;
 
     #[test]
-    fn default_launch_migrates_legacy_bypass_to_safe_access() {
+    fn default_launch_preserves_saved_full_access() {
         let mut config = Config {
             approval_policy: oxide_protocol::ApprovalPolicy::Never,
             sandbox: oxide_protocol::SandboxPolicy::DangerFullAccess,
@@ -225,6 +210,26 @@ mod permission_tests {
         };
 
         apply_permission_mode(&mut config, false, false);
+
+        assert_eq!(
+            config.approval_policy,
+            oxide_protocol::ApprovalPolicy::Never
+        );
+        assert_eq!(
+            config.sandbox,
+            oxide_protocol::SandboxPolicy::DangerFullAccess
+        );
+    }
+
+    #[test]
+    fn explicit_safe_overrides_saved_full_access() {
+        let mut config = Config {
+            approval_policy: oxide_protocol::ApprovalPolicy::Never,
+            sandbox: oxide_protocol::SandboxPolicy::DangerFullAccess,
+            ..Config::default()
+        };
+
+        apply_permission_mode(&mut config, true, false);
 
         assert_eq!(
             config.approval_policy,

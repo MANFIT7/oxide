@@ -29,7 +29,9 @@
 //! ```
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+const DCG_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
 
 #[derive(Clone, Debug)]
 pub struct HookCommand {
@@ -226,6 +228,96 @@ pub fn dangerous_tool_reason(tool: &str, args: &serde_json::Value) -> Option<Str
     })
 }
 
+/// Locate a user-installed Destructive Command Guard. Oxide intentionally does
+/// not bundle DCG; when absent, the built-in catastrophic rules remain active.
+pub fn dcg_binary() -> Option<PathBuf> {
+    if let Some(value) = std::env::var_os("DCG_BIN").filter(|value| !value.is_empty()) {
+        let candidate = PathBuf::from(value);
+        if candidate.components().count() > 1 || candidate.is_absolute() {
+            return candidate.is_file().then_some(candidate);
+        }
+        return find_on_path(&candidate);
+    }
+    find_on_path(Path::new("dcg")).or_else(|| {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        [
+            home.as_ref().map(|path| path.join(".local/bin/dcg")),
+            home.as_ref().map(|path| path.join(".cargo/bin/dcg")),
+            Some(PathBuf::from("/opt/homebrew/bin/dcg")),
+            Some(PathBuf::from("/usr/local/bin/dcg")),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|candidate| candidate.is_file())
+    })
+}
+
+fn find_on_path(name: &Path) -> Option<PathBuf> {
+    std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
+}
+
+/// Evaluate an Oxide-native shell call with a user-installed DCG. A denial is
+/// returned as a tool result; missing binaries, timeouts, and DCG errors fail
+/// open so the fallback guard/sandbox/approval layers continue to work.
+pub async fn dcg_tool_reason(tool: &str, args: &serde_json::Value) -> Option<String> {
+    let binary = dcg_binary()?;
+    dcg_tool_reason_with_binary(&binary, tool, args).await
+}
+
+async fn dcg_tool_reason_with_binary(
+    binary: &Path,
+    tool: &str,
+    args: &serde_json::Value,
+) -> Option<String> {
+    if tool != "shell" {
+        return None;
+    }
+    let command = args.get("command")?.as_str()?.trim();
+    if command.is_empty() {
+        return None;
+    }
+    let mut child = tokio::process::Command::new(binary);
+    child
+        .args(["--robot", "test", command])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let output = match tokio::time::timeout(DCG_TIMEOUT, child.output()).await {
+        Ok(Ok(output)) => output,
+        _ => return None,
+    };
+    if output.status.code() != Some(1) {
+        return None;
+    }
+    Some(format_dcg_denial(command, &output.stdout))
+}
+
+fn format_dcg_denial(command: &str, stdout: &[u8]) -> String {
+    let parsed = serde_json::from_slice::<serde_json::Value>(stdout).ok();
+    let reason = parsed
+        .as_ref()
+        .and_then(|value| value.get("reason"))
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("destructive command matched an enabled DCG rule");
+    let rule = parsed
+        .as_ref()
+        .and_then(|value| value.get("rule_id"))
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty());
+    match rule {
+        Some(rule) => {
+            format!("blocked by destructive command guard [{rule}]: {reason}\ncommand: {command}")
+        }
+        None => format!("blocked by destructive command guard: {reason}\ncommand: {command}"),
+    }
+}
+
 fn simple_commands(value: &toml::Value) -> Vec<String> {
     match value {
         toml::Value::String(command) => vec![command.clone()],
@@ -382,5 +474,48 @@ async = true
             &serde_json::json!({ "command": "git reset --hard HEAD" }),
         );
         assert!(reason.unwrap().contains("destructive git reset"));
+    }
+
+    #[test]
+    fn formats_dcg_robot_denial_with_rule_id() {
+        let reason = format_dcg_denial(
+            "git reset --hard HEAD",
+            br#"{"reason":"would discard changes","rule_id":"core.git.reset-hard"}"#,
+        );
+        assert!(reason.contains("core.git.reset-hard"));
+        assert!(reason.contains("would discard changes"));
+        assert!(reason.contains("git reset --hard HEAD"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dcg_denial_blocks_shell_but_errors_fail_open() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!("oxide-dcg-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let deny = root.join("deny-dcg");
+        std::fs::write(
+            &deny,
+            "#!/bin/sh\nprintf '%s' '{\"reason\":\"destructive reset\",\"rule_id\":\"core.git.reset-hard\"}'\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&deny, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let args = serde_json::json!({ "command": "git reset --hard HEAD" });
+
+        let blocked = dcg_tool_reason_with_binary(&deny, "shell", &args)
+            .await
+            .unwrap();
+        assert!(blocked.contains("core.git.reset-hard"));
+
+        let error = root.join("error-dcg");
+        std::fs::write(&error, "#!/bin/sh\nexit 3\n").unwrap();
+        std::fs::set_permissions(&error, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(dcg_tool_reason_with_binary(&error, "shell", &args)
+            .await
+            .is_none());
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }

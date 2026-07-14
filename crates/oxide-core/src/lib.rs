@@ -6272,7 +6272,11 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
 
         let hook_config = hooks::Hooks::load(&self.workspace);
         if hook_config.auto().guard_dangerous_shell {
-            if let Some(reason) = hooks::dangerous_tool_reason(&name, &arguments) {
+            let guard_reason = match hooks::dangerous_tool_reason(&name, &arguments) {
+                Some(reason) => Some(reason),
+                None => hooks::dcg_tool_reason(&name, &arguments).await,
+            };
+            if let Some(reason) = guard_reason {
                 self.session
                     .push(Message::tool_result(reason.clone(), &call_id));
                 self.emit_audit(

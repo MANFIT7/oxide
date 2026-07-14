@@ -250,7 +250,7 @@ mod tests {
     '.activity-card.has-out[open] .activity-out',
     '.review-actions .diff-kept',
     '.edits-row.pending .edits-rowcounts.shimmer',
-    '.subagents-card.run-disclosure:not([open]) .run-preview',
+    '.env-card-row.env-subagents-running .env-subagent-preview',
     '.todo-card.run-disclosure:not([open]) .run-preview',
     '.composer-live-changes .live-changes-head',
     '.status-pill .status-shimmer'
@@ -260,7 +260,7 @@ mod tests {
   const answer = document.querySelector('.row.agent:not(.agent-waiting)')?.getBoundingClientRect();
   const stream = document.querySelector('.agent-md.live');
   const streamRow = document.querySelector('.streaming-message');
-  const subagentsCard = document.querySelector('.subagents-card.run-disclosure');
+  const subagentsRow = document.querySelector('.env-card-row.env-subagents-running');
   const todoCard = document.querySelector('.todo-card.run-disclosure');
   const liveChangesCard = document.querySelector('.composer-live-changes');
   const runningSpinner = document.querySelector('.activity-card.running .activity-spin');
@@ -278,7 +278,7 @@ mod tests {
     spinnerChildCount: runningSpinner?.childElementCount ?? -1,
     runningSpinnerAnimationCount: runningSpinner?.getAnimations({subtree: true}).filter(a => a.animationName === 'oxide-unicode-frame').length ?? -1,
     settledSpinnerAnimationCount: settledSpinner?.getAnimations({subtree: true}).filter(a => a.animationName === 'oxide-unicode-frame').length ?? -1,
-    compactOrchestrationCards: [subagentsCard, todoCard, liveChangesCard].every(card => card && card.getBoundingClientRect().height <= 48),
+    compactOrchestrationCards: [subagentsRow, todoCard, liveChangesCard].every(card => card && card.getBoundingClientRect().height <= 48),
     statusSlotAligned: Boolean(spinnerRect && resultRect && Math.abs((spinnerRect.x + spinnerRect.width / 2) - (resultRect.x + resultRect.width / 2)) < 0.5 && Math.abs((spinnerRect.y + spinnerRect.height / 2) - (resultRect.y + resultRect.height / 2)) < 0.5),
     viewport: [window.innerWidth, window.innerHeight],
     text: document.body.innerText
@@ -428,10 +428,7 @@ JSON.stringify({
             reduced["streamRailAnimation"].as_str(),
             Some("oxide-stream-rail")
         );
-        assert_eq!(
-            reduced["toolHaloAnimation"].as_str(),
-            Some("oxide-tool-halo")
-        );
+        assert_eq!(reduced["toolHaloAnimation"].as_str(), Some("none"));
         assert_eq!(
             reduced["toolSpinnerAnimation"].as_str(),
             Some("oxide-unicode-frame")

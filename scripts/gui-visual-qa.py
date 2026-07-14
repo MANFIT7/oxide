@@ -170,6 +170,14 @@ Finished dev profile</pre>
           <span class="live-changes-counts"><span class="diff-adds">+18</span><span class="diff-dels">-4</span></span>
         </div>
       </div>
+      <div class="env-card">
+        <div class="env-card-head"><span class="env-card-title">Environment</span></div>
+        <button class="env-card-row env-subagents-running">
+          <span class="env-subagent-status"><span class="syn-spinner"></span></span>
+          <span class="env-subagent-copy"><span class="env-subagent-label">Subagents</span><span class="env-subagent-preview">reviewer · Audit slash command interactions</span></span>
+          <span class="env-card-badge nowrap">1 running</span>
+        </button>
+      </div>
       <div class="agents-window">
         <div class="agents-hero">
           <div>
@@ -456,6 +464,50 @@ def main() -> int:
             ],
         ),
         f"{rel(GUI)} routes running sub-agents to Environment → Agents while composer task/change surfaces stay compact",
+    )
+    require(
+        "slash command palette is keyboard-first",
+        contains_all(
+            gui,
+            [
+                'let mut slash_q = use_signal(|| None::<String>);',
+                'let mut slash_sel = use_signal(|| 0usize);',
+                '("mcp", "Manage connected MCP servers")',
+                '("plan", "Plan a task before implementation")',
+                '("goal", "Set or manage the active agent goal")',
+                'Key::ArrowDown if !items.is_empty()',
+                'Key::ArrowUp if !items.is_empty()',
+                'Key::Enter | Key::Tab if !e.modifiers().shift()',
+                '"mcp" => {',
+                '"plan" => {',
+                '"goal" => {',
+            ],
+        ),
+        f"{rel(GUI)} exposes native/custom slash commands with arrow, Enter, Tab, and Escape navigation",
+    )
+    require(
+        "default external destructive command guard",
+        contains_all(
+            hooks,
+            [
+                "pub fn dcg_binary() -> Option<PathBuf>",
+                "pub async fn dcg_tool_reason",
+                '.args(["--robot", "test", command])',
+                "std::time::Duration::from_millis(1500)",
+                "output.status.code() != Some(1)",
+            ],
+        )
+        and "hooks::dcg_tool_reason(&name, &arguments).await" in core
+        and contains_all(
+            gui,
+            [
+                '"Destructive command guard"',
+                '"DCG active · {path.display()}"',
+                '"Built-in guard active · DCG not found"',
+                '"Enabled by default for Oxide shell tools, including ChatGPT Subscription.',
+            ],
+        ),
+        "Oxide auto-detects user-installed DCG for native/subscription shell tools and exposes its status in Access settings",
     )
     require(
         "streamed tool arguments wrap within transcript",
