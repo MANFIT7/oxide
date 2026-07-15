@@ -412,6 +412,22 @@ def main() -> int:
         f"{rel(GUI)} and {rel(CSS)} cross-fade running/success/failure in a fixed slot and animate tool disclosure without layout measurement",
     )
     require(
+        "active reasoning tool and edit labels share lifecycle shimmer",
+        contains_all(
+            css,
+            [
+                ".thinking-glow,",
+                ".activity-card.running .activity-verb,",
+                ".activity-card.running .activity-text,",
+                ".composer-live-changes .live-changes-title {",
+                "animation: ox-shimmer 2s linear infinite;",
+                ".col.streaming .row.diffrow,",
+                ".thinking-box[open] > .thinking-body {",
+            ],
+        ),
+        f"{rel(CSS)} applies Emdash-style paint-only shimmer and entry/reveal motion to active reasoning, tools, and edits",
+    )
+    require(
         "motion policy keeps lifecycle polish active",
         contains_all(
             css,

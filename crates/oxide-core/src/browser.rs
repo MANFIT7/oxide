@@ -273,6 +273,11 @@ mod tests {
     thinkingAboveAnswer: Boolean(thinking && answer && thinking.bottom <= answer.top),
     streamAnimation: stream ? getComputedStyle(stream).animationName : '',
     streamRailAnimation: streamRow ? getComputedStyle(streamRow, '::before').animationName : '',
+    thinkingShimmerAnimation: getComputedStyle(document.querySelector('.thinking-glow')).animationName,
+    thinkingRevealAnimation: getComputedStyle(document.querySelector('.thinking-body')).animationName,
+    toolLabelShimmerAnimation: getComputedStyle(document.querySelector('.activity-card.running .activity-verb')).animationName,
+    liveEditShimmerAnimation: getComputedStyle(document.querySelector('.composer-live-changes .live-changes-title')).animationName,
+    liveEditEntryAnimation: getComputedStyle(liveChangesCard).animationName,
     toolSpinnerAnimation: runningSpinner ? getComputedStyle(runningSpinner, '::after').animationName : '',
     spinnerHasFrames: runningSpinner ? getComputedStyle(runningSpinner, '::after').content.includes('⠋') && getComputedStyle(runningSpinner, '::after').content.includes('⠏') : false,
     spinnerChildCount: runningSpinner?.childElementCount ?? -1,
@@ -311,6 +316,31 @@ mod tests {
             report["streamRailAnimation"].as_str(),
             Some("oxide-stream-rail"),
             "streaming rail should animate outside the live HTML: {report}"
+        );
+        assert_eq!(
+            report["thinkingShimmerAnimation"].as_str(),
+            Some("ox-shimmer"),
+            "live reasoning label should shimmer: {report}"
+        );
+        assert_eq!(
+            report["thinkingRevealAnimation"].as_str(),
+            Some("oxide-reveal-down"),
+            "expanded reasoning should reveal without a hard pop: {report}"
+        );
+        assert_eq!(
+            report["toolLabelShimmerAnimation"].as_str(),
+            Some("ox-shimmer"),
+            "running tool label should shimmer: {report}"
+        );
+        assert_eq!(
+            report["liveEditShimmerAnimation"].as_str(),
+            Some("ox-shimmer"),
+            "live edit title should shimmer: {report}"
+        );
+        assert_eq!(
+            report["liveEditEntryAnimation"].as_str(),
+            Some("oxide-tool-enter"),
+            "live edit summary should enter smoothly: {report}"
         );
         assert_eq!(
             report["toolSpinnerAnimation"].as_str(),
@@ -409,6 +439,9 @@ JSON.stringify({
   streamRailAnimation: getComputedStyle(document.querySelector('.streaming-message'), '::before').animationName,
   toolHaloAnimation: getComputedStyle(document.querySelector('.activity-card.running .activity-status'), '::after').animationName,
   toolSpinnerAnimation: getComputedStyle(document.querySelector('.activity-card.running .activity-spin'), '::after').animationName,
+  thinkingShimmerAnimation: getComputedStyle(document.querySelector('.thinking-glow')).animationName,
+  toolLabelShimmerAnimation: getComputedStyle(document.querySelector('.activity-card.running .activity-verb')).animationName,
+  liveEditTitleShimmerAnimation: getComputedStyle(document.querySelector('.composer-live-changes .live-changes-title')).animationName,
   statusShimmerAnimation: getComputedStyle(document.querySelector('.status-pill .status-shimmer')).animationName,
   editShimmerAnimation: getComputedStyle(document.querySelector('.edits-row.pending .edits-rowcounts.shimmer')).animationName
 })
@@ -432,6 +465,18 @@ JSON.stringify({
         assert_eq!(
             reduced["toolSpinnerAnimation"].as_str(),
             Some("oxide-unicode-frame")
+        );
+        assert_eq!(
+            reduced["thinkingShimmerAnimation"].as_str(),
+            Some("ox-shimmer")
+        );
+        assert_eq!(
+            reduced["toolLabelShimmerAnimation"].as_str(),
+            Some("ox-shimmer")
+        );
+        assert_eq!(
+            reduced["liveEditTitleShimmerAnimation"].as_str(),
+            Some("ox-shimmer")
         );
         assert_eq!(
             reduced["statusShimmerAnimation"].as_str(),

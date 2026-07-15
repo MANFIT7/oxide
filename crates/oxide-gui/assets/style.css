@@ -4202,7 +4202,8 @@ details.activity-card.has-out .activity-sum { padding: 2px 4px; }
 .edits-row.pending .edits-rowcounts.shimmer {
   animation-duration: 2s; animation-delay: -1s;
 }
-/* tool rows ala Synara: statis & tenang — muted, terang saat hover; tanpa shimmer per-row */
+/* Tool rows stay chrome-free; the final lifecycle layer adds a paint-only
+   shimmer to active labels while hover still lifts settled rows. */
 .activity-card.running .activity-verb { color: var(--text); }
 .activity-card:hover .activity-verb, .activity-card:hover .activity-text { color: var(--text); }
 /* dot busy di tab agent: pulse 640ms (opacity+transform saja — GPU friendly) */
@@ -4472,7 +4473,11 @@ details.changes-file[open] .diff-body { animation: disclosure-in 220ms ease-out;
   text-wrap: pretty;
 }
 
-.row.activity { animation: oxide-tool-enter .18s var(--ease-enter) both; }
+.row.activity,
+.col.streaming .row.diffrow,
+.composer-live-changes {
+  animation: oxide-tool-enter var(--dur-med) var(--ease-enter) both;
+}
 .activity-card {
   position: relative;
   transition: color .18s ease, opacity .18s ease;
@@ -4701,8 +4706,20 @@ details.has-out .activity-out-n::after { content: none; }
 .thinking-sum.live::before {
   border-color: var(--syn-accent);
 }
-.thinking-glow {
-  animation: ox-shimmer 1.7s linear infinite;
+/* Emdash-style active labels: reasoning, tool names/details, and the compact
+   live-edit title share one calm sweep. This is paint-only, so streaming text
+   and transcript geometry stay stable while the activity state changes. */
+.thinking-glow,
+.activity-card.running .activity-verb,
+.activity-card.running .activity-text,
+.composer-live-changes .live-changes-title {
+  background: linear-gradient(90deg, var(--muted) 0%, var(--muted) 30%, var(--text) 50%, var(--muted) 70%, var(--muted) 100%);
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  -webkit-text-fill-color: transparent;
+  animation: ox-shimmer 2s linear infinite;
 }
 .thinking-secs {
   font-size: 12px;
@@ -4720,6 +4737,9 @@ details.has-out .activity-out-n::after { content: none; }
   overflow-wrap: anywhere;
 }
 .thinking-body { max-height: 240px; overflow-y: auto; }
+.thinking-box[open] > .thinking-body {
+  animation: oxide-reveal-down var(--dur-med) var(--ease-out) both;
+}
 .thought-body { max-height: 280px; overflow-y: auto; }
 .thinking-body p,
 .thought-body p { margin: 0 0 7px; }
