@@ -1706,6 +1706,79 @@ type ProjectGroup = (
     String,
     Vec<(PathBuf, String, String, String, String)>,
 );
+
+#[derive(Clone, PartialEq, Eq)]
+struct BrainSkill {
+    name: String,
+    summary: String,
+    path: PathBuf,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct BrainProject {
+    workspace: PathBuf,
+    name: String,
+    facts: Vec<String>,
+    skills: Vec<BrainSkill>,
+    current: bool,
+}
+
+impl BrainProject {
+    fn memory_count(&self) -> usize {
+        self.facts.len() + self.skills.len()
+    }
+}
+
+fn brain_projects(groups: &[ProjectGroup], current: Option<&Path>) -> Vec<BrainProject> {
+    let mut workspaces = Vec::<PathBuf>::new();
+    if let Some(current) = current {
+        workspaces.push(current.to_path_buf());
+    }
+    for (workspace, _, _) in groups {
+        if !workspaces.iter().any(|known| known == workspace) {
+            workspaces.push(workspace.clone());
+        }
+    }
+
+    let mut projects = workspaces
+        .into_iter()
+        .map(|workspace| {
+            let memory = oxide_core::memory::Memory::new(&workspace);
+            let skills = memory
+                .skills()
+                .into_iter()
+                .map(|(name, summary)| BrainSkill {
+                    path: memory.skill_path(&name),
+                    name,
+                    summary,
+                })
+                .collect();
+            BrainProject {
+                name: project_name(&workspace),
+                facts: memory.facts(),
+                skills,
+                current: current == Some(workspace.as_path()),
+                workspace,
+            }
+        })
+        .collect::<Vec<_>>();
+    projects.sort_by(|a, b| {
+        b.current
+            .cmp(&a.current)
+            .then_with(|| b.memory_count().cmp(&a.memory_count()))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    projects
+}
+
+fn brain_node_label(text: &str) -> String {
+    let mut label = text.chars().take(18).collect::<String>();
+    if text.chars().count() > 18 {
+        label.push('…');
+    }
+    label
+}
+
 const PROJECT_SESSION_LIMIT: usize = 500;
 const PROJECT_SESSION_PAGE_SIZE: usize = 5;
 
@@ -3462,6 +3535,41 @@ mod tests {
     }
 
     #[test]
+    fn brain_projects_collect_workspace_memories_and_prioritize_current() {
+        let root = std::env::temp_dir().join(format!(
+            "oxide-brain-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let current = root.join("alpha");
+        let other = root.join("beta");
+        std::fs::create_dir_all(&current).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let current_memory = oxide_core::memory::Memory::new(&current);
+        current_memory.remember("Alpha prefers compact UI").unwrap();
+        current_memory
+            .save_skill("release-alpha", "# Release Alpha\nRun checks and publish")
+            .unwrap();
+        oxide_core::memory::Memory::new(&other)
+            .remember("Beta uses a custom build")
+            .unwrap();
+
+        let groups = vec![(other.clone(), "beta".to_string(), Vec::new())];
+        let projects = brain_projects(&groups, Some(&current));
+
+        assert_eq!(projects.len(), 2);
+        assert!(projects[0].current);
+        assert_eq!(projects[0].name, "alpha");
+        assert_eq!(projects[0].facts, ["Alpha prefers compact UI"]);
+        assert_eq!(projects[0].skills[0].name, "release-alpha");
+        assert_eq!(projects[1].name, "beta");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn reasoning_segments_share_one_stable_row_per_turn() {
         let mut messages = vec![ChatMsg::new(Author::User, "fix it")];
         let first_id = upsert_turn_thought(&mut messages, 1, "Inspecting files");
@@ -5041,7 +5149,7 @@ fn app() -> Element {
     let mut show_shortcuts = use_signal(|| false);
     // Cursor-style icon rail: sidebar collapses to a thin strip.
     let mut sidebar_collapsed = use_signal(|| false);
-    // Synara-style sidebar segmented tabs: "threads" (sessions) | "workspace" (tools).
+    // Sidebar segmented tabs: thread history, workspace memory graph, or tools.
     let mut sidebar_tab = use_signal(|| "threads".to_string());
     // Induk sub-agent yang anak-anaknya dilipat di sidebar (Synara:
     // expandedSubagentParentIds — di sini disimpan kebalikannya, default terbuka).
@@ -5138,6 +5246,7 @@ fn app() -> Element {
     let hermes_status = use_signal(|| "Hermes idle".to_string());
     let hermes_confirm_delete = use_signal(|| None::<String>);
     let mut projects_list = use_signal(Vec::<ProjectGroup>::new);
+    let mut brain_refresh = use_signal(|| 0u64);
     let mut session_menu = use_signal(|| None::<PathBuf>);
     // Per-project visible session count. Default is 5; Show more reveals
     // another page so long histories expand gradually.
@@ -7965,7 +8074,11 @@ fn app() -> Element {
             // ── Sidebar ────────────────────────────────────────────────
             aside { class: {
                     let base = if *sidebar_collapsed.read() { "sidebar collapsed" } else { "sidebar" };
-                    if *sidebar_tab.read() == "workspace" { format!("{base} ws-mode") } else { base.to_string() }
+                    match sidebar_tab.read().as_str() {
+                        "workspace" => format!("{base} ws-mode"),
+                        "brain" => format!("{base} brain-mode"),
+                        _ => base.to_string(),
+                    }
                 },
                 style: if *sidebar_collapsed.read() { String::new() } else { format!("width:{}px", *sidebar_w.read()) },
                 oncontextmenu: move |e: dioxus::prelude::MouseEvent| { e.prevent_default(); let c = e.client_coordinates(); theme_menu_pos.set((c.x, c.y)); session_menu.set(None); show_theme_menu.set(true); },
@@ -8064,10 +8177,20 @@ fn app() -> Element {
                     }
                     span { class: "brand-name", "Oxide" }
                 }
-                // Synara-style segmented control: Threads (sessions) | Workspace (tools).
+                // Workspace switcher: conversations, durable knowledge, or tools.
                 div { class: "side-seg",
                     button { class: if *sidebar_tab.read() == "threads" { "on" } else { "" },
-                        onclick: move |_| sidebar_tab.set("threads".to_string()), "Threads" }
+                        onclick: move |_| {
+                            show_board.set(false);
+                            sidebar_tab.set("threads".to_string());
+                        }, "Threads" }
+                    button { class: if *sidebar_tab.read() == "brain" { "on" } else { "" },
+                        onclick: move |_| {
+                            show_board.set(false);
+                            show_split.set(false);
+                            show_env.set(false);
+                            sidebar_tab.set("brain".to_string());
+                        }, "Brain" }
                     button { class: if *sidebar_tab.read() == "workspace" { "on" } else { "" },
                         onclick: move |_| sidebar_tab.set("workspace".to_string()), "Workspace" }
                 }
@@ -8075,6 +8198,7 @@ fn app() -> Element {
                     button { class: "nav-item", onclick: move |_| {
                             // Reset to a fresh chat: clear transcript, close panels, reset the engine session.
                             show_board.set(false);
+                            sidebar_tab.set("threads".to_string());
                             let mut op = ui.open_path; op.set(None);
                             messages.write().clear();
                             thinking.set(String::new());
@@ -8566,7 +8690,10 @@ fn app() -> Element {
                                 let tui_state = TUI_AGENT_STATES.read().get(&id).copied().unwrap_or("");
                                 rsx! {
                                     div { key: "{id}", class: "{tab_class}",
-                                        onclick: move |_| switch_tab(tabs, active_tab, messages, cfg, engine, i),
+                                        onclick: move |_| {
+                                            sidebar_tab.set("threads".to_string());
+                                            switch_tab(tabs, active_tab, messages, cfg, engine, i);
+                                        },
                                         if let Some(l) = logo { span { class: "agent-tab-logo prov-logo", dangerous_inner_html: l } }
                                         span { class: "agent-tab-title", "{title}" }
                                         if tui_state == "running" { span { class: "syn-spinner" } }
@@ -8606,6 +8733,7 @@ fn app() -> Element {
                                     div { class: "menu-label", "New agent · Cmd-click for TUI" }
                                     button { class: "menu-item", onclick: move |e| {
                                             show_newtab.set(false);
+                                            sidebar_tab.set("threads".to_string());
                                             let tui = e.modifiers().meta() || cfg.read().default_tab_mode == "tui";
                                             if tui { new_tui_tab(tabs, active_tab, messages, next_tab_id, "codex", "Codex"); }
                                             else { new_agent_tab(tabs, active_tab, messages, cfg, engine, next_tab_id, "codex", "", "Codex"); }
@@ -8615,6 +8743,7 @@ fn app() -> Element {
                                     }
                                     button { class: "menu-item", onclick: move |e| {
                                             show_newtab.set(false);
+                                            sidebar_tab.set("threads".to_string());
                                             let tui = e.modifiers().meta() || cfg.read().default_tab_mode == "tui";
                                             if tui { new_tui_tab(tabs, active_tab, messages, next_tab_id, "claude", "Claude Code"); }
                                             else { new_agent_tab(tabs, active_tab, messages, cfg, engine, next_tab_id, "claude", "", "Claude Code"); }
@@ -8686,6 +8815,7 @@ fn app() -> Element {
                     if cfg.read().workspace.is_some()
                         && !*show_env.read()
                         && !*show_board.read()
+                        && sidebar_tab.read().as_str() != "brain"
                         && !active_is_tui
                     {
                         {
@@ -9054,7 +9184,11 @@ fn app() -> Element {
                     for t in tabs.read().iter().filter(|t| t.mode == "tui") {
                         div {
                             key: "tuihost-{t.id}",
-                            class: if active_is_tui && t.id == active_tab_id && !editor_open {
+                            class: if active_is_tui
+                                && t.id == active_tab_id
+                                && !editor_open
+                                && sidebar_tab.read().as_str() != "brain"
+                            {
                                 "tui-host-live"
                             } else {
                                 "tui-host-off"
@@ -9081,6 +9215,28 @@ fn app() -> Element {
                             rects: split_rects,
                             def_provider: cfg.read().provider.clone(),
                             def_model: cfg.read().model.clone(),
+                        }
+                    } else if sidebar_tab.read().as_str() == "brain" {
+                        {
+                            let _ = brain_refresh.read();
+                            let current_workspace = cfg.read().workspace.clone();
+                            let projects = brain_projects(
+                                &projects_list.read(),
+                                current_workspace.as_deref(),
+                            );
+                            rsx! {
+                                BrainView {
+                                    projects,
+                                    on_refresh: move |_| {
+                                        refresh_projects_list(projects_list, cfg);
+                                        brain_refresh.set(brain_refresh() + 1);
+                                    },
+                                    on_open_skill: move |path: PathBuf| {
+                                        open_file(ui, path);
+                                        sidebar_tab.set("threads".to_string());
+                                    },
+                                }
+                            }
                         }
                     } else if *show_board.read() && cfg.read().workspace.is_some() {
                         div { class: "board",
@@ -9910,7 +10066,11 @@ fn app() -> Element {
                                     (i, prev)
                                 })
                                 .collect();
-                            if trail.len() > 1 && !active_is_tui && !*show_board.read() {
+                            if trail.len() > 1
+                                && !active_is_tui
+                                && !*show_board.read()
+                                && sidebar_tab.read().as_str() != "brain"
+                            {
                                 rsx! {
                                     nav { class: "msg-trail",
                                         for (ti, prev) in trail {
@@ -10333,6 +10493,7 @@ fn app() -> Element {
                                                         }
                                                         div { class: "agents-hero-actions",
                                                             button { class: "agent-action primary", onclick: move |_| {
+                                                                sidebar_tab.set("threads".to_string());
                                                                 new_agent_tab(tabs, active_tab, messages, cfg, engine, next_tab_id, "codex", "", "Codex");
                                                             }, Icon { name: "plus" } span { "New Codex" } }
                                                             button { class: "agent-action", onclick: move |_| {
@@ -11381,16 +11542,23 @@ fn app() -> Element {
                         match label {
                             "New chat" => {
                                 show_board.set(false);
+                                sidebar_tab.set("threads".to_string());
                                 let prov = cfg.read().provider.clone();
                                 let model = cfg.read().model.clone();
                                 let title = provider_title(&prov).to_string();
                                 new_agent_tab(tabs, active_tab, messages, cfg, engine, next_tab_id, &prov, &model, &title);
                             }
-                            "Open folder…" => open_folder(cfg, ui, engine),
+                            "Open folder…" => {
+                                sidebar_tab.set("threads".to_string());
+                                open_folder(cfg, ui, engine);
+                            }
                             "Split view" => { let v = !*show_split.read(); show_split.set(v); }
                             "MCP servers" => show_mcp.set(true),
                             "Skills" => show_skills.set(true),
-                            "Board" => { show_board.set(true); }
+                            "Board" => {
+                                sidebar_tab.set("workspace".to_string());
+                                show_board.set(true);
+                            }
                             "Automations" => {
                                 settings_initial_tab.set("automations".to_string());
                                 show_settings.set(true);
@@ -11490,6 +11658,7 @@ fn app() -> Element {
                                                         onclick: move |_| {
                                                             show_palette.set(false);
                                                             show_board.set(false);
+                                                            sidebar_tab.set("threads".to_string());
                                                             switch_tab(tabs, active_tab, messages, cfg, engine, idx);
                                                         },
                                                         Icon { name: "branch" }
@@ -11520,7 +11689,7 @@ fn app() -> Element {
                                                             let t2 = title.clone();
                                                             rsx! {
                                                                 button { class: "palette-item",
-                                                                    onclick: move |_| { show_palette.set(false); show_board.set(false); open_session_tab(tabs, active_tab, messages, next_tab_id, cfg, ui, engine, busy_tabs, p2.clone(), t2.clone()); },
+                                                                    onclick: move |_| { show_palette.set(false); show_board.set(false); sidebar_tab.set("threads".to_string()); open_session_tab(tabs, active_tab, messages, next_tab_id, cfg, ui, engine, busy_tabs, p2.clone(), t2.clone()); },
                                                                     Icon { name: "file" } span { class: "palette-label", "{title}" }
                                                                 }
                                                             }
@@ -14625,6 +14794,236 @@ fn Composer(
                                                 });
                                             },
                                                 Icon { name: "branch" } span { class: "menu-name", "{b}" }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn BrainView(
+    projects: Vec<BrainProject>,
+    on_refresh: EventHandler<()>,
+    on_open_skill: EventHandler<PathBuf>,
+) -> Element {
+    let mut selected = use_signal(|| 0usize);
+    let selected_idx = (*selected.read()).min(projects.len().saturating_sub(1));
+    let selected_project = projects.get(selected_idx).cloned();
+    let selected_path = selected_project
+        .as_ref()
+        .map(|project| project.workspace.display().to_string())
+        .unwrap_or_default();
+    let selected_memory_count = selected_project
+        .as_ref()
+        .map(BrainProject::memory_count)
+        .unwrap_or(0);
+    let selected_fact_count = selected_project
+        .as_ref()
+        .map(|project| project.facts.len())
+        .unwrap_or(0);
+    let selected_skill_count = selected_project
+        .as_ref()
+        .map(|project| project.skills.len())
+        .unwrap_or(0);
+    let project_count = projects.len();
+    let fact_count = projects
+        .iter()
+        .map(|project| project.facts.len())
+        .sum::<usize>();
+    let skill_count = projects
+        .iter()
+        .map(|project| project.skills.len())
+        .sum::<usize>();
+    let visible_count = project_count.min(8);
+    let graph_nodes = projects
+        .iter()
+        .take(visible_count)
+        .enumerate()
+        .map(|(index, project)| {
+            let angle = if visible_count == 1 {
+                -std::f64::consts::FRAC_PI_2
+            } else {
+                -std::f64::consts::FRAC_PI_2
+                    + std::f64::consts::TAU * index as f64 / visible_count as f64
+            };
+            let x = 450.0 + angle.cos() * 292.0;
+            let y = 260.0 + angle.sin() * 178.0;
+            (
+                index,
+                x,
+                y,
+                brain_node_label(&project.name),
+                project.memory_count(),
+                project.facts.len(),
+                project.skills.len(),
+                project.current,
+                project.workspace.display().to_string(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    rsx! {
+        section { class: "brain-view", aria_label: "Workspace memory graph",
+            div { class: "brain-head",
+                div {
+                    div { class: "brain-eyebrow", Icon { name: "brain" } "Workspace intelligence" }
+                    h2 { "Brain" }
+                    p { "Durable facts and reusable skills learned across your project folders." }
+                }
+                button { class: "brain-refresh", onclick: move |_| on_refresh.call(()),
+                    Icon { name: "refresh" } "Refresh"
+                }
+            }
+            div { class: "brain-stats",
+                div { class: "brain-stat", span { "Projects" } strong { "{project_count}" } }
+                div { class: "brain-stat facts", span { "Remembered facts" } strong { "{fact_count}" } }
+                div { class: "brain-stat skills", span { "Learned skills" } strong { "{skill_count}" } }
+            }
+            if projects.is_empty() {
+                div { class: "brain-empty",
+                    span { class: "brain-empty-icon", Icon { name: "brain" } }
+                    h3 { "The brain is still empty" }
+                    p { "Open a project and let Oxide save durable facts with remember or reusable procedures with save_skill." }
+                }
+            } else {
+                div { class: "brain-layout",
+                    div { class: "brain-map-card",
+                        div { class: "brain-map-title",
+                            span { "Knowledge map" }
+                            span { "Click a workspace node to inspect what it learned" }
+                        }
+                        svg { class: "brain-map", view_box: "0 0 900 520", role: "img",
+                            for (index, x, y, _, memories, _, _, _, _,) in graph_nodes.iter() {
+                                {
+                                    let edge_width = 1.0 + (*memories).min(8) as f64 * 0.12;
+                                    rsx! {
+                                        line {
+                                            key: "edge-{index}",
+                                            class: if *index == selected_idx { "brain-edge active" } else { "brain-edge" },
+                                            x1: "450", y1: "260", x2: "{x:.1}", y2: "{y:.1}",
+                                            style: "--edge-width:{edge_width:.2}px",
+                                        }
+                                    }
+                                }
+                            }
+                            circle { class: "brain-core-halo", cx: "450", cy: "260", r: "69" }
+                            circle { class: "brain-core", cx: "450", cy: "260", r: "54" }
+                            text { class: "brain-core-mark", x: "450", y: "255", "OX" }
+                            text { class: "brain-core-label", x: "450", y: "278", "Memory" }
+                            for (index, x, y, label, memories, facts, skills, current, path) in graph_nodes.iter().cloned() {
+                                {
+                                    let node_class = if index == selected_idx { "brain-node active" } else { "brain-node" };
+                                    let node_x = format!("{:.1}", x - 88.0);
+                                    let node_y = format!("{:.1}", y - 36.0);
+                                    let current_x = format!("{:.1}", x + 72.0);
+                                    let current_y = format!("{:.1}", y - 21.0);
+                                    let name_y = format!("{:.1}", y - 8.0);
+                                    let count_y = format!("{:.1}", y + 13.0);
+                                    let kinds_y = format!("{:.1}", y + 29.0);
+                                    rsx! {
+                                        g {
+                                            key: "project-{index}",
+                                            class: "{node_class}",
+                                            role: "button",
+                                            tabindex: "0",
+                                            onclick: move |_| selected.set(index),
+                                            onkeydown: move |event| {
+                                                let key = event.key();
+                                                if key == Key::Enter || key == Key::Character(" ".to_string()) {
+                                                    selected.set(index);
+                                                }
+                                            },
+                                            title { "{path}" }
+                                            rect { x: "{node_x}", y: "{node_y}", width: "176", height: "72", rx: "18" }
+                                            if current { circle { class: "brain-current-dot", cx: "{current_x}", cy: "{current_y}" } }
+                                            text { class: "brain-node-name", x: "{x:.1}", y: "{name_y}", "{label}" }
+                                            text { class: "brain-node-count", x: "{x:.1}", y: "{count_y}", "{memories} memories" }
+                                            text { class: "brain-node-kinds", x: "{x:.1}", y: "{kinds_y}", "{facts} facts  ·  {skills} skills" }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if project_count > visible_count {
+                            {
+                                let hidden_count = project_count - visible_count;
+                                rsx! { div { class: "brain-map-more", "+{hidden_count} more workspaces in the inspector" } }
+                            }
+                        }
+                    }
+                    aside { class: "brain-inspector",
+                        if let Some(project) = selected_project {
+                            div { class: "brain-project-head",
+                                span { class: "brain-project-icon", Icon { name: "folder" } }
+                                div {
+                                    h3 { "{project.name}" }
+                                    p { title: "{selected_path}", "{selected_path}" }
+                                }
+                                if project.current { span { class: "brain-current", "Current" } }
+                            }
+                            div { class: "brain-memory-summary",
+                                span { "{selected_memory_count} memories" }
+                                span { "Stored in .oxide/memory" }
+                            }
+                            if project.memory_count() == 0 {
+                                div { class: "brain-project-empty",
+                                    "No durable knowledge has been saved for this workspace yet."
+                                }
+                            } else {
+                                div { class: "brain-memory-section",
+                                    div { class: "brain-memory-section-head", span { "Facts" } span { "{selected_fact_count}" } }
+                                    if project.facts.is_empty() {
+                                        p { class: "brain-muted", "No remembered facts." }
+                                    } else {
+                                        for (index, fact) in project.facts.iter().enumerate() {
+                                            div { class: "brain-memory-row fact", key: "fact-{index}",
+                                                span { class: "brain-memory-dot" }
+                                                p { "{fact}" }
+                                            }
+                                        }
+                                    }
+                                }
+                                div { class: "brain-memory-section",
+                                    div { class: "brain-memory-section-head", span { "Skills" } span { "{selected_skill_count}" } }
+                                    if project.skills.is_empty() {
+                                        p { class: "brain-muted", "No learned skills." }
+                                    } else {
+                                        for skill in project.skills.iter().cloned() {
+                                            {
+                                                let skill_path = skill.path.clone();
+                                                rsx! {
+                                                    button { class: "brain-skill-row", key: "skill-{skill.name}", onclick: move |_| on_open_skill.call(skill_path.clone()),
+                                                        span { class: "brain-skill-icon", Icon { name: "brain" } }
+                                                        span { class: "brain-skill-copy",
+                                                            strong { "{skill.name}" }
+                                                            span { "{skill.summary}" }
+                                                        }
+                                                        Icon { name: "chevron" }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if projects.len() > 1 {
+                                div { class: "brain-project-switcher",
+                                    div { class: "brain-memory-section-head", span { "Workspaces" } span { "{project_count}" } }
+                                    for (index, item) in projects.iter().enumerate() {
+                                        {
+                                            let item_count = item.memory_count();
+                                            rsx! {
+                                                button { class: if index == selected_idx { "active" } else { "" }, onclick: move |_| selected.set(index),
+                                                    span { "{item.name}" }
+                                                    span { "{item_count}" }
+                                                }
                                             }
                                         }
                                     }

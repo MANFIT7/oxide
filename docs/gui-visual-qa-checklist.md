@@ -9,7 +9,7 @@ It focuses on states that compile tests cannot prove.
 2. Launch `./target/debug/oxide gui` from a real workspace.
 3. Keep DevTools console visible if available.
 4. Repeat the motion checks once with macOS Reduce Motion enabled.
-5. Run `python3 scripts/gui-visual-qa.py` before manual inspection. It checks the source-level visual-state contracts and writes `target/gui-visual-qa/fixture.html` for quick browser inspection.
+5. Run `python3 scripts/gui-visual-qa.py` before manual inspection. It checks the source-level visual-state contracts and writes `target/gui-visual-qa/fixture.html` plus the interactive `target/gui-visual-qa/brain.html` source-graph preview.
 6. When a Chromium-compatible browser is available, run `python3 scripts/gui-visual-qa.py --runtime`. It opens the fixture through the existing CDP harness, checks required selectors/layout order, captures `target/gui-visual-qa/fixture-cdp.png`, and performs a PNG nonblank sanity check.
 7. For a native app/window smoke on macOS, run `python3 scripts/gui-native-visual-smoke.py --no-build --strict` after building. It launches `./target/debug/oxide gui` with `OXIDE_GUI_VISUAL_FIXTURE=streaming`, captures the Oxide window region to `target/gui-native-visual-smoke/oxide-gui-native.png`, and performs PNG pixel sanity. This requires Accessibility and Screen Recording permission for the host terminal/Codex app.
 8. Record all deterministic native states (`streaming`, `review`, `verification`, `board`, and `settings`) with `python3 scripts/gui-native-visual-record.py --no-build`. Add `--golden-dir docs/gui-goldens --accept` to establish baselines, then rerun without `--accept` to enforce the pixel-difference thresholds.
@@ -98,6 +98,16 @@ It focuses on states that compile tests cannot prove.
 - With no cards, confirm every lane shows its count and a specific empty-state message instead of a blank slab.
 - Add a task and move it through the normal run/review flow; confirm the card settles once without replaying motion on unrelated renders.
 - Open the Environment dock below 900px and confirm it behaves as a deliberate right-side drawer with a visible close control, not an accidental overlap.
+
+## Brain Source Graph
+
+- Open `Brain` from the `Threads | Brain | Workspace` switcher and confirm the chat/TUI surface yields to the graph without leaving overlapping message-trail or Environment controls.
+- Confirm every known project folder appears in the inspector and up to eight workspace nodes remain readable around the central Oxide Memory node.
+- Confirm dashed knowledge edges flow continuously and the central halo pulses without moving node labels or changing the graph layout.
+- Click workspace nodes and navigate them with Tab plus Enter/Space; confirm the active edge/node updates and the facts/skills inspector follows the selected workspace.
+- Open a learned skill and confirm its `.oxide/memory/skills/*.md` file opens in the editor, then return to Brain without losing the graph state.
+- Check a workspace with no memory and confirm it shows a zero-memory node and clear empty inspector instead of disappearing.
+- Open `target/gui-visual-qa/brain.html` in a browser and confirm the Sourcegraph-style graph remains usable at 1280×820, below 980px, and in light/dark themes.
 
 ## Settings Navigation
 

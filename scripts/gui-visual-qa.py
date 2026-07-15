@@ -33,6 +33,7 @@ HOOKS = ROOT / "crates/oxide-core/src/hooks.rs"
 AUTOMATION = ROOT / "crates/oxide-core/src/automation.rs"
 OUT_DIR = ROOT / "target/gui-visual-qa"
 FIXTURE = OUT_DIR / "fixture.html"
+BRAIN_FIXTURE = OUT_DIR / "brain.html"
 
 
 failures: list[str] = []
@@ -268,6 +269,79 @@ Finished dev profile</pre>
 </html>
 """
     FIXTURE.write_text(fixture, encoding="utf-8")
+
+
+def write_brain_fixture(css: str) -> None:
+    """Write an interactive browser preview of the workspace memory graph."""
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    escaped_css = css.replace("</style", "<\\/style")
+    fixture = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Oxide Brain Preview</title>
+  <style>
+{escaped_css}
+    html, body {{ margin: 0; width: 100%; height: 100%; background: #111; }}
+    .brain-preview-shell {{ width: 100%; height: 100%; }}
+  </style>
+</head>
+<body>
+<div class="app" data-theme="dark">
+  <main class="brain-preview-shell">
+    <section class="brain-view" aria-label="Workspace memory graph">
+      <div class="brain-head">
+        <div><div class="brain-eyebrow">⌁ Workspace intelligence</div><h2>Brain</h2><p>Durable facts and reusable skills learned across your project folders.</p></div>
+        <button class="brain-refresh">↻ Refresh</button>
+      </div>
+      <div class="brain-stats">
+        <div class="brain-stat"><span>Projects</span><strong>4</strong></div>
+        <div class="brain-stat facts"><span>Remembered facts</span><strong>18</strong></div>
+        <div class="brain-stat skills"><span>Learned skills</span><strong>7</strong></div>
+      </div>
+      <div class="brain-layout">
+        <div class="brain-map-card">
+          <div class="brain-map-title"><span>Knowledge map</span><span>Click a workspace node to inspect what it learned</span></div>
+          <svg class="brain-map" viewBox="0 0 900 520" role="img">
+            <line class="brain-edge active" data-edge="oxide" x1="450" y1="260" x2="450" y2="82" style="--edge-width:1.96px"></line>
+            <line class="brain-edge" data-edge="synara" x1="450" y1="260" x2="742" y2="260" style="--edge-width:1.60px"></line>
+            <line class="brain-edge" data-edge="provider" x1="450" y1="260" x2="450" y2="438" style="--edge-width:1.48px"></line>
+            <line class="brain-edge" data-edge="harness" x1="450" y1="260" x2="158" y2="260" style="--edge-width:1.36px"></line>
+            <circle class="brain-core-halo" cx="450" cy="260" r="69"></circle>
+            <circle class="brain-core" cx="450" cy="260" r="54"></circle>
+            <text class="brain-core-mark" x="450" y="255">OX</text><text class="brain-core-label" x="450" y="278">Memory</text>
+            <g class="brain-node active" data-node="oxide" tabindex="0"><rect x="362" y="46" width="176" height="72" rx="18"></rect><circle class="brain-current-dot" cx="522" cy="61"></circle><text class="brain-node-name" x="450" y="74">oxide</text><text class="brain-node-count" x="450" y="95">12 memories</text><text class="brain-node-kinds" x="450" y="111">8 facts · 4 skills</text></g>
+            <g class="brain-node" data-node="synara" tabindex="0"><rect x="654" y="224" width="176" height="72" rx="18"></rect><text class="brain-node-name" x="742" y="252">synara</text><text class="brain-node-count" x="742" y="273">6 memories</text><text class="brain-node-kinds" x="742" y="289">4 facts · 2 skills</text></g>
+            <g class="brain-node" data-node="provider" tabindex="0"><rect x="362" y="402" width="176" height="72" rx="18"></rect><text class="brain-node-name" x="450" y="430">providers</text><text class="brain-node-count" x="450" y="451">4 memories</text><text class="brain-node-kinds" x="450" y="467">3 facts · 1 skill</text></g>
+            <g class="brain-node" data-node="harness" tabindex="0"><rect x="70" y="224" width="176" height="72" rx="18"></rect><text class="brain-node-name" x="158" y="252">harnesses</text><text class="brain-node-count" x="158" y="273">3 memories</text><text class="brain-node-kinds" x="158" y="289">3 facts · 0 skills</text></g>
+          </svg>
+        </div>
+        <aside class="brain-inspector">
+          <div class="brain-project-head"><span class="brain-project-icon">⌘</span><div><h3 id="brain-project-name">oxide</h3><p>/Volumes/Data/oxide</p></div><span class="brain-current">Current</span></div>
+          <div class="brain-memory-summary"><span id="brain-memory-total">12 memories</span><span>Stored in .oxide/memory</span></div>
+          <div class="brain-memory-section"><div class="brain-memory-section-head"><span>Facts</span><span>8</span></div><div class="brain-memory-row fact"><span class="brain-memory-dot"></span><p>Tool-call activity is paired by stable call ID.</p></div><div class="brain-memory-row fact"><span class="brain-memory-dot"></span><p>Reasoning is coalesced into one Thought row per turn.</p></div><div class="brain-memory-row fact"><span class="brain-memory-dot"></span><p>Animations use the shared Oxide motion tokens.</p></div></div>
+          <div class="brain-memory-section"><div class="brain-memory-section-head"><span>Skills</span><span>4</span></div><button class="brain-skill-row"><span class="brain-skill-icon">⌁</span><span class="brain-skill-copy"><strong>oxide-release-tag</strong><span>Build, verify, tag, and publish an Oxide release</span></span><span>›</span></button><button class="brain-skill-row"><span class="brain-skill-icon">⌁</span><span class="brain-skill-copy"><strong>audit-gui-motion</strong><span>Review motion contracts and visual regressions</span></span><span>›</span></button></div>
+        </aside>
+      </div>
+    </section>
+  </main>
+</div>
+<script>
+  const labels = {{oxide:['oxide','12 memories'],synara:['synara','6 memories'],provider:['providers','4 memories'],harness:['harnesses','3 memories']}};
+  document.querySelectorAll('.brain-node').forEach(node => node.addEventListener('click', () => {{
+    document.querySelectorAll('.brain-node,.brain-edge').forEach(el => el.classList.remove('active'));
+    node.classList.add('active');
+    document.querySelector(`[data-edge="${{node.dataset.node}}"]`)?.classList.add('active');
+    const [name, total] = labels[node.dataset.node];
+    document.getElementById('brain-project-name').textContent = name;
+    document.getElementById('brain-memory-total').textContent = total;
+  }}));
+</script>
+</body>
+</html>
+"""
+    BRAIN_FIXTURE.write_text(fixture, encoding="utf-8")
 
 
 def run_runtime_visual_qa() -> None:
@@ -946,6 +1020,37 @@ def main() -> int:
         "Board keeps four usable lanes through horizontal overflow, explicit empty states, counts, and host-invariant card transitions",
     )
     require(
+        "workspace brain source graph",
+        contains_all(
+            gui,
+            [
+                'sidebar_tab.set("threads".to_string())',
+                'sidebar_tab.set("brain".to_string())',
+                'class: "brain-view"',
+                'class: "brain-map"',
+                '"brain-edge active"',
+                'onclick: move |_| selected.set(index)',
+                'class: "brain-memory-row fact"',
+                'class: "brain-skill-row"',
+                "fn brain_projects(",
+            ],
+        )
+        and contains_all(
+            css,
+            [
+                ".brain-layout {",
+                ".brain-map {",
+                ".brain-edge {",
+                "animation: brain-edge-flow calc(var(--dur-slow) * 18) linear infinite;",
+                ".brain-core-halo {",
+                "animation: brain-core-pulse calc(var(--dur-slow) * 12)",
+                ".brain-node.active rect {",
+                "@media (max-width: 980px)",
+            ],
+        ),
+        "Brain connects workspace memory nodes with tokenized graph motion, keyboard focus, and a facts/skills inspector",
+    )
+    require(
         "settings navigation scales to all destinations",
         contains_all(gui, ['("sessions", "Sessions")', '("updates", "Updates")'])
         and contains_all(
@@ -1008,6 +1113,7 @@ def main() -> int:
         "Verification Center",
         "Fix feedback",
         "Board And Compact Layout",
+        "Brain Source Graph",
         "Theme Contrast And Keyboard",
         "gui-native-visual-record.py",
     ]
@@ -1040,7 +1146,9 @@ def main() -> int:
 
     if css:
         write_fixture(css)
+        write_brain_fixture(css)
         print(f"INFO fixture: {rel(FIXTURE)}")
+        print(f"INFO brain fixture: {rel(BRAIN_FIXTURE)}")
 
     if args.runtime:
         run_runtime_visual_qa()
