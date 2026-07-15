@@ -97,6 +97,21 @@ def write_fixture(css: str) -> None:
         </details>
       </div>
       <div class="row activity">
+        <details class="activity-card running activity-command has-out live-output" open>
+          <summary class="activity-sum">
+            <span class="activity-status" role="status" aria-atomic="true" aria-label="Running"><!-- UNICODE_ACTIVITY --><span class="activity-ic ok">✓</span><span class="activity-ic fail">×</span></span>
+            <span class="activity-verb">Running command</span>
+            <span class="activity-text">cargo test -p oxide-gui</span>
+            <span class="activity-out-n">5 lines</span><span class="activity-caret">⌃</span>
+          </summary>
+          <pre class="activity-out">Compiling oxide-gui
+Checking motion contracts
+Running visual fixture
+Testing command output tail
+Latest output remains visible</pre>
+        </details>
+      </div>
+      <div class="row activity">
         <details class="activity-card done activity-command has-out" open>
           <summary class="activity-sum">
             <span class="activity-status" role="status" aria-atomic="true" aria-label="Completed"><!-- UNICODE_ACTIVITY --><span class="activity-ic ok">✓</span><span class="activity-ic fail">×</span></span>
@@ -394,8 +409,9 @@ def main() -> int:
                 'UnicodeSpinner { class: "activity-spin" }',
                 'span { class: "activity-ic ok"',
                 'span { class: "activity-ic fail"',
-                'if has_output { "has-out" } else { "no-out" }',
-                'details { class: "{cls}", open: has_output && auto_open',
+                'let live_output = has_output && running && matches!(view.kind, ActivityKind::Command);',
+                '"has-out live-output"',
+                'details { class: "{cls}", open: has_output && (auto_open || live_output)',
                 'class: "activity-caret"',
             ],
         )
@@ -409,7 +425,52 @@ def main() -> int:
                 ".activity-card.has-out[open] .activity-caret",
             ],
         ),
-        f"{rel(GUI)} and {rel(CSS)} cross-fade running/success/failure in a fixed slot and animate tool disclosure without layout measurement",
+        f"{rel(GUI)} and {rel(CSS)} cross-fade running/success/failure in a fixed slot and keep disclosure state stable",
+    )
+    require(
+        "live command output follows the tail in a compact window",
+        contains_all(
+            gui,
+            [
+                '"has-out live-output"',
+                "const followLiveOutputs = () => {",
+                "querySelectorAll('.activity-card.live-output[open] .activity-out')",
+                "out.scrollTop = out.scrollHeight;",
+                "}).observe(document.body, { childList: true, subtree: true, characterData: true });",
+            ],
+        )
+        and contains_all(
+            css,
+            [
+                ".activity-card.live-output .activity-out {",
+                "max-height: 92px;",
+                "scrollbar-gutter: stable;",
+                "mask-image: linear-gradient(to bottom, transparent 0, #000 14px, #000 100%);",
+            ],
+        ),
+        f"{rel(GUI)} and {rel(CSS)} auto-open active commands, coalesce tail-follow with transcript scrolling, and fade old output",
+    )
+    require(
+        "reasoning and tool disclosures tween measured height",
+        contains_all(
+            gui,
+            [
+                "card.matches('.activity-card.has-out, .thinking-box, .thought-row')",
+                "if (now - started < 240) requestAnimationFrame(followTween);",
+            ],
+        )
+        and contains_all(
+            css,
+            [
+                ".activity-card.has-out::details-content {",
+                ".thinking-box::details-content,",
+                ".thought-row::details-content {",
+                "grid-template-rows: 0fr;",
+                "grid-template-rows: 1fr;",
+                "transition: grid-template-rows var(--dur-med) var(--ease-out),",
+            ],
+        ),
+        f"{rel(GUI)} and {rel(CSS)} interpolate disclosure height while preserving intent-based bottom anchoring",
     )
     require(
         "active reasoning tool and edit labels share lifecycle shimmer",

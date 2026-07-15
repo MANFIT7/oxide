@@ -24,7 +24,8 @@ It focuses on states that compile tests cannot prove.
 - Trigger a tool call with streamed arguments, then confirm the activity row first shows `Preparing <tool> ...`, updates as args stream, and settles into the final tool label when execution starts.
 - Confirm command/activity rows keep one fixed status slot: the Braille spinner cross-fades to a check or failure icon without nudging the label horizontally.
 - Confirm the agent and tool Braille sequence advances one fixed-width cell at a time without rotating, resizing, or shifting adjacent text.
-- Expand and collapse a tool with output; confirm the content and caret transition smoothly without shifting neighboring transcript rows.
+- While a command streams output, confirm its card opens automatically, stays near four lines tall, follows the newest line, and fades the old-output edge without moving the outer transcript sideways.
+- Expand and collapse Reasoning or a completed tool with output; confirm the real content height tweens smoothly, the caret stays synchronized, and a transcript already pinned to the bottom follows the tween without recapturing manual scrollback.
 - Stream an answer containing a very long unbroken code line (e.g. ask for a one-line shell pipeline over 200 chars); confirm the transcript never pans sideways — the code block scrolls internally while prose wraps.
 
 ## Compact Orchestration Surfaces

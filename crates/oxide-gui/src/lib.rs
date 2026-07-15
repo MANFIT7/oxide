@@ -5572,6 +5572,17 @@ fn app() -> Element {
             if (!window.__oxscroll) {
               window.__oxscroll = 1;
               let cur = null, inner = null;
+              let liveOutputQueued = false;
+              const followLiveOutputs = () => {
+                if (liveOutputQueued) return;
+                liveOutputQueued = true;
+                requestAnimationFrame(() => {
+                  liveOutputQueued = false;
+                  document.querySelectorAll('.activity-card.live-output[open] .activity-out').forEach((out) => {
+                    out.scrollTop = out.scrollHeight;
+                  });
+                });
+              };
               const rebind = () => {
                 const s = document.querySelector('.scroll');
                 if (s === cur) return;
@@ -5650,16 +5661,38 @@ fn app() -> Element {
                 s.addEventListener('keydown', (ev) => {
                   if (['PageUp', 'ArrowUp', 'Home'].includes(ev.key)) window.__oxstick = false;
                 }, { passive: true });
+                // If a disclosure is toggled while the reader is already pinned
+                // to the tail, follow its 180ms grid-track tween. A detached
+                // reader is never re-captured.
+                s.addEventListener('click', (ev) => {
+                  const summary = ev.target && ev.target.closest ? ev.target.closest('summary') : null;
+                  const card = summary && summary.parentElement;
+                  if (!card || !card.matches('.activity-card.has-out, .thinking-box, .thought-row')) return;
+                  if (window.__oxstick === false || bottomDistance() >= 8) return;
+                  const started = performance.now();
+                  const followTween = (now) => {
+                    if (window.__oxstick === false) return;
+                    ignoreScroll = true;
+                    s.scrollTop = s.scrollHeight;
+                    requestAnimationFrame(() => { ignoreScroll = false; });
+                    if (now - started < 240) requestAnimationFrame(followTween);
+                  };
+                  requestAnimationFrame(followTween);
+                });
                 inner = new MutationObserver(stick);
                 inner.observe(s, { childList: true, subtree: true, characterData: true });
                 // Fresh transcript mount (app start, welcome to chat): start at the bottom.
                 s.scrollTop = s.scrollHeight;
                 upd();
               };
-              // Watch the whole document subtree so .scroll being remounted
-              // (empty<->transcript, editor toggle, tab switch) re-binds the observer.
-              new MutationObserver(rebind).observe(document.body, { childList: true, subtree: true });
+              // Rebind the main transcript and follow live command windows in
+              // both the main chat and detached split panes.
+              new MutationObserver(() => {
+                rebind();
+                followLiveOutputs();
+              }).observe(document.body, { childList: true, subtree: true, characterData: true });
               rebind();
+              followLiveOutputs();
             }
             while (true) { await new Promise(r => setTimeout(r, 3600000)); }
             "#,
@@ -15630,10 +15663,18 @@ fn ActivityRow(
         view.output.lines().count()
     };
     let has_output = !view.output.is_empty();
-    let cls = format!("{cls} {}", if has_output { "has-out" } else { "no-out" });
+    let live_output = has_output && running && matches!(view.kind, ActivityKind::Command);
+    let output_cls = if live_output {
+        "has-out live-output"
+    } else if has_output {
+        "has-out"
+    } else {
+        "no-out"
+    };
+    let cls = format!("{cls} {output_cls}");
     rsx! {
         div { class: "row activity",
-            details { class: "{cls}", open: has_output && auto_open,
+            details { class: "{cls}", open: has_output && (auto_open || live_output),
                 summary {
                     class: "activity-sum",
                     aria_disabled: if has_output { "false" } else { "true" },

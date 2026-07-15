@@ -1940,6 +1940,14 @@ svg { width: 17px; height: 17px; flex-shrink: 0; }
 .activity-out-n { margin-left: auto; font-size: 11px; color: var(--faint); white-space: nowrap; flex-shrink: 0; }
 .activity-sum .copy-btn { flex-shrink: 0; }
 .activity-out { margin-top: 8px; padding: 9px 11px; background: var(--composer); border: 1px solid var(--border); border-radius: 8px; font-family: ui-monospace, Menlo, monospace; font-size: 11.5px; line-height: 1.55; color: var(--text); white-space: pre-wrap; word-break: break-word; max-height: 320px; overflow-y: auto; }
+/* Active commands behave like Emdash's live output window: compact, internally
+   scrollable, and softly faded at the old-output edge while JS follows the tail. */
+.activity-card.live-output .activity-out {
+  max-height: 92px;
+  scrollbar-gutter: stable;
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 14px, #000 100%);
+  mask-image: linear-gradient(to bottom, transparent 0, #000 14px, #000 100%);
+}
 details.has-out[open] .activity-out-n::after { content: " ▴"; }
 details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
 
@@ -4533,17 +4541,27 @@ details.changes-file[open] .diff-body { animation: disclosure-in 220ms ease-out;
   transform: scale(1);
 }
 
-/* Modern WebKit exposes ::details-content, letting opacity/transform animate in
-   both directions without measuring output height or causing transcript reflow. */
+/* The disclosure wrapper is a one-row grid, so open/close interpolates the
+   content's real height instead of snapping from hidden to auto. Opacity and
+   translate remain paint-only companions while the grid track moves rows. */
 .activity-card.has-out::details-content {
+  display: grid;
+  grid-template-rows: 0fr;
+  min-height: 0;
+  overflow: hidden;
   opacity: 0;
   transform: translateY(-3px);
-  transition: opacity .16s ease, transform .22s var(--ease-out), content-visibility .22s allow-discrete;
+  transition: grid-template-rows var(--dur-med) var(--ease-out),
+              opacity var(--dur-fast) ease,
+              transform var(--dur-med) var(--ease-out),
+              content-visibility var(--dur-med) allow-discrete;
 }
 .activity-card.has-out[open]::details-content {
+  grid-template-rows: 1fr;
   opacity: 1;
   transform: none;
 }
+.activity-card.has-out > .activity-out { min-height: 0; }
 .activity-card.has-out[open] .activity-out { animation: none; }
 .activity-caret {
   display: inline-flex;
@@ -4725,8 +4743,28 @@ details.has-out .activity-out-n::after { content: none; }
   font-size: 12px;
   opacity: .72;
 }
+.thinking-box::details-content,
+.thought-row::details-content {
+  display: grid;
+  grid-template-rows: 0fr;
+  min-height: 0;
+  overflow: hidden;
+  opacity: 0;
+  transform: translateY(-3px);
+  transition: grid-template-rows var(--dur-med) var(--ease-out),
+              opacity var(--dur-fast) ease,
+              transform var(--dur-med) var(--ease-out),
+              content-visibility var(--dur-med) allow-discrete;
+}
+.thinking-box[open]::details-content,
+.thought-row[open]::details-content {
+  grid-template-rows: 1fr;
+  opacity: 1;
+  transform: none;
+}
 .thinking-body,
 .thought-body {
+  min-height: 0;
   margin: 2px 0 0 12px;
   padding: 1px 0 2px 12px;
   border: 0;

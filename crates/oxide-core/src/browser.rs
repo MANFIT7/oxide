@@ -247,6 +247,7 @@ mod tests {
     '.streaming-message .agent-md.live',
     '.thinking-box[open] .thinking-body',
     '.activity-card.running .activity-status',
+    '.activity-card.live-output[open] .activity-out',
     '.activity-card.has-out[open] .activity-out',
     '.review-actions .diff-kept',
     '.edits-row.pending .edits-rowcounts.shimmer',
