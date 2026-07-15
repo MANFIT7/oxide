@@ -1369,6 +1369,54 @@ impl PartialEq for ChatMsg {
     }
 }
 
+fn thought_parts(text: &str) -> Option<(u64, &str)> {
+    let mut parts = text.strip_prefix("§thought\t")?.splitn(2, '\t');
+    let secs = parts.next()?.parse().ok()?;
+    Some((secs, parts.next().unwrap_or("")))
+}
+
+/// Keep one stable reasoning row per user turn. Later reasoning segments update
+/// the first row in place so tool calls remain interleaved below one compact
+/// disclosure instead of producing repeated `Thought for 1s` rows.
+fn upsert_turn_thought(messages: &mut Vec<ChatMsg>, secs: u64, text: &str) -> u64 {
+    let turn_start = messages
+        .iter()
+        .rposition(|message| message.author == Author::User)
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    if let Some(index) =
+        (turn_start..messages.len()).find(|&index| thought_parts(&messages[index].text).is_some())
+    {
+        let (previous_secs, previous_body) = thought_parts(&messages[index].text).unwrap();
+        let body = if previous_body.trim().is_empty() {
+            text.to_string()
+        } else if text.trim().is_empty() {
+            previous_body.to_string()
+        } else {
+            format!("{previous_body}\n\n{text}")
+        };
+        messages[index].text = format!("§thought\t{}\t{body}", previous_secs + secs.max(1));
+        messages[index].id
+    } else {
+        let thought = ChatMsg::new(Author::Note, format!("§thought\t{}\t{text}", secs.max(1)));
+        let id = thought.id;
+        messages.push(thought);
+        id
+    }
+}
+
+fn coalesce_transcript_thoughts(messages: Vec<ChatMsg>) -> Vec<ChatMsg> {
+    let mut coalesced = Vec::with_capacity(messages.len());
+    for message in messages {
+        if let Some((secs, body)) = thought_parts(&message.text) {
+            upsert_turn_thought(&mut coalesced, secs, body);
+        } else {
+            coalesced.push(message);
+        }
+    }
+    coalesced
+}
+
 fn ui_spec_message(spec: UiSpec) -> ChatMsg {
     ChatMsg::new(
         Author::UiSpec,
@@ -3396,6 +3444,106 @@ mod tests {
     }
 
     #[test]
+    fn local_server_filter_excludes_desktop_apps_and_ephemeral_ports() {
+        assert!(!is_plausible_dev_server("Discord", 6463));
+        assert!(!is_plausible_dev_server("Termius", 62601));
+        assert!(!is_plausible_dev_server("Dia", 65093));
+        assert!(!is_plausible_dev_server("Slack Helper", 3000));
+        assert!(!is_plausible_dev_server("unknown-app", 49152));
+    }
+
+    #[test]
+    fn local_server_filter_keeps_dev_runtimes_and_common_ports() {
+        assert!(is_plausible_dev_server("node", 6463));
+        assert!(is_plausible_dev_server("Python", 8123));
+        assert!(is_plausible_dev_server("my-project", 5173));
+        assert!(!is_plausible_dev_server("launchd", 3000));
+        assert!(!is_plausible_dev_server("node", 7000));
+    }
+
+    #[test]
+    fn reasoning_segments_share_one_stable_row_per_turn() {
+        let mut messages = vec![ChatMsg::new(Author::User, "fix it")];
+        let first_id = upsert_turn_thought(&mut messages, 1, "Inspecting files");
+        messages.push(ChatMsg::new(
+            Author::Activity {
+                running: false,
+                ok: true,
+                key: Some("read-1".to_string()),
+            },
+            "eye\tRead\tsrc/lib.rs\t",
+        ));
+        let second_id = upsert_turn_thought(&mut messages, 2, "Checking tests");
+
+        assert_eq!(first_id, second_id);
+        let thoughts: Vec<_> = messages
+            .iter()
+            .filter_map(|message| thought_parts(&message.text))
+            .collect();
+        assert_eq!(thoughts, vec![(3, "Inspecting files\n\nChecking tests")]);
+
+        messages.push(ChatMsg::new(Author::User, "next turn"));
+        upsert_turn_thought(&mut messages, 1, "Planning again");
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| thought_parts(&message.text).is_some())
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn legacy_reasoning_rows_coalesce_across_interleaved_tools() {
+        let messages = vec![
+            ChatMsg::new(Author::User, "fix it"),
+            ChatMsg::new(Author::Note, "§thought\t1\tInspecting"),
+            ChatMsg::new(
+                Author::Activity {
+                    running: false,
+                    ok: true,
+                    key: Some("read-1".to_string()),
+                },
+                "eye\tRead\tsrc/lib.rs\t",
+            ),
+            ChatMsg::new(Author::Note, "§thought\t1\tVerifying"),
+        ];
+        let messages = coalesce_transcript_thoughts(messages);
+        assert_eq!(messages.len(), 3);
+        assert_eq!(
+            thought_parts(&messages[1].text),
+            Some((2, "Inspecting\n\nVerifying"))
+        );
+    }
+
+    #[test]
+    fn live_tail_motion_is_bounded_to_six_latest_words() {
+        let tail = "one two three four five six seven";
+        let (prefix, fresh) = live_tail_chunks(tail);
+        assert_eq!(prefix, "one ");
+        assert_eq!(fresh.len(), 6);
+        assert_eq!(
+            prefix
+                + &fresh
+                    .iter()
+                    .map(|(_, word)| word.as_str())
+                    .collect::<String>(),
+            tail
+        );
+    }
+
+    #[test]
+    fn live_markdown_keeps_completed_lines_outside_animated_tail() {
+        let parts = live_markdown_parts("# Stable heading\nnew words");
+        assert!(parts.stable_html.contains("<h1>Stable heading</h1>"));
+        assert_eq!(parts.tail.as_deref(), Some("new words"));
+
+        let code = live_markdown_parts("```rust\nfn main() {");
+        assert!(code.tail.is_none());
+        assert!(code.stable_html.contains("<pre><code"));
+    }
+
+    #[test]
     fn thought_duration_switches_to_minutes() {
         assert_eq!(format_thought_duration(45), "45s");
         assert_eq!(format_thought_duration(688), "11m");
@@ -4397,7 +4545,8 @@ fn open_session_tab(
 /// uses per-turn `content-visibility`, so long sessions stay scrollable without
 /// discarding their beginning.
 fn session_rows_to_chat(rows: Vec<(String, String)>) -> Vec<ChatMsg> {
-    rows.into_iter()
+    let messages = rows
+        .into_iter()
         .filter_map(|(role, content)| {
             if !matches!(role.as_str(), "user" | "assistant" | "summary" | "ui_spec")
                 || is_internal_transcript_text(&content)
@@ -4412,7 +4561,8 @@ fn session_rows_to_chat(rows: Vec<(String, String)>) -> Vec<ChatMsg> {
             };
             Some(ChatMsg::new(author, content))
         })
-        .collect()
+        .collect();
+    coalesce_transcript_thoughts(messages)
 }
 
 /// Load a session transcript into chat messages.
@@ -4555,6 +4705,70 @@ async fn fetch_claude_usage() -> Option<(String, u8, u8)> {
     Some((plan, rem(&v["five_hour"]), rem(&v["seven_day"])))
 }
 
+const LOCAL_SERVER_DENY: &[&str] = &[
+    "discord",
+    "termius",
+    "dia",
+    "slack",
+    "notion",
+    "telegram",
+    "whatsapp",
+    "spotify",
+    "steam",
+    "dropbox",
+    "electron",
+    "chrome",
+    "firefox",
+    "safari",
+    "arc",
+    "rapportd",
+    "controlce",
+    "sharingd",
+    "identityser",
+    "rapport",
+    "cloudd",
+    "apsd",
+    "trustd",
+    "nsurlsess",
+    "airplay",
+    "wifiagent",
+    "music",
+    "podcasts",
+    "supercond",
+    "remoted",
+    "launchd",
+    "deleted",
+    "syncdefa",
+    "agent-",
+];
+
+const DEV_SERVER_COMMANDS: &[&str] = &[
+    "node", "vite", "next", "bun", "deno", "python", "ruby", "php", "cargo", "rustc", "webpack",
+    "esbuild", "turbo", "npm", "pnpm", "yarn", "rails", "flask", "uvicorn", "gunicorn", "caddy",
+    "dotnet", "java", "air", "gin", "hugo", "jekyll", "astro", "remix", "nuxt", "ng", "serve",
+    "http-ser",
+];
+
+fn is_plausible_dev_server(command: &str, port: u16) -> bool {
+    let command = command.to_ascii_lowercase();
+    if LOCAL_SERVER_DENY
+        .iter()
+        .any(|denied| command.starts_with(denied))
+        || matches!(port, 22 | 53 | 88 | 445 | 631 | 5353 | 7000)
+    {
+        return false;
+    }
+
+    DEV_SERVER_COMMANDS
+        .iter()
+        .any(|runtime| command.starts_with(runtime))
+        || matches!(
+            port,
+            1234 | 3000..=3009 | 4000 | 4200 | 4321 | 5000..=5005 | 5173..=5180
+                | 5500 | 8000..=8090 | 8788 | 9000
+        )
+}
+
 async fn scan_procs() -> Vec<(u16, String, u32)> {
     let out = match tokio::process::Command::new("lsof")
         .args(["-nP", "-iTCP", "-sTCP:LISTEN"])
@@ -4564,38 +4778,12 @@ async fn scan_procs() -> Vec<(u16, String, u32)> {
         Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
         Err(_) => return Vec::new(),
     };
-    const DENY: &[&str] = &[
-        "spotify",
-        "rapportd",
-        "controlce",
-        "sharingd",
-        "identityser",
-        "rapport",
-        "cloudd",
-        "apsd",
-        "trustd",
-        "nsurlsess",
-        "airplay",
-        "wifiagent",
-        "music",
-        "podcasts",
-        "supercond",
-        "remoted",
-        "launchd",
-        "deleted",
-        "syncdefa",
-        "agent-",
-    ];
     let mut found: std::collections::BTreeMap<u16, (String, u32)> =
         std::collections::BTreeMap::new();
     for line in out.lines().skip(1) {
         let mut cols = line.split_whitespace();
         let cmd = cols.next().unwrap_or("").to_string();
         let pid: u32 = cols.next().and_then(|p| p.parse().ok()).unwrap_or(0);
-        let lc = cmd.to_ascii_lowercase();
-        if DENY.iter().any(|d| lc.starts_with(d)) {
-            continue;
-        }
         if let Some(addr) = line.split_whitespace().find(|c| {
             c.contains(':')
                 && (c.contains("127.0.0.1")
@@ -4604,7 +4792,7 @@ async fn scan_procs() -> Vec<(u16, String, u32)> {
                     || c.contains("localhost"))
         }) {
             if let Some(p) = addr.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()) {
-                if pid > 0 {
+                if pid > 0 && is_plausible_dev_server(&cmd, p) {
                     found.entry(p).or_insert((cmd, pid));
                 }
             }
@@ -4625,44 +4813,10 @@ async fn scan_ports() -> Vec<(u16, String)> {
         Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
         Err(_) => return Vec::new(),
     };
-    // macOS/media daemons that squat on localhost ports — never a dev server.
-    const DENY: &[&str] = &[
-        "spotify",
-        "rapportd",
-        "controlce",
-        "sharingd",
-        "identityser",
-        "rapport",
-        "cloudd",
-        "apsd",
-        "trustd",
-        "nsurlsess",
-        "airplay",
-        "wifiagent",
-        "music",
-        "podcasts",
-        "supercond",
-        "remoted",
-        "launchd",
-        "deleted",
-        "syncdefa",
-        "agent-",
-    ];
-    // Runtimes that *are* dev servers — these we always surface.
-    const DEV: &[&str] = &[
-        "node", "vite", "next", "bun", "deno", "python", "ruby", "php", "cargo", "rustc",
-        "webpack", "esbuild", "turbo", "npm", "pnpm", "yarn", "rails", "flask", "uvicorn",
-        "gunicorn", "caddy", "dotnet", "java", "air", "gin", "hugo", "jekyll", "astro", "remix",
-        "nuxt", "ng", "serve", "http-ser",
-    ];
     let mut found: std::collections::BTreeMap<u16, String> = std::collections::BTreeMap::new();
     for line in out.lines().skip(1) {
         let mut cols = line.split_whitespace();
         let cmd = cols.next().unwrap_or("").to_string();
-        let lc = cmd.to_ascii_lowercase();
-        if DENY.iter().any(|d| lc.starts_with(d)) {
-            continue;
-        }
         // NAME column holds e.g. "127.0.0.1:5173" or "*:3000".
         if let Some(addr) = line.split_whitespace().find(|c| {
             c.contains(':')
@@ -4672,14 +4826,7 @@ async fn scan_ports() -> Vec<(u16, String)> {
                     || c.contains("localhost"))
         }) {
             if let Some(p) = addr.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()) {
-                if matches!(p, 22 | 53 | 88 | 445 | 631 | 5353 | 7000) {
-                    continue;
-                }
-                let is_dev = DEV.iter().any(|d| lc.starts_with(d));
-                let common = matches!(p, 3000..=3009 | 4000 | 4200 | 4321 | 5000..=5005 | 5173..=5180 | 8000..=8090 | 8788 | 9000 | 1234 | 5500);
-                // Keep only plausible dev servers: a known runtime, or a common
-                // dev port. Drops random ephemeral daemons.
-                if is_dev || common {
+                if is_plausible_dev_server(&cmd, p) {
                     found.entry(p).or_insert(cmd.clone());
                 }
             }
@@ -5145,6 +5292,9 @@ fn app() -> Element {
     let mut expanded_user = use_signal(HashSet::<u64>::new);
     // User override for the thinking-box open state (None = follow streaming).
     let mut think_open = use_signal(|| None::<bool>);
+    // The just-finished reasoning row briefly keeps its body open while the
+    // live label settles, then closes through the normal disclosure tween.
+    let mut settling_thought = use_signal(|| None::<u64>);
     // Per activity-group open state (keyed by first row index). Defaults to the
     // running state but, once the user toggles, their choice sticks across the
     // streaming re-renders that would otherwise force it back open.
@@ -6108,15 +6258,20 @@ fn app() -> Element {
                         {
                             m.pop();
                         }
-                        m.push(ChatMsg::new(
-                            Author::Note,
-                            format!("§thought\t{secs}\t{text}"),
-                        ));
+                        let thought_id = upsert_turn_thought(&mut m, secs, &text);
                         drop(m);
                         thinking.set(String::new());
                         think_started.set(None);
                         think_secs.set(0);
                         think_open.set(None);
+                        settling_thought.set(Some(thought_id));
+                        let mut settling = settling_thought;
+                        spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_millis(320)).await;
+                            if *settling.peek() == Some(thought_id) {
+                                settling.set(None);
+                            }
+                        });
                     }
                 }};
             }
@@ -9326,12 +9481,13 @@ fn app() -> Element {
                                                                 let mut parts = m.text.splitn(3, '\t');
                                                                 let _ = parts.next();
                                                                 let secs = parts.next().unwrap_or("1").parse().unwrap_or(1);
-                                                                let duration = format_thought_duration(secs);
                                                                 let body = parts.next().unwrap_or("").to_string();
                                                                 rsx! {
-                                                                    details { key: "m-{m.id}", class: "thought-row",
-                                                                        summary { class: "thought-sum", "Thought for {duration}" }
-                                                                        div { class: "thought-body", dangerous_inner_html: reasoning_html(&body, false) }
+                                                                    ThoughtRow {
+                                                                        key: "m-{m.id}",
+                                                                        secs,
+                                                                        body,
+                                                                        settling: *settling_thought.read() == Some(m.id),
                                                                     }
                                                                 }
                                                             }
@@ -12280,30 +12436,26 @@ fn md_to_html(src: &str, live: bool) -> String {
 /// it finishes (headings/bold appear live, and there's no end-of-turn pop), while
 /// the trailing in-progress line is kept raw so the actively-streaming line
 /// doesn't relayout on every token.
-fn md_live_html(src: &str) -> String {
-    // Inside an unclosed code fence, render the whole buffer as markdown so the
-    // partial code streams as a code block (pulldown extends an open fence to
-    // EOF) instead of leaking raw fence lines. Both ``` and ~~~ open fences.
+#[derive(Default)]
+struct LiveMarkdownParts {
+    stable_html: String,
+    tail: Option<String>,
+}
+
+fn live_markdown_parts(src: &str) -> LiveMarkdownParts {
+    // Partial fences and table rows must stay one contiguous markdown tree.
+    // They intentionally skip per-word motion to avoid code/table reflow.
     if src.matches("```").count() % 2 == 1 || src.matches("~~~").count() % 2 == 1 {
-        return md_to_html_uncached(src, true);
+        return LiveMarkdownParts {
+            stable_html: md_to_html_uncached(src, true),
+            tail: None,
+        };
     }
 
-    // Split off the trailing partial line at the last newline.
     let (stable, tail) = match src.rfind('\n') {
         Some(nl) => (&src[..=nl], &src[nl + 1..]),
         None => ("", src),
     };
-
-    // A markdown TABLE row is being streamed: a table needs its rows in one
-    // contiguous block, so keeping this "| … |" tail raw (below) would render it
-    // as literal text beneath the already-parsed rows — the table looks broken
-    // mid-stream. Render the whole buffer so the in-progress row joins its table,
-    // same idea as the open code-fence case above. (Costs a re-parse per token
-    // only while a table row streams, which is cheap and short-lived.) Also catch
-    // GFM tables WITHOUT outer pipes ("a | b" / "--- | ---" / "c | d"): if the
-    // in-progress tail and the line just above both carry an inner pipe, it's
-    // almost certainly a mid-stream table body row. Worst-case false positive is
-    // a harmless extra re-parse of prose — pulldown won't fabricate a table.
     let tail_is_table = {
         let t = tail.trim_start();
         t.starts_with('|')
@@ -12311,16 +12463,18 @@ fn md_live_html(src: &str) -> String {
                 && stable
                     .lines()
                     .rev()
-                    .find(|l| !l.trim().is_empty())
-                    .is_some_and(|l| l.contains('|')))
+                    .find(|line| !line.trim().is_empty())
+                    .is_some_and(|line| line.contains('|')))
     };
     if tail_is_table {
-        return md_to_html_uncached(src, true);
+        return LiveMarkdownParts {
+            stable_html: md_to_html_uncached(src, true),
+            tail: None,
+        };
     }
 
-    // The stable prefix only changes when a line completes — not on every
-    // streamed token (the tail carries the in-progress line) — so cache its
-    // markdown render and re-parse only when the prefix actually changes.
+    // The prefix changes only when a line completes, so it remains cached while
+    // keyed tail words update independently in the Dioxus tree.
     let stable_html = if stable.is_empty() {
         String::new()
     } else {
@@ -12332,8 +12486,8 @@ fn md_live_html(src: &str) -> String {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         stable.hash(&mut h);
         let key = h.finish();
-        LIVE_CACHE.with(|c| {
-            let mut cell = c.borrow_mut();
+        LIVE_CACHE.with(|cache| {
+            let mut cell = cache.borrow_mut();
             if cell.0 != key {
                 *cell = (key, md_to_html_uncached(stable, true));
             }
@@ -12341,11 +12495,41 @@ fn md_live_html(src: &str) -> String {
         })
     };
 
-    let mut html = String::with_capacity(stable_html.len() + tail.len() + 64);
-    html.push_str(&stable_html);
-    if !tail.is_empty() {
+    LiveMarkdownParts {
+        stable_html,
+        tail: Some(tail.to_string()),
+    }
+}
+
+fn live_tail_chunks(tail: &str) -> (String, Vec<(usize, String)>) {
+    const FRESH_WORDS: usize = 6;
+    let chunks: Vec<&str> = tail.split_inclusive(char::is_whitespace).collect();
+    let word_positions: Vec<usize> = chunks
+        .iter()
+        .enumerate()
+        .filter_map(|(index, chunk)| (!chunk.trim().is_empty()).then_some(index))
+        .collect();
+    let cutoff = word_positions
+        .len()
+        .checked_sub(FRESH_WORDS)
+        .map(|index| word_positions[index])
+        .unwrap_or(0);
+    let prefix = chunks[..cutoff].concat();
+    let fresh = chunks[cutoff..]
+        .iter()
+        .enumerate()
+        .map(|(offset, chunk)| (cutoff + offset, (*chunk).to_string()))
+        .collect();
+    (prefix, fresh)
+}
+
+fn md_live_html(src: &str) -> String {
+    let parts = live_markdown_parts(src);
+    let mut html = String::with_capacity(parts.stable_html.len() + src.len() + 64);
+    html.push_str(&parts.stable_html);
+    if let Some(tail) = parts.tail.filter(|tail| !tail.is_empty()) {
         html.push_str("<div class=\"live-tail\">");
-        html.push_str(&esc(tail));
+        html.push_str(&esc(&tail));
         html.push_str("</div>");
     }
     html
@@ -14534,6 +14718,51 @@ fn StatusPill(
 }
 
 #[component]
+fn ThoughtRow(secs: u64, body: String, #[props(default)] settling: bool) -> Element {
+    let duration = format_thought_duration(secs);
+    let class = if settling {
+        "thought-row settling"
+    } else {
+        "thought-row"
+    };
+    rsx! {
+        details { class: "{class}", open: settling,
+            summary { class: "thought-sum",
+                span { class: "thought-label-stack",
+                    if settling {
+                        span { class: "thought-label-live", "Reasoning" }
+                        span { class: "thought-label-settled", "Thought for {duration}" }
+                    } else {
+                        span { class: "thought-label", "Thought for {duration}" }
+                    }
+                }
+            }
+            div { class: "thought-body", dangerous_inner_html: reasoning_html(&body, false) }
+        }
+    }
+}
+
+#[component]
+fn LiveMarkdown(text: String) -> Element {
+    let LiveMarkdownParts { stable_html, tail } = live_markdown_parts(&text);
+    let tail = tail.filter(|tail| !tail.is_empty());
+    let (prefix, fresh) = tail.as_deref().map(live_tail_chunks).unwrap_or_default();
+    rsx! {
+        if !stable_html.is_empty() {
+            div { class: "live-stable", dangerous_inner_html: "{stable_html}" }
+        }
+        if tail.is_some() {
+            div { class: "live-tail",
+                "{prefix}"
+                for (key, chunk) in fresh {
+                    span { key: "live-word-{key}", class: "live-word fresh", "{chunk}" }
+                }
+            }
+        }
+    }
+}
+
+#[component]
 fn Message(
     author: Author,
     text: String,
@@ -14587,7 +14816,11 @@ fn Message(
             rsx! {
                 div { class: if live { "row agent streaming-message" } else { "row agent" },
                     img { class: "avatar", src: logo_uri() }
-                    div { class: "{body_cls}", dangerous_inner_html: md_to_html(&text, live) }
+                    if live {
+                        div { class: "{body_cls}", LiveMarkdown { text: text.clone() } }
+                    } else {
+                        div { class: "{body_cls}", dangerous_inner_html: md_to_html(&text, false) }
+                    }
                     if !live {
                         button { class: "msg-copy", title: "Copy message", onclick: move |_| { let c = copy.clone(); spawn(async move { let _ = document::eval(&format!("navigator.clipboard.writeText({c})")).await; }); }, Icon { name: "copy" } }
                     }
@@ -16024,13 +16257,14 @@ fn ChatPane(
     #[props(default)] initial: Vec<ChatMsg>,
     #[props(default)] isolate: bool,
 ) -> Element {
-    let mut messages = use_signal(move || initial.clone());
+    let mut messages = use_signal(move || coalesce_transcript_thoughts(initial.clone()));
     let mut input = use_signal(String::new);
     // Pending ask_user question in this pane: (question, options).
     let mut pane_question = use_signal(|| None::<(String, Vec<String>)>);
     let mut streaming = use_signal(|| false);
     let mut thinking = use_signal(String::new);
     let mut status = use_signal(String::new);
+    let mut settling_thought = use_signal(|| None::<u64>);
 
     let p0 = provider.clone();
     let m0 = model.clone();
@@ -16122,13 +16356,18 @@ fn ChatPane(
                         {
                             rows.pop();
                         }
-                        rows.push(ChatMsg::new(
-                            Author::Note,
-                            format!("§thought\t{secs}\t{text}"),
-                        ));
+                        let thought_id = upsert_turn_thought(&mut rows, secs, &text);
                         drop(rows);
                         thinking.set(String::new());
                         pane_think_started = None;
+                        settling_thought.set(Some(thought_id));
+                        let mut settling = settling_thought;
+                        spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_millis(320)).await;
+                            if *settling.peek() == Some(thought_id) {
+                                settling.set(None);
+                            }
+                        });
                     }
                 }};
             }
@@ -16254,6 +16493,12 @@ fn ChatPane(
         }
     });
 
+    let last_agent_id = messages
+        .read()
+        .iter()
+        .rfind(|msg| msg.author == Author::Agent)
+        .map(|msg| msg.id);
+
     rsx! {
         div { class: "pane-body",
             div { class: "pane-scroll",
@@ -16282,22 +16527,30 @@ fn ChatPane(
                                 let mut parts = msg.text.splitn(3, '\t');
                                 let _ = parts.next();
                                 let secs = parts.next().unwrap_or("1").parse().unwrap_or(1);
-                                                                let duration = format_thought_duration(secs);
                                 let body = parts.next().unwrap_or("").to_string();
                                 rsx! {
-                                    details { key: "m-{msg.id}", class: "thought-row",
-                                        summary { class: "thought-sum", "Thought for {duration}" }
-                                        div { class: "thought-body", dangerous_inner_html: reasoning_html(&body, false) }
+                                    ThoughtRow {
+                                        key: "m-{msg.id}",
+                                        secs,
+                                        body,
+                                        settling: *settling_thought.read() == Some(msg.id),
                                     }
                                 }
                             }
-                            _ => rsx! { Message { key: "m-{msg.id}", author: msg.author.clone(), text: msg.text.clone() } }
+                            _ => {
+                                let live = *streaming.read()
+                                    && msg.author == Author::Agent
+                                    && last_agent_id == Some(msg.id);
+                                rsx! { Message { key: "m-{msg.id}", author: msg.author.clone(), text: msg.text.clone(), live } }
+                            }
                         }
                     }
                 }
                 if !thinking.read().is_empty() {
                     details { class: "thinking-box", open: *streaming.read(),
-                        summary { class: "thinking-sum", "Reasoning" }
+                        summary { class: "thinking-sum live",
+                            span { class: "thinking-glow", "Reasoning" }
+                        }
                         div { class: "thinking-body", dangerous_inner_html: reasoning_html(&thinking.read(), false) }
                     }
                 }

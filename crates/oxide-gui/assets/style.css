@@ -4437,6 +4437,18 @@ details.changes-file[open] .diff-body { animation: disclosure-in 220ms ease-out;
   from { opacity: 0; transform: translateY(3px); }
   to { opacity: 1; transform: none; }
 }
+@keyframes oxide-stream-word {
+  from { opacity: .18; transform: translateY(2px); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes oxide-thought-live-out {
+  0%, 35% { opacity: 1; transform: none; }
+  100% { opacity: 0; transform: translateY(-1px); }
+}
+@keyframes oxide-thought-settled-in {
+  0%, 28% { opacity: 0; transform: translateY(1px); }
+  100% { opacity: 1; transform: none; }
+}
 @keyframes oxide-stream-rail {
   0%, 100% { opacity: .28; transform: scaleY(.42); }
   48% { opacity: .82; transform: scaleY(1); }
@@ -4479,6 +4491,11 @@ details.changes-file[open] .diff-body { animation: disclosure-in 220ms ease-out;
 .agent-md.live .live-tail {
   opacity: .9;
   text-wrap: pretty;
+}
+.agent-md.live .live-word.fresh {
+  display: inline-block;
+  animation: oxide-stream-word var(--dur-med) var(--ease-enter) both;
+  will-change: opacity, transform;
 }
 
 .row.activity,
@@ -4742,6 +4759,20 @@ details.has-out .activity-out-n::after { content: none; }
 .thinking-secs {
   font-size: 12px;
   opacity: .72;
+}
+.thought-label-stack {
+  display: inline-grid;
+  align-items: center;
+}
+.thought-label-stack > span { grid-area: 1 / 1; }
+.thought-label-live {
+  animation: oxide-thought-live-out var(--dur-slow) var(--ease-exit) both;
+}
+.thought-label-settled {
+  animation: oxide-thought-settled-in var(--dur-slow) var(--ease-enter) both;
+}
+.thought-row.settling .thought-body {
+  animation: oxide-reveal-down var(--dur-med) var(--ease-out) both;
 }
 .thinking-box::details-content,
 .thought-row::details-content {

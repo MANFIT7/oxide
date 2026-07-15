@@ -245,7 +245,9 @@ mod tests {
   const required = [
     '.agent-waiting .typing',
     '.streaming-message .agent-md.live',
+    '.agent-md.live .live-tail .live-word.fresh',
     '.thinking-box[open] .thinking-body',
+    '.thought-row.settling[open] .thought-label-settled',
     '.activity-card.running .activity-status',
     '.activity-card.live-output[open] .activity-out',
     '.activity-card.has-out[open] .activity-out',
@@ -260,7 +262,9 @@ mod tests {
   const thinking = document.querySelector('.thinking-box')?.getBoundingClientRect();
   const answer = document.querySelector('.row.agent:not(.agent-waiting)')?.getBoundingClientRect();
   const stream = document.querySelector('.agent-md.live');
+  const streamWord = document.querySelector('.agent-md.live .live-word.fresh');
   const streamRow = document.querySelector('.streaming-message');
+  const settledThoughtLabel = document.querySelector('.thought-row.settling .thought-label-settled');
   const subagentsRow = document.querySelector('.env-card-row.env-subagents-running');
   const todoCard = document.querySelector('.todo-card.run-disclosure');
   const liveChangesCard = document.querySelector('.composer-live-changes');
@@ -273,9 +277,11 @@ mod tests {
     missing,
     thinkingAboveAnswer: Boolean(thinking && answer && thinking.bottom <= answer.top),
     streamAnimation: stream ? getComputedStyle(stream).animationName : '',
+    streamWordAnimation: streamWord ? getComputedStyle(streamWord).animationName : '',
     streamRailAnimation: streamRow ? getComputedStyle(streamRow, '::before').animationName : '',
     thinkingShimmerAnimation: getComputedStyle(document.querySelector('.thinking-glow')).animationName,
     thinkingRevealAnimation: getComputedStyle(document.querySelector('.thinking-body')).animationName,
+    settledThoughtLabelAnimation: settledThoughtLabel ? getComputedStyle(settledThoughtLabel).animationName : '',
     toolLabelShimmerAnimation: getComputedStyle(document.querySelector('.activity-card.running .activity-verb')).animationName,
     liveEditShimmerAnimation: getComputedStyle(document.querySelector('.composer-live-changes .live-changes-title')).animationName,
     liveEditEntryAnimation: getComputedStyle(liveChangesCard).animationName,
@@ -314,6 +320,11 @@ mod tests {
             "live answer should use the first-token entrance: {report}"
         );
         assert_eq!(
+            report["streamWordAnimation"].as_str(),
+            Some("oxide-stream-word"),
+            "only the keyed live tail words should fade in: {report}"
+        );
+        assert_eq!(
             report["streamRailAnimation"].as_str(),
             Some("oxide-stream-rail"),
             "streaming rail should animate outside the live HTML: {report}"
@@ -327,6 +338,11 @@ mod tests {
             report["thinkingRevealAnimation"].as_str(),
             Some("oxide-reveal-down"),
             "expanded reasoning should reveal without a hard pop: {report}"
+        );
+        assert_eq!(
+            report["settledThoughtLabelAnimation"].as_str(),
+            Some("oxide-thought-settled-in"),
+            "finished reasoning should cross-fade into its settled label: {report}"
         );
         assert_eq!(
             report["toolLabelShimmerAnimation"].as_str(),
@@ -437,7 +453,9 @@ mod tests {
                 r#"
 JSON.stringify({
   streamAnimation: getComputedStyle(document.querySelector('.agent-md.live')).animationName,
+  streamWordAnimation: getComputedStyle(document.querySelector('.agent-md.live .live-word.fresh')).animationName,
   streamRailAnimation: getComputedStyle(document.querySelector('.streaming-message'), '::before').animationName,
+  thoughtSettleAnimation: getComputedStyle(document.querySelector('.thought-label-settled')).animationName,
   toolHaloAnimation: getComputedStyle(document.querySelector('.activity-card.running .activity-status'), '::after').animationName,
   toolSpinnerAnimation: getComputedStyle(document.querySelector('.activity-card.running .activity-spin'), '::after').animationName,
   thinkingShimmerAnimation: getComputedStyle(document.querySelector('.thinking-glow')).animationName,
@@ -459,8 +477,16 @@ JSON.stringify({
             Some("oxide-stream-first-token")
         );
         assert_eq!(
+            reduced["streamWordAnimation"].as_str(),
+            Some("oxide-stream-word")
+        );
+        assert_eq!(
             reduced["streamRailAnimation"].as_str(),
             Some("oxide-stream-rail")
+        );
+        assert_eq!(
+            reduced["thoughtSettleAnimation"].as_str(),
+            Some("oxide-thought-settled-in")
         );
         assert_eq!(reduced["toolHaloAnimation"].as_str(), Some("none"));
         assert_eq!(

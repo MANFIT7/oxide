@@ -87,6 +87,10 @@ def write_fixture(css: str) -> None:
         <summary class="thinking-sum live"><span class="thinking-glow">Reasoning</span><span class="thinking-secs">3s</span></summary>
         <div class="thinking-body">Inspecting harness routes, streamed tool args, and session metadata.</div>
       </details>
+      <details class="thought-row settling" open>
+        <summary class="thought-sum"><span class="thought-label-stack"><span class="thought-label-live">Reasoning</span><span class="thought-label-settled">Thought for 3s</span></span></summary>
+        <div class="thought-body">The reasoning label settles before this body collapses.</div>
+      </details>
       <div class="row activity">
         <details class="activity-card running activity-search activity-preparing no-out">
           <summary class="activity-sum">
@@ -125,7 +129,7 @@ Finished dev profile</pre>
       </div>
       <div class="row agent streaming-message">
         <div class="avatar"></div>
-        <div class="agent-text agent-md live"><div class="live-tail">Streaming answer text stays readable while the tail fades softly.</div></div>
+        <div class="agent-text agent-md live"><div class="live-stable"><p>Streaming answer text stays readable.</p></div><div class="live-tail"><span class="live-word fresh">New </span><span class="live-word fresh">words </span><span class="live-word fresh">fade </span><span class="live-word fresh">in.</span></div></div>
       </div>
       <div class="review-item">
         <details class="review-diff-d" open>
@@ -363,26 +367,31 @@ def main() -> int:
         f"{rel(CSS)} makes every legacy reduced-motion fallback unreachable so host settings cannot freeze the UI",
     )
     require(
-        "streaming lifecycle motion stays outside live HTML",
+        "streaming tail motion is keyed and bounded",
         contains_all(
             gui,
             [
                 '"row agent streaming-message"',
                 '"agent-text agent-md live"',
-                'html.push_str("<div class=\\"live-tail\\">")',
+                "fn LiveMarkdown(",
+                "fn live_tail_chunks(",
+                "const FRESH_WORDS: usize = 6;",
+                'key: "live-word-{key}"',
+                'class: "live-word fresh"',
             ],
         )
         and contains_all(
             css,
             [
                 "@keyframes oxide-stream-first-token",
+                "@keyframes oxide-stream-word",
                 "@keyframes oxide-stream-rail",
                 ".row.agent.streaming-message::before",
-                ".agent-md.live .live-tail",
-                "will-change: opacity, transform;",
+                ".agent-md.live .live-word.fresh",
+                "animation: oxide-stream-word var(--dur-med) var(--ease-enter) both;",
             ],
         ),
-        f"{rel(GUI)} and {rel(CSS)} keep chunk-stable streaming motion on the keyed row instead of reanimating markdown children",
+        f"{rel(GUI)} and {rel(CSS)} animate only six keyed tail words while completed markdown remains stable",
     )
     require(
         "detached pane streaming coalesces deltas",
@@ -489,12 +498,53 @@ def main() -> int:
         f"{rel(CSS)} applies Emdash-style paint-only shimmer and entry/reveal motion to active reasoning, tools, and edits",
     )
     require(
+        "reasoning settles before disclosure collapse",
+        contains_all(
+            gui,
+            [
+                "fn ThoughtRow(",
+                '"thought-row settling"',
+                'class: "thought-label-live"',
+                'class: "thought-label-settled"',
+                "settling_thought.set(Some(thought_id));",
+                "from_millis(320)",
+            ],
+        )
+        and contains_all(
+            css,
+            [
+                "@keyframes oxide-thought-live-out",
+                "@keyframes oxide-thought-settled-in",
+                ".thought-label-stack",
+                ".thought-row.settling .thought-body",
+            ],
+        ),
+        f"{rel(GUI)} and {rel(CSS)} cross-fade Reasoning into Thought for … before closing through the shared height tween",
+    )
+    require(
+        "reasoning segments coalesce per turn",
+        contains_all(
+            gui,
+            [
+                "fn upsert_turn_thought(",
+                "previous_secs + secs.max(1)",
+                'format!("{previous_body}\\n\\n{text}")',
+                "coalesce_transcript_thoughts(messages)",
+                "let thought_id = upsert_turn_thought(&mut m, secs, &text);",
+                "let thought_id = upsert_turn_thought(&mut rows, secs, &text);",
+            ],
+        ),
+        f"{rel(GUI)} keeps one stable Thought disclosure per user turn in primary, pane, and replay paths",
+    )
+    require(
         "motion policy keeps lifecycle polish active",
         contains_all(
             css,
             [
                 "@keyframes oxide-stream-first-token",
+                "@keyframes oxide-stream-word",
                 "@keyframes oxide-stream-rail",
+                "@keyframes oxide-thought-settled-in",
                 "@keyframes oxide-tool-halo",
                 "@keyframes oxide-unicode-frame",
                 motion_override,
