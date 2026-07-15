@@ -1590,9 +1590,16 @@ svg { width: 17px; height: 17px; flex-shrink: 0; }
   background: var(--surface); color: var(--muted); cursor: pointer; font: inherit; font-size: 11.5px;
   transition: color var(--dur-fast) ease, border-color var(--dur-fast) ease, transform var(--dur-fast) var(--ease-out);
 }
-.brain-refresh:hover { color: var(--text); border-color: color-mix(in srgb, var(--syn-accent) 34%, var(--border)); }
-.brain-refresh:active { transform: scale(.97); }
+.brain-refresh:hover:not(:disabled) { color: var(--text); border-color: color-mix(in srgb, var(--syn-accent) 34%, var(--border)); }
+.brain-refresh:active:not(:disabled) { transform: scale(.97); }
+.brain-refresh:disabled { cursor: wait; opacity: .62; }
 .brain-refresh svg { width: 13px; height: 13px; }
+.brain-load-error {
+  display: flex; align-items: center; gap: 8px; border: 1px solid color-mix(in srgb, var(--danger) 32%, var(--border));
+  border-radius: 9px; padding: 8px 10px; background: color-mix(in srgb, var(--danger) 7%, transparent);
+  color: var(--danger); font-size: 11.5px;
+}
+.brain-load-error svg { width: 14px; height: 14px; }
 .brain-stats { display: grid; grid-template-columns: repeat(3, minmax(120px, 1fr)); gap: 10px; }
 .brain-stat {
   min-height: 58px; display: flex; align-items: center; justify-content: space-between; gap: 12px;
@@ -2246,7 +2253,7 @@ details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
 
 /* ── Synara structure + motion (applies to all themes) ──────── */
 /* (kartu chat floating pindah ke seksi SYNARA REDESIGN di akhir file) */
-.composer:focus-within { border-color: color-mix(in srgb, var(--syn-accent) 55%, transparent) !important; }
+.composer:focus-within { border-color: var(--menu-border) !important; }
 /* frosted translucent surfaces */
 /* NOTE: no backdrop-filter here — it creates a containing block that clips the
    fixed-position theme/context menu rendered inside the sidebar. */
@@ -2293,9 +2300,9 @@ details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
 .thread:hover { background: color-mix(in srgb, var(--text) 6%, transparent); }
 .thread.active { background: color-mix(in srgb, var(--text) 6%, transparent); color: var(--text); }
 .thread-title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.thread-time { width: 1.7rem; text-align: right; font-size: 11px; color: color-mix(in srgb, var(--text) 38%, transparent); font-variant-numeric: tabular-nums; flex-shrink: 0; transition: opacity .12s; }
-.thread-anchor { position: relative; }
-.thread-anchor:hover .thread-time { opacity: 0; }
+.thread-time { width: 1.7rem; text-align: right; font-size: 11px; color: color-mix(in srgb, var(--text) 38%, transparent); font-variant-numeric: tabular-nums; flex-shrink: 0; overflow: hidden; transition: opacity var(--dur-fast) ease, width var(--dur-fast) var(--ease-out); }
+.thread-anchor:hover .thread-time,
+.thread-anchor:has(.pinned) .thread-time { opacity: 0; width: 0; }
 
 /* icon-chip ring (separates overlapping avatars/badges) */
 .sidebar-icon-chip { background: var(--sidebar); box-shadow: 0 0 0 1px var(--border), 0 1px 2px rgba(0,0,0,.05); }
@@ -2371,9 +2378,10 @@ details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
 .shortcut-key { font-family: ui-monospace, Menlo, monospace; font-size: 12px; background: var(--surface-hi); border: 1px solid var(--border); border-radius: 6px; padding: 2px 8px; min-width: 90px; text-align: center; color: var(--text); }
 .shortcut-desc { font-size: 13px; color: var(--muted); }
 
-/* grow right padding on hover so the title truncates before the action buttons */
-.thread-anchor:hover .thread.recent { padding-right: 74px; }
-.thread-anchor:has(.pinned) .thread.recent { padding-right: 26px; }
+/* Reserve only the action width on hover; the time label collapses above, so
+   short session titles stay visible instead of turning into an icon-only row. */
+.thread-anchor:hover .thread.recent { padding-right: 50px; }
+.thread-anchor:has(.pinned) .thread.recent { padding-right: 50px; }
 .row-act-btn { font-size: 11px; }
 
 /* in-app preview panel (ara-style port detection + local preview) */
@@ -2513,8 +2521,8 @@ details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
 }
 
 /* ── Cursor-3.0-style touches ─────────────────────────────────── */
-/* composer focus: soft accent glow ring */
-.composer:focus-within { border-color: color-mix(in srgb, var(--syn-accent) 55%, var(--border)); box-shadow: 0 0 0 3px color-mix(in srgb, var(--syn-accent) 14%, transparent), 0 8px 28px -18px color-mix(in srgb, var(--syn-accent) 35%, transparent); transition: box-shadow .18s ease, border-color .18s ease; }
+/* Keep composer focus visually quiet; the text caret already communicates it. */
+.composer:focus-within { border-color: var(--menu-border); box-shadow: none; transition: none; }
 /* streaming caret removed — it rendered as a stray blue block under the text
    (its @keyframes ox-caret was dead and has been dropped). */
 /* springy send button */
@@ -2546,6 +2554,23 @@ details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
   flex-direction: column;
   content-visibility: auto;
   contain-intrinsic-size: auto 220px;
+}
+.transcript-load-earlier {
+  align-self: center;
+  margin: 0 auto 18px;
+  padding: 6px 11px;
+  border: 1px solid color-mix(in srgb, var(--text) 10%, transparent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--surface) 70%, transparent);
+  color: var(--muted);
+  font: 500 12px/1.2 inherit;
+  cursor: pointer;
+  transition: color var(--dur-fast) ease, background var(--dur-fast) ease, border-color var(--dur-fast) ease;
+}
+.transcript-load-earlier:hover {
+  color: var(--text);
+  background: var(--surface);
+  border-color: color-mix(in srgb, var(--syn-accent) 28%, transparent);
 }
 .row.user.sticky-turn {
   position: sticky; top: 6px; z-index: 3;
@@ -4268,7 +4293,7 @@ details.activity-card.has-out .activity-sum { padding: 2px 4px; }
   box-shadow: 0 4px 16px -10px rgba(20,20,20,.18);
 }
 
-/* sidebar: segmented control Threads | Brain | Workspace */
+/* sidebar: segmented control Threads | Workspace */
 .side-seg {
   display: flex; gap: 2px; margin: 0 8px 10px;
   background: color-mix(in srgb, var(--text) 6%, transparent);
@@ -4289,6 +4314,11 @@ details.activity-card.has-out .activity-sum { padding: 2px 4px; }
 .app[data-theme="light"] .side-seg button.on { box-shadow: 0 1px 3px rgba(20,20,20,.1), 0 0 0 1px var(--border); }
 
 /* switching sidebar: Threads = sessions, Brain = memory graph, Workspace = tools */
+.nav-item.brain-nav.on {
+  background: color-mix(in srgb, var(--syn-accent) 10%, transparent);
+  color: var(--text);
+}
+.nav-item.brain-nav.on svg { color: var(--syn-accent); }
 .sidebar .nav-item.ws-item { display: none; }
 .sidebar.ws-mode .nav-item.ws-item { display: flex; }
 .sidebar.ws-mode .section-row, .sidebar.ws-mode .projects,

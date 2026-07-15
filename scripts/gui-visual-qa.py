@@ -284,11 +284,22 @@ def write_brain_fixture(css: str) -> None:
   <style>
 {escaped_css}
     html, body {{ margin: 0; width: 100%; height: 100%; background: #111; }}
-    .brain-preview-shell {{ width: 100%; height: 100%; }}
+    .brain-preview-shell {{ flex: 1; min-width: 0; height: 100%; }}
+    .brain-preview-logo {{ width: 24px; height: 24px; display: inline-flex; align-items: center; justify-content: center; border-radius: 7px; background: color-mix(in srgb, var(--syn-accent) 18%, transparent); color: var(--syn-accent); font-size: 9px; font-weight: 750; }}
+    .nav-preview-icon {{ width: 17px; flex: 0 0 17px; color: var(--muted); text-align: center; }}
   </style>
 </head>
 <body>
 <div class="app" data-theme="dark">
+  <aside class="sidebar brain-mode">
+    <div class="brand"><span class="brain-preview-logo">OX</span><span class="brand-name">Oxide</span></div>
+    <div class="side-seg"><button class="on">Threads</button><button>Workspace</button></div>
+    <nav class="nav">
+      <button class="nav-item"><span class="nav-preview-icon">＋</span><span>New chat</span></button>
+      <button class="nav-item"><span class="nav-preview-icon">⌕</span><span>Search</span></button>
+      <button class="nav-item brain-nav on"><span class="nav-preview-icon">⌁</span><span>Brain</span></button>
+    </nav>
+  </aside>
   <main class="brain-preview-shell">
     <section class="brain-view" aria-label="Workspace memory graph">
       <div class="brain-head">
@@ -1026,6 +1037,8 @@ def main() -> int:
             [
                 'sidebar_tab.set("threads".to_string())',
                 'sidebar_tab.set("brain".to_string())',
+                'class: if sidebar_tab.read().as_str() != "workspace" { "on" }',
+                'class: if *sidebar_tab.read() == "brain" { "nav-item brain-nav on"',
                 'class: "brain-view"',
                 'class: "brain-map"',
                 '"brain-edge active"',
@@ -1035,9 +1048,16 @@ def main() -> int:
                 "fn brain_projects(",
             ],
         )
+        and nearby(
+            gui,
+            'Icon { name: "search" } span { "Search" }',
+            'class: if *sidebar_tab.read() == "brain" { "nav-item brain-nav on"',
+            900,
+        )
         and contains_all(
             css,
             [
+                ".nav-item.brain-nav.on {",
                 ".brain-layout {",
                 ".brain-map {",
                 ".brain-edge {",
@@ -1048,7 +1068,7 @@ def main() -> int:
                 "@media (max-width: 980px)",
             ],
         ),
-        "Brain connects workspace memory nodes with tokenized graph motion, keyboard focus, and a facts/skills inspector",
+        "Brain stays compact below Search while connecting workspace memory nodes with tokenized graph motion, keyboard focus, and a facts/skills inspector",
     )
     require(
         "settings navigation scales to all destinations",

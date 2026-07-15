@@ -101,7 +101,7 @@ It focuses on states that compile tests cannot prove.
 
 ## Brain Source Graph
 
-- Open `Brain` from the `Threads | Brain | Workspace` switcher and confirm the chat/TUI surface yields to the graph without leaving overlapping message-trail or Environment controls.
+- Open `Brain` from the compact navigation item directly below `Search`; confirm the `Threads | Workspace` switcher remains two options wide and the chat/TUI surface yields to the graph without leaving overlapping message-trail or Environment controls.
 - Confirm every known project folder appears in the inspector and up to eight workspace nodes remain readable around the central Oxide Memory node.
 - Confirm dashed knowledge edges flow continuously and the central halo pulses without moving node labels or changing the graph layout.
 - Click workspace nodes and navigate them with Tab plus Enter/Space; confirm the active edge/node updates and the facts/skills inspector follows the selected workspace.

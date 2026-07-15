@@ -746,6 +746,13 @@ struct TurnRender {
     done_summary: Option<String>,
 }
 
+const INITIAL_TRANSCRIPT_TURNS: usize = 24;
+const TRANSCRIPT_TURN_BATCH: usize = 24;
+
+fn transcript_window_start(total_turns: usize, visible_turns: usize) -> usize {
+    total_turns.saturating_sub(visible_turns.max(1))
+}
+
 /// Flatten turns into fully-keyed render items. Diff rows are dropped here —
 /// they render nothing (consolidated into the Edited-files card), and unkeyed
 /// empties mixed into a keyed list destabilize reconciliation.
@@ -1769,6 +1776,36 @@ fn brain_projects(groups: &[ProjectGroup], current: Option<&Path>) -> Vec<BrainP
             .then_with(|| a.name.cmp(&b.name))
     });
     projects
+}
+
+fn load_brain_snapshot(
+    groups: Vec<ProjectGroup>,
+    current: Option<PathBuf>,
+    mut snapshot: Signal<Vec<BrainProject>>,
+    mut selected_workspace: Signal<Option<PathBuf>>,
+    mut loading: Signal<bool>,
+    mut error: Signal<Option<String>>,
+) {
+    loading.set(true);
+    error.set(None);
+    spawn(async move {
+        match tokio::task::spawn_blocking(move || brain_projects(&groups, current.as_deref())).await
+        {
+            Ok(projects) => {
+                let selected = selected_workspace.peek().clone();
+                if !projects
+                    .iter()
+                    .any(|project| selected.as_ref() == Some(&project.workspace))
+                {
+                    selected_workspace
+                        .set(projects.first().map(|project| project.workspace.clone()));
+                }
+                snapshot.set(projects);
+            }
+            Err(err) => error.set(Some(format!("Unable to load workspace memory: {err}"))),
+        }
+        loading.set(false);
+    });
 }
 
 fn brain_node_label(text: &str) -> String {
@@ -3721,7 +3758,7 @@ mod tests {
     }
 
     #[test]
-    fn persisted_session_keeps_full_scrollable_history() {
+    fn persisted_session_keeps_full_history_while_rendering_a_bounded_tail() {
         let mut rows: Vec<(String, String)> = (0..30)
             .map(|i| ("user".to_string(), format!("message {i}")))
             .collect();
@@ -3737,6 +3774,13 @@ mod tests {
         assert_eq!(messages.len(), 30);
         assert_eq!(messages.first().map(|m| m.text.as_str()), Some("message 0"));
         assert_eq!(messages.last().map(|m| m.text.as_str()), Some("message 29"));
+
+        let turns = build_transcript_turns(&messages);
+        assert_eq!(
+            transcript_window_start(turns.len(), INITIAL_TRANSCRIPT_TURNS),
+            6
+        );
+        assert_eq!(transcript_window_start(turns.len(), turns.len()), 0);
     }
 
     #[test]
@@ -4414,13 +4458,26 @@ fn thread_json_save<T: serde::Serialize>(ws: &Path, dir: &str, stem: &str, v: &T
     }
 }
 
-/// Smooth-scroll the transcript to message index `i` and flash it.
+/// Smooth-scroll the transcript to message index `i` and flash it. Retries
+/// after a render tick because revealing an older paged turn mounts it first.
 fn jump_to_msg(i: usize) {
     spawn(async move {
         let _ = dioxus::document::eval(&format!(
-            "const el=document.getElementById('msg-{i}'); if(el){{ el.scrollIntoView({{behavior:'smooth',block:'center'}}); el.classList.add('flash'); setTimeout(()=>el.classList.remove('flash'),1200); }}"
+            "for(const d of [0,40,140])setTimeout(()=>{{const el=document.getElementById('msg-{i}');if(el){{el.scrollIntoView({{behavior:'smooth',block:'center'}});el.classList.add('flash');setTimeout(()=>el.classList.remove('flash'),1200);}}}},d);"
         )).await;
     });
+}
+
+fn reveal_and_jump_to_msg(
+    tabs: Signal<Vec<AgentTab>>,
+    active_tab: Signal<usize>,
+    mut transcript_turn_limits: Signal<HashMap<u64, usize>>,
+    i: usize,
+) {
+    if let Some(tab_id) = tabs.peek().get(*active_tab.peek()).map(|tab| tab.id) {
+        transcript_turn_limits.write().insert(tab_id, usize::MAX);
+    }
+    jump_to_msg(i);
 }
 
 /// Jump the chat scroll to the bottom after the next render tick.
@@ -4457,9 +4514,13 @@ fn open_session_tab(
     mut ui: Ui,
     engine: Coroutine<EngineCmd>,
     busy_tabs: Signal<HashSet<u64>>,
+    mut transcript_turn_limits: Signal<HashMap<u64, usize>>,
+    mut session_open_seq: Signal<u64>,
     path: PathBuf,
     title: String,
 ) {
+    let request_id = session_open_seq.peek().saturating_add(1);
+    session_open_seq.set(request_id);
     // Already open in some tab? Switch to it — never a duplicate tab.
     if let Some(idx) = tabs
         .peek()
@@ -4471,187 +4532,209 @@ fn open_session_tab(
         }
         return;
     }
-    let loaded = load_session(&path);
-    let session_runtime = |meta: Option<&oxide_core::db::SessionMeta>, base: &Config| {
-        let provider = meta
-            .map(|m| m.provider.clone())
-            .filter(|p| !p.is_empty())
-            .unwrap_or_else(|| base.provider.clone());
-        let model = meta
-            .map(|m| m.model.clone())
-            .filter(|m| !m.is_empty())
-            .unwrap_or_else(|| base.model.clone());
-        let harness = meta
-            .map(|m| m.harness.clone())
-            .filter(|h| !h.is_empty())
-            .unwrap_or_else(|| base.harness.clone());
-        let effort = meta
-            .map(|m| m.reasoning_effort.clone())
-            .filter(|e| !e.is_empty())
-            .unwrap_or_else(|| base.reasoning_effort.clone());
-        (provider, model, harness, effort)
-    };
-    // If the current tab is mid-turn, NEVER replace it (that would kill its
-    // engine and abort the running task). Open the session in a NEW tab instead
-    // so folder A keeps working while you go look at folder B — synara-style.
-    {
-        let cur = *active_tab.peek();
-        let cur_busy = tabs
-            .peek()
-            .get(cur)
-            .map(|t| busy_tabs.peek().contains(&t.id))
-            .unwrap_or(false);
-        // A TUI/terminal tab renders a PTY, not a chat transcript — replacing
-        // its data would "open" the session invisibly. Open a NEW gui tab.
-        let cur_non_gui = tabs
-            .peek()
-            .get(cur)
-            .map(|t| t.mode != "gui")
-            .unwrap_or(false);
-        // Never clobber a tab that already holds a DIFFERENT conversation:
-        // a sidebar click on another session opens a new tab. In-place reuse
-        // is only for the tab already showing this session (refresh) or a
-        // pristine "New chat" tab (no session, no messages).
-        let cur_same_session = tabs
-            .peek()
-            .get(cur)
-            .and_then(|t| t.session.clone())
-            .as_deref()
-            == Some(path.as_path());
-        // A pristine "New chat" tab already carries an auto-bound session file
-        // (the engine emits SessionPath at spawn) — an EMPTY session is not
-        // content. Judge by the conversation itself (live view + stored copy),
-        // or a sidebar click leaves a dead empty tab behind.
-        let has_convo = |m: &[ChatMsg]| {
-            m.iter()
-                .any(|x| matches!(x.author, Author::User | Author::Agent))
+    let load_path = path.clone();
+    spawn(async move {
+        let Ok((loaded, meta)) = tokio::task::spawn_blocking(move || {
+            let session_id = sid(&load_path);
+            (
+                session_rows_to_chat(oxide_core::db::load(&session_id)),
+                oxide_core::db::meta(&session_id),
+            )
+        })
+        .await
+        else {
+            return;
         };
-        let cur_has_other_content = !cur_same_session
-            && (has_convo(&messages.peek())
-                || tabs
-                    .peek()
-                    .get(cur)
-                    .map(|t| has_convo(&t.messages))
-                    .unwrap_or(false));
-        if cur_busy || cur_non_gui || cur_has_other_content {
-            // Save the live transcript into the busy tab before leaving it.
-            if let Some(t) = tabs.write().get_mut(cur) {
-                t.messages = messages.peek().clone();
-            }
-            let meta = oxide_core::db::meta(&sid(&path));
-            let base_cfg = cfg.peek().clone();
-            let (prov, model, harness, effort) = session_runtime(meta.as_ref(), &base_cfg);
-            let id = *next_id.peek();
-            next_id.set(id + 1);
-            tabs.write().push(AgentTab {
-                id,
-                title: title.clone(),
-                provider: prov.clone(),
-                model: model.clone(),
-                harness: harness.clone(),
-                reasoning_effort: effort.clone(),
-                messages: loaded.clone(),
-                mode: "gui".into(),
-                bin: String::new(),
-                session: Some(path.clone()),
-                resume: None,
-                ws: meta
+        if *session_open_seq.peek() != request_id {
+            return;
+        }
+        let session_runtime = |meta: Option<&oxide_core::db::SessionMeta>, base: &Config| {
+            let provider = meta
+                .map(|m| m.provider.clone())
+                .filter(|p| !p.is_empty())
+                .unwrap_or_else(|| base.provider.clone());
+            let model = meta
+                .map(|m| m.model.clone())
+                .filter(|m| !m.is_empty())
+                .unwrap_or_else(|| base.model.clone());
+            let harness = meta
+                .map(|m| m.harness.clone())
+                .filter(|h| !h.is_empty())
+                .unwrap_or_else(|| base.harness.clone());
+            let effort = meta
+                .map(|m| m.reasoning_effort.clone())
+                .filter(|e| !e.is_empty())
+                .unwrap_or_else(|| base.reasoning_effort.clone());
+            (provider, model, harness, effort)
+        };
+        // If the current tab is mid-turn, NEVER replace it (that would kill its
+        // engine and abort the running task). Open the session in a NEW tab instead
+        // so folder A keeps working while you go look at folder B — synara-style.
+        {
+            let cur = *active_tab.peek();
+            let cur_busy = tabs
+                .peek()
+                .get(cur)
+                .map(|t| busy_tabs.peek().contains(&t.id))
+                .unwrap_or(false);
+            // A TUI/terminal tab renders a PTY, not a chat transcript — replacing
+            // its data would "open" the session invisibly. Open a NEW gui tab.
+            let cur_non_gui = tabs
+                .peek()
+                .get(cur)
+                .map(|t| t.mode != "gui")
+                .unwrap_or(false);
+            // Never clobber a tab that already holds a DIFFERENT conversation:
+            // a sidebar click on another session opens a new tab. In-place reuse
+            // is only for the tab already showing this session (refresh) or a
+            // pristine "New chat" tab (no session, no messages).
+            let cur_same_session = tabs
+                .peek()
+                .get(cur)
+                .and_then(|t| t.session.clone())
+                .as_deref()
+                == Some(path.as_path());
+            // A pristine "New chat" tab already carries an auto-bound session file
+            // (the engine emits SessionPath at spawn) — an EMPTY session is not
+            // content. Judge by the conversation itself (live view + stored copy),
+            // or a sidebar click leaves a dead empty tab behind.
+            let has_convo = |m: &[ChatMsg]| {
+                m.iter()
+                    .any(|x| matches!(x.author, Author::User | Author::Agent))
+            };
+            let cur_has_other_content = !cur_same_session
+                && (has_convo(&messages.peek())
+                    || tabs
+                        .peek()
+                        .get(cur)
+                        .map(|t| has_convo(&t.messages))
+                        .unwrap_or(false));
+            if cur_busy || cur_non_gui || cur_has_other_content {
+                // Save the live transcript into the busy tab before leaving it.
+                if let Some(t) = tabs.write().get_mut(cur) {
+                    t.messages = messages.peek().clone();
+                }
+                let base_cfg = cfg.peek().clone();
+                let (prov, model, harness, effort) = session_runtime(meta.as_ref(), &base_cfg);
+                let id = *next_id.peek();
+                next_id.set(id + 1);
+                transcript_turn_limits
+                    .write()
+                    .insert(id, INITIAL_TRANSCRIPT_TURNS);
+                tabs.write().push(AgentTab {
+                    id,
+                    title: title.clone(),
+                    provider: prov.clone(),
+                    model: model.clone(),
+                    harness: harness.clone(),
+                    reasoning_effort: effort.clone(),
+                    messages: loaded.clone(),
+                    mode: "gui".into(),
+                    bin: String::new(),
+                    session: Some(path.clone()),
+                    resume: None,
+                    ws: meta
+                        .as_ref()
+                        .map(|m| PathBuf::from(&m.workspace))
+                        .filter(|w| !w.as_os_str().is_empty())
+                        .unwrap_or_else(|| workspace_of(&base_cfg)),
+                });
+                let idx = tabs.peek().len() - 1;
+                active_tab.set(idx);
+                let mut c = base_cfg;
+                c.provider = prov;
+                c.model = model;
+                c.harness = harness;
+                c.reasoning_effort = effort;
+                if let Some(ws) = meta
                     .as_ref()
                     .map(|m| PathBuf::from(&m.workspace))
                     .filter(|w| !w.as_os_str().is_empty())
-                    .unwrap_or_else(|| workspace_of(&base_cfg)),
-            });
-            let idx = tabs.peek().len() - 1;
-            active_tab.set(idx);
-            let mut c = base_cfg;
-            c.provider = prov;
-            c.model = model;
-            c.harness = harness;
-            c.reasoning_effort = effort;
-            if let Some(ws) = oxide_core::db::meta(&sid(&path))
-                .map(|m| PathBuf::from(m.workspace))
-                .filter(|w| !w.as_os_str().is_empty())
-            {
+                {
+                    ui.workspace.set(ws.clone());
+                    c.recent_workspaces.retain(|p| p != &ws);
+                    c.recent_workspaces.insert(0, ws.clone());
+                    c.recent_workspaces.truncate(8);
+                    c.workspace = Some(ws);
+                }
+                c.resume_path = Some(path);
+                cfg.set(c.clone());
+                engine.send(EngineCmd::SwitchTab {
+                    id,
+                    conf: c,
+                    msgs: loaded,
+                });
+                scroll_chat_bottom();
+                return;
+            }
+        }
+        let cur = *active_tab.read();
+        // The session metadata was fetched with its messages off the UI thread.
+        // A session file lives at <workspace>/.oxide/sessions/<id>.jsonl — the
+        // chat MUST run in that workspace, or the engine (in another folder)
+        // appends this conversation into the wrong project.
+        let session_ws = meta
+            .as_ref()
+            .map(|m| PathBuf::from(&m.workspace))
+            .filter(|w| !w.as_os_str().is_empty());
+        let mut c = cfg.read().clone();
+        // Adopt the session's own runtime mode (provider/model/harness/effort), not
+        // whatever the composer was last set to.
+        let (sess_provider, sess_model, sess_harness, sess_effort) =
+            session_runtime(meta.as_ref(), &c);
+        c.provider = sess_provider.clone();
+        c.model = sess_model.clone();
+        c.harness = sess_harness.clone();
+        c.reasoning_effort = sess_effort.clone();
+        if let Some(t) = tabs.write().get_mut(cur) {
+            t.provider = sess_provider;
+            t.model = sess_model;
+            t.harness = sess_harness;
+            t.reasoning_effort = sess_effort;
+        }
+        if let Some(ws) = session_ws {
+            if c.workspace.as_deref() != Some(ws.as_path()) {
                 ui.workspace.set(ws.clone());
+                ui.open_path.set(None);
+                ui.expanded.set(HashSet::new());
                 c.recent_workspaces.retain(|p| p != &ws);
                 c.recent_workspaces.insert(0, ws.clone());
                 c.recent_workspaces.truncate(8);
                 c.workspace = Some(ws);
             }
-            c.resume_path = Some(path);
-            cfg.set(c.clone());
-            engine.send(EngineCmd::SwitchTab {
-                id,
-                conf: c,
-                msgs: loaded,
-            });
-            scroll_chat_bottom();
-            return;
         }
-    }
-    let cur = *active_tab.read();
-    // One metadata fetch for both the workspace and the provider (was two).
-    let meta = oxide_core::db::meta(&sid(&path));
-    // A session file lives at <workspace>/.oxide/sessions/<id>.jsonl — the
-    // chat MUST run in that workspace, or the engine (in another folder)
-    // appends this conversation into the wrong project.
-    let session_ws = meta
-        .as_ref()
-        .map(|m| PathBuf::from(&m.workspace))
-        .filter(|w| !w.as_os_str().is_empty());
-    let mut c = cfg.read().clone();
-    // Adopt the session's own runtime mode (provider/model/harness/effort), not
-    // whatever the composer was last set to.
-    let (sess_provider, sess_model, sess_harness, sess_effort) = session_runtime(meta.as_ref(), &c);
-    c.provider = sess_provider.clone();
-    c.model = sess_model.clone();
-    c.harness = sess_harness.clone();
-    c.reasoning_effort = sess_effort.clone();
-    if let Some(t) = tabs.write().get_mut(cur) {
-        t.provider = sess_provider;
-        t.model = sess_model;
-        t.harness = sess_harness;
-        t.reasoning_effort = sess_effort;
-    }
-    if let Some(ws) = session_ws {
-        if c.workspace.as_deref() != Some(ws.as_path()) {
-            ui.workspace.set(ws.clone());
-            ui.open_path.set(None);
-            ui.expanded.set(HashSet::new());
-            c.recent_workspaces.retain(|p| p != &ws);
-            c.recent_workspaces.insert(0, ws.clone());
-            c.recent_workspaces.truncate(8);
-            c.workspace = Some(ws);
+        // Open in the CURRENT tab (synara-style) — a sidebar click navigates, it
+        // doesn't multiply tabs. New tabs come from the + button.
+        let tab_id = tabs.read().get(cur).map(|t| t.id).unwrap_or(0);
+        transcript_turn_limits
+            .write()
+            .insert(tab_id, INITIAL_TRANSCRIPT_TURNS);
+        if let Some(t) = tabs.write().get_mut(cur) {
+            t.title = title;
+            t.messages = loaded.clone();
+            t.session = Some(path.clone());
+            // Tab ini sekarang memuat sesi tersebut — ikutkan grup project-nya.
+            if let Some(ws) = &c.workspace {
+                t.ws = ws.clone();
+            }
         }
-    }
-    // Open in the CURRENT tab (synara-style) — a sidebar click navigates, it
-    // doesn't multiply tabs. New tabs come from the + button.
-    let tab_id = tabs.read().get(cur).map(|t| t.id).unwrap_or(0);
-    if let Some(t) = tabs.write().get_mut(cur) {
-        t.title = title;
-        t.messages = loaded.clone();
-        t.session = Some(path.clone());
-        // Tab ini sekarang memuat sesi tersebut — ikutkan grup project-nya.
-        if let Some(ws) = &c.workspace {
-            t.ws = ws.clone();
-        }
-    }
-    c.resume_path = Some(path);
-    cfg.set(c.clone());
-    // The tab's CONTENT changed (different session) — its old engine, if any,
-    // holds the old history. Drop it; a fresh one resumes this session lazily.
-    engine.send(EngineCmd::CloseTab(tab_id));
-    engine.send(EngineCmd::SwitchTab {
-        id: tab_id,
-        conf: c,
-        msgs: loaded,
+        c.resume_path = Some(path);
+        cfg.set(c.clone());
+        // The tab's CONTENT changed (different session) — its old engine, if any,
+        // holds the old history. Drop it; a fresh one resumes this session lazily.
+        engine.send(EngineCmd::CloseTab(tab_id));
+        engine.send(EngineCmd::SwitchTab {
+            id: tab_id,
+            conf: c,
+            msgs: loaded,
+        });
+        scroll_chat_bottom();
     });
-    scroll_chat_bottom();
 }
 
-/// Convert every persisted conversation row into transcript messages. Rendering
-/// uses per-turn `content-visibility`, so long sessions stay scrollable without
-/// discarding their beginning.
+/// Convert every persisted conversation row into transcript messages. All rows
+/// remain available to engine/history; the UI mounts older turns in bounded
+/// batches so opening a long session does not parse every Markdown row at once.
 fn session_rows_to_chat(rows: Vec<(String, String)>) -> Vec<ChatMsg> {
     let messages = rows
         .into_iter()
@@ -4671,11 +4754,6 @@ fn session_rows_to_chat(rows: Vec<(String, String)>) -> Vec<ChatMsg> {
         })
         .collect();
     coalesce_transcript_thoughts(messages)
-}
-
-/// Load a session transcript into chat messages.
-fn load_session(path: &Path) -> Vec<ChatMsg> {
-    session_rows_to_chat(oxide_core::db::load(&sid(path)))
 }
 
 fn replay_role_label(role: &str) -> &'static str {
@@ -5246,7 +5324,10 @@ fn app() -> Element {
     let hermes_status = use_signal(|| "Hermes idle".to_string());
     let hermes_confirm_delete = use_signal(|| None::<String>);
     let mut projects_list = use_signal(Vec::<ProjectGroup>::new);
-    let mut brain_refresh = use_signal(|| 0u64);
+    let brain_projects_snapshot = use_signal(Vec::<BrainProject>::new);
+    let brain_selected_workspace = use_signal(|| None::<PathBuf>);
+    let brain_loading = use_signal(|| false);
+    let brain_error = use_signal(|| None::<String>);
     let mut session_menu = use_signal(|| None::<PathBuf>);
     // Per-project visible session count. Default is 5; Show more reveals
     // another page so long histories expand gradually.
@@ -5397,8 +5478,15 @@ fn app() -> Element {
     // Full-screen preview for an image attached to a sent message.
     let mut chat_img = use_signal(|| None::<String>);
     // Long user prompts render clamped (the sticky header would otherwise eat
-    // half the viewport); indices here are user-expanded.
+    // half the viewport); ids here are user-expanded.
     let mut expanded_user = use_signal(HashSet::<u64>::new);
+    // Keep long saved sessions cheap to open: all messages stay in memory and
+    // in engine history, but only the newest turn window mounts expensive
+    // Markdown/tool DOM. Older turns are revealed in bounded batches.
+    let mut transcript_turn_limits = use_signal(HashMap::<u64, usize>::new);
+    // Monotonic guard for async session loads: a slower earlier click must not
+    // replace the transcript selected by a newer click.
+    let session_open_seq = use_signal(|| 0u64);
     // User override for the thinking-box open state (None = follow streaming).
     let mut think_open = use_signal(|| None::<bool>);
     // The just-finished reasoning row briefly keeps its body open while the
@@ -8177,20 +8265,13 @@ fn app() -> Element {
                     }
                     span { class: "brand-name", "Oxide" }
                 }
-                // Workspace switcher: conversations, durable knowledge, or tools.
+                // Keep the primary switch compact; durable knowledge lives below Search.
                 div { class: "side-seg",
-                    button { class: if *sidebar_tab.read() == "threads" { "on" } else { "" },
+                    button { class: if sidebar_tab.read().as_str() != "workspace" { "on" } else { "" },
                         onclick: move |_| {
                             show_board.set(false);
                             sidebar_tab.set("threads".to_string());
                         }, "Threads" }
-                    button { class: if *sidebar_tab.read() == "brain" { "on" } else { "" },
-                        onclick: move |_| {
-                            show_board.set(false);
-                            show_split.set(false);
-                            show_env.set(false);
-                            sidebar_tab.set("brain".to_string());
-                        }, "Brain" }
                     button { class: if *sidebar_tab.read() == "workspace" { "on" } else { "" },
                         onclick: move |_| sidebar_tab.set("workspace".to_string()), "Workspace" }
                 }
@@ -8221,6 +8302,24 @@ fn app() -> Element {
                     }
                     button { class: "nav-item", onclick: move |_| { show_palette.set(true); palette_query.set(String::new()); palette_sel.set(0); },
                         Icon { name: "search" } span { "Search" }
+                    }
+                    button {
+                        class: if *sidebar_tab.read() == "brain" { "nav-item brain-nav on" } else { "nav-item brain-nav" },
+                        onclick: move |_| {
+                            show_board.set(false);
+                            show_split.set(false);
+                            show_env.set(false);
+                            load_brain_snapshot(
+                                projects_list.peek().clone(),
+                                cfg.peek().workspace.clone(),
+                                brain_projects_snapshot,
+                                brain_selected_workspace,
+                                brain_loading,
+                                brain_error,
+                            );
+                            sidebar_tab.set("brain".to_string());
+                        },
+                        Icon { name: "brain" } span { "Brain" }
                     }
                     button { class: "nav-item ws-item", onclick: move |_| show_mcp.set(true),
                         if let Some(l) = provider_logo("mcp") { span { class: "nav-logo", dangerous_inner_html: l } } else { Icon { name: "plugins" } }
@@ -8275,7 +8374,7 @@ fn app() -> Element {
                                                         button { class: "row-act-btn pinned", title: "Unpin", onclick: move |e: dioxus::prelude::MouseEvent| { e.stop_propagation(); toggle_pin(cfg, &p_pin); sessions_refresh.set(sessions_refresh() + 1); }, Icon { name: "pin" } }
                                                     }
                                                     div { class: "thread recent",
-                                                        onclick: move |_| { show_board.set(false); open_session_tab(tabs, active_tab, messages, next_tab_id, cfg, ui, engine, busy_tabs, p_open.clone(), t_open.clone()); },
+                                                        onclick: move |_| { show_board.set(false); open_session_tab(tabs, active_tab, messages, next_tab_id, cfg, ui, engine, busy_tabs, transcript_turn_limits, session_open_seq, p_open.clone(), t_open.clone()); },
                                                         span { class: "thread-title", title: "{title}", "{title}" }
                                                     }
                                                 }
@@ -8485,7 +8584,7 @@ fn app() -> Element {
                                                     }
                                                     div { class: if sparent.is_empty() { "thread recent sub" } else { "thread recent sub subchild" },
                                                         title: "right-click / double-click for options",
-                                                        onclick: move |_| { show_board.set(false); open_session_tab(tabs, active_tab, messages, next_tab_id, cfg, ui, engine, busy_tabs, p_open.clone(), t_open.clone()); },
+                                                        onclick: move |_| { show_board.set(false); open_session_tab(tabs, active_tab, messages, next_tab_id, cfg, ui, engine, busy_tabs, transcript_turn_limits, session_open_seq, p_open.clone(), t_open.clone()); },
                                                         oncontextmenu: {
                                                             let p = p_dbl.clone();
                                                             move |e: dioxus::prelude::MouseEvent| { e.prevent_default(); e.stop_propagation(); show_theme_menu.set(false); session_menu.set(Some(p.clone())); }
@@ -8587,7 +8686,7 @@ fn app() -> Element {
                                 let c_title = ctitle.clone();
                                 rsx! {
                                     div { class: "thread recent", key: "chat-{cpath.display()}",
-                                        onclick: move |_| { show_board.set(false); open_session_tab(tabs, active_tab, messages, next_tab_id, cfg, ui, engine, busy_tabs, c_open.clone(), c_title.clone()); },
+                                        onclick: move |_| { show_board.set(false); open_session_tab(tabs, active_tab, messages, next_tab_id, cfg, ui, engine, busy_tabs, transcript_turn_limits, session_open_seq, c_open.clone(), c_title.clone()); },
                                         if let Some(l) = provider_logo(&cprov) { span { class: "sess-logo prov-logo", dangerous_inner_html: l } }
                                         span { class: "thread-title", title: "{ctitle}", "{ctitle}" }
                                     }
@@ -9106,7 +9205,7 @@ fn app() -> Element {
                                                             if let Some(p) = pinned_msgs.write().get_mut(pi) { p.2 = !p.2; }
                                                             thread_json_save(&ui.workspace.peek().clone(), "pins", &thread_stem(&tabs, &active_tab), &*pinned_msgs.read());
                                                         } }
-                                                    span { class: "env-pin-text", onclick: move |_| jump_to_msg(mi), "{snip}" }
+                                                    span { class: "env-pin-text", onclick: move |_| reveal_and_jump_to_msg(tabs, active_tab, transcript_turn_limits, mi), "{snip}" }
                                                     button { class: "env-proc-kill", title: "Unpin", onclick: move |_| {
                                                             pinned_msgs.write().retain(|p| p.0 != mi);
                                                             thread_json_save(&ui.workspace.peek().clone(), "pins", &thread_stem(&tabs, &active_tab), &*pinned_msgs.read());
@@ -9128,7 +9227,7 @@ fn app() -> Element {
                                                             if let Some(m) = markers.write().get_mut(ki) { m.2 = (m.2 + 1) % 4; }
                                                             thread_json_save(&ui.workspace.peek().clone(), "markers", &thread_stem(&tabs, &active_tab), &*markers.read());
                                                         } }
-                                                    span { class: "env-pin-text", onclick: move |_| jump_to_msg(mi), "{text}" }
+                                                    span { class: "env-pin-text", onclick: move |_| reveal_and_jump_to_msg(tabs, active_tab, transcript_turn_limits, mi), "{text}" }
                                                     button { class: "env-proc-kill", title: "Remove", onclick: move |_| {
                                                             let mut mv = markers.write();
                                                             if ki < mv.len() { mv.remove(ki); }
@@ -9217,26 +9316,26 @@ fn app() -> Element {
                             def_model: cfg.read().model.clone(),
                         }
                     } else if sidebar_tab.read().as_str() == "brain" {
-                        {
-                            let _ = brain_refresh.read();
-                            let current_workspace = cfg.read().workspace.clone();
-                            let projects = brain_projects(
-                                &projects_list.read(),
-                                current_workspace.as_deref(),
-                            );
-                            rsx! {
-                                BrainView {
-                                    projects,
-                                    on_refresh: move |_| {
-                                        refresh_projects_list(projects_list, cfg);
-                                        brain_refresh.set(brain_refresh() + 1);
-                                    },
-                                    on_open_skill: move |path: PathBuf| {
-                                        open_file(ui, path);
-                                        sidebar_tab.set("threads".to_string());
-                                    },
-                                }
-                            }
+                        BrainView {
+                            projects: brain_projects_snapshot.read().clone(),
+                            selected_workspace: brain_selected_workspace,
+                            loading: *brain_loading.read(),
+                            error: brain_error.read().clone(),
+                            on_refresh: move |_| {
+                                refresh_projects_list(projects_list, cfg);
+                                load_brain_snapshot(
+                                    projects_list.peek().clone(),
+                                    cfg.peek().workspace.clone(),
+                                    brain_projects_snapshot,
+                                    brain_selected_workspace,
+                                    brain_loading,
+                                    brain_error,
+                                );
+                            },
+                            on_open_skill: move |path: PathBuf| {
+                                open_file(ui, path);
+                                sidebar_tab.set("threads".to_string());
+                            },
                         }
                     } else if *show_board.read() && cfg.read().workspace.is_some() {
                         div { class: "board",
@@ -9445,12 +9544,57 @@ fn app() -> Element {
                                 {
                                     let last_user_idx = messages.read().iter().rposition(|m| m.author == Author::User);
                                     let last_agent_idx = messages.read().iter().rposition(|m| m.author == Author::Agent);
+                                    let tab_id = tabs
+                                        .read()
+                                        .get(*active_tab.read())
+                                        .map(|tab| tab.id)
+                                        .unwrap_or(0);
                                     let rturns = {
                                         let msgs = messages.read();
                                         flatten_turns(build_transcript_turns(&msgs), &msgs)
                                     };
+                                    let total_turns = rturns.len();
+                                    let visible_turns = transcript_turn_limits
+                                        .read()
+                                        .get(&tab_id)
+                                        .copied()
+                                        .unwrap_or(usize::MAX);
+                                    let window_start =
+                                        transcript_window_start(total_turns, visible_turns);
+                                    let earlier_batch = window_start.min(TRANSCRIPT_TURN_BATCH);
+                                    let earlier_label = format!(
+                                        "Load {earlier_batch} earlier turn{} · {window_start} remaining",
+                                        if earlier_batch == 1 { "" } else { "s" }
+                                    );
                                     rsx! {
-                                        for turn in rturns.into_iter() {
+                                        if window_start > 0 {
+                                            button {
+                                                class: "transcript-load-earlier",
+                                                onclick: move |_| {
+                                                    spawn(async move {
+                                                        let _ = dioxus::document::eval(
+                                                            "const s=document.querySelector('.scroll'); if(s){window.__oxprependH=s.scrollHeight;window.__oxprependY=s.scrollTop;window.__oxstick=false;}",
+                                                        )
+                                                        .await;
+                                                        let current = transcript_turn_limits
+                                                            .read()
+                                                            .get(&tab_id)
+                                                            .copied()
+                                                            .unwrap_or(INITIAL_TRANSCRIPT_TURNS);
+                                                        transcript_turn_limits.write().insert(
+                                                            tab_id,
+                                                            current.saturating_add(TRANSCRIPT_TURN_BATCH),
+                                                        );
+                                                        let _ = dioxus::document::eval(
+                                                            "for(const d of [0,40,120])setTimeout(()=>requestAnimationFrame(()=>{const s=document.querySelector('.scroll');if(!s)return;const h=window.__oxprependH??s.scrollHeight;const y=window.__oxprependY??0;s.scrollTop=y+(s.scrollHeight-h);}),d);",
+                                                        )
+                                                        .await;
+                                                    });
+                                                },
+                                                "{earlier_label}"
+                                            }
+                                        }
+                                        for turn in rturns.into_iter().skip(window_start) {
                                         div { key: "t-{turn.key}", class: "turn",
                                         for item in turn.items.into_iter() {
                                             {
@@ -10958,6 +11102,8 @@ fn app() -> Element {
                                                                             ui,
                                                                             engine,
                                                                             busy_tabs,
+                                                                            transcript_turn_limits,
+                                                                            session_open_seq,
                                                                             open_path.clone(),
                                                                             open_title.clone(),
                                                                         );
@@ -10992,6 +11138,8 @@ fn app() -> Element {
                                                                             ui,
                                                                             engine,
                                                                             busy_tabs,
+                                                                            transcript_turn_limits,
+                                                                            session_open_seq,
                                                                             open_path.clone(),
                                                                             open_title.clone(),
                                                                         );
@@ -11689,7 +11837,7 @@ fn app() -> Element {
                                                             let t2 = title.clone();
                                                             rsx! {
                                                                 button { class: "palette-item",
-                                                                    onclick: move |_| { show_palette.set(false); show_board.set(false); sidebar_tab.set("threads".to_string()); open_session_tab(tabs, active_tab, messages, next_tab_id, cfg, ui, engine, busy_tabs, p2.clone(), t2.clone()); },
+                                                                    onclick: move |_| { show_palette.set(false); show_board.set(false); sidebar_tab.set("threads".to_string()); open_session_tab(tabs, active_tab, messages, next_tab_id, cfg, ui, engine, busy_tabs, transcript_turn_limits, session_open_seq, p2.clone(), t2.clone()); },
                                                                     Icon { name: "file" } span { class: "palette-label", "{title}" }
                                                                 }
                                                             }
@@ -14810,10 +14958,29 @@ fn Composer(
 #[component]
 fn BrainView(
     projects: Vec<BrainProject>,
+    mut selected_workspace: Signal<Option<PathBuf>>,
+    loading: bool,
+    error: Option<String>,
     on_refresh: EventHandler<()>,
     on_open_skill: EventHandler<PathBuf>,
 ) -> Element {
-    let mut selected = use_signal(|| 0usize);
+    let initial_selected = selected_workspace
+        .peek()
+        .as_ref()
+        .and_then(|workspace| {
+            projects
+                .iter()
+                .position(|project| &project.workspace == workspace)
+        })
+        .unwrap_or(0);
+    let mut selected = use_signal(move || initial_selected);
+    let selection_projects = projects.clone();
+    use_effect(move || {
+        let selected_idx = (*selected.read()).min(selection_projects.len().saturating_sub(1));
+        if let Some(project) = selection_projects.get(selected_idx) {
+            selected_workspace.set(Some(project.workspace.clone()));
+        }
+    });
     let selected_idx = (*selected.read()).min(projects.len().saturating_sub(1));
     let selected_project = projects.get(selected_idx).cloned();
     let selected_path = selected_project
@@ -14877,8 +15044,12 @@ fn BrainView(
                     h2 { "Brain" }
                     p { "Durable facts and reusable skills learned across your project folders." }
                 }
-                button { class: "brain-refresh", onclick: move |_| on_refresh.call(()),
-                    Icon { name: "refresh" } "Refresh"
+                button {
+                    class: "brain-refresh",
+                    disabled: loading,
+                    onclick: move |_| on_refresh.call(()),
+                    Icon { name: "refresh" }
+                    if loading { "Refreshing" } else { "Refresh" }
                 }
             }
             div { class: "brain-stats",
@@ -14886,7 +15057,16 @@ fn BrainView(
                 div { class: "brain-stat facts", span { "Remembered facts" } strong { "{fact_count}" } }
                 div { class: "brain-stat skills", span { "Learned skills" } strong { "{skill_count}" } }
             }
-            if projects.is_empty() {
+            if let Some(message) = error.as_ref() {
+                div { class: "brain-load-error", Icon { name: "error" } span { "{message}" } }
+            }
+            if loading && projects.is_empty() {
+                div { class: "brain-empty loading",
+                    span { class: "brain-empty-icon", Icon { name: "brain" } }
+                    h3 { "Loading workspace memory" }
+                    p { "Reading durable facts and learned skills without blocking the interface." }
+                }
+            } else if projects.is_empty() {
                 div { class: "brain-empty",
                     span { class: "brain-empty-icon", Icon { name: "brain" } }
                     h3 { "The brain is still empty" }
