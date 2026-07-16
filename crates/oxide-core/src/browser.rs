@@ -58,9 +58,10 @@ pub fn detect_browser() -> Option<PathBuf> {
 }
 
 pub struct BrowserSession {
-    _browser: Browser,
+    browser: Browser,
     page: Page,
-    _pump: JoinHandle<()>,
+    pump: JoinHandle<()>,
+    profile_dir: PathBuf,
 }
 
 impl BrowserSession {
@@ -77,7 +78,8 @@ impl BrowserSession {
         if !headless {
             builder = builder.with_head();
         }
-        builder = builder.user_data_dir(unique_browser_profile_dir());
+        let profile_dir = unique_browser_profile_dir();
+        builder = builder.user_data_dir(profile_dir.clone());
         if let Some((width, height)) = viewport {
             builder = builder.viewport(Viewport {
                 width,
@@ -98,10 +100,21 @@ impl BrowserSession {
         let pump = tokio::spawn(async move { while handler.next().await.is_some() {} });
         let page = browser.new_page("about:blank").await?;
         Ok(Self {
-            _browser: browser,
+            browser,
             page,
-            _pump: pump,
+            pump,
+            profile_dir,
         })
+    }
+
+    /// Close Chromium and remove its temporary profile after the turn that used
+    /// browser tools finishes. Keeping the session alive within a turn preserves
+    /// navigate/read/click sequences without leaving an idle browser on the host.
+    pub async fn close(mut self) -> Result<()> {
+        let close_result = self.browser.close().await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), &mut self.pump).await;
+        let _ = tokio::fs::remove_dir_all(&self.profile_dir).await;
+        close_result.map(|_| ()).map_err(Into::into)
     }
 
     pub async fn navigate(&self, url: &str) -> Result<String> {
@@ -243,11 +256,11 @@ mod tests {
                 r#"
 (() => {
   const required = [
-    '.agent-waiting .typing',
     '.streaming-message .agent-md.live',
     '.agent-md.live .live-tail .live-word.fresh',
     '.thinking-box[open] .thinking-body',
-    '.thought-row.settling[open] .thought-label-settled',
+    '.thought-row.settling:not([open]) .thought-label-settled',
+    '.act-group:not([open]) .act-group-head',
     '.activity-card.running .activity-status',
     '.activity-card.live-output[open] .activity-out',
     '.activity-card.has-out[open] .activity-out',
@@ -256,6 +269,8 @@ mod tests {
     '.env-card-row.env-subagents-running .env-subagent-preview',
     '.todo-card.run-disclosure:not([open]) .run-preview',
     '.composer-live-changes .live-changes-head',
+    '.skill-menu .skill-mention-mark',
+    '.artifact-card .artifact-image',
     '.status-pill .status-shimmer'
   ];
   const missing = required.filter((selector) => !document.querySelector(selector));
@@ -265,9 +280,14 @@ mod tests {
   const streamWord = document.querySelector('.agent-md.live .live-word.fresh');
   const streamRow = document.querySelector('.streaming-message');
   const settledThoughtLabel = document.querySelector('.thought-row.settling .thought-label-settled');
+  const settledThought = document.querySelector('.thought-row.settling');
+  const workingGroup = document.querySelector('.act-group');
   const subagentsRow = document.querySelector('.env-card-row.env-subagents-running');
   const todoCard = document.querySelector('.todo-card.run-disclosure');
   const liveChangesCard = document.querySelector('.composer-live-changes');
+  const skillMenu = document.querySelector('.skill-menu');
+  const artifactCard = document.querySelector('.artifact-card');
+  const artifactImage = document.querySelector('.artifact-card .artifact-image');
   const runningSpinner = document.querySelector('.activity-card.running .activity-spin');
   const settledSpinner = document.querySelector('.activity-card.done .activity-spin');
   const runningResult = document.querySelector('.activity-card.running .activity-ic.ok');
@@ -282,6 +302,8 @@ mod tests {
     thinkingShimmerAnimation: getComputedStyle(document.querySelector('.thinking-glow')).animationName,
     thinkingRevealAnimation: getComputedStyle(document.querySelector('.thinking-body')).animationName,
     settledThoughtLabelAnimation: settledThoughtLabel ? getComputedStyle(settledThoughtLabel).animationName : '',
+    settledThoughtCollapsed: Boolean(settledThought && !settledThought.open),
+    workingGroupCollapsed: Boolean(workingGroup && !workingGroup.open && workingGroup.getBoundingClientRect().height <= 44),
     toolLabelShimmerAnimation: getComputedStyle(document.querySelector('.activity-card.running .activity-verb')).animationName,
     liveEditShimmerAnimation: getComputedStyle(document.querySelector('.composer-live-changes .live-changes-title')).animationName,
     liveEditEntryAnimation: getComputedStyle(liveChangesCard).animationName,
@@ -291,6 +313,8 @@ mod tests {
     runningSpinnerAnimationCount: runningSpinner?.getAnimations({subtree: true}).filter(a => a.animationName === 'oxide-unicode-frame').length ?? -1,
     settledSpinnerAnimationCount: settledSpinner?.getAnimations({subtree: true}).filter(a => a.animationName === 'oxide-unicode-frame').length ?? -1,
     compactOrchestrationCards: [subagentsRow, todoCard, liveChangesCard].every(card => card && card.getBoundingClientRect().height <= 48),
+    skillMenuCompact: Boolean(skillMenu && skillMenu.getBoundingClientRect().height <= 140),
+    artifactPreviewSized: Boolean(artifactCard && artifactImage && artifactCard.getBoundingClientRect().width >= 240 && artifactImage.getBoundingClientRect().height >= 120),
     statusSlotAligned: Boolean(spinnerRect && resultRect && Math.abs((spinnerRect.x + spinnerRect.width / 2) - (resultRect.x + resultRect.width / 2)) < 0.5 && Math.abs((spinnerRect.y + spinnerRect.height / 2) - (resultRect.y + resultRect.height / 2)) < 0.5),
     viewport: [window.innerWidth, window.innerHeight],
     text: document.body.innerText
@@ -345,6 +369,16 @@ mod tests {
             "finished reasoning should cross-fade into its settled label: {report}"
         );
         assert_eq!(
+            report["settledThoughtCollapsed"].as_bool(),
+            Some(true),
+            "finished Thought should not auto-expand its reasoning body: {report}"
+        );
+        assert_eq!(
+            report["workingGroupCollapsed"].as_bool(),
+            Some(true),
+            "Working action groups should stay collapsed until explicitly opened: {report}"
+        );
+        assert_eq!(
             report["toolLabelShimmerAnimation"].as_str(),
             Some("ox-shimmer"),
             "running tool label should shimmer: {report}"
@@ -390,6 +424,16 @@ mod tests {
             "Subagents, Tasks, and Changing files should stay one-line until expanded: {report}"
         );
         assert_eq!(
+            report["skillMenuCompact"].as_bool(),
+            Some(true),
+            "$skill suggestions should stay compact above the composer: {report}"
+        );
+        assert_eq!(
+            report["artifactPreviewSized"].as_bool(),
+            Some(true),
+            "generated image citations should render as useful preview cards: {report}"
+        );
+        assert_eq!(
             report["statusSlotAligned"].as_bool(),
             Some(true),
             "tool spinner and result icon should occupy the same fixed slot: {report}"
@@ -399,6 +443,8 @@ mod tests {
             text.contains("Reasoning")
                 && text.contains("Preparing")
                 && text.contains("ask_user")
+                && text.contains("audit-gui-motion")
+                && text.contains("GUI evidence")
                 && text.contains("Kept"),
             "fixture text did not render expected labels: {text}"
         );

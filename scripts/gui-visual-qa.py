@@ -23,6 +23,7 @@ PROTOCOL = ROOT / "crates/oxide-protocol/src/lib.rs"
 PROVIDER = ROOT / "crates/oxide-providers/src/lib.rs"
 CHATGPT = ROOT / "crates/oxide-providers/src/chatgpt.rs"
 CORE = ROOT / "crates/oxide-core/src/lib.rs"
+BROWSER = ROOT / "crates/oxide-core/src/browser.rs"
 DB = ROOT / "crates/oxide-core/src/db.rs"
 STORE = ROOT / "crates/oxide-core/src/store.rs"
 CHECKLIST = ROOT / "docs/gui-visual-qa-checklist.md"
@@ -80,17 +81,17 @@ def write_fixture(css: str) -> None:
 <div class="app" data-theme="dark">
   <main class="chat">
     <section class="col streaming">
-      <div class="row agent agent-waiting streaming-message">
-        <div class="avatar"></div>
-        <div class="typing" role="status" aria-atomic="true"><!-- UNICODE_TYPING --><span class="typing-shimmer">Thinking…</span></div>
-      </div>
       <details class="thinking-box" open>
         <summary class="thinking-sum live"><span class="thinking-glow">Reasoning</span><span class="thinking-secs">3s</span></summary>
         <div class="thinking-body">Inspecting harness routes, streamed tool args, and session metadata.</div>
       </details>
-      <details class="thought-row settling" open>
+      <details class="thought-row settling">
         <summary class="thought-sum"><span class="thought-label-stack"><span class="thought-label-live">Reasoning</span><span class="thought-label-settled">Thought for 3s</span></span></summary>
         <div class="thought-body">The reasoning label settles before this body collapses.</div>
+      </details>
+      <details class="act-group">
+        <summary class="act-group-head"><span class="diff-caret">›</span><span class="act-group-icon">⚙</span><span>Working… 93 actions</span></summary>
+        <div class="row activity"><span>Hidden until explicitly expanded</span></div>
       </details>
       <div class="row activity">
         <details class="activity-card running activity-search activity-preparing no-out">
@@ -131,6 +132,10 @@ Finished dev profile</pre>
       <div class="row agent streaming-message">
         <div class="avatar"></div>
         <div class="agent-text agent-md live"><div class="live-stable"><p>Streaming answer text stays readable.</p></div><div class="live-tail"><span class="live-word fresh">New </span><span class="live-word fresh">words </span><span class="live-word fresh">fade </span><span class="live-word fresh">in.</span></div></div>
+      </div>
+      <div class="row agent">
+        <div class="avatar"></div>
+        <div class="agent-content"><div class="agent-text agent-md"><p>GUI verification completed.</p></div><div class="artifact-grid"><button class="artifact-card"><svg class="artifact-image" viewBox="0 0 480 240"><rect width="480" height="240" fill="#16181d"></rect><rect x="28" y="28" width="424" height="184" rx="14" fill="#22252c"></rect><circle cx="54" cy="51" r="6" fill="#5c9cf5"></circle><path d="M55 92h250M55 122h340M55 152h210" stroke="#747b89" stroke-width="10" stroke-linecap="round"></path></svg><span class="artifact-caption"><span class="artifact-kind">▧ GUI evidence</span><span class="artifact-name">oxide-gui-native.png</span><span class="artifact-path">.oxide/screenshots/oxide-gui-native.png</span></span></button></div></div>
       </div>
       <div class="review-item">
         <details class="review-diff-d" open>
@@ -180,6 +185,16 @@ Finished dev profile</pre>
         <summary class="todo-head run-summary"><span class="todo-ic">☷</span><span class="run-label">Tasks 2/5</span><span class="run-preview">Implement compact orchestration layout</span><span class="run-caret">⌄</span></summary>
         <div class="todo-row in_progress"><span class="todo-box"></span><span class="todo-text">Implement compact orchestration layout</span></div>
       </details>
+      <div class="composer-dock">
+        <div class="composer-stack">
+        <div class="queue-bar">
+          <span class="queue-label"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><circle cx="12" cy="12" r="9"></circle><path d="M12 7v5l3 2"></path></svg><span>Queued (2)</span></span>
+          <div class="queue-chip queue-primary"><button class="queue-prompt"><span class="queue-index">1</span><span class="queue-text">Polish the queued prompt controls above the composer</span></button><button class="queue-steer">↗</button><button class="queue-x">×</button></div>
+          <details class="queue-more"><summary class="queue-more-trigger">+1 <span>⌃</span></summary><div class="queue-menu"><div class="queue-row"><button class="queue-prompt"><span class="queue-index">2</span><span class="queue-text">Run the targeted visual checks</span></button><button class="queue-steer">↑</button><button class="queue-steer">↗</button><button class="queue-x">×</button></div><button class="queue-clear">Clear all</button></div></details>
+        </div>
+        <div class="composer"><div class="mention-menu skill-menu fixture-skill-menu"><div class="menu-label">Skills</div><button class="menu-item sel"><span class="skill-mention-mark">$</span><span class="menu-name">audit-gui-motion</span><span class="menu-meta">Workspace skill</span></button><button class="menu-item"><span class="skill-mention-mark">$</span><span class="menu-name">oxide-release-tag</span><span class="menu-meta">Workspace skill</span></button></div><div class="input ce-input" data-empty="false">Use <span class="ce-chip" data-prefix="$">audit-gui-motion</span> for this change…</div></div>
+        </div>
+      </div>
       <div class="composer-live-changes">
         <div class="live-changes-head">
           <span class="live-changes-icon">~</span>
@@ -247,7 +262,6 @@ Finished dev profile</pre>
   </div>
 </div>
 """
-    body = body.replace("<!-- UNICODE_TYPING -->", unicode_spinner_fixture("typing-unicode"))
     body = body.replace("<!-- UNICODE_ACTIVITY -->", unicode_spinner_fixture("activity-spin"))
     body = body.replace("<!-- UNICODE_STATUS -->", unicode_spinner_fixture("status-spinner"))
     fixture = f"""<!doctype html>
@@ -261,6 +275,7 @@ Finished dev profile</pre>
     body {{ margin: 0; min-height: 100vh; background: #0d0d0f; color: #f4f4f5; }}
     .chat {{ max-width: 920px; margin: 0 auto; padding: 40px 24px; }}
     .avatar {{ width: 28px; height: 28px; border-radius: 50%; background: #22242a; flex: none; }}
+    .fixture-skill-menu {{ position: relative; inset: auto; width: 100%; margin-bottom: 10px; box-shadow: none; }}
   </style>
 </head>
 <body>
@@ -287,6 +302,7 @@ def write_brain_fixture(css: str) -> None:
     .brain-preview-shell {{ flex: 1; min-width: 0; height: 100%; }}
     .brain-preview-logo {{ width: 24px; height: 24px; display: inline-flex; align-items: center; justify-content: center; border-radius: 7px; background: color-mix(in srgb, var(--syn-accent) 18%, transparent); color: var(--syn-accent); font-size: 9px; font-weight: 750; }}
     .nav-preview-icon {{ width: 17px; flex: 0 0 17px; color: var(--muted); text-align: center; }}
+    .nav-preview-icon svg {{ width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.9; stroke-linecap: round; stroke-linejoin: round; }}
   </style>
 </head>
 <body>
@@ -297,7 +313,7 @@ def write_brain_fixture(css: str) -> None:
     <nav class="nav">
       <button class="nav-item"><span class="nav-preview-icon">＋</span><span>New chat</span></button>
       <button class="nav-item"><span class="nav-preview-icon">⌕</span><span>Search</span></button>
-      <button class="nav-item brain-nav on"><span class="nav-preview-icon">⌁</span><span>Brain</span></button>
+      <button class="nav-item brain-nav on"><span class="nav-preview-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9.5 4a2.5 2.5 0 0 1 2.5 2.5v10a2.5 2.5 0 0 1-4.96.44A2.5 2.5 0 0 1 4.5 14.5a3 3 0 0 1 .34-5.95A2.5 2.5 0 0 1 9.5 7.3Z"></path><path d="M14.5 4A2.5 2.5 0 0 0 12 6.5v10a2.5 2.5 0 0 0 4.96.44A2.5 2.5 0 0 0 19.5 14.5a3 3 0 0 0-.34-5.95A2.5 2.5 0 0 0 14.5 7.3Z"></path><path d="M3 13h4"></path><path d="M17 13h4"></path><path d="M8 9h8"></path></svg></span><span>Brain</span></button>
     </nav>
   </aside>
   <main class="brain-preview-shell">
@@ -393,6 +409,7 @@ def main() -> int:
     provider = read(PROVIDER)
     chatgpt = read(CHATGPT)
     core = read(CORE)
+    browser = read(BROWSER)
     db = read(DB)
     store = read(STORE)
     checklist = read(CHECKLIST)
@@ -403,14 +420,31 @@ def main() -> int:
     automation = read(AUTOMATION)
 
     require(
-        "pre-token shimmer render",
-        contains_all(gui, ['class: "row agent agent-waiting streaming-message"', 'class: "typing"', "if live"]) and ".typing" in css,
-        f"{rel(GUI)} renders .agent-waiting/.typing for live empty agent rows",
+        "pre-token progress uses one status surface",
+        contains_all(
+            gui,
+            [
+                "&& thinking.read().is_empty()",
+                "&& !live_answer_visible",
+                "&& !has_running_activity",
+                "The live reasoning block and StatusPill already communicate",
+            ],
+        )
+        and 'class: "row agent agent-waiting streaming-message"' not in gui,
+        f"{rel(GUI)} suppresses the duplicate empty-agent Thinking row when Reasoning, Working, or the live answer already owns progress",
     )
     require(
-        "typing shimmer css",
-        contains_all(css, [".typing", "glass-sweep", "@keyframes glass-sweep"]),
-        f"{rel(CSS)} defines glass-sweep typing skeleton",
+        "settled answer avoids full-block blur",
+        contains_all(
+            css,
+            [
+                "@keyframes oxide-focus-in",
+                "transform: translateY(2px)",
+                "animation: oxide-focus-in .24s var(--ease-out) both;",
+            ],
+        )
+        and "filter: blur(6px)" not in css,
+        f"{rel(CSS)} settles long Markdown answers with compositor-only opacity/transform instead of rasterizing blur",
     )
     require(
         "unicode activity micro-motion stays single-node",
@@ -420,7 +454,6 @@ def main() -> int:
                 "fn UnicodeSpinner",
                 'rsx! { span { class: "unicode-spinner {class}", aria_hidden: "true" } }',
                 'UnicodeSpinner { class: "status-spinner" }',
-                'UnicodeSpinner { class: "typing-unicode" }',
                 'UnicodeSpinner { class: "activity-spin" }',
                 'role: "status"',
                 'aria_atomic: "true"',
@@ -492,6 +525,20 @@ def main() -> int:
         )
         and nearby(gui, "fn ChatPane(", "macro_rules! flush_pane_streams", 9000),
         f"{rel(GUI)} batches pane answer/reasoning deltas at frame cadence and flushes before structural events",
+    )
+    require(
+        "foreground streaming coalesces answer and reasoning deltas",
+        contains_all(
+            gui,
+            [
+                "macro_rules! flush_reasoning_live",
+                "if !agent_buf.is_empty() || !reasoning_buf.is_empty()",
+                "agent_buf.len() + reasoning_buf.len() > 800",
+                "flush_reasoning_live!();",
+            ],
+        )
+        and nearby(gui, "let mut view_tab: u64", "macro_rules! flush_reasoning_live", 9000),
+        f"{rel(GUI)} batches foreground answer/reasoning paints at frame cadence instead of re-rendering per token",
     )
     require(
         "tool lifecycle uses stable status and disclosure slots",
@@ -573,14 +620,31 @@ def main() -> int:
             [
                 ".thinking-glow,",
                 ".activity-card.running .activity-verb,",
-                ".activity-card.running .activity-text,",
                 ".composer-live-changes .live-changes-title {",
                 "animation: ox-shimmer 2s linear infinite;",
                 ".col.streaming .row.diffrow,",
                 ".thinking-box[open] > .thinking-body {",
             ],
         ),
-        f"{rel(CSS)} applies Emdash-style paint-only shimmer and entry/reveal motion to active reasoning, tools, and edits",
+        f"{rel(CSS)} keeps one Emdash-style shimmer per active tool plus reasoning/edit motion without repainting tool details",
+    )
+    require(
+        "continuous motion stays bounded to useful feedback",
+        contains_all(
+            css,
+            [
+                ".brain-edge.active {",
+                "animation: brain-edge-flow calc(var(--dur-slow) * 18) linear infinite;",
+                ".brain-core-halo {",
+                "background: var(--warn, #d9a35c); opacity: .9;",
+                "static gradient avoids repainting the full",
+            ],
+        )
+        and "brain-core-pulse" not in css
+        and "bg-pulse" not in css
+        and "ultrathink-rainbow" not in css
+        and ".activity-card.running .activity-text," not in css,
+        f"{rel(CSS)} leaves functional spinner/shimmer feedback active while removing large or duplicate infinite repaint loops",
     )
     require(
         "reasoning settles before disclosure collapse",
@@ -591,6 +655,7 @@ def main() -> int:
                 '"thought-row settling"',
                 'class: "thought-label-live"',
                 'class: "thought-label-settled"',
+                'details { class: "{class}",',
                 "settling_thought.set(Some(thought_id));",
                 "from_millis(320)",
             ],
@@ -601,10 +666,10 @@ def main() -> int:
                 "@keyframes oxide-thought-live-out",
                 "@keyframes oxide-thought-settled-in",
                 ".thought-label-stack",
-                ".thought-row.settling .thought-body",
             ],
-        ),
-        f"{rel(GUI)} and {rel(CSS)} cross-fade Reasoning into Thought for … before closing through the shared height tween",
+        )
+        and 'open: settling' not in gui,
+        f"{rel(GUI)} and {rel(CSS)} cross-fade Reasoning into a collapsed Thought label without auto-expanding its body",
     )
     require(
         "reasoning segments coalesce per turn",
@@ -620,6 +685,21 @@ def main() -> int:
             ],
         ),
         f"{rel(GUI)} keeps one stable Thought disclosure per user turn in primary, pane, and replay paths",
+    )
+    require(
+        "working and reasoning surfaces do not duplicate",
+        contains_all(
+            gui,
+            [
+                ".unwrap_or(false);",
+                "active_thought_id != Some(m.id)",
+                "active_thought_id != Some(msg.id)",
+                "&& !has_running_activity",
+                "&& !live_answer_visible",
+            ],
+        )
+        and "unwrap_or(tool_detail == \"detailed\")" not in gui,
+        f"{rel(GUI)} keeps Working collapsed by default, hides settled Thought while live Reasoning owns the turn, and suppresses redundant Thinking status",
     )
     require(
         "motion policy keeps lifecycle polish active",
@@ -676,6 +756,96 @@ def main() -> int:
             ],
         ),
         f"{rel(GUI)} routes running sub-agents to Environment → Agents while composer task/change surfaces stay compact",
+    )
+    require(
+        "queued prompts stay compact above composer",
+        contains_all(
+            gui,
+            [
+                "fn QueuedPromptBar(",
+                "restore_queued_prompt(queue, 0)",
+                "steer_queued_prompt(queue, engine, 0)",
+                'details { class: "queue-more"',
+                '"Clear all"',
+                "QueuedPromptBar { queue, engine }",
+                "Some(q.remove(0))",
+            ],
+        )
+        and nearby(gui, "QueuedPromptBar { queue, engine }", 'class: match (*streaming.read(), cur_effort.as_str())', 320)
+        and contains_all(
+            css,
+            [
+                ".queue-primary { flex: 1 1 360px; max-width: 470px; }",
+                ".queue-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }",
+                ".queue-menu {",
+                ".composer-stack > .queue-bar { margin: 0 auto 8px; }",
+            ],
+        ),
+        "Queued prompts use one Codex-style rail with edit, steer, remove, reorder, clear, and automatic next-turn drain controls",
+    )
+    require(
+        "dollar skill mentions are keyboard-first",
+        contains_all(
+            gui,
+            [
+                "let q=null, skill=null;",
+                'v["skill"].as_str()',
+                "skill_candidates(&ws, &query_for_scan)",
+                "ce_insert_js(&token, &label, '$')",
+                "chip.dataset.token={token}; chip.dataset.prefix=marker;",
+                "body+=(c.dataset.prefix||'@')",
+                'class: "mention-menu skill-menu"',
+                "Key::Enter | Key::Tab if !e.modifiers().shift()",
+            ],
+        )
+        and contains_all(
+            css,
+            [
+                ".skill-menu {",
+                ".skill-mention-mark {",
+                '.ce-chip[data-prefix="$"]::before',
+            ],
+        ),
+        f"{rel(GUI)} and {rel(CSS)} expose Codex-style $skill discovery, keyboard insertion, visible chips, and existing skill instruction injection",
+    )
+    require(
+        "generated image citations become artifact previews",
+        contains_all(
+            gui,
+            [
+                "fn image_artifacts(text: &str, workspace: &Path)",
+                "if !path.starts_with(&workspace)",
+                'class: "artifact-grid"',
+                'class: "artifact-card"',
+                'loading: "lazy"',
+                "open_file(ui, path.clone())",
+            ],
+        )
+        and contains_all(
+            css,
+            [
+                ".artifact-grid {",
+                ".artifact-card {",
+                ".artifact-image {",
+                ".artifact-caption {",
+            ],
+        ),
+        f"{rel(GUI)} renders up to four workspace-confined screenshot/image citations as lazy Codex-style cards that open the existing image viewer",
+    )
+    require(
+        "browser automation closes with its owning turn",
+        contains_all(
+            browser,
+            [
+                "pub async fn close(mut self) -> Result<()>",
+                "self.browser.close().await",
+                "remove_dir_all(&self.profile_dir).await",
+            ],
+        )
+        and contains_all(core, ["async fn finish_turn(&mut self, turn: TurnId)", "self.close_browser().await;"])
+        and core.count("self.finish_turn(turn).await;") >= 6
+        and core.count("self.emit(Event::TurnFinished { turn }).await;") == 1,
+        f"{rel(BROWSER)} closes Chromium and deletes its temporary profile at the shared {rel(CORE)} turn-finish boundary",
     )
     require(
         "slash command palette is keyboard-first",
@@ -990,6 +1160,8 @@ def main() -> int:
                 "15 * 60",
                 "ToastAction::InstallUpdate",
                 "show_native_notification",
+                "tokio::time::sleep(std::time::Duration::from_secs(10))",
+                "whats_new.set(None)",
                 "oxide:draft:",
                 "localStorage.setItem",
             ],
@@ -1039,6 +1211,8 @@ def main() -> int:
                 'sidebar_tab.set("brain".to_string())',
                 'class: if sidebar_tab.read().as_str() != "workspace" { "on" }',
                 'class: if *sidebar_tab.read() == "brain" { "nav-item brain-nav on"',
+                '"brain" => rsx! {',
+                'path { d: "M9.5 4a2.5 2.5 0 0 1 2.5 2.5v10',
                 'class: "brain-view"',
                 'class: "brain-map"',
                 '"brain-edge active"',
@@ -1061,14 +1235,15 @@ def main() -> int:
                 ".brain-layout {",
                 ".brain-map {",
                 ".brain-edge {",
+                ".brain-edge.active {",
                 "animation: brain-edge-flow calc(var(--dur-slow) * 18) linear infinite;",
                 ".brain-core-halo {",
-                "animation: brain-core-pulse calc(var(--dur-slow) * 12)",
+                "opacity: .62;",
                 ".brain-node.active rect {",
                 "@media (max-width: 980px)",
             ],
         ),
-        "Brain stays compact below Search while connecting workspace memory nodes with tokenized graph motion, keyboard focus, and a facts/skills inspector",
+        "Brain stays compact below Search while only the selected knowledge edge animates; workspace nodes, keyboard focus, and facts/skills inspector remain interactive",
     )
     require(
         "settings navigation scales to all destinations",

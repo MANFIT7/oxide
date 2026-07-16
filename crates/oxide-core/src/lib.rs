@@ -2513,6 +2513,20 @@ impl Engine {
             .collect()
     }
 
+    /// Finish browser automation with the turn that owns it. This keeps one
+    /// browser alive for multi-step navigate/read/click flows, then releases the
+    /// Chromium process and temporary profile before the frontend sees Done.
+    async fn close_browser(&mut self) {
+        if let Some(session) = self.browser.take() {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(8), session.close()).await;
+        }
+    }
+
+    async fn finish_turn(&mut self, turn: TurnId) {
+        self.close_browser().await;
+        self.emit(Event::TurnFinished { turn }).await;
+    }
+
     /// Ensure the browser session is launched; returns a ref or an error string.
     async fn ensure_browser(&mut self) -> Result<&browser::BrowserSession, String> {
         if self.browser.is_none() {
@@ -3409,7 +3423,7 @@ Rules:
                             })
                             .await;
                             self.note_db_error_once().await;
-                            self.emit(Event::TurnFinished { turn }).await;
+                            self.finish_turn(turn).await;
                         } else {
                             // hermes-style background self-improvement: every few
                             // turns a detached reviewer distills durable facts/
@@ -4685,7 +4699,7 @@ Produce a compact, self-contained answer (read files only when needed; do NOT ed
             })
             .await;
             self.note_db_error_once().await;
-            self.emit(Event::TurnFinished { turn }).await;
+            self.finish_turn(turn).await;
             return;
         }
 
@@ -5055,7 +5069,7 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                 .await;
                 self.run_stop_lifecycle(turn, &user_text, true).await;
                 self.note_db_error_once().await;
-                self.emit(Event::TurnFinished { turn }).await;
+                self.finish_turn(turn).await;
                 return;
             }
 
@@ -5120,7 +5134,7 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                 }
                 self.run_stop_lifecycle(turn, &user_text, true).await;
                 self.note_db_error_once().await;
-                self.emit(Event::TurnFinished { turn }).await;
+                self.finish_turn(turn).await;
                 return;
             }
 
@@ -5210,7 +5224,7 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
             }
             self.run_stop_lifecycle(turn, &user_text, interrupted).await;
             self.note_db_error_once().await;
-            self.emit(Event::TurnFinished { turn }).await;
+            self.finish_turn(turn).await;
             return;
         }
 
@@ -5810,7 +5824,7 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
         }
         self.run_stop_lifecycle(turn, &user_text, interrupted).await;
         self.note_db_error_once().await;
-        self.emit(Event::TurnFinished { turn }).await;
+        self.finish_turn(turn).await;
 
         // Context-aware follow-up suggestions, generated off-turn on the fast
         // lane. CLI drivers are skipped (a cold CLI spawn for 3 chips isn't

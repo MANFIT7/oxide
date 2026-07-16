@@ -2184,10 +2184,10 @@ fn chatgpt_status() -> Option<String> {
     Some(format!("Connected · {mode}"))
 }
 
-/// JS: report the in-progress `@query` at the caret + whether the editor is empty.
+/// JS: report in-progress `@query` / `$skill` at the caret + editor state.
 const CE_QUERY_JS: &str = r#"
 const el=document.getElementById('ce-input');
-let q=null;
+let q=null, skill=null;
 const sel=window.getSelection();
 if(sel && sel.rangeCount){
   const r=sel.getRangeAt(0); const n=r.startContainer;
@@ -2195,6 +2195,8 @@ if(sel && sel.rangeCount){
     const t=n.textContent.slice(0,r.startOffset);
     const m=t.match(/(?:^|\s)@([^\s@]*)$/);
     if(m) q=m[1];
+    const sm=t.match(/(?:^|\s)\$([^\s$]*)$/);
+    if(sm) skill=sm[1];
   }
 }
 const empty = !el || (el.textContent.replace(/ /g,'').trim()==='' && el.querySelectorAll('.ce-chip').length===0);
@@ -2205,7 +2207,7 @@ if (el) {
   const sm = el.textContent.trim().match(/^\/([a-zA-Z0-9_-]*)$/);
   if (sm) slash = sm[1];
 }
-return JSON.stringify({q, empty, slash});
+return JSON.stringify({q, skill, empty, slash});
 "#;
 
 /// JS: serialize the editor into `{body, tokens}` for submission.
@@ -2216,7 +2218,7 @@ function walk(n){
   n.childNodes.forEach(c=>{
     if(c.nodeType===3) body+=c.textContent;
     else if(c.nodeName==='BR') body+='\n';
-    else if(c.classList && c.classList.contains('ce-chip')){ tokens.push(c.dataset.token); body+='@'+(c.textContent||''); }
+    else if(c.classList && c.classList.contains('ce-chip')){ tokens.push(c.dataset.token); body+=(c.dataset.prefix||'@')+(c.textContent||''); }
     else {
       if(body && !body.endsWith('\n') && (c.nodeName==='DIV'||c.nodeName==='P')) body+='\n';
       walk(c);
@@ -2227,34 +2229,35 @@ walk(el);
 return JSON.stringify({body: body.replace(/ /g,' ').trim(), tokens});
 "#;
 
-/// JS to replace the caret's `@query` with an inline chip span.
-fn ce_insert_js(token: &str, label: &str) -> String {
+/// JS to replace the caret's `@query` / `$skill` with an inline chip span.
+fn ce_insert_js(token: &str, label: &str, marker: char) -> String {
     let token = serde_json::to_string(token).unwrap_or_else(|_| "\"\"".into());
     let label = serde_json::to_string(label).unwrap_or_else(|_| "\"\"".into());
+    let marker = serde_json::to_string(&marker.to_string()).unwrap_or_else(|_| "\"@\"".into());
     format!(
         r#"
 const sel=window.getSelection(); if(!sel||!sel.rangeCount) return false;
 const r=sel.getRangeAt(0); const n=r.startContainer;
 if(n.nodeType!==3) return false;
-const t=n.textContent; const off=r.startOffset;
-const m=t.slice(0,off).match(/(?:^|\s)@([^\s@]*)$/);
-if(!m) return false;
-const start=off - m[1].length - 1;
-const after=n.splitText(start);
-after.textContent=after.textContent.slice(m[1].length+1);
+const t=n.textContent; const off=r.startOffset; const before=t.slice(0,off); const marker={marker};
+const at=before.lastIndexOf(marker); if(at<0 || (at>0 && !/\s/.test(before[at-1]))) return false;
+const query=before.slice(at+1); if(/\s/.test(query) || query.includes(marker)) return false;
+const after=n.splitText(at);
+after.textContent=after.textContent.slice(query.length+1);
 const chip=document.createElement('span');
 chip.className='ce-chip'; chip.setAttribute('contenteditable','false');
-chip.dataset.token={token}; chip.textContent={label};
+chip.dataset.token={token}; chip.dataset.prefix=marker; chip.textContent={label};
 const sp=document.createTextNode(' ');
 n.parentNode.insertBefore(chip, after);
 n.parentNode.insertBefore(sp, after);
 const nr=document.createRange(); nr.setStartAfter(sp); nr.collapse(true);
 sel.removeAllRanges(); sel.addRange(nr);
-const ed=document.getElementById('ce-input'); if(ed) ed.focus();
+const ed=document.getElementById('ce-input'); if(ed){{ ed.focus(); ed.dispatchEvent(new InputEvent('input',{{bubbles:true}})); }}
 return true;
 "#,
         token = token,
-        label = label
+        label = label,
+        marker = marker
     )
 }
 
@@ -2472,7 +2475,8 @@ fn user_segments(text: &str) -> Vec<(bool, String)> {
     let mut i = 0;
     while i < chars.len() {
         let at_word_start = i == 0 || chars[i - 1].is_whitespace();
-        if chars[i] == '@' && at_word_start {
+        if matches!(chars[i], '@' | '$') && at_word_start {
+            let marker = chars[i];
             let mut j = i + 1;
             let mut name = String::new();
             while j < chars.len() && !chars[j].is_whitespace() {
@@ -2483,7 +2487,12 @@ fn user_segments(text: &str) -> Vec<(bool, String)> {
                 if !buf.is_empty() {
                     out.push((false, std::mem::take(&mut buf)));
                 }
-                out.push((true, name));
+                let label = if marker == '$' {
+                    format!("${name}")
+                } else {
+                    name
+                };
+                out.push((true, label));
                 i = j;
                 continue;
             }
@@ -4152,6 +4161,49 @@ mod tests {
     }
 
     #[test]
+    fn dollar_skill_candidates_and_image_artifacts_stay_workspace_local() {
+        let root = std::env::temp_dir().join(format!("oxide-gui-artifacts-{}", std::process::id()));
+        let outside =
+            std::env::temp_dir().join(format!("oxide-gui-outside-{}.png", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".oxide/memory/skills")).unwrap();
+        std::fs::create_dir_all(root.join(".oxide/screenshots")).unwrap();
+        std::fs::write(
+            root.join(".oxide/memory/skills/gui-proof.md"),
+            "Capture GUI evidence",
+        )
+        .unwrap();
+        std::fs::write(root.join(".oxide/screenshots/proof.png"), b"png").unwrap();
+        std::fs::write(&outside, b"outside").unwrap();
+
+        assert_eq!(
+            skill_candidates(&root, "proof"),
+            vec!["skill:gui-proof".to_string()]
+        );
+        assert_eq!(
+            user_segments("Use $gui-proof now"),
+            vec![
+                (false, "Use ".to_string()),
+                (true, "$gui-proof".to_string()),
+                (false, " now".to_string()),
+            ]
+        );
+        let artifacts = image_artifacts(
+            &format!(
+                "Screenshot saved → .oxide/screenshots/proof.png\nOutside: {}",
+                outside.display()
+            ),
+            &root,
+        );
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].name, "proof.png");
+        assert_eq!(artifacts[0].src, "/wsimg/.oxide/screenshots/proof.png");
+
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_file(outside);
+    }
+
+    #[test]
     fn toast_kinds_use_semantic_icons_and_roles() {
         assert_eq!(toast_icon_name("ok"), "circle-check");
         assert_eq!(toast_icon_name("err"), "circle-alert");
@@ -4271,6 +4323,24 @@ fn show_native_notification(cfg: Signal<Config>, title: &str, body: &str) {
     std::thread::spawn(move || {
         #[cfg(target_os = "macos")]
         {
+            let helper = std::env::current_exe().ok().and_then(|exe| {
+                let contents = exe.parent()?.parent()?;
+                let helper = contents.join("Helpers/Oxide Notifications.app");
+                helper.exists().then_some(helper)
+            });
+            if let Some(helper) = helper {
+                let launched = std::process::Command::new("open")
+                    .arg("-g")
+                    .arg("-n")
+                    .arg(helper)
+                    .arg("--args")
+                    .args([&title, &body])
+                    .status()
+                    .is_ok_and(|status| status.success());
+                if launched {
+                    return;
+                }
+            }
             let _ = std::process::Command::new("osascript")
                 .args([
                     "-e",
@@ -4410,6 +4480,38 @@ fn queue_preview(text: &str) -> String {
         .chars()
         .take(54)
         .collect()
+}
+
+fn restore_queued_prompt(mut queue: Signal<Vec<String>>, index: usize) {
+    let full = {
+        let mut queued = queue.write();
+        (index < queued.len()).then(|| queued.remove(index))
+    };
+    let Some(full) = full else {
+        return;
+    };
+    let full = strip_scaffold(&full);
+    let js = format!(
+        "const e=document.getElementById('ce-input'); if(e){{ e.textContent={}; e.focus(); const r=document.createRange(); r.selectNodeContents(e); r.collapse(false); const s=window.getSelection(); s.removeAllRanges(); s.addRange(r); e.dispatchEvent(new InputEvent('input',{{bubbles:true}})); }} return true;",
+        serde_json::to_string(&full).unwrap_or_default()
+    );
+    spawn(async move {
+        let _ = dioxus::document::eval(&js).join::<bool>().await;
+    });
+}
+
+fn steer_queued_prompt(mut queue: Signal<Vec<String>>, engine: Coroutine<EngineCmd>, index: usize) {
+    let text = {
+        let mut queued = queue.write();
+        (index < queued.len()).then(|| queued.remove(index))
+    };
+    if let Some(text) = text {
+        let display = strip_scaffold(&text);
+        engine.send(EngineCmd::Submit {
+            engine: text,
+            display,
+        });
+    }
 }
 
 /// Stem of the active tab's session file (per-thread storage key).
@@ -5593,6 +5695,18 @@ fn app() -> Element {
             }
         }
     });
+    use_effect(move || {
+        let Some(version) = whats_new.read().clone() else {
+            return;
+        };
+        spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            if whats_new.peek().as_deref() == Some(version.as_str()) {
+                mark_seen_version(cfg);
+                whats_new.set(None);
+            }
+        });
+    });
 
     // Warm the syntect syntax set off-thread so the first code block in a reply
     // doesn't stall the UI mid-stream.
@@ -6413,6 +6527,7 @@ fn app() -> Element {
             // on fast streams. Buffer deltas and paint at ~30fps instead (modern
             // streaming-UI practice).
             let mut agent_buf = String::new();
+            let mut reasoning_buf = String::new();
             let mut last_paint = std::time::Instant::now();
             // True between a turn's Done note and the next TurnStarted. A late
             // activity arriving in this window is inserted ABOVE the Done note so
@@ -6440,8 +6555,22 @@ fn app() -> Element {
                     }
                 }};
             }
+            macro_rules! flush_reasoning_live {
+                () => {{
+                    if !reasoning_buf.is_empty() {
+                        let chunk = std::mem::take(&mut reasoning_buf);
+                        thinking.write().push_str(&chunk);
+                        if let Some(started) = *think_started.peek() {
+                            think_secs.set(started.elapsed().as_secs());
+                        }
+                        last_paint = std::time::Instant::now();
+                    }
+                }};
+            }
+
             macro_rules! flush_thinking {
                 () => {{
+                    flush_reasoning_live!();
                     let text = thinking.peek().clone();
                     if !text.trim().is_empty() {
                         let secs = (*think_started.peek())
@@ -6494,6 +6623,7 @@ fn app() -> Element {
                     cmd = rx.next() => {
                       // Land buffered streaming text before any view change.
                       flush_agent!();
+                      flush_reasoning_live!();
                       match cmd {
                         Some(EngineCmd::Submit { engine: eng, display }) => {
                             followups.write().clear();
@@ -6783,24 +6913,17 @@ fn app() -> Element {
                         None => break,
                       }
                     },
-                    // Idle-flush: the delta handler only paints when >=33ms passed
-                    // since the last paint OR the buffer grew past 800B, so the final
-                    // sub-33ms tail of a burst sits in agent_buf until the NEXT event.
-                    // If the provider then pauses (bursty/slow stream, end-of-text gap
-                    // before TurnFinished), nothing wakes the loop and the buffered tail
-                    // stays invisible — chrome (spinner/shimmer/elapsed) keeps moving so
-                    // it reads as "frozen then jumps". This arm bounds tail latency to
-                    // ~50ms. The `if !agent_buf.is_empty()` guard is REQUIRED: select!
-                    // only builds the sleep future when the precondition is true, so an
-                    // empty buffer means no timer (no busy-spin); flush_agent! empties
-                    // the buffer via mem::take so the arm self-disables after one fire.
-                    // Anchored to last_paint (not loop-idle) so a chatty background tab
-                    // can't starve the foreground tail.
+                    // Idle-flush: delta handlers paint at frame cadence, so the
+                    // final sub-frame tail of a burst can sit in a buffer until the
+                    // next event. Wake once after ~50ms to land both answer and
+                    // reasoning tails; the guard disables the timer when both are
+                    // empty, so this never becomes a busy loop.
                     _ = tokio::time::sleep(
                         std::time::Duration::from_millis(50)
                             .saturating_sub(last_paint.elapsed()),
-                    ), if !agent_buf.is_empty() => {
+                    ), if !agent_buf.is_empty() || !reasoning_buf.is_empty() => {
                         flush_agent!();
+                        flush_reasoning_live!();
                     },
                     Some((ev_tid, ev_gen, ev)) = ev_rx.recv() => {
                         // Drop events from a replaced engine (stale generation).
@@ -7072,6 +7195,9 @@ fn app() -> Element {
                         if !matches!(ev, Event::AgentMessageDelta { .. }) {
                             flush_agent!();
                         }
+                        if !matches!(ev, Event::ReasoningDelta { .. }) {
+                            flush_reasoning_live!();
+                        }
                         // Liveness + tool-timer bookkeeping (any event = engine alive;
                         // tool rows time from their start event to the next signal).
                         last_ev_s.set(*elapsed_s.peek());
@@ -7117,7 +7243,7 @@ fn app() -> Element {
                                 }
                             }
                             Event::ReasoningDelta { text, .. } => {
-                                if thinking.peek().is_empty() {
+                                if thinking.peek().is_empty() && reasoning_buf.is_empty() {
                                     think_started.set(Some(std::time::Instant::now()));
                                     let needs_anchor = messages
                                         .peek()
@@ -7128,12 +7254,14 @@ fn app() -> Element {
                                         messages.write().push(ChatMsg::new(Author::Agent, String::new()));
                                     }
                                 }
-                                thinking.write().push_str(&text);
-                                if let Some(t) = *think_started.peek() {
-                                    think_secs.set(t.elapsed().as_secs());
-                                }
+                                reasoning_buf.push_str(&text);
                                 if status.peek().as_str() != "Thinking…" {
                                     status.set("Thinking…".to_string());
+                                }
+                                if last_paint.elapsed() >= std::time::Duration::from_millis(33)
+                                    || agent_buf.len() + reasoning_buf.len() > 800
+                                {
+                                    flush_reasoning_live!();
                                 }
                             }
                             Event::Info { text } => {
@@ -9542,8 +9670,21 @@ fn app() -> Element {
                                 key: "col-{active_tab}",
                                 class: if *streaming.read() { "col streaming" } else { "col" },
                                 {
-                                    let last_user_idx = messages.read().iter().rposition(|m| m.author == Author::User);
-                                    let last_agent_idx = messages.read().iter().rposition(|m| m.author == Author::Agent);
+                                    let is_streaming = *streaming.read();
+                                    let (last_user_idx, last_agent_idx, active_thought_id) = {
+                                        let msgs = messages.read();
+                                        let last_user = msgs.iter().rposition(|m| m.author == Author::User);
+                                        let last_agent = msgs.iter().rposition(|m| m.author == Author::Agent);
+                                        let active_thought = if is_streaming && !thinking.read().is_empty() {
+                                            msgs.iter()
+                                                .rev()
+                                                .find(|m| matches!(m.author, Author::Note) && m.text.starts_with("§thought\t"))
+                                                .map(|m| m.id)
+                                        } else {
+                                            None
+                                        };
+                                        (last_user, last_agent, active_thought)
+                                    };
                                     let tab_id = tabs
                                         .read()
                                         .get(*active_tab.read())
@@ -9608,16 +9749,16 @@ fn app() -> Element {
                                                         if let Author::Activity { running, ok, .. } = m.author { (m.text.clone(), running, ok) } else { (m.text.clone(), false, true) }
                                                     }).collect();
                                                     let (icon, label) = activity_group_display(&rows);
-                                                    // Default COLLAPSED, even while live — an open group with dozens
-                                                    // of (animating) rows lags hard. The header shows live progress;
-                                                    // the user expands for detail. And cap rendered rows to the most
-                                                    // recent so expanding a huge group stays light.
+                                                    // Always default COLLAPSED, even while live or in detailed mode —
+                                                    // an open group with dozens of rows competes with Thought/Reasoning
+                                                    // and can create many simultaneous animation timelines. Detailed
+                                                    // mode still controls which rows appear after the user expands it.
                                                     let tool_detail = cfg.read().tool_detail.clone();
                                                     let is_open = act_open
                                                         .read()
                                                         .get(&group_key)
                                                         .copied()
-                                                        .unwrap_or(tool_detail == "detailed");
+                                                        .unwrap_or(false);
                                                     const ACT_ROW_CAP: usize = 12;
                                                     // Compact density: settled-ok rows collapse into the header;
                                                     // running and failed rows always stay visible.
@@ -9783,11 +9924,13 @@ fn app() -> Element {
                                                                 let secs = parts.next().unwrap_or("1").parse().unwrap_or(1);
                                                                 let body = parts.next().unwrap_or("").to_string();
                                                                 rsx! {
-                                                                    ThoughtRow {
-                                                                        key: "m-{m.id}",
-                                                                        secs,
-                                                                        body,
-                                                                        settling: *settling_thought.read() == Some(m.id),
+                                                                    if active_thought_id != Some(m.id) {
+                                                                        ThoughtRow {
+                                                                            key: "m-{m.id}",
+                                                                            secs,
+                                                                            body,
+                                                                            settling: *settling_thought.read() == Some(m.id),
+                                                                        }
                                                                     }
                                                                 }
                                                             }
@@ -9921,16 +10064,31 @@ fn app() -> Element {
                                         }
                                     }
                                 }
-                                if *streaming.read() {
-                                    // Keep the pill mounted for the WHOLE turn — gating it on a
-                                    // non-empty status made it unmount/remount whenever `status`
-                                    // momentarily emptied between events, restarting the spinner's
-                                    // CSS animation each time (it looked frozen/stuck). A stable
-                                    // key + always-mounted pill lets the spin run continuously.
-                                    StatusPill {
-                                        text: status.read().clone(),
-                                        elapsed_s: *elapsed_s.read(),
-                                        stalled_s: elapsed_s.read().saturating_sub(*last_ev_s.read()),
+                                {
+                                    let (live_answer_visible, has_running_activity) = {
+                                        let msgs = messages.read();
+                                        let answer_visible = msgs
+                                            .iter()
+                                            .rfind(|m| m.author == Author::Agent)
+                                            .map(|m| !m.text.is_empty())
+                                            .unwrap_or(false);
+                                        let running_activity = msgs.iter().any(|m| {
+                                            matches!(m.author, Author::Activity { running: true, .. })
+                                        });
+                                        (answer_visible, running_activity)
+                                    };
+                                    let show_status = *streaming.read()
+                                        && thinking.read().is_empty()
+                                        && !live_answer_visible
+                                        && !has_running_activity;
+                                    rsx! {
+                                        if show_status {
+                                            StatusPill {
+                                                text: status.read().clone(),
+                                                elapsed_s: *elapsed_s.read(),
+                                                stalled_s: elapsed_s.read().saturating_sub(*last_ev_s.read()),
+                                            }
+                                        }
                                     }
                                 }
                                 if !bg_jobs.read().is_empty() || !bg_watch.read().is_empty() {
@@ -9984,58 +10142,6 @@ fn app() -> Element {
                                             }
                                         }
                                     }
-                                        }
-                                    }
-                                }
-                                if !queue.read().is_empty() {
-                                    div { class: "queue-bar",
-                                        span { class: "queue-label", Icon { name: "clock" } "Queued ({queue.read().len()})" }
-                                        for (qi, q) in queue.read().iter().enumerate() {
-                                            {
-                                                let preview = queue_preview(q);
-                                                let full = q.clone();
-                                                rsx! {
-                                                    span { class: "queue-chip", title: "Click to edit this queued message",
-                                                        onclick: move |_| {
-                                                            // Pull the item back into the composer for editing.
-                                                            let mut qv = queue.write();
-                                                            if qi < qv.len() { qv.remove(qi); }
-                                                            let full = strip_scaffold(&full);
-                                                            let js = format!(
-                                                                "const e=document.getElementById('ce-input'); if(e){{ e.textContent={}; e.focus(); const r=document.createRange(); r.selectNodeContents(e); r.collapse(false); const s=window.getSelection(); s.removeAllRanges(); s.addRange(r); }} return true;",
-                                                                serde_json::to_string(&full).unwrap_or_default()
-                                                            );
-                                                                spawn(async move { let _ = dioxus::document::eval(&js).join::<bool>().await; });
-                                                        },
-                                                        span { class: "queue-index", "{qi + 1}" }
-                                                        "{preview}"
-                                                        if qi > 0 {
-                                                            button { class: "queue-steer", title: "Move up in the queue",
-                                                                onclick: move |e: dioxus::prelude::MouseEvent| {
-                                                                    e.stop_propagation();
-                                                                    let mut qv = queue.write();
-                                                                    if qi > 0 && qi < qv.len() { qv.swap(qi, qi - 1); }
-                                                                }, Icon { name: "arrow-up" } }
-                                                        }
-                                                        button { class: "queue-steer", title: "Steer now — inject into the running turn instead of waiting",
-                                                            onclick: move |e: dioxus::prelude::MouseEvent| {
-                                                                e.stop_propagation();
-                                                                let text = {
-                                                                    let mut qv = queue.write();
-                                                                    if qi < qv.len() { Some(qv.remove(qi)) } else { None }
-                                                                };
-                                                                if let Some(t) = text {
-                                                                    let display = strip_scaffold(&t);
-                                                                    engine.send(EngineCmd::Submit { engine: t, display });
-                                                                }
-                                                            }, Icon { name: "corner-up-right" } }
-                                                        button { class: "queue-x", onclick: move |e: dioxus::prelude::MouseEvent| { e.stop_propagation(); let mut qv = queue.write(); if qi < qv.len() { qv.remove(qi); } }, Icon { name: "x" } }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        if queue.read().len() > 1 {
-                                            button { class: "queue-clear", title: "Clear queued prompts", onclick: move |_| queue.write().clear(), "Clear" }
                                         }
                                     }
                                 }
@@ -12690,6 +12796,124 @@ fn highlight_code(code: &str, lang: &str) -> String {
     gen.finalize()
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ImageArtifact {
+    path: PathBuf,
+    src: String,
+    name: String,
+    rel: String,
+}
+
+fn encode_asset_path(path: &Path) -> String {
+    path.display()
+        .to_string()
+        .bytes()
+        .map(|b| match b {
+            b'/' | b'.' | b'-' | b'_' | b'~' | b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+/// Existing workspace-local image files cited by an agent response. These are
+/// rendered as Codex-style artifact cards; canonicalization keeps the preview
+/// on the same workspace boundary as the wsimg asset handler.
+fn image_artifacts(text: &str, workspace: &Path) -> Vec<ImageArtifact> {
+    let Ok(workspace) = workspace.canonicalize() else {
+        return Vec::new();
+    };
+    let mut candidates = Vec::new();
+
+    for line in text.lines() {
+        if let Some(path) = line
+            .split_once("screenshot saved →")
+            .or_else(|| line.split_once("Screenshot saved →"))
+            .map(|(_, path)| path.trim())
+        {
+            candidates.push(path.to_string());
+        }
+        let mut rest = line;
+        while let Some(start) = rest.find("](") {
+            let after = &rest[start + 2..];
+            let Some(end) = after.find(')') else {
+                break;
+            };
+            candidates.push(after[..end].trim().trim_matches(['<', '>']).to_string());
+            rest = &after[end + 1..];
+        }
+        candidates.extend(line.split_whitespace().filter_map(|part| {
+            let candidate = part.trim_matches(|c: char| {
+                matches!(c, '`' | '"' | '\'' | '(' | ')' | '[' | ']' | ',' | ';')
+            });
+            let ext = Path::new(candidate)
+                .extension()
+                .and_then(|ext| ext.to_str())?
+                .to_ascii_lowercase();
+            matches!(
+                ext.as_str(),
+                "png" | "jpg" | "jpeg" | "gif" | "svg" | "webp"
+            )
+            .then(|| candidate.to_string())
+        }));
+    }
+
+    let mut seen = HashSet::new();
+    let mut artifacts = Vec::new();
+    for candidate in candidates {
+        let candidate = candidate
+            .split_once(" \"")
+            .map(|(path, _)| path)
+            .unwrap_or(candidate.as_str())
+            .trim()
+            .trim_matches(|c: char| matches!(c, '`' | '"' | '\'' | '(' | ')' | '[' | ']'))
+            .trim_end_matches(|c: char| matches!(c, '.' | ':' | ',' | ';'));
+        if candidate.starts_with("data:") || candidate.contains("://") {
+            continue;
+        }
+        let path = PathBuf::from(candidate);
+        let path = if path.is_absolute() {
+            path
+        } else {
+            workspace.join(path)
+        };
+        let Ok(path) = path.canonicalize() else {
+            continue;
+        };
+        if !path.starts_with(&workspace) || !seen.insert(path.clone()) {
+            continue;
+        }
+        let Some(ext) = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase())
+        else {
+            continue;
+        };
+        if !matches!(
+            ext.as_str(),
+            "png" | "jpg" | "jpeg" | "gif" | "svg" | "webp"
+        ) {
+            continue;
+        }
+        let rel_path = path.strip_prefix(&workspace).unwrap_or(&path);
+        artifacts.push(ImageArtifact {
+            src: format!("/wsimg/{}", encode_asset_path(rel_path)),
+            name: path
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_else(|| "Image artifact".to_string()),
+            rel: rel_path.display().to_string(),
+            path,
+        });
+        if artifacts.len() == 4 {
+            break;
+        }
+    }
+    artifacts
+}
+
 fn format_thought_duration(secs: u64) -> String {
     if secs >= 3600 {
         format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
@@ -14072,6 +14296,113 @@ fn SettingsModal(
 }
 
 #[component]
+fn QueuedPromptBar(mut queue: Signal<Vec<String>>, engine: Coroutine<EngineCmd>) -> Element {
+    let items = queue.read().clone();
+    let Some(first) = items.first() else {
+        return rsx! {};
+    };
+    let total = items.len();
+    let first_preview = queue_preview(first);
+
+    rsx! {
+        div { class: "queue-bar",
+            span { class: "queue-label", Icon { name: "clock" } span { "Queued ({total})" } }
+            div { class: "queue-chip queue-primary",
+                button {
+                    class: "queue-prompt",
+                    title: "Edit queued prompt",
+                    onclick: move |_| restore_queued_prompt(queue, 0),
+                    span { class: "queue-index", "1" }
+                    span { class: "queue-text", "{first_preview}" }
+                }
+                button {
+                    class: "queue-steer",
+                    title: "Steer now — inject into the running turn",
+                    aria_label: "Steer queued prompt now",
+                    onclick: move |_| steer_queued_prompt(queue, engine, 0),
+                    Icon { name: "corner-up-right" }
+                }
+                button {
+                    class: "queue-x",
+                    title: "Remove queued prompt",
+                    aria_label: "Remove queued prompt",
+                    onclick: move |_| {
+                        let mut queued = queue.write();
+                        if !queued.is_empty() {
+                            queued.remove(0);
+                        }
+                    },
+                    Icon { name: "x" }
+                }
+            }
+            if total > 1 {
+                details { class: "queue-more",
+                    summary { class: "queue-more-trigger", title: "Show all queued prompts",
+                        "+{total - 1}"
+                        Icon { name: "chevron" }
+                    }
+                    div { class: "queue-menu",
+                        for (offset, prompt) in items.iter().skip(1).cloned().enumerate() {
+                            {
+                                let index = offset + 1;
+                                let preview = queue_preview(&prompt);
+                                rsx! {
+                                    div { class: "queue-row",
+                                        button {
+                                            class: "queue-prompt",
+                                            title: "Edit queued prompt",
+                                            onclick: move |_| restore_queued_prompt(queue, index),
+                                            span { class: "queue-index", "{index + 1}" }
+                                            span { class: "queue-text", "{preview}" }
+                                        }
+                                        button {
+                                            class: "queue-steer",
+                                            title: "Move up in the queue",
+                                            aria_label: "Move queued prompt up",
+                                            onclick: move |_| {
+                                                let mut queued = queue.write();
+                                                if index < queued.len() {
+                                                    queued.swap(index, index - 1);
+                                                }
+                                            },
+                                            Icon { name: "arrow-up" }
+                                        }
+                                        button {
+                                            class: "queue-steer",
+                                            title: "Steer now — inject into the running turn",
+                                            aria_label: "Steer queued prompt now",
+                                            onclick: move |_| steer_queued_prompt(queue, engine, index),
+                                            Icon { name: "corner-up-right" }
+                                        }
+                                        button {
+                                            class: "queue-x",
+                                            title: "Remove queued prompt",
+                                            aria_label: "Remove queued prompt",
+                                            onclick: move |_| {
+                                                let mut queued = queue.write();
+                                                if index < queued.len() {
+                                                    queued.remove(index);
+                                                }
+                                            },
+                                            Icon { name: "x" }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        button {
+                            class: "queue-clear",
+                            onclick: move |_| queue.write().clear(),
+                            "Clear all"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
 fn Composer(
     streaming: Signal<bool>,
     engine: Coroutine<EngineCmd>,
@@ -14113,6 +14444,10 @@ fn Composer(
     let mut paste_seq = use_signal(|| 0u64);
     // `@mention` picker driven by the contenteditable caret query.
     let mut mention_q = use_signal(|| None::<String>);
+    // Codex-style `$skill` picker; dedicated to reusable workspace skills.
+    let mut skill_q = use_signal(|| None::<String>);
+    let mut skill_sel = use_signal(|| 0usize);
+    let mut skill_items_sig = use_signal(Vec::<String>::new);
     // Leading `/query` in the contenteditable — drives the slash-command menu.
     let mut slash_q = use_signal(|| None::<String>);
     let mut slash_sel = use_signal(|| 0usize);
@@ -14243,6 +14578,16 @@ fn Composer(
     } else {
         (*mention_sel.read()).min(mention_items.len() - 1)
     };
+    let skill_items: Vec<String> = match skill_q.read().as_ref() {
+        Some(_) => skill_items_sig.read().clone(),
+        None => Vec::new(),
+    };
+    let skill_open = skill_q.read().is_some();
+    let ksel = if skill_items.is_empty() {
+        0
+    } else {
+        (*skill_sel.read()).min(skill_items.len() - 1)
+    };
     // `/slash` command picker — driven by the contenteditable's leading "/query".
     let slash_items: Vec<(String, String)> = match slash_q.read().as_ref() {
         Some(q) => slash_commands(&workspace, q),
@@ -14309,8 +14654,10 @@ fn Composer(
     };
 
     rsx! {
-        div {
-            class: match (*streaming.read(), cur_effort.as_str()) {
+        div { class: "composer-stack",
+            QueuedPromptBar { queue, engine }
+            div {
+                class: match (*streaming.read(), cur_effort.as_str()) {
                 (true, "ultra") => "composer working ultra",
                 (false, "ultra") => "composer ultra",
                 (true, _) => "composer working",
@@ -14341,6 +14688,38 @@ fn Composer(
                                     Icon { name: "spark" }
                                     span { class: "menu-name", "/{name}" }
                                     if !desc.is_empty() { span { class: "menu-meta", "{desc}" } }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if skill_open && !skill_items.is_empty() {
+                div { class: "mention-menu skill-menu",
+                    div { class: "menu-label", "Skills" }
+                    for (i, token) in skill_items.iter().cloned().enumerate() {
+                        {
+                            let selected_token = token.clone();
+                            let name = mention_label(&token);
+                            rsx! {
+                                button {
+                                    class: if i == ksel { "menu-item sel" } else { "menu-item" },
+                                    onmouseenter: move |_| skill_sel.set(i),
+                                    onclick: move |_| {
+                                        let token = selected_token.clone();
+                                        let label = mention_label(&token);
+                                        spawn(async move {
+                                            let _ = dioxus::document::eval(&ce_insert_js(&token, &label, '$'))
+                                                .join::<bool>()
+                                                .await;
+                                        });
+                                        skill_q.set(None);
+                                        skill_sel.set(0);
+                                        ce_empty.set(false);
+                                    },
+                                    span { class: "skill-mention-mark", "$" }
+                                    span { class: "menu-name", "{name}" }
+                                    span { class: "menu-meta", "Workspace skill" }
                                 }
                             }
                         }
@@ -14383,7 +14762,7 @@ fn Composer(
                                         onclick: move |_| {
                                             let tok = p_sel.clone();
                                             let label = mention_label(&tok);
-                                            spawn(async move { let _ = dioxus::document::eval(&ce_insert_js(&tok, &label)).join::<bool>().await; });
+                                            spawn(async move { let _ = dioxus::document::eval(&ce_insert_js(&tok, &label, '@')).join::<bool>().await; });
                                             mention_q.set(None);
                                             mention_sel.set(0);
                                             ce_empty.set(false);
@@ -14487,6 +14866,25 @@ fn Composer(
                                 mention_items_sig.set(Vec::new());
                             }
                         }
+                        let new_skill = v["skill"].as_str().map(|s| s.to_string());
+                        if *skill_q.read() != new_skill {
+                            skill_q.set(new_skill.clone());
+                            skill_sel.set(0);
+                            if let Some(query) = new_skill {
+                                let ws = ws_oninput.clone();
+                                let query_for_scan = query.clone();
+                                let items = tokio::task::spawn_blocking(move || {
+                                    skill_candidates(&ws, &query_for_scan)
+                                })
+                                .await
+                                .unwrap_or_default();
+                                if skill_q.peek().as_deref() == Some(query.as_str()) {
+                                    skill_items_sig.set(items);
+                                }
+                            } else {
+                                skill_items_sig.set(Vec::new());
+                            }
+                        }
                         let new_empty = v["empty"].as_bool().unwrap_or(true);
                         if *ce_empty.read() != new_empty {
                             ce_empty.set(new_empty);
@@ -14499,6 +14897,49 @@ fn Composer(
                     });
                 },
                 onkeydown: move |e| {
+                    // Codex-style `$skill`: arrows select, Enter/Tab inserts,
+                    // Escape closes without submitting the unfinished token.
+                    if skill_q.read().is_some() {
+                        let items = skill_items_sig.read().clone();
+                        if !items.is_empty() {
+                            match e.key() {
+                                Key::ArrowDown => {
+                                    e.prevent_default();
+                                    let current = *skill_sel.read();
+                                    skill_sel.set((current + 1) % items.len());
+                                    return;
+                                }
+                                Key::ArrowUp => {
+                                    e.prevent_default();
+                                    let current = *skill_sel.read();
+                                    skill_sel.set((current + items.len() - 1) % items.len());
+                                    return;
+                                }
+                                Key::Enter | Key::Tab if !e.modifiers().shift() => {
+                                    e.prevent_default();
+                                    let selected = (*skill_sel.read()).min(items.len() - 1);
+                                    let token = items[selected].clone();
+                                    let label = mention_label(&token);
+                                    spawn(async move {
+                                        let _ = dioxus::document::eval(&ce_insert_js(&token, &label, '$'))
+                                            .join::<bool>()
+                                            .await;
+                                    });
+                                    skill_q.set(None);
+                                    skill_sel.set(0);
+                                    ce_empty.set(false);
+                                    return;
+                                }
+                                Key::Escape => {
+                                    e.prevent_default();
+                                    skill_q.set(None);
+                                    skill_sel.set(0);
+                                    return;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
                     // When the @mention popup is open, the keyboard drives it.
                     let q = mention_q.read().clone();
                     if let Some(q) = q {
@@ -14512,7 +14953,7 @@ fn Composer(
                                     let s = (*mention_sel.read()).min(items.len() - 1);
                                     let tok = items[s].clone();
                                     let label = mention_label(&tok);
-                                    spawn(async move { let _ = dioxus::document::eval(&ce_insert_js(&tok, &label)).join::<bool>().await; });
+                                    spawn(async move { let _ = dioxus::document::eval(&ce_insert_js(&tok, &label, '@')).join::<bool>().await; });
                                     mention_q.set(None);
                                     mention_sel.set(0);
                                     ce_empty.set(false);
@@ -14952,6 +15393,7 @@ fn Composer(
                 }
             }
         }
+        }
     }
 }
 
@@ -15305,7 +15747,7 @@ fn ThoughtRow(secs: u64, body: String, #[props(default)] settling: bool) -> Elem
         "thought-row"
     };
     rsx! {
-        details { class: "{class}", open: settling,
+        details { class: "{class}",
             summary { class: "thought-sum",
                 span { class: "thought-label-stack",
                     if settling {
@@ -15349,6 +15791,7 @@ fn Message(
     #[props(default)] tool_secs: u64,
     #[props(default)] compact_tools: bool,
 ) -> Element {
+    let ui = use_context::<Ui>();
     match author {
         Author::User => {
             let segs = user_segments(&text);
@@ -15366,18 +15809,9 @@ fn Message(
         }
         Author::Agent => {
             if text.is_empty() {
-                if live {
-                    return rsx! {
-                        div { class: "row agent agent-waiting streaming-message",
-                            img { class: "avatar", src: logo_uri() }
-                            div { class: "typing", role: "status", aria_atomic: "true",
-                                UnicodeSpinner { class: "typing-unicode" }
-                                span { class: "typing-shimmer", "Thinking\u{2026}" }
-                            }
-                        }
-                    };
-                }
-                // A stray placeholder left after a turn renders nothing.
+                // The live reasoning block and StatusPill already communicate
+                // progress. Rendering another animated "Thinking…" row here
+                // duplicates that status and adds an unnecessary timeline.
                 return rsx! {};
             }
             // The copy button only renders once settled — don't pay a full-text
@@ -15392,13 +15826,49 @@ fn Message(
             } else {
                 "agent-text agent-md"
             };
+            let artifacts = if live {
+                Vec::new()
+            } else {
+                let workspace = ui.workspace.read().clone();
+                image_artifacts(&text, &workspace)
+            };
             rsx! {
                 div { class: if live { "row agent streaming-message" } else { "row agent" },
                     img { class: "avatar", src: logo_uri() }
-                    if live {
-                        div { class: "{body_cls}", LiveMarkdown { text: text.clone() } }
-                    } else {
-                        div { class: "{body_cls}", dangerous_inner_html: md_to_html(&text, false) }
+                    div { class: "agent-content",
+                        if live {
+                            div { class: "{body_cls}", LiveMarkdown { text: text.clone() } }
+                        } else {
+                            div { class: "{body_cls}", dangerous_inner_html: md_to_html(&text, false) }
+                        }
+                        if !artifacts.is_empty() {
+                            div { class: "artifact-grid",
+                                for artifact in artifacts {
+                                    {
+                                        let path = artifact.path.clone();
+                                        let title = format!("Open {}", artifact.rel);
+                                        rsx! {
+                                            button {
+                                                class: "artifact-card",
+                                                title: "{title}",
+                                                onclick: move |_| open_file(ui, path.clone()),
+                                                img {
+                                                    class: "artifact-image",
+                                                    src: "{artifact.src}",
+                                                    alt: "Preview of {artifact.name}",
+                                                    loading: "lazy",
+                                                }
+                                                span { class: "artifact-caption",
+                                                    span { class: "artifact-kind", Icon { name: "camera" } "GUI evidence" }
+                                                    span { class: "artifact-name", "{artifact.name}" }
+                                                    span { class: "artifact-path", "{artifact.rel}" }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                     if !live {
                         button { class: "msg-copy", title: "Copy message", onclick: move |_| { let c = copy.clone(); spawn(async move { let _ = document::eval(&format!("navigator.clipboard.writeText({c})")).await; }); }, Icon { name: "copy" } }
@@ -17072,11 +17542,33 @@ fn ChatPane(
         }
     });
 
-    let last_agent_id = messages
-        .read()
-        .iter()
-        .rfind(|msg| msg.author == Author::Agent)
-        .map(|msg| msg.id);
+    let is_streaming = *streaming.read();
+    let (last_agent_id, active_thought_id, live_answer_visible, has_running_activity) = {
+        let msgs = messages.read();
+        let last_agent = msgs
+            .iter()
+            .rfind(|msg| msg.author == Author::Agent)
+            .map(|msg| msg.id);
+        let active_thought = if is_streaming && !thinking.read().is_empty() {
+            msgs.iter()
+                .rev()
+                .find(|msg| {
+                    matches!(msg.author, Author::Note) && msg.text.starts_with("§thought\t")
+                })
+                .map(|msg| msg.id)
+        } else {
+            None
+        };
+        let answer_visible = is_streaming
+            && last_agent
+                .and_then(|id| msgs.iter().find(|msg| msg.id == id))
+                .map(|msg| !msg.text.is_empty())
+                .unwrap_or(false);
+        let running_activity = msgs
+            .iter()
+            .any(|msg| matches!(msg.author, Author::Activity { running: true, .. }));
+        (last_agent, active_thought, answer_visible, running_activity)
+    };
 
     rsx! {
         div { class: "pane-body",
@@ -17108,11 +17600,13 @@ fn ChatPane(
                                 let secs = parts.next().unwrap_or("1").parse().unwrap_or(1);
                                 let body = parts.next().unwrap_or("").to_string();
                                 rsx! {
-                                    ThoughtRow {
-                                        key: "m-{msg.id}",
-                                        secs,
-                                        body,
-                                        settling: *settling_thought.read() == Some(msg.id),
+                                    if active_thought_id != Some(msg.id) {
+                                        ThoughtRow {
+                                            key: "m-{msg.id}",
+                                            secs,
+                                            body,
+                                            settling: *settling_thought.read() == Some(msg.id),
+                                        }
                                     }
                                 }
                             }
@@ -17133,7 +17627,12 @@ fn ChatPane(
                         div { class: "thinking-body", dangerous_inner_html: reasoning_html(&thinking.read(), false) }
                     }
                 }
-                if *streaming.read() && !status.read().is_empty() {
+                if is_streaming
+                    && thinking.read().is_empty()
+                    && !live_answer_visible
+                    && !has_running_activity
+                    && !status.read().is_empty()
+                {
                     StatusPill { text: status.read().clone() }
                 }
             }
@@ -17593,10 +18092,11 @@ fn Icon(name: &'static str) -> Element {
         },
         "pin" => rsx! { path { d: "M9 3h6l-1 6 3 3v2h-5v5l-1 2-1-2v-5H4v-2l3-3-1-6z" } },
         "brain" => rsx! {
-            line { x1: "5", y1: "19", x2: "5", y2: "14" }
-            line { x1: "10", y1: "19", x2: "10", y2: "11" }
-            line { x1: "15", y1: "19", x2: "15", y2: "8" }
-            line { x1: "20", y1: "19", x2: "20", y2: "5" }
+            path { d: "M9.5 4a2.5 2.5 0 0 1 2.5 2.5v10a2.5 2.5 0 0 1-4.96.44A2.5 2.5 0 0 1 4.5 14.5a3 3 0 0 1 .34-5.95A2.5 2.5 0 0 1 9.5 7.3Z" }
+            path { d: "M14.5 4A2.5 2.5 0 0 0 12 6.5v10a2.5 2.5 0 0 0 4.96.44A2.5 2.5 0 0 0 19.5 14.5a3 3 0 0 0-.34-5.95A2.5 2.5 0 0 0 14.5 7.3Z" }
+            path { d: "M3 13h4" }
+            path { d: "M17 13h4" }
+            path { d: "M8 9h8" }
         },
         "mic" => {
             rsx! { rect { x: "9", y: "3", width: "6", height: "11", rx: "3" } path { d: "M5 11a7 7 0 0 0 14 0M12 18v3" } }

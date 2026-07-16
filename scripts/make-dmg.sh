@@ -59,6 +59,29 @@ cp "$ICONSET/icon_1024x1024.png" "$ICONSET/icon_512x512@2x.png"
 iconutil -c icns "$ICONSET" -o "$APPDIR/Contents/Resources/oxide.icns"
 rm -rf "$ICONSET" "$DIST/icon_"*
 
+# AppleScript notifications inherit the sender app's icon and cannot receive a
+# custom image directly. Bundle a tiny background helper with Oxide's existing
+# icon so Notification Center identifies notifications as Oxide, not osascript.
+echo "▶ building notification helper…"
+NOTIFY_APP="$APPDIR/Contents/Helpers/Oxide Notifications.app"
+mkdir -p "$(dirname "$NOTIFY_APP")"
+osacompile -o "$NOTIFY_APP" <<'APPLESCRIPT'
+on run argv
+  if (count of argv) < 2 then return
+  display notification (item 2 of argv) with title (item 1 of argv)
+end run
+APPLESCRIPT
+cp "$APPDIR/Contents/Resources/oxide.icns" "$NOTIFY_APP/Contents/Resources/applet.icns"
+NOTIFY_PLIST="$NOTIFY_APP/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Add :CFBundleIdentifier string com.oxide.desktop.notifications" "$NOTIFY_PLIST" 2>/dev/null \
+  || /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier com.oxide.desktop.notifications" "$NOTIFY_PLIST"
+/usr/libexec/PlistBuddy -c "Set :CFBundleName Oxide" "$NOTIFY_PLIST"
+/usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string Oxide" "$NOTIFY_PLIST" 2>/dev/null \
+  || /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName Oxide" "$NOTIFY_PLIST"
+/usr/libexec/PlistBuddy -c "Add :LSUIElement bool true" "$NOTIFY_PLIST" 2>/dev/null \
+  || /usr/libexec/PlistBuddy -c "Set :LSUIElement true" "$NOTIFY_PLIST"
+touch "$NOTIFY_APP"
+
 VERSION="$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/' || echo 0.0.1)"
 
 cat > "$APPDIR/Contents/Info.plist" <<PLIST
@@ -85,6 +108,7 @@ PLIST
 SIGN_ID="$(security find-identity -v -p codesigning 2>/dev/null | grep -m1 "$SIGN_NAME" | awk '{print $2}' || true)"
 if [ -n "${SIGN_ID:-}" ]; then
   echo "▶ signing with $SIGN_NAME (stable identity)…"
+  codesign --force --sign "$SIGN_ID" --identifier com.oxide.desktop.notifications "$NOTIFY_APP"
   codesign --force --sign "$SIGN_ID" --identifier com.oxide.desktop "$APPDIR/Contents/MacOS/oxide-bin"
   codesign --force --sign "$SIGN_ID" --identifier com.oxide.desktop "$APPDIR/Contents/MacOS/$APP"
   codesign --force --deep --sign "$SIGN_ID" --identifier com.oxide.desktop "$APPDIR"
@@ -98,6 +122,7 @@ elif [ "$REQUIRE_SIGNING" = "1" ]; then
   exit 1
 else
   echo "⚠ no '$SIGN_NAME' identity in keychain — app will be ad-hoc signed and macOS may re-ask volume permissions after updates." >&2
+  codesign --force --sign - --identifier com.oxide.desktop.notifications "$NOTIFY_APP" 2>/dev/null || true
   codesign --force --deep --sign - "$APPDIR" 2>/dev/null || true
 fi
 
