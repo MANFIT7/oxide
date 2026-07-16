@@ -12868,7 +12868,7 @@ fn image_artifacts(text: &str, workspace: &Path) -> Vec<ImageArtifact> {
             .unwrap_or(candidate.as_str())
             .trim()
             .trim_matches(|c: char| matches!(c, '`' | '"' | '\'' | '(' | ')' | '[' | ']'))
-            .trim_end_matches(|c: char| matches!(c, '.' | ':' | ',' | ';'));
+            .trim_end_matches(['.', ':', ',', ';']);
         if candidate.starts_with("data:") || candidate.contains("://") {
             continue;
         }
