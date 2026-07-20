@@ -7,7 +7,9 @@
 //! chars/4 heuristic — good enough to decide *when* to compact without pulling
 //! in a tokenizer.
 
-use oxide_providers::{Message, Role};
+use oxide_providers::Message;
+#[cfg(test)]
+use oxide_providers::Role;
 use std::collections::HashSet;
 
 /// Drop dangling tool-call/tool-result pairs so the provider request never 400s.
@@ -77,6 +79,7 @@ pub fn estimate_tokens(messages: &[Message]) -> u64 {
 /// Keeps the leading system message and the `keep_recent` newest messages,
 /// dropping the oldest non-system messages until under budget. Returns the
 /// number of messages dropped.
+#[cfg(test)]
 pub fn compact(messages: &mut Vec<Message>, max_tokens: u64, keep_recent: usize) -> u64 {
     if estimate_tokens(messages) <= max_tokens {
         return 0;

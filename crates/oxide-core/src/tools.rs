@@ -359,57 +359,82 @@ impl ToolRouter {
         // stdout pipe open so wait_with_output never sees EOF).
         #[cfg(unix)]
         cmd.process_group(0);
-        let child = match cmd.spawn() {
+        let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => return (format!("shell spawn error: {e}"), false),
         };
         #[cfg(unix)]
         let pgid = child.id().map(|id| id as i32);
-        let dur = std::time::Duration::from_secs(timeout_s);
-        match tokio::time::timeout(dur, child.wait_with_output()).await {
-            Ok(Ok(out)) => {
-                let mut s = String::new();
-                s.push_str(&String::from_utf8_lossy(&out.stdout));
-                let err = String::from_utf8_lossy(&out.stderr);
-                if !err.trim().is_empty() {
-                    s.push_str("\n[stderr] ");
-                    s.push_str(&err);
+
+        let (line_tx, mut line_rx) = mpsc::channel::<(&'static str, String)>(64);
+        if let Some(stdout) = child.stdout.take() {
+            spawn_shell_reader(stdout, "stdout", line_tx.clone());
+        }
+        if let Some(stderr) = child.stderr.take() {
+            spawn_shell_reader(stderr, "stderr", line_tx.clone());
+        }
+        drop(line_tx);
+
+        let mut capture = ShellCapture::default();
+        let mut wait_task = tokio::spawn(async move { child.wait().await });
+        let deadline = tokio::time::sleep(std::time::Duration::from_secs(timeout_s));
+        tokio::pin!(deadline);
+        let mut rx_open = true;
+
+        let status = loop {
+            tokio::select! {
+                result = &mut wait_task => {
+                    break result.unwrap_or_else(|err| Err(std::io::Error::other(err)));
                 }
-                let ok = out.status.success();
-                let capped: String = s.chars().take(20_000).collect();
-                let code = out
-                    .status
-                    .code()
-                    .map(|c| c.to_string())
-                    .unwrap_or_else(|| "signal".to_string());
+                line = line_rx.recv(), if rx_open => {
+                    match line {
+                        Some((stream, chunk)) => capture.push(stream, &chunk),
+                        None => rx_open = false,
+                    }
+                }
+                _ = &mut deadline => {
+                    #[cfg(unix)]
+                    if let Some(pg) = pgid {
+                        unsafe { libc::killpg(pg, libc::SIGKILL); }
+                    }
+                    if tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        &mut wait_task,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        wait_task.abort();
+                    }
+                    return (
+                        format!(
+                            "$ {command}\n[timeout after {timeout_s}s · {}]\n{}\nFor long-running processes (dev servers, watchers), start them detached with output redirected — e.g. `nohup npm run dev >/tmp/oxide-dev.log 2>&1 &` — then poll the log or port instead of blocking.",
+                            format_elapsed(started.elapsed()),
+                            capture.body(),
+                        ),
+                        false,
+                    );
+                }
+            }
+        };
+
+        while let Ok(Some((stream, chunk))) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), line_rx.recv()).await
+        {
+            capture.push(stream, &chunk);
+        }
+
+        match status {
+            Ok(exit) => {
+                let ok = exit.success();
+                let code = exit.status_code_string();
                 let elapsed = format_elapsed(started.elapsed());
-                let body = if capped.trim().is_empty() {
-                    "(no output)".to_string()
-                } else {
-                    capped
-                };
                 (
-                    format!("$ {command}\n[exit {code} · {elapsed}]\n{body}"),
+                    format!("$ {command}\n[exit {code} · {elapsed}]\n{}", capture.body()),
                     ok,
                 )
             }
-            Ok(Err(e)) => (format!("shell error: {e}"), false),
-            Err(_) => {
-                // Kill the whole process group so grandchildren die too.
-                #[cfg(unix)]
-                if let Some(pg) = pgid {
-                    unsafe {
-                        libc::killpg(pg, libc::SIGKILL);
-                    }
-                }
-                (
-                    format!(
-                        "$ {command}\n[timeout after {timeout_s}s · {}]\nFor long-running processes (dev servers, watchers), start them detached with output redirected — e.g. `nohup npm run dev >/tmp/oxide-dev.log 2>&1 &` — then poll the log or port instead of blocking.",
-                        format_elapsed(started.elapsed())
-                    ),
-                    false,
-                )
-            }
+            Err(e) => (format!("shell error: {e}"), false),
         }
     }
 
@@ -448,7 +473,7 @@ impl ToolRouter {
         #[cfg(unix)]
         let pgid = child.id().map(|id| id as i32);
 
-        let (line_tx, mut line_rx) = mpsc::unbounded_channel::<(&'static str, String)>();
+        let (line_tx, mut line_rx) = mpsc::channel::<(&'static str, String)>(64);
         if let Some(stdout) = child.stdout.take() {
             spawn_shell_reader(stdout, "stdout", line_tx.clone());
         }
@@ -457,8 +482,7 @@ impl ToolRouter {
         }
         drop(line_tx);
 
-        let mut stdout = String::new();
-        let mut stderr = String::new();
+        let mut capture = ShellCapture::default();
         let mut wait_task = tokio::spawn(async move { child.wait().await });
         let deadline = tokio::time::sleep(std::time::Duration::from_secs(timeout_s));
         tokio::pin!(deadline);
@@ -472,7 +496,7 @@ impl ToolRouter {
                 line = line_rx.recv(), if rx_open => {
                     match line {
                         Some((stream, chunk)) => {
-                            append_shell_chunk(if stream == "stderr" { &mut stderr } else { &mut stdout }, &chunk);
+                            capture.push(stream, &chunk);
                             let _ = event_tx.send(Event::CommandOutput {
                                 turn,
                                 command_id: command_id.clone(),
@@ -489,8 +513,16 @@ impl ToolRouter {
                     if let Some(pg) = pgid {
                         unsafe { libc::killpg(pg, libc::SIGKILL); }
                     }
-                    wait_task.abort();
-                    let body = shell_output_body(&stdout, &stderr);
+                    if tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        &mut wait_task,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        wait_task.abort();
+                    }
+                    let body = capture.body();
                     return (
                         format!(
                             "$ {command}\n[timeout after {timeout_s}s · {}]\n{body}\nFor long-running processes (dev servers, watchers), start them detached with output redirected — e.g. `nohup npm run dev >/tmp/oxide-dev.log 2>&1 &` — then poll the log or port instead of blocking.",
@@ -505,14 +537,7 @@ impl ToolRouter {
         while let Ok(Some((stream, chunk))) =
             tokio::time::timeout(std::time::Duration::from_millis(50), line_rx.recv()).await
         {
-            append_shell_chunk(
-                if stream == "stderr" {
-                    &mut stderr
-                } else {
-                    &mut stdout
-                },
-                &chunk,
-            );
+            capture.push(stream, &chunk);
             let _ = event_tx
                 .send(Event::CommandOutput {
                     turn,
@@ -529,7 +554,7 @@ impl ToolRouter {
                 let ok = exit.success();
                 let code = exit.status_code_string();
                 let elapsed = format_elapsed(started.elapsed());
-                let body = shell_output_body(&stdout, &stderr);
+                let body = capture.body();
                 (
                     format!("$ {command}\n[exit {code} · {elapsed}]\n{body}"),
                     ok,
@@ -572,11 +597,67 @@ impl ToolRouter {
     }
 }
 
-fn spawn_shell_reader<R>(
-    reader: R,
-    stream: &'static str,
-    tx: mpsc::UnboundedSender<(&'static str, String)>,
-) where
+const SHELL_OUTPUT_HEAD_BYTES: usize = 8_000;
+const SHELL_OUTPUT_TAIL_BYTES: usize = 12_000;
+
+#[derive(Default)]
+struct ShellCapture {
+    head: Vec<u8>,
+    tail: std::collections::VecDeque<u8>,
+    total: usize,
+    last_stream: Option<&'static str>,
+}
+
+impl ShellCapture {
+    fn push(&mut self, stream: &'static str, chunk: &str) {
+        let marker = if self.last_stream == Some(stream) {
+            &[][..]
+        } else if stream == "stderr" {
+            b"\n[stderr] "
+        } else if self.last_stream.is_some() {
+            b"\n[stdout] "
+        } else {
+            &[][..]
+        };
+        self.push_bytes(marker);
+        self.push_bytes(chunk.as_bytes());
+        self.last_stream = Some(stream);
+    }
+
+    fn push_bytes(&mut self, bytes: &[u8]) {
+        self.total = self.total.saturating_add(bytes.len());
+        let head_room = SHELL_OUTPUT_HEAD_BYTES.saturating_sub(self.head.len());
+        let split = head_room.min(bytes.len());
+        self.head.extend_from_slice(&bytes[..split]);
+        for byte in &bytes[split..] {
+            if self.tail.len() == SHELL_OUTPUT_TAIL_BYTES {
+                self.tail.pop_front();
+            }
+            self.tail.push_back(*byte);
+        }
+    }
+
+    fn body(&self) -> String {
+        if self.total == 0 {
+            return "(no output)".to_string();
+        }
+        if self.total <= SHELL_OUTPUT_HEAD_BYTES + SHELL_OUTPUT_TAIL_BYTES {
+            let mut bytes = self.head.clone();
+            bytes.extend(self.tail.iter().copied());
+            return String::from_utf8_lossy(&bytes).into_owned();
+        }
+        let omitted = self.total.saturating_sub(self.head.len() + self.tail.len());
+        let tail: Vec<u8> = self.tail.iter().copied().collect();
+        format!(
+            "{}\n… [output truncated: {omitted} bytes omitted] …\n{}",
+            String::from_utf8_lossy(&self.head),
+            String::from_utf8_lossy(&tail)
+        )
+    }
+}
+
+fn spawn_shell_reader<R>(reader: R, stream: &'static str, tx: mpsc::Sender<(&'static str, String)>)
+where
     R: AsyncRead + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
@@ -587,41 +668,11 @@ fn spawn_shell_reader<R>(
                 break;
             }
             let chunk = String::from_utf8_lossy(&buf[..n]).to_string();
-            let _ = tx.send((stream, chunk));
+            if tx.send((stream, chunk)).await.is_err() {
+                break;
+            }
         }
     });
-}
-
-fn append_shell_chunk(buf: &mut String, chunk: &str) {
-    buf.push_str(chunk);
-    if buf.len() > 24_000 {
-        let keep: String = buf
-            .chars()
-            .rev()
-            .take(20_000)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
-        *buf = keep;
-    }
-}
-
-fn shell_output_body(stdout: &str, stderr: &str) -> String {
-    let mut s = stdout.to_string();
-    if !stderr.trim().is_empty() {
-        if !s.trim().is_empty() {
-            s.push('\n');
-        }
-        s.push_str("[stderr] ");
-        s.push_str(stderr);
-    }
-    let capped: String = s.chars().take(20_000).collect();
-    if capped.trim().is_empty() {
-        "(no output)".to_string()
-    } else {
-        capped
-    }
 }
 
 trait ExitStatusExt {
@@ -780,6 +831,40 @@ mod tests {
         assert!(out.contains("[exit 0"));
         assert!(out.contains("hello"));
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[tokio::test]
+    async fn shell_timeout_keeps_bounded_partial_output() {
+        let tmp = std::env::temp_dir().join(format!("oxide-shell-timeout-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let r = router(&tmp);
+
+        let (out, ok) = r
+            .execute(
+                "shell",
+                &serde_json::json!({ "command": "printf before-timeout; sleep 5", "timeout_seconds": 1 }),
+            )
+            .await;
+
+        assert!(!ok);
+        assert!(out.contains("timeout after 1s"));
+        assert!(out.contains("before-timeout"));
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn shell_capture_preserves_order_and_marks_truncation() {
+        let mut capture = ShellCapture::default();
+        capture.push("stdout", "start");
+        capture.push("stderr", "problem");
+        capture.push("stdout", &"x".repeat(40_000));
+        capture.push("stdout", "end");
+
+        let body = capture.body();
+        assert!(body.starts_with("start\n[stderr] problem\n[stdout] "));
+        assert!(body.contains("output truncated:"));
+        assert!(body.ends_with("end"));
+        assert!(body.len() < 22_000);
     }
 
     #[tokio::test]

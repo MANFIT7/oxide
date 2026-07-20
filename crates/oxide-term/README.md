@@ -1,45 +1,73 @@
-# oxide-term — native GPU terminal (PoC)
+# oxide-term — native GPU terminal
 
-A standalone, GPU-rendered terminal for Oxide. **Not** an embedded web terminal
-(xterm.js) — a real native terminal emulator in Rust.
+A standalone native terminal renderer bundled with Oxide. It runs as a sibling
+process because a wgpu/Metal surface cannot be embedded directly in the Dioxus
+webview.
 
 ## Stack
-- **portable-pty** — spawns the shell, owns the PTY (same crate the Oxide GUI uses).
-- **alacritty_terminal** — the VTE emulation core (the cell grid). The same crate Zed embeds.
-- **glyphon** (cosmic-text + wgpu) — GPU text: glyph shaping + atlas + rendering.
-- **wgpu** — on macOS this selects the **Metal** backend automatically.
-- **winit** — window + input + event loop.
-- **Nerd Font** — JetBrainsMono Nerd Font Mono is bundled (powerline / dev-icon glyphs render).
 
-## Run
+- **portable-pty** — PTY and child-process lifecycle.
+- **alacritty_terminal** — VTE emulation and terminal grid.
+- **glyphon** / **cosmic-text** — GPU text shaping and atlas rendering.
+- **wgpu** — Metal on macOS.
+- **winit** — native window and input loop.
+- **JetBrainsMono Nerd Font Mono** — bundled terminal font.
+
+`oxide-term` is a member of the root Cargo workspace and is built, tested, and
+packaged next to the main `oxide` executable.
+
+## Usage
+
 ```sh
-cargo run --manifest-path crates/oxide-term/Cargo.toml
-# (release for smoothness)
-cargo run --release --manifest-path crates/oxide-term/Cargo.toml
+cargo run -p oxide-term
+cargo run -p oxide-term -- --cwd /path/to/workspace
+cargo run -p oxide-term -- --cwd /path/to/workspace PROGRAM ARGS...
 ```
-A window opens running your `$SHELL`. Type — it forwards to the PTY; output renders on the GPU.
 
-This crate is **excluded from the main workspace** (`exclude` in the root `Cargo.toml`)
-so its heavy wgpu/winit deps don't slow the Oxide build or gate releases.
+The GUI launcher resolves only the sibling `oxide-term` binary. It does not run
+a workspace-relative or `PATH` fallback binary. Each launch receives the active
+workspace explicitly and writes stderr to a unique private log file.
 
-## Status — Milestones 1 + 1.5 + 2 (compiles clean; visuals need a live GPU)
-- ✅ window + wgpu (**Metal**) + glyphon text + PTY + alacritty_terminal grid
-- ✅ **per-cell fg color + bold** (glyphon rich-text runs) + **per-cell bg color**
-  (a small wgpu solid-quad pipeline) + xterm-256 palette fallback
-- ✅ **inverse block cursor** (swaps fg/bg on the cursor cell)
-- ✅ **scrollback** (mouse wheel → `scroll_display`; any keypress jumps to bottom)
-- ✅ **keyboard incl. Ctrl-combos** (Ctrl-C/D/Z…, arrows, Home/End/Del, Esc, Tab)
-- ✅ resize re-grids PTY + Term
-- ⬜ **selection + copy/paste** (mouse drag → `Selection`, OSC 52 / clipboard)
-- ⬜ **bold-italic faces, underline/strikethrough, true cursor shapes (beam/underline)**
-- ⬜ **M3 — integration into Oxide**: launch this as a sibling native window/process
-  from the GUI (a wgpu surface can't live inside the Dioxus/wry webview). Needs a
-  packaging decision (bundle the binary) + your visual confirmation of M2 first.
+```text
+oxide-term [--cwd DIR] [PROGRAM ARGS...]
+oxide-term --help
+oxide-term --version
+```
 
-## Known tuning points (report what you see)
-- **Font:** loaded by data + referenced as `JetBrainsMono Nerd Font Mono`. If glyphs
-  fall back to a different face, the internal family name differs → adjust `FONT_FAMILY`.
-- **Cell width** (`CELL_W = FONT_SIZE * 0.6`) is an approximation; if columns drift or
-  bg quads misalign with glyphs, derive it from the font's real advance metric.
-- **Colors:** a fresh `Term` may not preload a full theme, so unset palette slots fall
-  back to a built-in xterm-256 palette (`palette_256`). Default fg/bg match Oxide's.
+An explicit invalid `--cwd` is an error rather than silently falling back to a
+different directory.
+
+## Current capabilities
+
+- Native window and wgpu/Metal rendering.
+- Per-cell foreground/background colors, bold text, and xterm-256 fallback.
+- Inverse block cursor.
+- Scrollback and mouse-wheel navigation.
+- Keyboard input including common Ctrl combinations and navigation keys.
+- PTY/grid resize using the measured bundled-font cell advance.
+- Bounded PTY reader queue.
+- Explicit child exit detection, termination, and reaping.
+- GUI launch from the active workspace.
+
+The embedded GUI terminal remains the primary integrated terminal surface. It
+supports selection/copy and bracketed paste through WTerm. The native renderer
+still lacks mouse selection/copy-paste, underline/strikethrough, and complete
+beam/underline cursor-shape rendering.
+
+## Shared terminals
+
+Environment → Terminal can create a managed shared terminal through `tmux` when
+`tmux` is installed. Oxide uses a private socket below `~/.oxide/terminal/` and
+a stable workspace-specific session name. The UI can copy an attach command for
+Terminal.app, Ghostty, iTerm, or another external terminal.
+
+Agent access is intentionally not a raw writable PTY connection:
+
+- **Share output** inserts a bounded, read-only terminal snapshot into the chat
+  composer for user review.
+- The user must review the snapshot for secrets and explicitly send it.
+- Shell tools continue to run through Oxide approval, sandbox, timeout, and
+  bounded-output handling.
+- External terminals share input only through the explicit managed tmux session.
+
+This keeps interactive user shells separate from automatic agent execution.

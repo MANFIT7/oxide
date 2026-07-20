@@ -92,6 +92,9 @@ pub enum Event {
     /// Engine wants to run a tool and is asking the frontend for approval.
     ApprovalRequested {
         request_id: u64,
+        /// Matches the `call_id` of the tool row waiting for this decision.
+        #[serde(default)]
+        call_id: String,
         tool: String,
         summary: String,
     },

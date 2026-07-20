@@ -1019,6 +1019,7 @@ impl OxideDesktop {
                 request_id,
                 tool,
                 summary,
+                ..
             } => {
                 self.inspector = InspectorTab::Approvals;
                 upsert_pending_approval(

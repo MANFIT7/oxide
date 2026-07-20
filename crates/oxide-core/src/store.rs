@@ -124,6 +124,26 @@ impl SessionStore {
         Ok(())
     }
 
+    pub fn save_context_checkpoint(&self, payload: &str) -> std::io::Result<()> {
+        crate::db::save_context_checkpoint(&self.id, payload);
+        Ok(())
+    }
+
+    pub fn load_context_checkpoint(id: &str) -> Option<(i64, String)> {
+        crate::db::load_context_checkpoint(id)
+    }
+
+    pub fn load_after(id: &str, seq: i64) -> Vec<StoredMessage> {
+        crate::db::load_after(id, seq)
+            .into_iter()
+            .map(|(role, content)| StoredMessage {
+                role,
+                content,
+                ts_ms: 0,
+            })
+            .collect()
+    }
+
     /// Replace the whole conversation (restore-to-message).
     pub fn rewrite(&self, msgs: &[(String, String)]) -> std::io::Result<()> {
         let config = self.config.lock().map(|g| g.clone()).unwrap_or_default();
@@ -398,6 +418,29 @@ mod tests {
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].role, "user");
         assert_eq!(msgs[1].content, "hello");
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn context_checkpoint_tracks_covered_transcript_boundary() {
+        let tmp = std::env::temp_dir().join(format!(
+            "oxide-context-checkpoint-{}-{}",
+            std::process::id(),
+            crate::db::new_id()
+        ));
+        let store = SessionStore::open(&tmp).unwrap();
+        store.append("user", "before").unwrap();
+        store.append("assistant", "done before checkpoint").unwrap();
+        store.save_context_checkpoint("{\"version\":1}").unwrap();
+        store.append("user", "after").unwrap();
+
+        let (covered_seq, payload) =
+            SessionStore::load_context_checkpoint(&store.id).expect("checkpoint");
+        assert_eq!(covered_seq, 1);
+        assert_eq!(payload, "{\"version\":1}");
+        let after = SessionStore::load_after(&store.id, covered_seq);
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].content, "after");
         std::fs::remove_dir_all(&tmp).ok();
     }
 

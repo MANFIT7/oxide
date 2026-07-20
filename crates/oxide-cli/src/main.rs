@@ -408,6 +408,7 @@ async fn run_exec(
                 request_id,
                 tool,
                 summary,
+                ..
             } => {
                 if !json_events {
                     println!("\n[approval] {tool}: {summary}");

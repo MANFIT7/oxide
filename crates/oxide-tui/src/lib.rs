@@ -567,6 +567,7 @@ fn apply_event(event: Event, state: &mut State) {
             request_id,
             tool,
             summary,
+            ..
         } => {
             state.flush_streaming();
             state.pending_approval = Some(request_id);

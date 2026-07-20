@@ -118,6 +118,15 @@ Latest output remains visible</pre>
         </details>
       </div>
       <div class="row activity">
+        <details class="activity-card waiting-approval activity-command no-out">
+          <summary class="activity-sum">
+            <span class="activity-status" role="status" aria-atomic="true" aria-label="Waiting for approval"><span class="unicode-spinner activity-spin" aria-hidden="true"></span><span class="activity-ic approval">◇</span><span class="activity-ic ok">✓</span><span class="activity-ic fail">×</span></span>
+            <span class="activity-verb">Waiting for approval</span>
+            <span class="activity-text">git push origin main</span>
+          </summary>
+        </details>
+      </div>
+      <div class="row activity">
         <details class="activity-card done activity-command has-out" open>
           <summary class="activity-sum">
             <span class="activity-status" role="status" aria-atomic="true" aria-label="Completed"><!-- UNICODE_ACTIVITY --><span class="activity-ic ok">✓</span><span class="activity-ic fail">×</span></span>
@@ -313,7 +322,7 @@ def write_brain_fixture(css: str) -> None:
     <nav class="nav">
       <button class="nav-item"><span class="nav-preview-icon">＋</span><span>New chat</span></button>
       <button class="nav-item"><span class="nav-preview-icon">⌕</span><span>Search</span></button>
-      <button class="nav-item brain-nav on"><span class="nav-preview-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9.5 4a2.5 2.5 0 0 1 2.5 2.5v10a2.5 2.5 0 0 1-4.96.44A2.5 2.5 0 0 1 4.5 14.5a3 3 0 0 1 .34-5.95A2.5 2.5 0 0 1 9.5 7.3Z"></path><path d="M14.5 4A2.5 2.5 0 0 0 12 6.5v10a2.5 2.5 0 0 0 4.96.44A2.5 2.5 0 0 0 19.5 14.5a3 3 0 0 0-.34-5.95A2.5 2.5 0 0 0 14.5 7.3Z"></path><path d="M3 13h4"></path><path d="M17 13h4"></path><path d="M8 9h8"></path></svg></span><span>Brain</span></button>
+      <button class="nav-item brain-nav on"><span class="nav-preview-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4.22222 21.9948V18.4451C4.22222 17.1737 3.88927 16.5128 3.23482 15.4078C2.4503 14.0833 2 12.5375 2 10.8866C2 5.97866 5.97969 2 10.8889 2C15.7981 2 19.7778 5.97866 19.7778 10.8866C19.7778 11.4663 19.7778 11.7562 19.802 11.9187C19.8598 12.3072 20.0411 12.6414 20.2194 12.9873L22 16.4407L20.6006 17.1402C20.195 17.3429 19.9923 17.4443 19.851 17.6314C19.7097 17.8184 19.67 18.0296 19.5904 18.4519L19.5826 18.4931C19.4004 19.4606 19.1993 20.5286 18.6329 21.2024C18.4329 21.4403 18.1853 21.6336 17.9059 21.7699C17.4447 21.9948 16.8777 21.9948 15.7437 21.9948C15.219 21.9948 14.6928 22.0069 14.1682 21.9942C12.9247 21.9639 12 20.9184 12 19.7044"></path><path d="M14.388 10.5315C13.9617 10.5315 13.5729 10.3702 13.2784 10.1048M14.388 10.5315C14.388 11.6774 13.7241 12.7658 12.4461 12.7658C11.1681 12.7658 10.5043 13.8541 10.5043 15M14.388 10.5315C16.5373 10.5315 16.5373 7.18017 14.388 7.18017C14.1927 7.18017 14.0053 7.21403 13.8312 7.27624C13.9362 4.77819 10.3349 4.1 9.51923 6.44018M10.5043 8.29729C10.5043 7.52323 10.1133 6.8411 9.51923 6.44018M9.51923 6.44018C7.66742 5.19034 5.19883 7.4331 6.37324 9.43277C4.40226 9.72827 4.61299 12.7658 6.6205 12.7658C7.18344 12.7658 7.68111 12.4844 7.98234 12.0538"></path></svg></span><span>Brain</span></button>
     </nav>
   </aside>
   <main class="brain-preview-shell">
@@ -548,9 +557,11 @@ def main() -> int:
                 "fn ActivityStatus",
                 'class: "activity-status"',
                 'UnicodeSpinner { class: "activity-spin" }',
+                'span { class: "activity-ic approval"',
                 'span { class: "activity-ic ok"',
                 'span { class: "activity-ic fail"',
-                'let live_output = has_output && running && matches!(view.kind, ActivityKind::Command);',
+                "let live_output =",
+                "has_output && running && !waiting && matches!(view.kind, ActivityKind::Command);",
                 '"has-out live-output"',
                 'details { class: "{cls}", open: has_output && (auto_open || live_output)',
                 'class: "activity-caret"',
@@ -566,7 +577,7 @@ def main() -> int:
                 ".activity-card.has-out[open] .activity-caret",
             ],
         ),
-        f"{rel(GUI)} and {rel(CSS)} cross-fade running/success/failure in a fixed slot and keep disclosure state stable",
+        f"{rel(GUI)} and {rel(CSS)} cross-fade running/approval/success/failure in a fixed slot and keep disclosure state stable",
     )
     require(
         "live command output follows the tail in a compact window",
@@ -627,6 +638,35 @@ def main() -> int:
             ],
         ),
         f"{rel(CSS)} keeps one Emdash-style shimmer per active tool plus reasoning/edit motion without repainting tool details",
+    )
+    require(
+        "approval lifecycle reuses the keyed tool row",
+        contains_all(
+            gui,
+            [
+                "fn mark_activity_waiting_for_approval(",
+                "activity_idx(messages, call_id)",
+                "fn resume_activity_after_approval(",
+                'view.verb = "Waiting for approval".to_string();',
+                'span { class: "activity-ic approval"',
+                '"waiting-approval"',
+            ],
+        )
+        and contains_all(
+            css,
+            [
+                ".activity-card.waiting-approval .activity-status .activity-ic.approval,",
+                ".activity-card.waiting-approval .activity-verb { color: var(--warn); }",
+            ],
+        )
+        and contains_all(
+            protocol,
+            [
+                "ApprovalRequested {",
+                "call_id: String,",
+            ],
+        ),
+        f"{rel(PROTOCOL)}, {rel(GUI)}, and {rel(CSS)} pair approval by call_id and cross-fade spinner/shield/result in one row",
     )
     require(
         "continuous motion stays bounded to useful feedback",
@@ -1212,7 +1252,7 @@ def main() -> int:
                 'class: if sidebar_tab.read().as_str() != "workspace" { "on" }',
                 'class: if *sidebar_tab.read() == "brain" { "nav-item brain-nav on"',
                 '"brain" => rsx! {',
-                'path { d: "M9.5 4a2.5 2.5 0 0 1 2.5 2.5v10',
+                'd: "M4.22222 21.9948V18.4451C4.22222 17.1737',
                 'class: "brain-view"',
                 'class: "brain-map"',
                 '"brain-edge active"',

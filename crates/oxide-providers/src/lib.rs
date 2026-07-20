@@ -28,7 +28,7 @@ use tokio::sync::mpsc;
 /// A tool call the assistant made, carried structurally so providers can emit a
 /// proper `function_call`/`tool_use` item (with a stable id) on replay instead
 /// of flattening it to text — which is what makes the model re-plan/re-call.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,
@@ -36,7 +36,7 @@ pub struct ToolCall {
 }
 
 /// One message in the conversation sent to the model.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Message {
     pub role: Role,
     pub content: String,
@@ -84,7 +84,7 @@ impl Message {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Role {
     System,
     User,

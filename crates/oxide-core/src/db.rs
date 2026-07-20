@@ -80,6 +80,12 @@ impl LocalDb {
                ts_ms INTEGER NOT NULL,
                PRIMARY KEY (session_id, seq)
              );
+             CREATE TABLE IF NOT EXISTS context_checkpoints (
+               session_id TEXT PRIMARY KEY,
+               covered_seq INTEGER NOT NULL,
+               payload TEXT NOT NULL,
+               updated_ms INTEGER NOT NULL
+             );
              CREATE TABLE IF NOT EXISTS session_tombstones (
                id TEXT PRIMARY KEY,
                deleted_at INTEGER NOT NULL
@@ -541,6 +547,62 @@ pub fn load(id: &str) -> Vec<(String, String)> {
     })
 }
 
+/// Persist the latest model-visible context checkpoint together with the last
+/// transcript sequence it covers. Later rows can then be replayed without
+/// duplicating messages already captured in the checkpoint.
+pub fn save_context_checkpoint(id: &str, payload: &str) {
+    let id = id.to_string();
+    let payload = payload.to_string();
+    let updated_ms = now_ms();
+    with_db(move |db| {
+        let covered_seq = db
+            .query_one(
+                "find context checkpoint boundary",
+                "SELECT COALESCE(MAX(seq), -1) FROM messages WHERE session_id=?1",
+                turso::params![id.as_str()],
+                |r| r.get::<i64>(0),
+            )
+            .unwrap_or(-1);
+        db.execute(
+            "save context checkpoint",
+            "INSERT INTO context_checkpoints (session_id, covered_seq, payload, updated_ms)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(session_id) DO UPDATE SET
+               covered_seq=excluded.covered_seq,
+               payload=excluded.payload,
+               updated_ms=excluded.updated_ms",
+            turso::params![id, covered_seq, payload, updated_ms],
+        );
+    });
+}
+
+/// Latest compacted context and the transcript sequence included in it.
+pub fn load_context_checkpoint(id: &str) -> Option<(i64, String)> {
+    let id = id.to_string();
+    with_db(move |db| {
+        db.query_one(
+            "load context checkpoint",
+            "SELECT covered_seq, payload FROM context_checkpoints WHERE session_id=?1",
+            turso::params![id],
+            |r| Ok((r.get::<i64>(0)?, r.get::<String>(1)?)),
+        )
+    })
+}
+
+/// Transcript rows appended after a persisted context checkpoint.
+pub fn load_after(id: &str, seq: i64) -> Vec<(String, String)> {
+    let id = id.to_string();
+    with_db(move |db| {
+        db.query_map(
+            "load messages after context checkpoint",
+            "SELECT role, content FROM messages
+             WHERE session_id=?1 AND seq>?2 ORDER BY seq",
+            turso::params![id, seq],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+    })
+}
+
 /// Count user-visible messages without materializing the whole transcript.
 pub fn message_count(id: &str) -> usize {
     let id = id.to_string();
@@ -587,6 +649,11 @@ pub fn rewrite_with_config(
         db.execute(
             "delete session messages",
             "DELETE FROM messages WHERE session_id=?1",
+            turso::params![id.as_str()],
+        );
+        db.execute(
+            "delete stale context checkpoint",
+            "DELETE FROM context_checkpoints WHERE session_id=?1",
             turso::params![id.as_str()],
         );
         let base_ts = now_ms();
@@ -1200,6 +1267,11 @@ pub fn delete(id: &str) {
         db.execute(
             "delete session messages",
             "DELETE FROM messages WHERE session_id=?1",
+            turso::params![id.as_str()],
+        );
+        db.execute(
+            "delete session context checkpoint",
+            "DELETE FROM context_checkpoints WHERE session_id=?1",
             turso::params![id.as_str()],
         );
         db.execute(

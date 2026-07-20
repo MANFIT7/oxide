@@ -4785,11 +4785,15 @@ details.changes-file[open] .diff-body { animation: disclosure-in 220ms ease-out;
 }
 .activity-status .activity-ic { animation: none; }
 .activity-status .activity-ic svg { width: 11px; height: 11px; }
+.activity-card.waiting-approval .activity-status .activity-ic.approval,
 .activity-card.done .activity-status .activity-ic.ok,
 .activity-card.fail .activity-status .activity-ic.fail {
   opacity: 1;
   transform: scale(1);
 }
+.activity-card.waiting-approval .activity-status,
+.activity-card.waiting-approval .activity-verb { color: var(--warn); }
+.activity-card.waiting-approval .activity-text { color: color-mix(in srgb, var(--warn) 72%, var(--muted)); }
 
 /* The disclosure wrapper is a one-row grid, so open/close interpolates the
    content's real height instead of snapping from hidden to auto. Opacity and

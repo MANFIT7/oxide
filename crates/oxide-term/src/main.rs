@@ -9,7 +9,7 @@
 //! scrollback (mouse wheel), and keyboard input incl. Ctrl-combos. Selection +
 //! Oxide-window integration are the remaining steps.
 
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::{Event as TermEvent, EventListener};
@@ -51,6 +51,7 @@ const DEFAULT_BG: Rgb = Rgb {
 /// Wakes the winit loop when the PTY produced output.
 enum UserEvent {
     PtyData,
+    PtyExited,
 }
 
 #[derive(Clone)]
@@ -226,6 +227,8 @@ struct Pty {
     parser: Arc<Mutex<Processor>>,
     writer: Box<dyn std::io::Write + Send>,
     master: Box<dyn portable_pty::MasterPty + Send>,
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    child_reaped: bool,
     rx: Receiver<Vec<u8>>,
     size: TermSize,
 }
@@ -255,15 +258,22 @@ impl Pty {
             let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
             portable_pty::CommandBuilder::new(shell)
         };
-        let dir = cwd
-            .map(std::path::PathBuf::from)
-            .filter(|p| p.is_dir())
-            .or_else(|| std::env::current_dir().ok());
-        if let Some(d) = dir {
-            cmd.cwd(d);
-        }
+        let dir = match cwd {
+            Some(cwd) => {
+                let path = std::path::PathBuf::from(cwd);
+                if !path.is_dir() {
+                    anyhow::bail!(
+                        "terminal working directory does not exist: {}",
+                        path.display()
+                    );
+                }
+                path
+            }
+            None => std::env::current_dir()?,
+        };
+        cmd.cwd(dir);
         cmd.env("TERM", "xterm-256color");
-        let _child = pair.slave.spawn_command(cmd)?;
+        let child = pair.slave.spawn_command(cmd)?;
         drop(pair.slave);
 
         let writer = pair.master.take_writer()?;
@@ -276,7 +286,7 @@ impl Pty {
         )));
         let parser = Arc::new(Mutex::new(Processor::new()));
 
-        let (tx, rx): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = channel();
+        let (tx, rx): (SyncSender<Vec<u8>>, Receiver<Vec<u8>>) = sync_channel(64);
         std::thread::spawn(move || {
             let mut buf = [0u8; 8192];
             loop {
@@ -290,6 +300,7 @@ impl Pty {
                     }
                 }
             }
+            let _ = proxy.send_event(UserEvent::PtyExited);
         });
 
         Ok(Self {
@@ -297,6 +308,8 @@ impl Pty {
             parser,
             writer,
             master: pair.master,
+            child,
+            child_reaped: false,
             rx,
             size,
         })
@@ -311,6 +324,30 @@ impl Pty {
         let mut parser = self.parser.lock().unwrap();
         for chunk in chunks {
             parser.advance(&mut *term, &chunk);
+        }
+    }
+
+    fn child_exited(&mut self) -> bool {
+        if self.child_reaped {
+            return true;
+        }
+        match self.child.try_wait() {
+            Ok(Some(_)) => {
+                self.child_reaped = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn shutdown(&mut self) {
+        if self.child_reaped {
+            return;
+        }
+        if !self.child_exited() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            self.child_reaped = true;
         }
     }
 
@@ -416,6 +453,12 @@ impl Pty {
         }
 
         Frame { runs, quads }
+    }
+}
+
+impl Drop for Pty {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -898,9 +941,19 @@ impl ApplicationHandler<UserEvent> for App {
         window.request_redraw();
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: UserEvent) {
-        if let Some(gpu) = self.gpu.as_ref() {
-            gpu.window.request_redraw();
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
+        match event {
+            UserEvent::PtyData => {
+                if let Some(gpu) = self.gpu.as_ref() {
+                    gpu.window.request_redraw();
+                }
+            }
+            UserEvent::PtyExited => {
+                if let Some(pty) = self.pty.as_mut() {
+                    pty.shutdown();
+                }
+                event_loop.exit();
+            }
         }
     }
 
@@ -911,7 +964,12 @@ impl ApplicationHandler<UserEvent> for App {
         event: WindowEvent,
     ) {
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                if let Some(pty) = self.pty.as_mut() {
+                    pty.shutdown();
+                }
+                event_loop.exit();
+            }
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
             WindowEvent::Resized(size) => {
                 if let (Some(gpu), Some(pty)) = (self.gpu.as_mut(), self.pty.as_mut()) {
@@ -997,15 +1055,36 @@ fn key_to_bytes(
     }
 }
 
+fn parse_args(
+    args: impl IntoIterator<Item = String>,
+) -> anyhow::Result<(Option<String>, Vec<String>)> {
+    let mut args = args.into_iter().peekable();
+    let mut cwd = None;
+    if args.peek().is_some_and(|arg| arg == "--cwd") {
+        args.next();
+        let value = args
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("--cwd requires a directory"))?;
+        if !std::path::Path::new(&value).is_dir() {
+            anyhow::bail!("terminal working directory does not exist: {value}");
+        }
+        cwd = Some(value);
+    }
+    Ok((cwd, args.collect()))
+}
+
 fn main() -> anyhow::Result<()> {
     // Usage: oxide-term [--cwd DIR] [PROGRAM ARGS...]   (default PROGRAM = $SHELL)
-    let mut args = std::env::args().skip(1).peekable();
-    let mut cwd = None;
-    if args.peek().map(|a| a == "--cwd").unwrap_or(false) {
-        args.next();
-        cwd = args.next();
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    if raw_args.as_slice() == ["--version"] {
+        println!("oxide-term {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
     }
-    let cmd: Vec<String> = args.collect();
+    if matches!(raw_args.as_slice(), [arg] if arg == "--help" || arg == "-h") {
+        println!("Usage: oxide-term [--cwd DIR] [PROGRAM ARGS...]\n\nRuns PROGRAM, or $SHELL when omitted, in a native GPU terminal.");
+        return Ok(());
+    }
+    let (cwd, cmd) = parse_args(raw_args)?;
 
     #[cfg(target_os = "macos")]
     use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
@@ -1031,4 +1110,29 @@ fn main() -> anyhow::Result<()> {
     };
     event_loop.run_app(&mut app)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_args_rejects_missing_or_invalid_cwd() {
+        assert!(parse_args(["--cwd".to_string()]).is_err());
+        assert!(parse_args(["--cwd".to_string(), "/definitely/missing".to_string()]).is_err());
+    }
+
+    #[test]
+    fn parse_args_preserves_program_arguments() {
+        let cwd = std::env::current_dir().unwrap();
+        let (parsed_cwd, command) = parse_args([
+            "--cwd".to_string(),
+            cwd.display().to_string(),
+            "printf".to_string(),
+            "hello".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(parsed_cwd.as_deref(), Some(cwd.to_string_lossy().as_ref()));
+        assert_eq!(command, ["printf", "hello"]);
+    }
 }

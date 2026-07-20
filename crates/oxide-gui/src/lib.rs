@@ -124,52 +124,157 @@ fn open_in_editor(app: &'static str, path: std::path::PathBuf) {
     });
 }
 
-/// Resolve the `oxide-term` binary: bundled next to the app exe (inside
-/// Oxide.app/Contents/MacOS), a dev build under the repo, then PATH.
-fn oxide_term_bin() -> std::path::PathBuf {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let p = dir.join("oxide-term");
-            if p.exists() {
-                return p;
-            }
-        }
+/// Resolve only the `oxide-term` binary bundled next to the current executable.
+/// Development builds use the same shared target directory, so the sibling path
+/// works there too without trusting the workspace or PATH.
+fn oxide_term_bin() -> Result<std::path::PathBuf, String> {
+    let exe = std::env::current_exe()
+        .map_err(|error| format!("cannot resolve Oxide executable: {error}"))?;
+    let candidate = exe
+        .parent()
+        .ok_or_else(|| "Oxide executable has no parent directory".to_string())?
+        .join("oxide-term");
+    if candidate.is_file() {
+        candidate
+            .canonicalize()
+            .map_err(|error| format!("cannot resolve {}: {error}", candidate.display()))
+    } else {
+        Err(format!(
+            "native terminal binary is missing at {} (build `cargo build -p oxide-term`)",
+            candidate.display()
+        ))
     }
-    if let Ok(cwd) = std::env::current_dir() {
-        // oxide-term is a workspace member → built into the shared target/.
-        for rel in ["target/release/oxide-term", "target/debug/oxide-term"] {
-            let p = cwd.join(rel);
-            if p.exists() {
-                return p;
-            }
-        }
-    }
-    std::path::PathBuf::from("oxide-term")
 }
 
 /// Open the standalone native GPU terminal (oxide-term) in a separate wgpu/Metal
-/// window running `cmd` (empty = $SHELL) in `cwd`. A GPU surface can't live in the
-/// Dioxus webview, so it's a sibling native window. Returns false if it couldn't
-/// spawn (binary absent).
-fn spawn_oxide_term(cwd: &str, cmd: &[String]) -> bool {
-    let mut c = std::process::Command::new(oxide_term_bin());
-    if !cwd.is_empty() {
-        c.arg("--cwd").arg(cwd);
+/// window running `cmd` (empty = $SHELL) in `cwd`.
+fn spawn_oxide_term(cwd: &std::path::Path, cmd: &[String]) -> Result<std::path::PathBuf, String> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LOG_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+    if !cwd.is_dir() {
+        return Err(format!(
+            "terminal working directory does not exist: {}",
+            cwd.display()
+        ));
     }
-    for a in cmd {
-        c.arg(a);
+    let binary = oxide_term_bin()?;
+    let log_dir = std::env::temp_dir().join("oxide-terminal-logs");
+    std::fs::create_dir_all(&log_dir)
+        .map_err(|error| format!("cannot create terminal log directory: {error}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&log_dir, std::fs::Permissions::from_mode(0o700));
     }
-    // Capture oxide-term's stderr to a log so a GPU/Metal init crash (which makes
-    // the window silently fail to appear) is diagnosable instead of vanishing.
-    if let Ok(f) = std::fs::File::create(std::env::temp_dir().join("oxide-term.log")) {
-        c.stderr(std::process::Stdio::from(f));
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let log_path = log_dir.join(format!(
+        "oxide-term-{}-{timestamp}-{}.log",
+        std::process::id(),
+        LOG_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
-    c.spawn().is_ok()
+    let log = options
+        .open(&log_path)
+        .map_err(|error| format!("cannot create terminal log {}: {error}", log_path.display()))?;
+
+    let mut command = std::process::Command::new(binary);
+    command.arg("--cwd").arg(cwd);
+    command.args(cmd);
+    command.stderr(std::process::Stdio::from(log));
+    command
+        .spawn()
+        .map_err(|error| format!("cannot launch native terminal: {error}"))?;
+    Ok(log_path)
 }
 
-/// Open a plain native GPU terminal ($SHELL) — the terminal-panel button.
-fn launch_native_terminal() -> bool {
-    spawn_oxide_term("", &[])
+fn launch_native_terminal(cwd: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    spawn_oxide_term(cwd, &[])
+}
+
+fn managed_tmux_command(workspace: &std::path::Path) -> Result<Vec<String>, String> {
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| "HOME is unavailable; cannot create a private tmux socket".to_string())?;
+    let tmux = [
+        home.join(".local/bin/tmux"),
+        std::path::PathBuf::from("/opt/homebrew/bin/tmux"),
+        std::path::PathBuf::from("/usr/local/bin/tmux"),
+        std::path::PathBuf::from("/usr/bin/tmux"),
+    ]
+    .into_iter()
+    .find(|path| path.is_file())
+    .ok_or_else(|| "tmux is not installed; install it to enable shared terminals".to_string())?;
+    let runtime = home.join(".oxide/terminal");
+    std::fs::create_dir_all(&runtime)
+        .map_err(|error| format!("cannot create tmux runtime directory: {error}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("cannot secure tmux runtime directory: {error}"))?;
+    }
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in workspace.to_string_lossy().bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    let stem: String = workspace
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+        .take(24)
+        .collect();
+    let session = format!(
+        "oxide-{}-{hash:08x}",
+        if stem.is_empty() { "workspace" } else { &stem }
+    );
+    Ok(vec![
+        tmux.display().to_string(),
+        "-S".to_string(),
+        runtime.join("tmux.sock").display().to_string(),
+        "new-session".to_string(),
+        "-A".to_string(),
+        "-s".to_string(),
+        session,
+        "-c".to_string(),
+        workspace.display().to_string(),
+    ])
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn copy_terminal_attach_to_clipboard(text: &str) -> Result<(), String> {
+    use std::io::Write;
+    let mut child = std::process::Command::new("/usr/bin/pbcopy")
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("cannot open clipboard: {error}"))?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| "clipboard input is unavailable".to_string())?
+        .write_all(text.as_bytes())
+        .map_err(|error| format!("cannot write clipboard: {error}"))?;
+    let status = child.wait().map_err(|error| error.to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("clipboard command exited with {status}"))
+    }
 }
 
 struct ModelPreset {
@@ -497,6 +602,88 @@ const DONE_NOTE_MARK: &str = "\u{2713} Done";
 fn activity_idx(msgs: &[ChatMsg], key: &str) -> Option<usize> {
     msgs.iter()
         .rposition(|m| matches!(&m.author, Author::Activity { key: Some(k), .. } if k == key))
+}
+
+const APPROVAL_ACTIVITY_MARK: &str = "§approval\t";
+
+fn approval_activity_parts(text: &str) -> Option<(u64, &str)> {
+    let rest = text.strip_prefix(APPROVAL_ACTIVITY_MARK)?;
+    let (request_id, original) = rest.split_once('\t')?;
+    Some((request_id.parse().ok()?, original))
+}
+
+fn activity_waiting_for_approval(text: &str) -> bool {
+    approval_activity_parts(text).is_some()
+}
+
+/// Put the exact tool row into its approval state without creating a second
+/// transcript notice. `call_id` comes from the protocol so interleaved tools
+/// never move the wrong spinner. A fallback row covers tools such as `shell`
+/// whose command-specific row is emitted only after approval succeeds.
+fn mark_activity_waiting_for_approval(
+    messages: &mut Vec<ChatMsg>,
+    call_id: &str,
+    request_id: u64,
+    tool: &str,
+    summary: &str,
+) {
+    let idx = if let Some(idx) = activity_idx(messages, call_id) {
+        idx
+    } else {
+        let detail = if summary.trim().is_empty() {
+            tool
+        } else {
+            summary
+        };
+        buf_push_activity(
+            messages,
+            ChatMsg::new(
+                Author::Activity {
+                    running: true,
+                    ok: true,
+                    key: Some(call_id.to_string()),
+                },
+                format!(
+                    "spark\tTool\t{}",
+                    detail.chars().take(140).collect::<String>()
+                ),
+            ),
+        );
+        activity_idx(messages, call_id).expect("approval activity was just inserted")
+    };
+    let original = approval_activity_parts(&messages[idx].text)
+        .map(|(_, original)| original)
+        .unwrap_or(&messages[idx].text)
+        .to_string();
+    messages[idx].text = format!("{APPROVAL_ACTIVITY_MARK}{request_id}\t{original}");
+    if let Author::Activity { running, ok, .. } = &mut messages[idx].author {
+        *running = true;
+        *ok = true;
+    }
+}
+
+fn clear_activity_approval_marker(text: &mut String) {
+    if let Some((_, original)) = approval_activity_parts(text) {
+        *text = original.to_string();
+    }
+}
+
+/// Approval resumes the same row in place. A rejected row keeps its shield
+/// until `ToolCallEnd` cross-fades it directly to failure.
+fn resume_activity_after_approval(messages: &mut [ChatMsg], request_id: u64) -> bool {
+    let Some(row) = messages.iter_mut().rev().find(|message| {
+        approval_activity_parts(&message.text)
+            .map(|(id, _)| id == request_id)
+            .unwrap_or(false)
+    }) else {
+        return false;
+    };
+    clear_activity_approval_marker(&mut row.text);
+    if let Author::Activity { running, ok, .. } = &mut row.author {
+        *running = true;
+        *ok = true;
+    }
+    true
 }
 
 /// Follow a background job's output file across turn boundaries: poll for
@@ -837,6 +1024,11 @@ fn activity_kind(icon: &str, verb: &str, detail: &str) -> ActivityKind {
 }
 
 fn activity_view(text: &str) -> ActivityView {
+    if let Some((_, original)) = approval_activity_parts(text) {
+        let mut view = activity_view(original);
+        view.verb = "Waiting for approval".to_string();
+        return view;
+    }
     let mut parts = text.splitn(4, '\t');
     let icon = parts.next().unwrap_or("spark").to_string();
     let verb = parts.next().unwrap_or("").to_string();
@@ -938,6 +1130,9 @@ fn build_transcript_turns(messages: &[ChatMsg]) -> Vec<TranscriptTurn> {
 
 fn activity_group_display(rows: &[(String, bool, bool)]) -> (&'static str, String) {
     let n = rows.len();
+    let waiting = rows
+        .iter()
+        .any(|(text, _, _)| activity_waiting_for_approval(text));
     let running = rows.iter().any(|(_, running, _)| *running);
     let mut edits = 0;
     let mut commands = 0;
@@ -953,7 +1148,9 @@ fn activity_group_display(rows: &[(String, bool, bool)]) -> (&'static str, Strin
         }
     }
 
-    if running {
+    if waiting {
+        ("shield", "Waiting for approval".to_string())
+    } else if running {
         (
             "settings",
             format!("Working… {n} action{}", if n == 1 { "" } else { "s" }),
@@ -2458,6 +2655,15 @@ fn strip_scaffold(text: &str) -> String {
             in_diff_fence = true;
             continue;
         }
+        if l.starts_with("(user attached") {
+            if let Some((_, remainder)) = l.split_once(')') {
+                let remainder = remainder.trim_start();
+                if !remainder.is_empty() {
+                    keep.push(remainder);
+                }
+            }
+            continue;
+        }
         if DROP_PREFIX.iter().any(|p| l.starts_with(p)) {
             continue;
         }
@@ -2773,7 +2979,7 @@ why it's wrong, and the concrete fix. If the diff is clean, say so plainly.{}\n\
         text.push('\n');
     }
     if n_imgs > 0 {
-        text.push_str(&format!("\n(user attached {n_imgs} image{} — image content is NOT visible to you; ask the user to describe it if needed)", if n_imgs == 1 { "" } else { "s" }));
+        text.push_str(&format!("\n(user attached {n_imgs} image{} — image content is NOT visible to you; ask the user to describe it if needed)\n", if n_imgs == 1 { "" } else { "s" }));
     }
     if let Some(p) = &picked {
         text.push_str(&format!(
@@ -3705,6 +3911,21 @@ mod tests {
     }
 
     #[test]
+    fn queued_prompt_preview_preserves_text_after_attachment_note() {
+        let queued = "(user attached 1 image — internal note)Perbaiki tampilan queue ini\u{2}wsimg:.oxide/attachments/screenshot.png";
+        assert_eq!(strip_scaffold(queued), "Perbaiki tampilan queue ini");
+        assert_eq!(queue_preview(queued), "Perbaiki tampilan queue ini");
+        assert_eq!(
+            queued_display_text(queued),
+            "Perbaiki tampilan queue ini\u{2}wsimg:.oxide/attachments/screenshot.png"
+        );
+        assert_eq!(
+            queue_preview("\u{2}wsimg:.oxide/attachments/screenshot.png"),
+            "1 attachment"
+        );
+    }
+
+    #[test]
     fn reasoning_markdown_separates_adjacent_summary_items() {
         assert_eq!(
             normalize_reasoning_markdown("**Inspecting spinner****Checking layout**"),
@@ -3752,6 +3973,48 @@ mod tests {
         assert_eq!(turns[0].groups.len(), 1);
         assert!(turns[0].groups[0].activity);
         assert_eq!(turns[0].groups[0].indices, vec![0, 2]);
+    }
+
+    #[test]
+    fn approval_lifecycle_updates_only_the_keyed_tool_row() {
+        let first = "terminal\tRun\tcargo test";
+        let second = "eye\tRead\tsrc/lib.rs";
+        let mut messages = vec![
+            ChatMsg::new(
+                Author::Activity {
+                    running: true,
+                    ok: true,
+                    key: Some("call-a".into()),
+                },
+                first,
+            ),
+            ChatMsg::new(
+                Author::Activity {
+                    running: true,
+                    ok: true,
+                    key: Some("call-b".into()),
+                },
+                second,
+            ),
+        ];
+
+        mark_activity_waiting_for_approval(&mut messages, "call-a", 42, "shell", "Run cargo test");
+
+        assert!(activity_waiting_for_approval(&messages[0].text));
+        assert!(!activity_waiting_for_approval(&messages[1].text));
+        assert_eq!(
+            activity_view(&messages[0].text).verb,
+            "Waiting for approval"
+        );
+        assert_eq!(activity_view(&messages[0].text).detail, "cargo test");
+        let grouped = vec![
+            (messages[0].text.clone(), true, true),
+            (messages[1].text.clone(), true, true),
+        ];
+        assert_eq!(activity_group_display(&grouped).1, "Waiting for approval");
+        assert!(resume_activity_after_approval(&mut messages, 42));
+        assert_eq!(messages[0].text, first);
+        assert_eq!(messages[1].text, second);
     }
 
     #[test]
@@ -3859,6 +4122,15 @@ mod tests {
         assert!(scan_agent_osc(&mut acc).is_empty());
         acc.extend_from_slice(b"\x1b]633;OXIDE_AGENT_EVENT=Start\x07");
         assert_eq!(scan_agent_osc(&mut acc), vec!["running"]);
+    }
+
+    #[test]
+    fn terminal_snapshot_removes_control_sequences() {
+        let text =
+            terminal_visible_text(b"plain\x1b[31m red\x1b[0m\x1b]633;secret-state\x07 done\r\n");
+        assert!(text.contains("plain red done"));
+        assert!(!text.contains("31m"));
+        assert!(!text.contains("secret-state"));
     }
 
     #[test]
@@ -4461,24 +4733,56 @@ fn select_env_tab(
     show_env.set(true);
 }
 
+fn queued_display_text(text: &str) -> String {
+    let visible = strip_scaffold(text);
+    let markers: String = text
+        .split('\u{2}')
+        .skip(1)
+        .filter(|marker| marker.starts_with("wsimg:") || marker.starts_with("wstxt:"))
+        .map(|marker| format!("\u{2}{marker}"))
+        .collect();
+    format!("{visible}{markers}")
+}
+
 fn queue_preview(text: &str) -> String {
     let clean = strip_scaffold(text);
     if clean.starts_with("Act as Bugbot.") {
         return "/review (Bugbot)".to_string();
     }
-    clean
+    let preview = clean.lines().map(str::trim).find(|line| {
+        !line.is_empty()
+            && !line.starts_with("## ")
+            && !line.starts_with("Context files:")
+            && !line.starts_with("[Plan mode]")
+            && !line.starts_with("[Pursue goal]")
+    });
+    if let Some(preview) = preview {
+        return preview.chars().take(120).collect();
+    }
+
+    let attachments = text
+        .split('\u{2}')
+        .skip(1)
+        .filter(|marker| marker.starts_with("wsimg:") || marker.starts_with("wstxt:"))
+        .count();
+    if attachments > 0 {
+        return format!(
+            "{attachments} attachment{}",
+            if attachments == 1 { "" } else { "s" }
+        );
+    }
+
+    text.split('\u{2}')
+        .next()
+        .unwrap_or(text)
         .lines()
         .map(str::trim)
-        .find(|line| {
-            !line.is_empty()
-                && !line.starts_with("## ")
-                && !line.starts_with("Context files:")
-                && !line.starts_with("[Plan mode]")
-                && !line.starts_with("[Pursue goal]")
-        })
-        .unwrap_or("queued prompt")
+        .find(|line| !line.is_empty())
+        .unwrap_or("Empty prompt")
+        .trim_start_matches('#')
+        .trim()
         .chars()
-        .take(54)
+        .take(120)
         .collect()
 }
 
@@ -4506,7 +4810,7 @@ fn steer_queued_prompt(mut queue: Signal<Vec<String>>, engine: Coroutine<EngineC
         (index < queued.len()).then(|| queued.remove(index))
     };
     if let Some(text) = text {
-        let display = strip_scaffold(&text);
+        let display = queued_display_text(&text);
         engine.send(EngineCmd::Submit {
             engine: text,
             display,
@@ -5317,6 +5621,7 @@ fn app() -> Element {
     let mut terms = use_signal(|| vec![(1u64, "zsh 1".to_string(), Vec::<String>::new())]);
     let mut term_sel = use_signal(|| 0usize);
     let mut term_seq = use_signal(|| 1u64);
+    let mut term_notice = use_signal(String::new);
     let mut show_settings =
         use_signal(move || matches!(visual_fixture, Some(VisualFixtureMode::Settings)));
     let mut settings_initial_tab = use_signal(|| "model".to_string());
@@ -6871,6 +7176,10 @@ fn app() -> Element {
                             scroll_chat_bottom();
                         }
                         Some(EngineCmd::Approve { id, decision }) => {
+                            if !matches!(decision, ApprovalDecision::Reject) {
+                                resume_activity_after_approval(&mut messages.write(), id);
+                            }
+                            status.set("Working…".to_string());
                             if let Some(h) = handles.get(&view_tab) {
                                 busy_tabs.write().insert(view_tab);
                                 tab_statuses.write().insert(view_tab, TabStatus::Running);
@@ -7051,6 +7360,7 @@ fn app() -> Element {
                                             out = out.chars().take(4000).collect::<String>() + "\n… (truncated)";
                                         }
                                     if let Some(idx) = activity_idx(buf, &call_id) {
+                                        clear_activity_approval_marker(&mut buf[idx].text);
                                         if let Author::Activity { running, ok: o, .. } = &mut buf[idx].author {
                                             *running = false;
                                             *o = ok;
@@ -7094,9 +7404,9 @@ fn app() -> Element {
                                         t.session = Some(pb);
                                     }
                                 }
-                                Event::ApprovalRequested { request_id, tool, summary } => {
-                                    parked_appr.entry(ev_tid).or_default().push((request_id, tool.clone(), summary));
-                                    buf.push(ChatMsg::new(Author::Note, format!("Waiting for approval ({tool}) - open this tab to respond")));
+                                Event::ApprovalRequested { request_id, call_id, tool, summary } => {
+                                    parked_appr.entry(ev_tid).or_default().push((request_id, tool.clone(), summary.clone()));
+                                    mark_activity_waiting_for_approval(buf, &call_id, request_id, &tool, &summary);
                                     push_action_toast(
                                         toasts,
                                         toast_seq,
@@ -7559,7 +7869,15 @@ fn app() -> Element {
                                 });
                                 scroll_chat_bottom_if_sticky();
                             }
-                            Event::ApprovalRequested { request_id, tool, summary } => {
+                            Event::ApprovalRequested { request_id, call_id, tool, summary } => {
+                                mark_activity_waiting_for_approval(
+                                    &mut messages.write(),
+                                    &call_id,
+                                    request_id,
+                                    &tool,
+                                    &summary,
+                                );
+                                status.set(format!("Waiting for approval · {tool}"));
                                 approvals.write().push((request_id, tool.clone(), summary.clone()));
                                 timeline.write().push(TimelineItem { title: format!("Approval needed · {tool}"), sub: summary });
                                 show_native_notification(cfg, "Oxide needs approval", &tool);
@@ -7624,6 +7942,7 @@ fn app() -> Element {
                                     if let Some(idx) = idx {
                                         let mut m = messages.write();
                                         if let Some(c) = m.get_mut(idx) {
+                                            clear_activity_approval_marker(&mut c.text);
                                             if let Author::Activity { running, ok: o, .. } = &mut c.author { *running = false; *o = ok; }
                                             if !(out.is_empty() || tool == "shell" && activity_has_output(&c.text)) {
                                                 c.text.push('\t');
@@ -7938,7 +8257,7 @@ fn app() -> Element {
                                 }
                                 if let Some(start) = turn_start.write().take() {
                                     let secs = start.elapsed().as_secs();
-                                    let dur = if secs >= 60 { format!("{}m {}s", secs / 60, secs % 60) } else { format!("{secs}s") };
+                                    let dur = format_thought_duration(secs);
                                     // Cursor-style turn summary: duration + change totals.
                                     let (nf, ta, td) = {
                                         let e = turn_edits.read();
@@ -7958,8 +8277,9 @@ fn app() -> Element {
                                 }
                                 if let Some(text) = next {
                                     if let Some(h) = handles.get(&ev_tid) {
+                                        let display = queued_display_text(&text);
                                         followups.write().clear();
-                                        messages.write().push(ChatMsg::new(Author::User, text.clone()));
+                                        messages.write().push(ChatMsg::new(Author::User, display));
                                         messages.write().push(ChatMsg::new(Author::Agent, String::new()));
                                         scroll_chat_bottom();
                                         streaming.set(true);
@@ -11520,7 +11840,64 @@ fn app() -> Element {
                                             }, Icon { name: "plus" } }
 
 
-                                            button { class: "term-tab add", title: "Native GPU terminal (Metal · oxide-term)", onclick: move |_| { launch_native_terminal(); }, Icon { name: "terminal" } }
+                                            {
+                                                let native_workspace = workspace.clone();
+                                                rsx! {
+                                                    button { class: "term-tab add", title: "Native GPU terminal (Metal · oxide-term)", onclick: move |_| {
+                                                        match launch_native_terminal(&native_workspace) {
+                                                            Ok(_) => term_notice.set(String::new()),
+                                                            Err(error) => term_notice.set(error),
+                                                        }
+                                                    }, Icon { name: "terminal" } }
+                                                }
+                                            }
+                                            {
+                                                let shared_workspace = workspace.clone();
+                                                rsx! {
+                                                    button { class: "term-tab add", title: "Open a managed terminal that external terminals can attach to", onclick: move |_| {
+                                                        match managed_tmux_command(&shared_workspace) {
+                                                            Ok(command) => {
+                                                                let id = *term_seq.read() + 1;
+                                                                term_seq.set(id);
+                                                                terms.write().push((id, format!("shared {id}"), command));
+                                                                let selected = terms.read().len().saturating_sub(1);
+                                                                term_sel.set(selected);
+                                                                term_notice.set("Shared terminal opened through a private tmux socket".to_string());
+                                                            }
+                                                            Err(error) => term_notice.set(error),
+                                                        }
+                                                    }, "Shared" }
+                                                }
+                                            }
+                                            button { class: "term-tab add", title: "Add a bounded read-only snapshot to the composer for review", onclick: move |_| {
+                                                let selected = terms.read().get(*term_sel.read()).map(|term| term.0);
+                                                if let Some(id) = selected {
+                                                    match add_terminal_snapshot_to_composer(ENV_TERM_ID_BASE + id) {
+                                                        Ok(()) => term_notice.set("Terminal snapshot added to the composer; review it for secrets before sending".to_string()),
+                                                        Err(error) => term_notice.set(error),
+                                                    }
+                                                }
+                                            }, "Share output" }
+                                            {
+                                                let external_workspace = workspace.clone();
+                                                rsx! {
+                                                    button { class: "term-tab add", title: "Copy a command that attaches Terminal.app, Ghostty, or another terminal to the managed session", onclick: move |_| {
+                                                        match managed_tmux_command(&external_workspace) {
+                                                            Ok(command) => {
+                                                                let attach = command.iter().map(|part| shell_quote(part)).collect::<Vec<_>>().join(" ");
+                                                                match copy_terminal_attach_to_clipboard(&attach) {
+                                                                    Ok(()) => term_notice.set("Shared-terminal attach command copied to the clipboard".to_string()),
+                                                                    Err(error) => term_notice.set(error),
+                                                                }
+                                                            }
+                                                            Err(error) => term_notice.set(error),
+                                                        }
+                                                    }, "Copy attach" }
+                                                }
+                                            }
+                                        }
+                                        if !term_notice.read().is_empty() {
+                                            div { class: "env-note", "{term_notice}" }
                                         }
                                         // Real PTY login shells (wterm) — one per tab, all
                                         // kept mounted; only the selected one is visible.
@@ -11529,11 +11906,11 @@ fn app() -> Element {
                                             let sel_id = terms.read().get(sel).map(|t| t.0);
                                             let ws_term = workspace.display().to_string();
                                             rsx! {
-                                                for t in terms.read().iter().map(|t| t.0).collect::<Vec<_>>() {
+                                                for (t, _, command) in terms.read().iter().cloned().collect::<Vec<_>>() {
                                                     div {
                                                         key: "envterm-{t}",
                                                         class: if Some(t) == sel_id { "env-term-host" } else { "env-term-host env-hidden" },
-                                                        TerminalView { id: ENV_TERM_ID_BASE + t, bin: String::new(), ws: ws_term.clone(), resume: None }
+                                                        TerminalView { id: ENV_TERM_ID_BASE + t, bin: String::new(), ws: ws_term.clone(), resume: None, command }
                                                     }
                                                 }
                                             }
@@ -15250,7 +15627,6 @@ fn Composer(
                                 show_effort.set(!v);
                                 show_models.set(false);
                             },
-                            Icon { name: "brain" }
                             "{effort_label(&cur_effort)}"
                             span { class: "chev", Icon { name: "chevron" } }
                         }
@@ -15273,7 +15649,6 @@ fn Composer(
                                                     engine.send(EngineCmd::Reconfigure(c));
                                                     show_effort.set(false);
                                                 },
-                                                Icon { name: "brain" }
                                                 span { class: "menu-copy",
                                                     span { class: "menu-name", "{preset.label}" }
                                                     span { class: "menu-meta", "{preset.summary}" }
@@ -15953,6 +16328,84 @@ fn scan_mouse_mode(bytes: &[u8]) -> Option<bool> {
 /// Status agent per tab TUI dari hook OSC 633 (Synara model):
 /// "running" | "review" (turn selesai, siap direview) | "attention" (butuh izin).
 static TUI_AGENT_STATES: GlobalSignal<HashMap<u64, &'static str>> = Signal::global(HashMap::new);
+static TERMINAL_TAILS: GlobalSignal<HashMap<u64, Vec<u8>>> = Signal::global(HashMap::new);
+const TERMINAL_TAIL_BYTES: usize = 64 * 1024;
+
+struct TerminalChildGuard {
+    child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
+}
+
+impl TerminalChildGuard {
+    fn new(child: Box<dyn portable_pty::Child + Send + Sync>) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn shutdown(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+impl Drop for TerminalChildGuard {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+fn append_terminal_tail(id: u64, bytes: &[u8]) {
+    let mut tails = TERMINAL_TAILS.write();
+    let tail = tails.entry(id).or_default();
+    tail.extend_from_slice(bytes);
+    if tail.len() > TERMINAL_TAIL_BYTES {
+        tail.drain(..tail.len() - TERMINAL_TAIL_BYTES);
+    }
+}
+
+fn terminal_snapshot(id: u64) -> String {
+    let tails = TERMINAL_TAILS.read();
+    tails
+        .get(&id)
+        .map(|bytes| terminal_visible_text(bytes))
+        .unwrap_or_default()
+}
+
+fn terminal_visible_text(bytes: &[u8]) -> String {
+    let mut visible = Vec::with_capacity(bytes.len());
+    let mut state = 0u8;
+    for &byte in bytes {
+        match state {
+            0 if byte == 0x1b => state = 1,
+            0 if byte == b'\r' => visible.push(b'\n'),
+            0 if byte == b'\n' || byte == b'\t' || byte >= 0x20 => visible.push(byte),
+            1 if byte == b'[' => state = 2,
+            1 if byte == b']' => state = 3,
+            1 => state = 0,
+            2 if (0x40..=0x7e).contains(&byte) => state = 0,
+            3 if byte == 0x07 => state = 0,
+            3 if byte == 0x1b => state = 4,
+            4 if byte == b'\\' => state = 0,
+            4 => state = 3,
+            _ => {}
+        }
+    }
+    String::from_utf8_lossy(&visible).trim().to_string()
+}
+
+fn add_terminal_snapshot_to_composer(id: u64) -> Result<(), String> {
+    let snapshot = terminal_snapshot(id);
+    if snapshot.is_empty() {
+        return Err("terminal has no shareable output yet".to_string());
+    }
+    let body = format!("Terminal output (read-only snapshot):\n```text\n{snapshot}\n```\n");
+    let encoded = serde_json::to_string(&body).map_err(|error| error.to_string())?;
+    let script = format!(
+        "const e=document.getElementById('ce-input'); if(!e) return false; const t={encoded}; if(e.textContent && !e.textContent.endsWith('\\n')) e.appendChild(document.createTextNode('\\n')); e.appendChild(document.createTextNode(t)); e.focus(); e.dispatchEvent(new InputEvent('input',{{bubbles:true}})); return true;"
+    );
+    let _ = dioxus::document::eval(&script);
+    Ok(())
+}
 
 /// Scan OSC 633 `OXIDE_AGENT_EVENT=<ev>` BEL dari stream PTY. `acc` menyimpan
 /// ekor antar-chunk supaya sequence yang terbelah dua read tetap terdeteksi.
@@ -16090,15 +16543,25 @@ fn ensure_managed_zsh() -> Option<std::path::PathBuf> {
 /// PTY running `bin` (codex / claude / shell). The terminal renders inside the
 /// Dioxus webview (DOM grid), not a separate native window.
 #[component]
-fn TerminalView(id: u64, bin: String, ws: String, resume: Option<String>) -> Element {
+fn TerminalView(
+    id: u64,
+    bin: String,
+    ws: String,
+    resume: Option<String>,
+    #[props(default)] command: Vec<String>,
+) -> Element {
     let host = format!("term-{id}");
     let host_js = host.clone();
+    let terminal_error = use_signal(String::new);
+    let mut future_error = terminal_error;
     use_future(move || {
         let host = host_js.clone();
         let bin = bin.clone();
         let ws = ws.clone();
         let resume = resume.clone();
+        let command = command.clone();
         async move {
+            future_error.set(String::new());
             // Inject the self-contained wterm bundle once (it declares `var
             // OxideWTerm`); dioxus wraps eval in an async fn, so re-attach it to
             // window explicitly or later terminals won't see it.
@@ -16112,20 +16575,25 @@ fn TerminalView(id: u64, bin: String, ws: String, resume: Option<String>) -> Ele
                 r##"
                 for (let i = 0; i < 300 && !window.OxideWTerm; i++) {{ await new Promise(r => setTimeout(r, 20)); }}
                 const el = document.getElementById("{host}");
-                if (!el || !window.OxideWTerm) return;
+                if (!el || !window.OxideWTerm) {{ dioxus.send(JSON.stringify({{ error: 'terminal renderer unavailable' }})); return; }}
                 el.innerHTML = "";
                 try {{ await document.fonts.load("12.5px 'JetBrainsMono Nerd Font Mono'"); await document.fonts.ready; }} catch (e) {{}}
                 let term;
+                let currentSize = {{ cols: 110, rows: 32 }};
                 try {{
                     term = new window.OxideWTerm.WTerm(el, {{
-                        cols: 110, rows: 32,
+                        cols: currentSize.cols, rows: currentSize.rows,
                         autoResize: true,
                         cursorBlink: true,
                         onData: (d) => dioxus.send(JSON.stringify({{ inp: d }})),
-                        onResize: (cols, rows) => dioxus.send(JSON.stringify({{ resize: [rows, cols] }})),
+                        onResize: (cols, rows) => {{
+                            currentSize.cols = Math.max(1, cols);
+                            currentSize.rows = Math.max(1, rows);
+                            dioxus.send(JSON.stringify({{ resize: [rows, cols] }}));
+                        }},
                     }});
                     await term.init();
-                }} catch (e) {{ return; }}
+                }} catch (e) {{ dioxus.send(JSON.stringify({{ error: String(e) }})); return; }}
                 term.focus();
                 // Cmd-C (copy on a selection) and click-to-focus are handled by
                 // wterm natively. Paste is NOT: WKWebView returns empty for the
@@ -16157,8 +16625,8 @@ fn TerminalView(id: u64, bin: String, ws: String, resume: Option<String>) -> Ele
                     const rect = el.getBoundingClientRect();
                     let col = 1, row = 1;
                     if (rect.width > 0 && rect.height > 0) {{
-                        col = Math.max(1, Math.min(110, Math.floor((e.clientX - rect.left) / (rect.width / 110)) + 1));
-                        row = Math.max(1, Math.min(32, Math.floor((e.clientY - rect.top) / (rect.height / 32)) + 1));
+                        col = Math.max(1, Math.min(currentSize.cols, Math.floor((e.clientX - rect.left) / (rect.width / currentSize.cols)) + 1));
+                        row = Math.max(1, Math.min(currentSize.rows, Math.floor((e.clientY - rect.top) / (rect.height / currentSize.rows)) + 1));
                     }}
                     const dir = e.deltaY < 0 ? 'up' : 'down';
                     const steps = Math.max(1, Math.min(5, Math.round(Math.abs(e.deltaY) / 40)));
@@ -16177,38 +16645,49 @@ fn TerminalView(id: u64, bin: String, ws: String, resume: Option<String>) -> Ele
                 pixel_height: 0,
             }) {
                 Ok(p) => p,
-                Err(_) => return,
+                Err(error) => {
+                    future_error.set(format!("Could not open terminal PTY: {error}"));
+                    return;
+                }
             };
-            // Empty bin → a plain login shell; codex/claude → their TUI with
-            // permissions bypassed (yolo), resuming the originating session.
-            let shell = if bin.is_empty() {
-                std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string())
-            } else {
-                bin.clone()
-            };
+            // Empty bin/command → a plain login shell; explicit commands are
+            // used for managed shared sessions; codex/claude launch their TUIs.
+            let shell = command.first().cloned().unwrap_or_else(|| {
+                if bin.is_empty() {
+                    std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string())
+                } else {
+                    bin.clone()
+                }
+            });
             let mut cmd = portable_pty::CommandBuilder::new(&shell);
-            match bin.as_str() {
-                "codex" => {
-                    cmd.arg("--dangerously-bypass-approvals-and-sandbox");
-                    if let Some(sid) = &resume {
-                        cmd.arg("resume");
-                        cmd.arg(sid);
+            if command.is_empty() {
+                match bin.as_str() {
+                    "codex" => {
+                        cmd.arg("--dangerously-bypass-approvals-and-sandbox");
+                        if let Some(sid) = &resume {
+                            cmd.arg("resume");
+                            cmd.arg(sid);
+                        }
                     }
+                    "claude" => {
+                        cmd.arg("--dangerously-skip-permissions");
+                        // Hook OSC 633 (Synara): status Start/Stop/PermissionRequest
+                        // dari CLI mengalir lewat stream PTY → dot status di tab.
+                        if let Some(settings) = ensure_agent_hook_assets() {
+                            cmd.arg("--settings");
+                            cmd.arg(settings);
+                        }
+                        if let Some(sid) = &resume {
+                            cmd.arg("--resume");
+                            cmd.arg(sid);
+                        }
+                    }
+                    _ => {}
                 }
-                "claude" => {
-                    cmd.arg("--dangerously-skip-permissions");
-                    // Hook OSC 633 (Synara): status Start/Stop/PermissionRequest
-                    // dari CLI mengalir lewat stream PTY → dot status di tab.
-                    if let Some(settings) = ensure_agent_hook_assets() {
-                        cmd.arg("--settings");
-                        cmd.arg(settings);
-                    }
-                    if let Some(sid) = &resume {
-                        cmd.arg("--resume");
-                        cmd.arg(sid);
-                    }
+            } else {
+                for arg in command.iter().skip(1) {
+                    cmd.arg(arg);
                 }
-                _ => {}
             }
             cmd.cwd(&ws);
             cmd.env("TERM", "xterm-256color");
@@ -16225,24 +16704,36 @@ fn TerminalView(id: u64, bin: String, ws: String, resume: Option<String>) -> Ele
                 let path = std::env::var("PATH").unwrap_or_default();
                 cmd.env("PATH", format!("{home}/.superconductor/bin:{home}/.local/bin:{home}/.bun/bin:/opt/homebrew/bin:/usr/local/bin:{path}"));
             }
-            let mut child = match pair.slave.spawn_command(cmd) {
-                Ok(c) => c,
-                Err(_) => return,
+            let child = match pair.slave.spawn_command(cmd) {
+                Ok(child) => child,
+                Err(error) => {
+                    future_error.set(format!("Could not start terminal process: {error}"));
+                    return;
+                }
             };
+            let mut child = TerminalChildGuard::new(child);
             drop(pair.slave);
             let mut reader = match pair.master.try_clone_reader() {
-                Ok(r) => r,
-                Err(_) => return,
+                Ok(reader) => reader,
+                Err(error) => {
+                    future_error.set(format!("Could not read terminal output: {error}"));
+                    child.shutdown();
+                    return;
+                }
             };
             let mut writer = match pair.master.take_writer() {
-                Ok(w) => w,
-                Err(_) => return,
+                Ok(writer) => writer,
+                Err(error) => {
+                    future_error.set(format!("Could not write terminal input: {error}"));
+                    child.shutdown();
+                    return;
+                }
             };
             let master = pair.master;
 
             let mouse_on = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let mouse_on_rd = mouse_on.clone();
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
             let (agent_tx, mut agent_rx) = tokio::sync::mpsc::unbounded_channel::<&'static str>();
             std::thread::spawn(move || {
                 use std::io::Read;
@@ -16268,7 +16759,7 @@ fn TerminalView(id: u64, bin: String, ws: String, resume: Option<String>) -> Ele
                             for st in scan_agent_osc(&mut osc_acc) {
                                 let _ = agent_tx.send(st);
                             }
-                            if tx.send(buf[..n].to_vec()).is_err() {
+                            if tx.blocking_send(buf[..n].to_vec()).is_err() {
                                 break;
                             }
                         }
@@ -16283,6 +16774,7 @@ fn TerminalView(id: u64, bin: String, ws: String, resume: Option<String>) -> Ele
                 tokio::select! {
                     bytes = rx.recv() => match bytes {
                         Some(bytes) => {
+                            append_terminal_tail(id, &bytes);
                             let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
                             if eval.send(serde_json::Value::String(b64)).is_err() { break; }
                         }
@@ -16295,7 +16787,10 @@ fn TerminalView(id: u64, bin: String, ws: String, resume: Option<String>) -> Ele
                     msg = eval.recv::<String>() => match msg {
                         Ok(s) => {
                             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
-                                if let Some(inp) = v.get("inp").and_then(|x| x.as_str()) {
+                                if let Some(error) = v.get("error").and_then(|value| value.as_str()) {
+                                    future_error.set(format!("Terminal renderer failed: {error}"));
+                                    break;
+                                } else if let Some(inp) = v.get("inp").and_then(|x| x.as_str()) {
                                     let _ = writer.write_all(inp.as_bytes());
                                     let _ = writer.flush();
                                 } else if let Some(rc) = v.get("resize").and_then(|x| x.as_array()) {
@@ -16355,11 +16850,19 @@ fn TerminalView(id: u64, bin: String, ws: String, resume: Option<String>) -> Ele
                     },
                 }
             }
-            let _ = child.kill();
+            child.shutdown();
             TUI_AGENT_STATES.write().remove(&id);
+            TERMINAL_TAILS.write().remove(&id);
         }
     });
-    rsx! { div { id: "{host}", class: "wterm-host", tabindex: "0" } }
+    rsx! {
+        div { class: "terminal-surface",
+            div { id: "{host}", class: "wterm-host", tabindex: "0" }
+            if !terminal_error.read().is_empty() {
+                div { class: "terminal-error", "{terminal_error}" }
+            }
+        }
+    }
 }
 
 /// Commands into a ChatPane's own engine.
@@ -16900,8 +17403,10 @@ fn ui_value_display(value: Option<&serde_json::Value>) -> String {
 }
 
 #[component]
-fn ActivityStatus(running: bool, ok: bool) -> Element {
-    let label = if running {
+fn ActivityStatus(running: bool, ok: bool, #[props(default)] waiting: bool) -> Element {
+    let label = if waiting {
+        "Waiting for approval"
+    } else if running {
         "Running"
     } else if ok {
         "Completed"
@@ -16911,6 +17416,7 @@ fn ActivityStatus(running: bool, ok: bool) -> Element {
     rsx! {
         span { class: "activity-status", role: "status", aria_atomic: "true", aria_label: "{label}",
             UnicodeSpinner { class: "activity-spin" }
+            span { class: "activity-ic approval", aria_hidden: "true", Icon { name: "shield" } }
             span { class: "activity-ic ok", aria_hidden: "true", Icon { name: "check" } }
             span { class: "activity-ic fail", aria_hidden: "true", Icon { name: "x" } }
         }
@@ -16926,7 +17432,10 @@ fn ActivityRow(
     #[props(default)] auto_open: bool,
 ) -> Element {
     let view = activity_view(&text);
-    let state = if running {
+    let waiting = activity_waiting_for_approval(&text);
+    let state = if waiting {
+        "waiting-approval"
+    } else if running {
         "running"
     } else if ok {
         "done"
@@ -16945,7 +17454,8 @@ fn ActivityRow(
         view.output.lines().count()
     };
     let has_output = !view.output.is_empty();
-    let live_output = has_output && running && matches!(view.kind, ActivityKind::Command);
+    let live_output =
+        has_output && running && !waiting && matches!(view.kind, ActivityKind::Command);
     let output_cls = if live_output {
         "has-out live-output"
     } else if has_output {
@@ -16954,6 +17464,7 @@ fn ActivityRow(
         "no-out"
     };
     let cls = format!("{cls} {output_cls}");
+    let duration = format_thought_duration(secs);
     rsx! {
         div { class: "row activity",
             details { class: "{cls}", open: has_output && (auto_open || live_output),
@@ -16965,8 +17476,8 @@ fn ActivityRow(
                             event.prevent_default();
                         }
                     },
-                    ActivityStatus { running, ok }
-                    if running && secs >= 2 { span { class: "activity-secs", "{secs}s" } }
+                    ActivityStatus { running, ok, waiting }
+                    if running && !waiting && secs >= 2 { span { class: "activity-secs", "{duration}" } }
                     span { class: "activity-verb", "{view.verb}" }
                     if !view.detail.is_empty() { span { class: "activity-text", "{view.detail}" } }
                     if has_output {
@@ -17009,7 +17520,10 @@ fn EditActivityRow(
     #[props(default)] secs: u64,
 ) -> Element {
     let view = activity_view(&text);
-    let state = if running {
+    let waiting = activity_waiting_for_approval(&text);
+    let state = if waiting {
+        "waiting-approval"
+    } else if running {
         "running"
     } else if ok {
         "done"
@@ -17017,11 +17531,12 @@ fn EditActivityRow(
         "fail"
     };
     let cls = format!("activity-card {state} activity-{}", view.kind.class_name());
+    let duration = format_thought_duration(secs);
     rsx! {
         div { class: "row activity",
             div { class: "{cls}",
-                ActivityStatus { running, ok }
-                if running && secs >= 2 { span { class: "activity-secs", "{secs}s" } }
+                ActivityStatus { running, ok, waiting }
+                if running && !waiting && secs >= 2 { span { class: "activity-secs", "{duration}" } }
                 span { class: "activity-verb", "{view.verb}" }
                 if !view.detail.is_empty() { span { class: "activity-text", "{view.detail}" } }
                 if count > 1 { span { class: "activity-count", "×{count}" } }
@@ -18092,11 +18607,14 @@ fn Icon(name: &'static str) -> Element {
         },
         "pin" => rsx! { path { d: "M9 3h6l-1 6 3 3v2h-5v5l-1 2-1-2v-5H4v-2l3-3-1-6z" } },
         "brain" => rsx! {
-            path { d: "M9.5 4a2.5 2.5 0 0 1 2.5 2.5v10a2.5 2.5 0 0 1-4.96.44A2.5 2.5 0 0 1 4.5 14.5a3 3 0 0 1 .34-5.95A2.5 2.5 0 0 1 9.5 7.3Z" }
-            path { d: "M14.5 4A2.5 2.5 0 0 0 12 6.5v10a2.5 2.5 0 0 0 4.96.44A2.5 2.5 0 0 0 19.5 14.5a3 3 0 0 0-.34-5.95A2.5 2.5 0 0 0 14.5 7.3Z" }
-            path { d: "M3 13h4" }
-            path { d: "M17 13h4" }
-            path { d: "M8 9h8" }
+            path {
+                d: "M4.22222 21.9948V18.4451C4.22222 17.1737 3.88927 16.5128 3.23482 15.4078C2.4503 14.0833 2 12.5375 2 10.8866C2 5.97866 5.97969 2 10.8889 2C15.7981 2 19.7778 5.97866 19.7778 10.8866C19.7778 11.4663 19.7778 11.7562 19.802 11.9187C19.8598 12.3072 20.0411 12.6414 20.2194 12.9873L22 16.4407L20.6006 17.1402C20.195 17.3429 19.9923 17.4443 19.851 17.6314C19.7097 17.8184 19.67 18.0296 19.5904 18.4519L19.5826 18.4931C19.4004 19.4606 19.1993 20.5286 18.6329 21.2024C18.4329 21.4403 18.1853 21.6336 17.9059 21.7699C17.4447 21.9948 16.8777 21.9948 15.7437 21.9948C15.219 21.9948 14.6928 22.0069 14.1682 21.9942C12.9247 21.9639 12 20.9184 12 19.7044",
+                stroke_width: "1.5",
+            }
+            path {
+                d: "M14.388 10.5315C13.9617 10.5315 13.5729 10.3702 13.2784 10.1048M14.388 10.5315C14.388 11.6774 13.7241 12.7658 12.4461 12.7658C11.1681 12.7658 10.5043 13.8541 10.5043 15M14.388 10.5315C16.5373 10.5315 16.5373 7.18017 14.388 7.18017C14.1927 7.18017 14.0053 7.21403 13.8312 7.27624C13.9362 4.77819 10.3349 4.1 9.51923 6.44018M10.5043 8.29729C10.5043 7.52323 10.1133 6.8411 9.51923 6.44018M9.51923 6.44018C7.66742 5.19034 5.19883 7.4331 6.37324 9.43277C4.40226 9.72827 4.61299 12.7658 6.6205 12.7658C7.18344 12.7658 7.68111 12.4844 7.98234 12.0538",
+                stroke_width: "1.5",
+            }
         },
         "mic" => {
             rsx! { rect { x: "9", y: "3", width: "6", height: "11", rx: "3" } path { d: "M5 11a7 7 0 0 0 14 0M12 18v3" } }
