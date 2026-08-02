@@ -5158,8 +5158,10 @@ mod tests {
         )
         .unwrap();
 
-        let mut config = Config::default();
-        config.theme = "light".to_string();
+        let mut config = Config {
+            theme: "light".to_string(),
+            ..Config::default()
+        };
         config.mcp_servers.push(oxide_config::McpServerConfig {
             name: "merged-global-server".to_string(),
             command: "safe-server".to_string(),
@@ -5198,8 +5200,10 @@ mod tests {
         let not_a_directory = root.join("not-a-directory");
         write_atomic(&not_a_directory, "blocked\n").unwrap();
 
-        let mut config = Config::default();
-        config.theme = "light".to_string();
+        let config = Config {
+            theme: "light".to_string(),
+            ..Config::default()
+        };
         let error = persist_config_preferences_transaction(
             &workspace_path,
             &not_a_directory.join("config.toml"),
