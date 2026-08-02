@@ -780,8 +780,14 @@ fn validate_native_mcp_provider(server: &McpServerConfig) -> anyhow::Result<()> 
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let preset = SupabasePresetBuilder::new(project_ref)
-        .and_then(|builder| builder.read_only(read_only).feature_names(features))?
+    let builder = if project_ref.trim().is_empty() {
+        SupabasePresetBuilder::for_account()
+    } else {
+        SupabasePresetBuilder::new(project_ref)?
+    };
+    let preset = builder
+        .read_only(read_only)
+        .feature_names(features)?
         .build();
     let endpoint = reqwest::Url::parse(server.url.trim())?;
     if endpoint.scheme() != "https"
@@ -799,9 +805,19 @@ fn validate_native_mcp_provider(server: &McpServerConfig) -> anyhow::Result<()> 
         .map(|(key, value)| (key.into_owned(), value.into_owned()))
         .collect::<Vec<_>>();
     let query = pairs.iter().cloned().collect::<BTreeMap<_, _>>();
-    if pairs.len() != 3
-        || query.len() != 3
-        || query.get("project_ref").map(String::as_str) != Some(preset.project_ref())
+    let project_scope_matches = if preset.project_ref().is_empty() {
+        !query.contains_key("project_ref")
+    } else {
+        query.get("project_ref").map(String::as_str) == Some(preset.project_ref())
+    };
+    let expected_query_count = if preset.project_ref().is_empty() {
+        2
+    } else {
+        3
+    };
+    if pairs.len() != expected_query_count
+        || query.len() != expected_query_count
+        || !project_scope_matches
         || query.get("read_only").map(String::as_str)
             != Some(if preset.read_only() { "true" } else { "false" })
     {
@@ -9387,6 +9403,28 @@ mod map_test {
         let mut wrong_project = server;
         wrong_project.url = "https://mcp.supabase.com/mcp?project_ref=project-2&read_only=true&features=database%2Cdocs".to_string();
         assert!(super::validate_native_mcp_provider(&wrong_project).is_err());
+    }
+
+    #[test]
+    fn supabase_provider_accepts_official_account_oauth_endpoint() {
+        let server = McpServerConfig {
+            name: "supabase".to_string(),
+            url: "https://mcp.supabase.com/mcp?read_only=true&features=account%2Cdatabase%2Cdocs"
+                .to_string(),
+            provider: "supabase".to_string(),
+            auth_mode: McpAuthMode::OAuth,
+            auth_profile_id: "connection-1".to_string(),
+            provider_options: std::collections::BTreeMap::from([
+                ("read_only".to_string(), "true".to_string()),
+                ("features".to_string(), "account,database,docs".to_string()),
+            ]),
+            ..McpServerConfig::default()
+        };
+        assert!(super::validate_native_mcp_provider(&server).is_ok());
+
+        let mut injected_project = server;
+        injected_project.url = "https://mcp.supabase.com/mcp?project_ref=other&read_only=true&features=account%2Cdatabase%2Cdocs".to_string();
+        assert!(super::validate_native_mcp_provider(&injected_project).is_err());
     }
 
     #[test]

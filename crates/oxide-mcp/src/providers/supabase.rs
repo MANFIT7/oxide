@@ -74,7 +74,11 @@ impl SupabaseMcpPreset {
 
     /// Stable profile key for isolating OAuth credentials between projects.
     pub fn credential_profile_id(&self) -> String {
-        format!("supabase:{}", self.project_ref)
+        if self.project_ref.is_empty() {
+            "supabase:account".to_string()
+        } else {
+            format!("supabase:{}", self.project_ref)
+        }
     }
 }
 
@@ -86,6 +90,18 @@ pub struct SupabasePresetBuilder {
 }
 
 impl SupabasePresetBuilder {
+    pub fn for_account() -> Self {
+        Self {
+            project_ref: String::new(),
+            read_only: true,
+            features: BTreeSet::from([
+                SupabaseFeature::Account,
+                SupabaseFeature::Docs,
+                SupabaseFeature::Database,
+            ]),
+        }
+    }
+
     pub fn new(project_ref: impl Into<String>) -> Result<Self, SupabasePresetError> {
         let project_ref = project_ref.into();
         validate_project_ref(&project_ref)?;
@@ -138,11 +154,14 @@ impl SupabasePresetBuilder {
             .join(",");
         let mut endpoint = reqwest::Url::parse(SUPABASE_MCP_ENDPOINT)
             .expect("the built-in Supabase MCP endpoint is valid");
-        endpoint
-            .query_pairs_mut()
-            .append_pair("project_ref", &self.project_ref)
+        let mut query = endpoint.query_pairs_mut();
+        if !self.project_ref.is_empty() {
+            query.append_pair("project_ref", &self.project_ref);
+        }
+        query
             .append_pair("read_only", if self.read_only { "true" } else { "false" })
             .append_pair("features", &feature_names);
+        drop(query);
         SupabaseMcpPreset {
             project_ref: self.project_ref,
             read_only: self.read_only,
@@ -199,6 +218,23 @@ mod tests {
             Some("true")
         );
         assert_eq!(preset.credential_profile_id(), "supabase:abc123");
+    }
+
+    #[test]
+    fn account_preset_exposes_project_selection_without_a_project_ref() {
+        let preset = SupabasePresetBuilder::for_account().build();
+        let url = reqwest::Url::parse(preset.endpoint()).unwrap();
+        let query = url
+            .query_pairs()
+            .collect::<std::collections::BTreeMap<_, _>>();
+
+        assert!(!query.contains_key("project_ref"));
+        assert_eq!(
+            query.get("read_only").map(|value| value.as_ref()),
+            Some("true")
+        );
+        assert!(preset.features().contains(&SupabaseFeature::Account));
+        assert_eq!(preset.credential_profile_id(), "supabase:account");
     }
 
     #[test]

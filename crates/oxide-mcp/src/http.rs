@@ -1229,6 +1229,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_required_response_initializes_and_echoes_session_header() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for step in 0..3 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                requests.push(read_http_request(&mut socket).await);
+                let (status, extra_headers, body) = match step {
+                    0 => (
+                        "400 Bad Request",
+                        "",
+                        r#"{"message":"Mcp-Session-Id header is required for non-initialization requests"}"#.to_string(),
+                    ),
+                    1 => (
+                        "200 OK",
+                        "Mcp-Session-Id: supabase-session-123\r\n",
+                        format!(
+                            r#"{{"jsonrpc":"2.0","id":2,"result":{{"protocolVersion":"{}","capabilities":{{}}}}}}"#,
+                            crate::LEGACY_PROTOCOL_VERSION
+                        ),
+                    ),
+                    _ => ("202 Accepted", "", String::new()),
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\n{extra_headers}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+            requests
+        });
+
+        let client =
+            crate::McpClient::connect_http("wire-session-legacy", &format!("http://{address}/mcp"))
+                .await
+                .unwrap();
+        let requests = requests.await.unwrap();
+        let initialize = requests[1].split_once("\r\n\r\n").unwrap().1;
+        let initialized_headers = requests[2]
+            .split_once("\r\n\r\n")
+            .unwrap()
+            .0
+            .to_ascii_lowercase();
+
+        assert_eq!(client.lifecycle(), crate::McpLifecycle::LegacyInitialize);
+        assert_eq!(
+            serde_json::from_str::<Value>(initialize)
+                .unwrap()
+                .get("method"),
+            Some(&json!("initialize"))
+        );
+        assert!(initialized_headers.contains("mcp-session-id: supabase-session-123"));
+    }
+
+    #[tokio::test]
     async fn generic_http_failure_does_not_trigger_legacy_fallback() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();

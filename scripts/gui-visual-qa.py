@@ -1665,6 +1665,23 @@ def main() -> int:
         "Settings uses a desktop side rail and a discoverable compact horizontal fallback instead of a clipped hidden scrollbar",
     )
     require(
+        "Supabase catalog opens OAuth directly with optional project scoping",
+        contains_all(
+            gui,
+            [
+                "fn supabase_provider_url(",
+                '"account,database,docs"',
+                '"Connect with OAuth"',
+                '"Configure project scope"',
+                '"Project reference (optional)"',
+                "McpControlAction::Authorize",
+                "Event::McpAuthorizationUrl { name, url }",
+                "open_external_http_url(url.clone())",
+            ],
+        ),
+        "the primary action launches browser OAuth immediately while advanced setup can still pin one project",
+    )
+    require(
         "accessible chrome and dialogs",
         contains_all(
             gui,

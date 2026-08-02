@@ -4258,6 +4258,45 @@ mod tests {
     }
 
     #[test]
+    fn supabase_urls_support_direct_account_oauth_and_project_scoping() {
+        let account = reqwest::Url::parse(&supabase_provider_url("", true)).unwrap();
+        let account_query = account
+            .query_pairs()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert!(!account_query.contains_key("project_ref"));
+        assert_eq!(
+            account_query.get("features").map(|value| value.as_ref()),
+            Some("account,database,docs")
+        );
+
+        let project = reqwest::Url::parse(&supabase_provider_url("project-1", true)).unwrap();
+        let project_query = project
+            .query_pairs()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            project_query.get("project_ref").map(|value| value.as_ref()),
+            Some("project-1")
+        );
+        assert_eq!(
+            project_query.get("features").map(|value| value.as_ref()),
+            Some("database,docs")
+        );
+    }
+
+    #[test]
+    fn supabase_connection_names_skip_existing_suffixes() {
+        let servers = ["supabase", "supabase-2", "other"]
+            .into_iter()
+            .map(|name| oxide_config::McpServerConfig {
+                name: name.to_string(),
+                ..oxide_config::McpServerConfig::default()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(next_supabase_connection_name(&servers), "supabase-3");
+    }
+
+    #[test]
     fn local_server_filter_excludes_desktop_apps_and_ephemeral_ports() {
         assert!(!is_plausible_dev_server("Discord", 6463));
         assert!(!is_plausible_dev_server("Termius", 62601));
@@ -14328,6 +14367,82 @@ fn supabase_project_ref(server: &oxide_config::McpServerConfig) -> String {
         .unwrap_or_default()
 }
 
+fn supabase_feature_names(project_ref: &str) -> &'static str {
+    if project_ref.trim().is_empty() {
+        "account,database,docs"
+    } else {
+        "database,docs"
+    }
+}
+
+fn supabase_provider_url(project_ref: &str, read_only: bool) -> String {
+    let mut endpoint = reqwest::Url::parse("https://mcp.supabase.com/mcp")
+        .expect("the built-in Supabase MCP endpoint is valid");
+    let mut query = endpoint.query_pairs_mut();
+    if !project_ref.trim().is_empty() {
+        query.append_pair("project_ref", project_ref.trim());
+    }
+    query
+        .append_pair("read_only", if read_only { "true" } else { "false" })
+        .append_pair("features", supabase_feature_names(project_ref));
+    drop(query);
+    endpoint.into()
+}
+
+fn configured_supabase_server(
+    original: Option<oxide_config::McpServerConfig>,
+    connection_name: String,
+    project_ref: String,
+    read_only: bool,
+) -> oxide_config::McpServerConfig {
+    let previous_project = original
+        .as_ref()
+        .map(supabase_project_ref)
+        .unwrap_or_default();
+    let mut saved = original.unwrap_or_default();
+    saved.name = connection_name;
+    saved.command.clear();
+    saved.args.clear();
+    saved.url = supabase_provider_url(&project_ref, read_only);
+    saved.provider = "supabase".to_string();
+    saved.auth_mode = oxide_config::McpAuthMode::OAuth;
+    if saved.auth_profile_id.is_empty() || previous_project != project_ref {
+        saved.auth_profile_id = new_mcp_auth_profile_id("supabase");
+    }
+    saved.provider_options = std::collections::BTreeMap::from([
+        ("read_only".to_string(), read_only.to_string()),
+        (
+            "features".to_string(),
+            supabase_feature_names(&project_ref).to_string(),
+        ),
+    ]);
+    if !project_ref.is_empty() {
+        saved
+            .provider_options
+            .insert("project_ref".to_string(), project_ref);
+    }
+    saved.enabled = true;
+    saved.source.clear();
+    saved.external_ref = false;
+    saved.cwd.clear();
+    saved.env.clear();
+    saved.env_vars.clear();
+    saved.bearer_token_env_var.clear();
+    saved.http_headers.clear();
+    saved.env_http_headers.clear();
+    saved
+}
+
+fn next_supabase_connection_name(servers: &[oxide_config::McpServerConfig]) -> String {
+    if !servers.iter().any(|server| server.name == "supabase") {
+        return "supabase".to_string();
+    }
+    (2..)
+        .map(|suffix| format!("supabase-{suffix}"))
+        .find(|candidate| !servers.iter().any(|server| server.name == *candidate))
+        .expect("an available Supabase connection name exists")
+}
+
 fn apply_mcp_servers(
     cfg: Signal<Config>,
     engine: Coroutine<EngineCmd>,
@@ -14720,22 +14835,43 @@ fn McpModal(
                                         span { class: "mcp-catalog-state", "Available" }
                                     }
                                     h4 { "Supabase" }
-                                    p { "Database and documentation tools scoped to one project, authorized with OAuth." }
+                                    p { "Authorize in your browser, choose a Supabase organization, then use its projects." }
                                     ul {
-                                        li { Icon { name: "check" } "Read-only by default" }
+                                        li { Icon { name: "check" } "Read-only across the chosen organization" }
                                         li { Icon { name: "check" } "Tokens stored in system keychain" }
-                                        li { Icon { name: "check" } "No service-role key in config" }
+                                        li { Icon { name: "check" } "Project selection through account tools" }
                                     }
                                     button { class: "mcp-btn primary wide", onclick: move |_| {
+                                        let mut list = cfg.read().mcp_servers.clone();
+                                        let connection_name = next_supabase_connection_name(&list);
+                                        list.push(configured_supabase_server(
+                                            None,
+                                            connection_name.clone(),
+                                            String::new(),
+                                            true,
+                                        ));
+                                        list.sort_by(|left, right| left.name.cmp(&right.name));
+                                        apply_mcp_servers_with_followup(
+                                            cfg,
+                                            engine,
+                                            list,
+                                            connection_name,
+                                            McpControlAction::Authorize,
+                                        );
+                                        supabase_open.set(false);
+                                        manual_open.set(false);
+                                        active_section.set("installed".to_string());
+                                    }, "Connect with OAuth" }
+                                    button { class: "mcp-btn subtle wide", onclick: move |_| {
                                         supabase_open.set(true);
                                         manual_open.set(false);
                                         supabase_editing.set(None);
-                                        supabase_name.set(if cfg.read().mcp_servers.iter().any(|server| server.name == "supabase") { "supabase-2".to_string() } else { "supabase".to_string() });
+                                        supabase_name.set(next_supabase_connection_name(&cfg.read().mcp_servers));
                                         supabase_project.set(String::new());
                                         supabase_read_only.set(true);
                                         supabase_write_confirmed.set(false);
                                         supabase_message.set(String::new());
-                                    }, "Connect Supabase" }
+                                    }, "Configure project scope" }
                                 }
                                 article { class: "mcp-catalog-card",
                                     div { class: "mcp-catalog-top",
@@ -14768,7 +14904,7 @@ fn McpModal(
                                         div {
                                             span { class: "mcp-setup-kicker", if supabase_editing.read().is_some() { "Edit provider" } else { "New connection" } }
                                             h3 { "Connect Supabase" }
-                                            p { "Oxide stores only non-secret project settings here. OAuth credentials go to the system keychain." }
+                                            p { "Project scoping is optional. OAuth credentials go to the system keychain." }
                                         }
                                         button { class: "mcp-btn icon", aria_label: "Close Supabase setup", onclick: move |_| { supabase_open.set(false); supabase_message.set(String::new()); }, Icon { name: "x" } }
                                     }
@@ -14779,9 +14915,9 @@ fn McpModal(
                                             small { "Used as the MCP tool namespace." }
                                         }
                                         label { class: "mcp-field",
-                                            span { "Project reference" }
+                                            span { "Project reference (optional)" }
                                             input { value: "{supabase_project}", placeholder: "abcdefghijklmnopqrst", spellcheck: "false", oninput: move |event| supabase_project.set(event.value()) }
-                                            small { "Find it in Supabase project settings. This is not a secret." }
+                                            small { "Leave blank for read-only access to all projects in the organization selected during OAuth." }
                                         }
                                     }
                                     div { class: "mcp-permission-box",
@@ -14822,7 +14958,7 @@ fn McpModal(
                                                 supabase_message.set("Connection name may use letters, numbers, '-' or '_', but not '__'.".to_string());
                                                 return;
                                             }
-                                            if project_ref.is_empty() || !project_ref.chars().all(|value| value.is_ascii_alphanumeric() || value == '-' || value == '_') {
+                                            if !project_ref.chars().all(|value| value.is_ascii_alphanumeric() || value == '-' || value == '_') {
                                                 supabase_message.set("Enter a valid Supabase project reference.".to_string());
                                                 return;
                                             }
@@ -14840,34 +14976,15 @@ fn McpModal(
                                             if let Some(original) = original.as_ref() {
                                                 list.retain(|server| !(server.name == original.name && server.source == original.source));
                                             }
-                                            let previous_project = original.as_ref().map(supabase_project_ref).unwrap_or_default();
                                             let read_only = *supabase_read_only.read();
-                                            let provider_url = format!("https://mcp.supabase.com/mcp?project_ref={project_ref}&read_only={read_only}&features=database%2Cdocs");
+                                            let provider_url = supabase_provider_url(&project_ref, read_only);
                                             let needs_authorization = original.as_ref().map(|server| server.auth_profile_id.is_empty() || server.url != provider_url).unwrap_or(true);
-                                            let mut saved = original.unwrap_or_default();
-                                            saved.name = connection_name.clone();
-                                            saved.command.clear();
-                                            saved.args.clear();
-                                            saved.url = provider_url;
-                                            saved.provider = "supabase".to_string();
-                                            saved.auth_mode = oxide_config::McpAuthMode::OAuth;
-                                            if saved.auth_profile_id.is_empty() || previous_project != project_ref {
-                                                saved.auth_profile_id = new_mcp_auth_profile_id("supabase");
-                                            }
-                                            saved.provider_options = std::collections::BTreeMap::from([
-                                                ("project_ref".to_string(), project_ref.clone()),
-                                                ("read_only".to_string(), read_only.to_string()),
-                                                ("features".to_string(), "database,docs".to_string()),
-                                            ]);
-                                            saved.enabled = true;
-                                            saved.source.clear();
-                                            saved.external_ref = false;
-                                            saved.cwd.clear();
-                                            saved.env.clear();
-                                            saved.env_vars.clear();
-                                            saved.bearer_token_env_var.clear();
-                                            saved.http_headers.clear();
-                                            saved.env_http_headers.clear();
+                                            let saved = configured_supabase_server(
+                                                original,
+                                                connection_name.clone(),
+                                                project_ref,
+                                                read_only,
+                                            );
                                             list.push(saved);
                                             list.sort_by(|left, right| left.name.cmp(&right.name));
                                             let action = if needs_authorization { McpControlAction::Authorize } else { McpControlAction::Reconnect };

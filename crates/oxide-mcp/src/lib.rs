@@ -186,6 +186,16 @@ fn highest_mutual_legacy_version(error: &McpJsonRpcError) -> Option<&'static str
         })
 }
 
+fn requires_session_initialization(error: &anyhow::Error) -> bool {
+    let Some(HttpTransportError::Status { status: 400, body }) =
+        error.downcast_ref::<HttpTransportError>()
+    else {
+        return false;
+    };
+    let body = body.to_ascii_lowercase();
+    body.contains("mcp-session-id") && body.contains("required") && body.contains("initialization")
+}
+
 /// A connected MCP server, surfacing its tools to Oxide.
 pub struct McpClient {
     server: String,
@@ -292,7 +302,8 @@ impl McpClient {
             }
             Err(error)
                 if json_rpc_error_from_error(&error)
-                    .is_some_and(|error| error.code == METHOD_NOT_FOUND) =>
+                    .is_some_and(|error| error.code == METHOD_NOT_FOUND)
+                    || requires_session_initialization(&error) =>
             {
                 let (instructions, protocol_version) = self
                     .initialize_legacy_with_version(LEGACY_PROTOCOL_VERSION)
