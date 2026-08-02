@@ -131,7 +131,7 @@ impl HttpAuthChallenge {
 #[derive(Debug, thiserror::Error)]
 pub enum HttpTransportError {
     #[error("MCP HTTP authorization challenge ({status})", status = .0.status())]
-    Authentication(HttpAuthChallenge),
+    Authentication(Box<HttpAuthChallenge>),
     #[error("MCP HTTP OAuth token provider failed: {0}")]
     OAuthTokenProvider(#[source] OAuthCoordinatorError),
     #[error("MCP HTTP token provider failed: {0}")]
@@ -147,7 +147,7 @@ pub enum HttpTransportError {
 /// Extract a typed authentication challenge from an `anyhow` transport error.
 pub fn auth_challenge_from_error(error: &anyhow::Error) -> Option<&HttpAuthChallenge> {
     match error.downcast_ref::<HttpTransportError>() {
-        Some(HttpTransportError::Authentication(challenge)) => Some(challenge),
+        Some(HttpTransportError::Authentication(challenge)) => Some(challenge.as_ref()),
         _ => None,
     }
 }
@@ -376,14 +376,10 @@ impl HttpTransport {
                 status,
                 reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
             ) {
-                return Err(
-                    HttpTransportError::Authentication(HttpAuthChallenge::from_response(
-                        status,
-                        www_authenticate,
-                        &self.url,
-                    ))
-                    .into(),
-                );
+                return Err(HttpTransportError::Authentication(Box::new(
+                    HttpAuthChallenge::from_response(status, www_authenticate, &self.url),
+                ))
+                .into());
             }
             if let Some(error) = non_success_json_rpc_error(&body, want_id) {
                 return Err(error.into());
@@ -686,7 +682,8 @@ fn value_at_argument_path<'a>(arguments: &'a Value, path: &[String]) -> Option<&
 fn safe_integer_header_value(value: &Value) -> Option<String> {
     const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
     if let Some(value) = value.as_i64() {
-        return (value >= -MAX_SAFE_INTEGER && value <= MAX_SAFE_INTEGER)
+        return (-MAX_SAFE_INTEGER..=MAX_SAFE_INTEGER)
+            .contains(&value)
             .then(|| value.to_string());
     }
     value
