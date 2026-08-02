@@ -332,8 +332,8 @@ jobs:
           release_utc="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
           release_local="$(TZ=Asia/Makassar date '+%Y-%m-%d %H:%M:%S WITA')"
           run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          short_sha="$(git rev-parse --short "$TAG")"
-          full_sha="$(git rev-parse "$TAG")"
+          short_sha="$(git rev-parse --short "${TAG}^{commit}")"
+          full_sha="$(git rev-parse "${TAG}^{commit}")"
 
           {
             echo "Built by GitHub Actions on ${release_local} (${release_utc})."
