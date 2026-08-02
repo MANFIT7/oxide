@@ -1968,7 +1968,7 @@ enum BrowserToolOutcome {
 }
 
 enum BrowserLaunchOutcome {
-    Launched(anyhow::Result<browser::BrowserSession>),
+    Launched(anyhow::Result<Box<browser::BrowserSession>>),
     TimedOut,
     Controlled(BrowserControlAction),
 }
@@ -2772,13 +2772,13 @@ impl Engine {
                 }
                 result = tokio::time::timeout(std::time::Duration::from_secs(20), launch) => {
                     match result {
-                        Ok(result) => BrowserLaunchOutcome::Launched(result),
+                        Ok(result) => BrowserLaunchOutcome::Launched(result.map(Box::new)),
                         Err(_) => BrowserLaunchOutcome::TimedOut,
                     }
                 }
             };
             match outcome {
-                BrowserLaunchOutcome::Launched(Ok(session)) => self.browser = Some(session),
+                BrowserLaunchOutcome::Launched(Ok(session)) => self.browser = Some(*session),
                 BrowserLaunchOutcome::Launched(Err(error)) => {
                     return Err(format!(
                         "browser launch failed: {error} (is a Chromium-based browser installed?)"
