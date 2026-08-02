@@ -6071,6 +6071,9 @@ fn app() -> Element {
     let mut show_shortcuts = use_signal(|| false);
     // Cursor-style icon rail: sidebar collapses to a thin strip.
     let mut sidebar_collapsed = use_signal(|| false);
+    // Compact layouts can promote the rail into an overlay drawer. CSS owns the
+    // breakpoint; this signal only exposes deterministic open/closed markup.
+    let mut sidebar_drawer_open = use_signal(|| false);
     // Sidebar segmented tabs: thread history, workspace memory graph, or tools.
     let mut sidebar_tab = use_signal(|| "threads".to_string());
     // Induk sub-agent yang anak-anaknya dilipat di sidebar (Synara:
@@ -6177,6 +6180,7 @@ fn app() -> Element {
     let brain_loading = use_signal(|| false);
     let brain_error = use_signal(|| None::<String>);
     let mut session_menu = use_signal(|| None::<PathBuf>);
+    let mut session_menu_pos = use_signal(|| (16.0f64, 16.0f64));
     // Per-project visible session count. Default is 5; Show more reveals
     // another page so long histories expand gradually.
     let mut project_session_pages = use_signal(HashMap::<String, usize>::new);
@@ -6517,9 +6521,20 @@ fn app() -> Element {
                     show_shortcuts.set(v);
                 }
                 Ok(k) if k == "esc" => {
+                    let drawer_was_open = *sidebar_drawer_open.read();
                     show_palette.set(false);
                     show_shortcuts.set(false);
                     chat_img.set(None);
+                    sidebar_drawer_open.set(false);
+                    session_menu.set(None);
+                    if drawer_was_open {
+                        spawn(async move {
+                            let _ = dioxus::document::eval(
+                                "requestAnimationFrame(()=>document.getElementById('mobile-sidebar-toggle')?.focus())",
+                            )
+                            .await;
+                        });
+                    }
                 }
                 Ok(_) => {}
                 Err(_) => break,
@@ -9280,15 +9295,26 @@ fn app() -> Element {
                 }
             },
             // ── Sidebar ────────────────────────────────────────────────
-            aside { class: {
-                    let base = if *sidebar_collapsed.read() { "sidebar collapsed" } else { "sidebar" };
+            aside { id: "primary-sidebar", class: {
+                    let collapsed_class = if *sidebar_collapsed.read() { "sidebar collapsed" } else { "sidebar" };
+                    let base = if *sidebar_drawer_open.read() {
+                        format!("{collapsed_class} drawer-open")
+                    } else {
+                        collapsed_class.to_string()
+                    };
                     match sidebar_tab.read().as_str() {
                         "workspace" => format!("{base} ws-mode"),
                         "brain" => format!("{base} brain-mode"),
-                        _ => base.to_string(),
+                        _ => base,
                     }
                 },
+                aria_label: "Primary navigation",
                 style: if *sidebar_collapsed.read() { String::new() } else { format!("width:{}px", *sidebar_w.read()) },
+                onkeydown: move |event| {
+                    if event.key() == Key::Escape && *sidebar_drawer_open.read() {
+                        sidebar_drawer_open.set(false);
+                    }
+                },
                 oncontextmenu: move |e: dioxus::prelude::MouseEvent| { e.prevent_default(); let c = e.client_coordinates(); theme_menu_pos.set((c.x, c.y)); session_menu.set(None); show_theme_menu.set(true); },
                 if *show_theme_menu.read() {
                     div { class: "menu-backdrop", onclick: move |_| show_theme_menu.set(false) }
@@ -9382,29 +9408,64 @@ fn app() -> Element {
                 }
                 div { class: "brand",
                     button {
-                        class: "logo-btn",
-                        title: "Collapse or expand sidebar",
-                        aria_label: "Collapse or expand sidebar",
-                        onclick: move |_| { let v = *sidebar_collapsed.read(); sidebar_collapsed.set(!v); },
+                        class: "logo-btn desktop-sidebar-toggle",
+                        title: if *sidebar_collapsed.read() { "Expand sidebar" } else { "Collapse sidebar" },
+                        aria_label: if *sidebar_collapsed.read() { "Expand sidebar" } else { "Collapse sidebar" },
+                        aria_controls: "primary-sidebar",
+                        aria_expanded: if *sidebar_collapsed.read() { "false" } else { "true" },
+                        "data-tooltip": if *sidebar_collapsed.read() { "Expand sidebar" } else { "Collapse sidebar" },
+                        onclick: move |_| {
+                            let collapsed = *sidebar_collapsed.read();
+                            sidebar_collapsed.set(!collapsed);
+                        },
+                        img { class: "logo", src: logo_uri(), alt: "" }
+                    }
+                    button {
+                        id: "mobile-sidebar-toggle",
+                        class: "logo-btn mobile-sidebar-toggle",
+                        title: if *sidebar_drawer_open.read() { "Close sidebar" } else { "Open sidebar" },
+                        aria_label: if *sidebar_drawer_open.read() { "Close sidebar" } else { "Open sidebar" },
+                        aria_controls: "primary-sidebar",
+                        aria_expanded: if *sidebar_drawer_open.read() { "true" } else { "false" },
+                        "data-tooltip": if *sidebar_drawer_open.read() { "Close sidebar" } else { "Open sidebar" },
+                        onclick: move |_| {
+                            let open = *sidebar_drawer_open.read();
+                            sidebar_drawer_open.set(!open);
+                            if !open {
+                                sidebar_collapsed.set(false);
+                            }
+                        },
                         img { class: "logo", src: logo_uri(), alt: "" }
                     }
                     span { class: "brand-name", "Oxide" }
                 }
                 // Keep the primary switch compact; durable knowledge lives below Search.
-                div { class: "side-seg",
-                    button { class: if sidebar_tab.read().as_str() != "workspace" { "on" } else { "" },
+                div { class: "side-seg", role: "group", aria_label: "Sidebar view",
+                    button {
+                        class: if sidebar_tab.read().as_str() == "threads" { "on" } else { "" },
+                        aria_pressed: if sidebar_tab.read().as_str() == "threads" { "true" } else { "false" },
                         onclick: move |_| {
                             show_board.set(false);
                             sidebar_tab.set("threads".to_string());
+                            sidebar_drawer_open.set(false);
                         }, "Threads" }
-                    button { class: if *sidebar_tab.read() == "workspace" { "on" } else { "" },
-                        onclick: move |_| sidebar_tab.set("workspace".to_string()), "Workspace" }
+                    button {
+                        class: if *sidebar_tab.read() == "workspace" { "on" } else { "" },
+                        aria_pressed: if *sidebar_tab.read() == "workspace" { "true" } else { "false" },
+                        onclick: move |_| {
+                            show_board.set(false);
+                            sidebar_tab.set("workspace".to_string());
+                            sidebar_drawer_open.set(false);
+                        },
+                        "Workspace"
+                    }
                 }
-                nav { class: "nav",
-                    button { class: "nav-item", onclick: move |_| {
+                nav { class: "nav", aria_label: "Workspace actions",
+                    button { class: "nav-item", title: "New chat", aria_label: "New chat", "data-tooltip": "New chat", onclick: move |_| {
                             // Reset to a fresh chat: clear transcript, close panels, reset the engine session.
                             show_board.set(false);
                             sidebar_tab.set("threads".to_string());
+                            sidebar_drawer_open.set(false);
                             let mut op = ui.open_path; op.set(None);
                             messages.write().clear();
                             thinking.set(String::new());
@@ -9423,15 +9484,25 @@ fn app() -> Element {
                             }
                             engine.send(EngineCmd::Reconfigure(cfg.read().clone()));
                         },
-                        Icon { name: "edit" } span { "New chat" }
+                        Icon { name: "edit" } span { class: "nav-label", "New chat" }
                     }
-                    button { class: "nav-item", onclick: move |_| { show_palette.set(true); palette_query.set(String::new()); palette_sel.set(0); },
-                        Icon { name: "search" } span { "Search" }
+                    button { class: "nav-item", title: "Search", aria_label: "Search chats and files", "data-tooltip": "Search", onclick: move |_| {
+                            sidebar_drawer_open.set(false);
+                            show_palette.set(true);
+                            palette_query.set(String::new());
+                            palette_sel.set(0);
+                        },
+                        Icon { name: "search" } span { class: "nav-label", "Search" }
                     }
                     button {
                         class: if *sidebar_tab.read() == "brain" { "nav-item brain-nav on" } else { "nav-item brain-nav" },
+                        title: "Brain",
+                        aria_label: "Open workspace Brain",
+                        "data-tooltip": "Brain",
+                        aria_current: if *sidebar_tab.read() == "brain" { "page" } else { "false" },
                         onclick: move |_| {
                             show_board.set(false);
+                            sidebar_drawer_open.set(false);
                             show_split.set(false);
                             show_env.set(false);
                             load_brain_snapshot(
@@ -9444,29 +9515,58 @@ fn app() -> Element {
                             );
                             sidebar_tab.set("brain".to_string());
                         },
-                        Icon { name: "brain" } span { "Brain" }
+                        Icon { name: "brain" } span { class: "nav-label", "Brain" }
                     }
-                    button { class: "nav-item ws-item", onclick: move |_| show_mcp.set(true),
-                        if let Some(l) = provider_logo("mcp") { span { class: "nav-logo", dangerous_inner_html: l } } else { Icon { name: "plugins" } }
-                        span { "MCP" }
+                    button { class: "nav-item ws-item", title: "MCP servers", aria_label: "Manage MCP servers", "data-tooltip": "MCP", onclick: move |_| {
+                            sidebar_tab.set("workspace".to_string());
+                            sidebar_drawer_open.set(false);
+                            show_mcp.set(true);
+                        },
+                        if let Some(l) = provider_logo("mcp") {
+                            span {
+                                class: "nav-logo",
+                                aria_hidden: "true",
+                                dangerous_inner_html: l,
+                            }
+                        } else { Icon { name: "plugins" } }
+                        span { class: "nav-label", "MCP" }
                     }
-                    button { class: "nav-item ws-item", onclick: move |_| show_skills.set(true),
-                        Icon { name: "target" } span { "Skills" }
+                    button { class: "nav-item ws-item", title: "Skills", aria_label: "Manage skills", "data-tooltip": "Skills", onclick: move |_| {
+                            sidebar_tab.set("workspace".to_string());
+                            sidebar_drawer_open.set(false);
+                            show_skills.set(true);
+                        },
+                        Icon { name: "spark" } span { class: "nav-label", "Skills" }
                     }
-                    button { class: if *show_board.read() { "nav-item ws-item on" } else { "nav-item ws-item" }, onclick: move |_| { let v = *show_board.read(); show_board.set(!v); },
-                        Icon { name: "list" } span { "Board" }
+                    button {
+                        class: if *show_board.read() { "nav-item ws-item on" } else { "nav-item ws-item" },
+                        title: "Board",
+                        aria_label: "Open task board",
+                        "data-tooltip": "Board",
+                        aria_pressed: if *show_board.read() { "true" } else { "false" },
+                        onclick: move |_| {
+                            let v = *show_board.read();
+                            sidebar_tab.set("workspace".to_string());
+                            sidebar_drawer_open.set(false);
+                            show_board.set(!v);
+                        },
+                        Icon { name: "kanban" } span { class: "nav-label", "Board" }
                     }
-                    button { class: "nav-item ws-item", onclick: move |_| {
+                    button { class: "nav-item ws-item", title: "Automations", aria_label: "Manage automations", "data-tooltip": "Automations", onclick: move |_| {
+                            sidebar_tab.set("workspace".to_string());
+                            sidebar_drawer_open.set(false);
                             settings_initial_tab.set("automations".to_string());
                             show_settings.set(true);
                         },
-                        Icon { name: "clock" } span { "Automations" }
+                        Icon { name: "automation" } span { class: "nav-label", "Automations" }
                     }
                 }
-                div { class: "section-row",
-                    span { class: "section-label", "Projects" }
-                    button { class: "section-add", title: "Open folder", onclick: move |_| open_folder(cfg, ui, engine),
-                        Icon { name: "plus" }
+                if !*sidebar_collapsed.read() {
+                    div { class: "section-row",
+                        span { class: "section-label", "Projects" }
+                        button { class: "section-add", title: "Open folder", aria_label: "Open folder", onclick: move |_| open_folder(cfg, ui, engine),
+                            Icon { name: "plus" }
+                        }
                     }
                 }
                 div { class: "projects",
@@ -9495,18 +9595,22 @@ fn app() -> Element {
                                             let anchor_class = if restored_sessions.read().contains(&p_str) { "thread-anchor restored" } else { "thread-anchor" };
                                             rsx! {
                                                 div { class: "{anchor_class}",
-                                                    div { class: "row-actions",
-                                                        button { class: "row-act-btn pinned", title: "Unpin", onclick: move |e: dioxus::prelude::MouseEvent| { e.stop_propagation(); toggle_pin(cfg, &p_pin); sessions_refresh.set(sessions_refresh() + 1); }, Icon { name: "pin" } }
-                                                    }
-                                                    div { class: "thread recent",
-                                                        onclick: move |_| { show_board.set(false); open_session_tab(tabs, active_tab, messages, next_tab_id, cfg, ui, engine, busy_tabs, transcript_turn_limits, session_open_seq, p_open.clone(), t_open.clone()); },
+                                                    button { class: "thread recent",
+                                                        aria_label: "Open pinned session {title}",
+                                                        onclick: move |_| {
+                                                            sidebar_drawer_open.set(false);
+                                                            show_board.set(false);
+                                                            open_session_tab(tabs, active_tab, messages, next_tab_id, cfg, ui, engine, busy_tabs, transcript_turn_limits, session_open_seq, p_open.clone(), t_open.clone());
+                                                        },
                                                         span { class: "thread-title", title: "{title}", "{title}" }
+                                                    }
+                                                    div { class: "row-actions",
+                                                        button { class: "row-act-btn pinned", title: "Unpin", aria_label: "Unpin session", onclick: move |e: dioxus::prelude::MouseEvent| { e.stop_propagation(); toggle_pin(cfg, &p_pin); sessions_refresh.set(sessions_refresh() + 1); }, Icon { name: "pin" } }
                                                     }
                                                 }
                                             }
                                         }
                                     }
-                                    div { class: "section-label", "Projects" }
                                 }
                             }
                         }
@@ -9523,12 +9627,20 @@ fn app() -> Element {
                                 let can_show_more = shown < total;
                                 let show_more_label = if can_show_more { "Show more" } else { "Show less" };
                                 let pws_switch = pws.clone();
+                                let project_busy = is_current && (*streaming.read() || !busy_tabs.read().is_empty());
+                                let project_aria_label = match (is_current, project_busy) {
+                                    (true, true) => format!("Project {pname}, current, agent working"),
+                                    (true, false) => format!("Project {pname}, current"),
+                                    (false, _) => format!("Switch to project {pname}"),
+                                };
                                 rsx! {
                                   div { key: "{pkey}", class: "project-group",
                                     div { class: if is_current { "project current" } else { "project" },
-                                        title: if is_current { "" } else { "Switch to this project" },
-                                        onclick: move |_| { if !is_current { apply_workspace(cfg, ui, engine, pws_switch.clone()); } },
-                                        span { class: if collapsed { "proj-caret closed" } else { "proj-caret" },
+                                        button {
+                                            class: if collapsed { "proj-caret closed" } else { "proj-caret" },
+                                            title: if collapsed { "Expand project sessions" } else { "Collapse project sessions" },
+                                            aria_label: if collapsed { "Expand project sessions" } else { "Collapse project sessions" },
+                                            aria_expanded: if collapsed { "false" } else { "true" },
                                             onclick: move |e: dioxus::prelude::MouseEvent| {
                                                 e.stop_propagation();
                                                 let mut c = collapsed_projects.write();
@@ -9536,9 +9648,21 @@ fn app() -> Element {
                                             },
                                             Icon { name: "chevron" }
                                         }
-                                        Icon { name: "folder" }
-                                        span { class: "project-name", "{pname}" }
-                                        button { class: "project-del", title: "Remove this project's chats from the list",
+                                        button {
+                                            class: "project-main",
+                                            title: if is_current { "Current project" } else { "Switch to this project" },
+                                            aria_label: "{project_aria_label}",
+                                            aria_current: if is_current { "page" } else { "false" },
+                                            onclick: move |_| {
+                                                sidebar_drawer_open.set(false);
+                                                if !is_current {
+                                                    apply_workspace(cfg, ui, engine, pws_switch.clone());
+                                                }
+                                            },
+                                            Icon { name: "folder" }
+                                            span { class: "project-name", "{pname}" }
+                                        }
+                                        button { class: "project-del", title: "Remove this project's chats from the list", aria_label: "Hide project chats",
                                             onclick: {
                                                 let pdel = pws.clone();
                                                 move |e: dioxus::prelude::MouseEvent| {
@@ -9578,9 +9702,10 @@ fn app() -> Element {
                                         // Anchored next to the + button (not floating mid-row
                                         // after the flexible name) so busy state reads as part
                                         // of the header's control cluster.
-                                        if is_current && (*streaming.read() || !busy_tabs.read().is_empty()) { span { class: "syn-spinner" } }
-                                        button { class: "project-add", title: "New chat here", onclick: move |e: dioxus::prelude::MouseEvent| {
+                                        if project_busy { span { class: "syn-spinner", aria_hidden: "true" } }
+                                        button { class: "project-add", title: "New chat here", aria_label: "New chat in project", onclick: move |e: dioxus::prelude::MouseEvent| {
                                                 e.stop_propagation();
+                                                sidebar_drawer_open.set(false);
                                                 show_board.set(false);
                                                 if !is_current { apply_workspace(cfg, ui, engine, pws.clone()); }
                                                 let mut op = ui.open_path; op.set(None);
@@ -9609,16 +9734,48 @@ fn app() -> Element {
                                                 let tab_status_class_name = tab_status.as_ref().map(tab_status_class).unwrap_or("");
                                                 let tab_status_label_text = tab_status.as_ref().map(tab_status_label).unwrap_or("");
                                                 let editing = *renaming_tab.read() == Some(id);
+                                                let unread = !busy && unread_tabs.read().contains(&id);
+                                                let accessible_status = if busy || tui_state == "running" {
+                                                    "Working"
+                                                } else if tui_state == "attention" {
+                                                    "Needs permission"
+                                                } else if tui_state == "review" {
+                                                    "Turn finished, ready for review"
+                                                } else if unread {
+                                                    "Finished while backgrounded"
+                                                } else {
+                                                    tab_status_label_text
+                                                };
                                                 let ttl_dc = ttl.clone();
                                                 rsx! {
                                                     div { key: "tab{id}", class: if is_active { "thread active" } else { "thread" },
-                                                        onclick: move |_| { unread_tabs.write().remove(&id); show_board.set(false); switch_tab(tabs, active_tab, messages, cfg, engine, i); },
+                                                        role: if editing { "group" } else { "button" },
+                                                        tabindex: if editing { "-1" } else { "0" },
+                                                        aria_label: "{ttl}",
+                                                        aria_current: if is_active { "page" } else { "false" },
+                                                        aria_busy: if busy || tui_state == "running" { "true" } else { "false" },
+                                                        onclick: move |_| {
+                                                            sidebar_drawer_open.set(false);
+                                                            unread_tabs.write().remove(&id);
+                                                            show_board.set(false);
+                                                            switch_tab(tabs, active_tab, messages, cfg, engine, i);
+                                                        },
+                                                        onkeydown: move |event| {
+                                                            let key = event.key();
+                                                            if !editing && (key == Key::Enter || key == Key::Character(" ".to_string())) {
+                                                                event.prevent_default();
+                                                                sidebar_drawer_open.set(false);
+                                                                unread_tabs.write().remove(&id);
+                                                                show_board.set(false);
+                                                                switch_tab(tabs, active_tab, messages, cfg, engine, i);
+                                                            }
+                                                        },
                                                         ondoubleclick: move |_| { rename_text.set(ttl_dc.clone()); renaming_tab.set(Some(id)); },
-                                                        span { class: "sess-branch", Icon { name: "branch" } }
-                                                        if busy || tui_state == "running" { span { class: "syn-spinner" } }
-                                                        else if tui_state == "attention" { span { class: "tab-agent-dot attention", title: "Needs permission" } }
-                                                        else if tui_state == "review" { span { class: "tab-agent-dot review", title: "Turn finished — review" } }
-                                                        else if let Some(l) = logo { span { class: "tab-prov", dangerous_inner_html: l } }
+                                                        span { class: "sess-branch", aria_hidden: "true", Icon { name: "branch" } }
+                                                        if busy || tui_state == "running" { span { class: "syn-spinner", aria_hidden: "true" } }
+                                                        else if tui_state == "attention" { span { class: "tab-agent-dot attention", title: "Needs permission", aria_hidden: "true" } }
+                                                        else if tui_state == "review" { span { class: "tab-agent-dot review", title: "Turn finished — review", aria_hidden: "true" } }
+                                                        else if let Some(l) = logo { span { class: "tab-prov", aria_hidden: "true", dangerous_inner_html: l } }
                                                         if editing {
                                                             input { class: "rename-input", value: "{rename_text}", autofocus: true,
                                                                 oninput: move |e| rename_text.set(e.value()),
@@ -9637,14 +9794,23 @@ fn app() -> Element {
                                                                 span { class: "tab-verb", title: "{v}", "{v}" }
                                                             }
                                                         }
-                                                        if !busy && unread_tabs.read().contains(&id) {
-                                                            span { class: "unread-dot", title: "Finished while backgrounded" }
+                                                        if unread {
+                                                            span { class: "unread-dot", title: "Finished while backgrounded", aria_hidden: "true" }
                                                         }
                                                         if tab_status.is_some() {
                                                             span {
                                                                 class: "tab-state {tab_status_class_name}",
                                                                 title: "{tab_status_label_text}",
+                                                                aria_hidden: "true",
                                                                 "{tab_status_label_text}"
+                                                            }
+                                                        }
+                                                        if !accessible_status.is_empty() {
+                                                            span {
+                                                                class: "sr-only",
+                                                                role: "status",
+                                                                aria_live: "polite",
+                                                                "{accessible_status}"
                                                             }
                                                         }
                                                     }
@@ -9668,15 +9834,17 @@ fn app() -> Element {
                                         .take(if collapsed { 0 } else { shown }).cloned() {
                                         {
                                             let p_open = path.clone();
-                                            let p_dbl = path.clone();
+                                            let p_key = path.clone();
+                                            let p_context = path.clone();
+                                            let p_more = path.clone();
                                             let p_del = path.clone();
                                             let p_arch = path.clone();
-                                            let p_arch2 = path.clone();
                                             let t_open = title.clone();
+                                            let t_key = title.clone();
                                             let menu_open = session_menu.read().as_ref() == Some(&path);
+                                            let menu_pos = *session_menu_pos.read();
                                             let path_str = path.display().to_string();
                                             let path_str_pin = path_str.clone();
-                                            let path_str_archive = path_str.clone();
                                             let path_str_menu_archive = path_str.clone();
                                             let is_pinned = pinned_ids.contains(&path_str);
                                             let n_children = child_counts.get(&path_str).copied().unwrap_or(0);
@@ -9687,41 +9855,65 @@ fn app() -> Element {
                                                 div { class: "{anchor_class}",
                                                     div { class: "row-actions",
                                                         button { class: if is_pinned { "row-act-btn pinned" } else { "row-act-btn" }, title: if is_pinned { "Unpin" } else { "Pin" },
+                                                            aria_label: if is_pinned { "Unpin session" } else { "Pin session" },
                                                             onclick: move |e: dioxus::prelude::MouseEvent| { e.stop_propagation(); toggle_pin(cfg, &path_str_pin); sessions_refresh.set(sessions_refresh() + 1); }, Icon { name: "pin" } }
-                                                        button { class: "row-act-btn", title: "Archive", onclick: move |e: dioxus::prelude::MouseEvent| {
-                                                            e.stop_propagation();
-                                                            archive_session(&p_arch2);
-                                                            sessions_refresh.set(sessions_refresh() + 1);
-                                                            refresh_projects_list(projects_list, cfg);
-                                                            push_action_toast(
-                                                                toasts,
-                                                                toast_seq,
-                                                                "info",
-                                                                "Session archived",
-                                                                "Restore",
-                                                                ToastAction::RestoreSessions(vec![path_str_archive.clone()]),
-                                                            );
-                                                        }, Icon { name: "archive" } }
-                                                        // Delete is non-destructive here — the visible row action only
-                                                        // archives (hides). Permanent delete lives in the right-click
-                                                        // menu and in Settings / Archived sessions, so a stray click
-                                                        // never destroys a CLI-backed session.
+                                                        button {
+                                                            class: "row-act-btn",
+                                                            title: "More session actions",
+                                                            aria_label: "More session actions",
+                                                            aria_haspopup: "true",
+                                                            aria_expanded: if menu_open { "true" } else { "false" },
+                                                            onclick: move |event: dioxus::prelude::MouseEvent| {
+                                                                event.stop_propagation();
+                                                                let coordinates = event.client_coordinates();
+                                                                session_menu_pos.set((coordinates.x, coordinates.y + 8.0));
+                                                                show_theme_menu.set(false);
+                                                                let current = session_menu.read().clone();
+                                                                session_menu.set(if current.as_ref() == Some(&p_more) { None } else { Some(p_more.clone()) });
+                                                            },
+                                                            Icon { name: "more" }
+                                                        }
                                                     }
                                                     div { class: if sparent.is_empty() { "thread recent sub" } else { "thread recent sub subchild" },
-                                                        title: "right-click / double-click for options",
-                                                        onclick: move |_| { show_board.set(false); open_session_tab(tabs, active_tab, messages, next_tab_id, cfg, ui, engine, busy_tabs, transcript_turn_limits, session_open_seq, p_open.clone(), t_open.clone()); },
-                                                        oncontextmenu: {
-                                                            let p = p_dbl.clone();
-                                                            move |e: dioxus::prelude::MouseEvent| { e.prevent_default(); e.stop_propagation(); show_theme_menu.set(false); session_menu.set(Some(p.clone())); }
+                                                        title: "Open session; right-click for actions",
+                                                        role: "button",
+                                                        tabindex: "0",
+                                                        aria_label: "Open session {title}",
+                                                        onclick: move |_| {
+                                                            sidebar_drawer_open.set(false);
+                                                            show_board.set(false);
+                                                            open_session_tab(tabs, active_tab, messages, next_tab_id, cfg, ui, engine, busy_tabs, transcript_turn_limits, session_open_seq, p_open.clone(), t_open.clone());
                                                         },
-                                                        ondoubleclick: move |_| { let cur = session_menu.read().clone(); session_menu.set(if cur.as_ref() == Some(&p_dbl) { None } else { Some(p_dbl.clone()) }); },
-                                                        span { class: "sess-branch", Icon { name: "branch" } }
-                                                        if let Some(l) = provider_logo(&sprov) { span { class: "sess-logo prov-logo", dangerous_inner_html: l } }
+                                                        onkeydown: move |event| {
+                                                            let key = event.key();
+                                                            if key == Key::Enter || key == Key::Character(" ".to_string()) {
+                                                                event.prevent_default();
+                                                                sidebar_drawer_open.set(false);
+                                                                show_board.set(false);
+                                                                open_session_tab(tabs, active_tab, messages, next_tab_id, cfg, ui, engine, busy_tabs, transcript_turn_limits, session_open_seq, p_key.clone(), t_key.clone());
+                                                            }
+                                                        },
+                                                        oncontextmenu: {
+                                                            let p = p_context.clone();
+                                                            move |e: dioxus::prelude::MouseEvent| {
+                                                                e.prevent_default();
+                                                                e.stop_propagation();
+                                                                let coordinates = e.client_coordinates();
+                                                                session_menu_pos.set((coordinates.x, coordinates.y));
+                                                                show_theme_menu.set(false);
+                                                                session_menu.set(Some(p.clone()));
+                                                            }
+                                                        },
+                                                        span { class: "sess-branch", aria_hidden: "true", Icon { name: "branch" } }
+                                                        if let Some(l) = provider_logo(&sprov) { span { class: "sess-logo prov-logo", aria_hidden: "true", dangerous_inner_html: l } }
                                                     span { class: "thread-title", title: "{title}", "{title}" }
                                                         // Synara: lipat/buka anak sub-agent dari baris induknya.
                                                         if n_children > 0 {
                                                             button { class: if kids_collapsed { "sub-toggle folded" } else { "sub-toggle" },
                                                                 title: if kids_collapsed { "Show subagents" } else { "Hide subagents" },
+                                                                aria_label: if kids_collapsed { format!("Show {n_children} subagents") } else { format!("Hide {n_children} subagents") },
+                                                                aria_expanded: if kids_collapsed { "false" } else { "true" },
+                                                                onkeydown: move |event| event.stop_propagation(),
                                                                 onclick: move |e: dioxus::prelude::MouseEvent| {
                                                                     e.stop_propagation();
                                                                     let mut set = collapsed_subagents.write();
@@ -9735,8 +9927,18 @@ fn app() -> Element {
                                                     }
                                                     if menu_open {
                                                         div { class: "menu-backdrop", onclick: move |_| session_menu.set(None) }
-                                                        div { class: "thread-menu",
-                                                            button { class: "menu-item", onclick: move |_| {
+                                                        div {
+                                                            class: "thread-menu",
+                                                            role: "group",
+                                                            aria_label: "Session actions",
+                                                            style: "position:fixed;left:clamp(8px,{menu_pos.0}px,calc(100vw - 166px));top:clamp(8px,{menu_pos.1}px,calc(100vh - 104px))",
+                                                            onkeydown: move |event| {
+                                                                if event.key() == Key::Escape {
+                                                                    event.prevent_default();
+                                                                    session_menu.set(None);
+                                                                }
+                                                            },
+                                                            button { class: "menu-item", autofocus: true, aria_label: "Archive session", onclick: move |_| {
                                                                 archive_session(&p_arch);
                                                                 session_menu.set(None);
                                                                 sessions_refresh.set(sessions_refresh() + 1);
@@ -9752,7 +9954,7 @@ fn app() -> Element {
                                                             },
                                                                 Icon { name: "folder" } span { class: "menu-name", "Archive" }
                                                             }
-                                                            button { class: "menu-item danger", onclick: move |_| {
+                                                            button { class: "menu-item danger", aria_label: "Delete session permanently", onclick: move |_| {
                                                                 let restore = capture_deleted_session(&p_del);
                                                                 delete_session(&p_del);
                                                                 session_menu.set(None);
@@ -9800,7 +10002,10 @@ fn app() -> Element {
                 }
                 // Synara: seksi "Chats" — sesi tanpa proyek, flat di footer sidebar.
                 // Hanya dirender bila memang ada (tanpa placeholder "No chats yet").
-                if !chats_list.read().is_empty() && *sidebar_tab.read() == "threads" {
+                if !*sidebar_collapsed.read()
+                    && !chats_list.read().is_empty()
+                    && *sidebar_tab.read() == "threads"
+                {
                     div { class: "section-row",
                         span { class: "section-label", "Chats" }
                     }
@@ -9810,9 +10015,14 @@ fn app() -> Element {
                                 let c_open = cpath.clone();
                                 let c_title = ctitle.clone();
                                 rsx! {
-                                    div { class: "thread recent", key: "chat-{cpath.display()}",
-                                        onclick: move |_| { show_board.set(false); open_session_tab(tabs, active_tab, messages, next_tab_id, cfg, ui, engine, busy_tabs, transcript_turn_limits, session_open_seq, c_open.clone(), c_title.clone()); },
-                                        if let Some(l) = provider_logo(&cprov) { span { class: "sess-logo prov-logo", dangerous_inner_html: l } }
+                                    button { class: "thread recent", key: "chat-{cpath.display()}",
+                                        aria_label: "Open chat {ctitle}",
+                                        onclick: move |_| {
+                                            sidebar_drawer_open.set(false);
+                                            show_board.set(false);
+                                            open_session_tab(tabs, active_tab, messages, next_tab_id, cfg, ui, engine, busy_tabs, transcript_turn_limits, session_open_seq, c_open.clone(), c_title.clone());
+                                        },
+                                        if let Some(l) = provider_logo(&cprov) { span { class: "sess-logo prov-logo", aria_hidden: "true", dangerous_inner_html: l } }
                                         span { class: "thread-title", title: "{ctitle}", "{ctitle}" }
                                     }
                                 }
@@ -9859,6 +10069,8 @@ fn app() -> Element {
                         rsx! {
                             button { class: "{row_cls}",
                                 title: "v{info.version} — {info.notes}",
+                                aria_label: if busy { "Oxide update in progress" } else if err { "Retry Oxide update" } else { "Install Oxide update" },
+                                "data-tooltip": if busy { "Updating Oxide" } else if err { "Retry update" } else { "Update Oxide" },
                                 disabled: busy,
                                 onclick: move |_| {
                                     install_update(info_run.clone(), updating, update_err, update_pct);
@@ -9872,19 +10084,62 @@ fn app() -> Element {
                         }
                     }
                 }
-                button { class: "settings-btn", onclick: move |_| {
+                button { class: "settings-btn", title: "Settings", aria_label: "Open settings", "data-tooltip": "Settings", onclick: move |_| {
+                        sidebar_drawer_open.set(false);
                         settings_initial_tab.set("model".to_string());
                         show_settings.set(true);
                     },
                     Icon { name: "settings" } span { "Settings" }
                 }
             }
+            button {
+                class: if *sidebar_drawer_open.read() { "sidebar-drawer-backdrop open" } else { "sidebar-drawer-backdrop" },
+                tabindex: if *sidebar_drawer_open.read() { "0" } else { "-1" },
+                aria_label: "Close sidebar",
+                aria_hidden: if *sidebar_drawer_open.read() { "false" } else { "true" },
+                onclick: move |_| {
+                    sidebar_drawer_open.set(false);
+                    spawn(async move {
+                        let _ = dioxus::document::eval(
+                            "requestAnimationFrame(()=>document.getElementById('mobile-sidebar-toggle')?.focus())",
+                        )
+                        .await;
+                    });
+                },
+            }
 
             // ── Center column ──────────────────────────────────────────
-            div { class: "panel-resizer", title: "Drag to resize sidebar",
+            div {
+                class: "panel-resizer",
+                title: "Drag or use arrow keys to resize sidebar",
+                role: "separator",
+                tabindex: "0",
+                aria_label: "Resize sidebar",
+                aria_orientation: "vertical",
+                aria_valuemin: "170",
+                aria_valuemax: "440",
+                aria_valuenow: (*sidebar_w.read() as i32).to_string(),
                 onmousedown: move |e: dioxus::prelude::MouseEvent| {
                     e.prevent_default();
                     panel_drag.set(Some((1, e.client_coordinates().x, *sidebar_w.read())));
+                },
+                onkeydown: move |event| {
+                    let current = *sidebar_w.read();
+                    let next = match event.key() {
+                        Key::ArrowLeft => Some((current - 12.0).max(170.0)),
+                        Key::ArrowRight => Some((current + 12.0).min(440.0)),
+                        Key::Home => Some(170.0),
+                        Key::End => Some(440.0),
+                        _ => None,
+                    };
+                    if let Some(next) = next {
+                        event.prevent_default();
+                        sidebar_w.set(next);
+                        let mut config = cfg.read().clone();
+                        config.sidebar_width = next;
+                        cfg.set(config.clone());
+                        persist_config_preferences(&config);
+                    }
                 },
             }
             main { class: "main",
@@ -19676,6 +19931,11 @@ fn Icon(name: &'static str) -> Element {
         "plus" => {
             rsx! { line { x1: "12", y1: "5", x2: "12", y2: "19" } line { x1: "5", y1: "12", x2: "19", y2: "12" } }
         }
+        "more" => rsx! {
+            circle { cx: "5", cy: "12", r: "1" }
+            circle { cx: "12", cy: "12", r: "1" }
+            circle { cx: "19", cy: "12", r: "1" }
+        },
         "trash" => {
             rsx! { polyline { points: "3 6 5 6 21 6" } path { d: "M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" } }
         }
@@ -19689,17 +19949,31 @@ fn Icon(name: &'static str) -> Element {
             line { x1: "9", y1: "12", x2: "21", y2: "12" }
             line { x1: "9", y1: "18", x2: "21", y2: "18" }
         },
+        "kanban" => rsx! {
+            rect { x: "3", y: "4", width: "7", height: "16", rx: "1.5" }
+            rect { x: "14", y: "4", width: "7", height: "10", rx: "1.5" }
+        },
         "target" => {
             rsx! { circle { cx: "12", cy: "12", r: "9" } circle { cx: "12", cy: "12", r: "5" } circle { cx: "12", cy: "12", r: "1" } }
         }
         "clock" => {
             rsx! { circle { cx: "12", cy: "12", r: "9" } polyline { points: "12 7 12 12 15 14" } }
         }
+        "automation" => rsx! {
+            path { d: "M20.5 9A9 9 0 1 0 21 12" }
+            polyline { points: "16 8.5 20.5 9 20 4.5" }
+            polyline { points: "12 7 12 12 16 14" }
+        },
         "circle-check" => rsx! {
             circle { cx: "12", cy: "12", r: "9" }
             polyline { points: "8 12 11 15 16 9" }
         },
         "circle-alert" => rsx! {
+            circle { cx: "12", cy: "12", r: "9" }
+            line { x1: "12", y1: "7", x2: "12", y2: "13" }
+            circle { cx: "12", cy: "17", r: ".35" }
+        },
+        "error" => rsx! {
             circle { cx: "12", cy: "12", r: "9" }
             line { x1: "12", y1: "7", x2: "12", y2: "13" }
             circle { cx: "12", cy: "17", r: ".35" }
@@ -19847,7 +20121,11 @@ fn Icon(name: &'static str) -> Element {
             path { d: "M6.5 12H1.75" }
             path { d: "M22.25 12H17.5" }
         },
-        _ => rsx! { circle { cx: "12", cy: "12", r: "3" } },
+        _ => rsx! {
+            circle { cx: "12", cy: "12", r: "9" }
+            path { d: "M9.5 9a2.7 2.7 0 0 1 5.1 1.3c0 1.8-2.6 2.2-2.6 4" }
+            circle { cx: "12", cy: "18", r: ".35" }
+        },
     };
     rsx! {
         svg {

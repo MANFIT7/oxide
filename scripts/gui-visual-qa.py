@@ -37,6 +37,8 @@ AUTOMATION = ROOT / "crates/oxide-core/src/automation.rs"
 OUT_DIR = ROOT / "target/gui-visual-qa"
 FIXTURE = OUT_DIR / "fixture.html"
 BRAIN_FIXTURE = OUT_DIR / "brain.html"
+SIDEBAR_FIXTURE = OUT_DIR / "sidebar.html"
+SIDEBAR_COMPACT_FIXTURE = OUT_DIR / "sidebar-compact.html"
 
 
 failures: list[str] = []
@@ -352,7 +354,7 @@ def write_brain_fixture(css: str) -> None:
 <div class="app" data-theme="dark">
   <aside class="sidebar brain-mode">
     <div class="brand"><span class="brain-preview-logo">OX</span><span class="brand-name">Oxide</span></div>
-    <div class="side-seg"><button class="on">Threads</button><button>Workspace</button></div>
+    <div class="side-seg" role="group" aria-label="Sidebar view"><button aria-pressed="false">Threads</button><button aria-pressed="false">Workspace</button></div>
     <nav class="nav">
       <button class="nav-item"><span class="nav-preview-icon">＋</span><span>New chat</span></button>
       <button class="nav-item"><span class="nav-preview-icon">⌕</span><span>Search</span></button>
@@ -420,6 +422,86 @@ def write_brain_fixture(css: str) -> None:
 </html>
 """
     BRAIN_FIXTURE.write_text(fixture, encoding="utf-8")
+
+
+def write_sidebar_fixture(css: str) -> None:
+    """Write an interactive browser preview of expanded, rail, and drawer states."""
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    escaped_css = css.replace("</style", "<\\/style")
+    fixture = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Oxide Sidebar Preview</title>
+  <style>
+{escaped_css}
+    html, body {{ margin: 0; width: 100%; height: 100%; background: #111; }}
+    .sidebar-preview-main {{ min-width: 0; padding: 28px 34px; background: var(--bg); }}
+    .sidebar-preview-main h1 {{ margin: 0; font-size: 26px; }}
+    .sidebar-preview-main p {{ max-width: 58ch; color: var(--muted); line-height: 1.55; }}
+    .sidebar-preview-card {{ max-width: 620px; margin-top: 24px; padding: 22px; border: 1px solid var(--border); border-radius: 14px; background: var(--surface); }}
+    .sidebar-preview-logo {{ width: 24px; height: 24px; display: grid; place-items: center; border-radius: 7px; background: color-mix(in srgb, var(--syn-accent) 18%, transparent); color: var(--syn-accent); font-size: 9px; font-weight: 750; }}
+    .sidebar-preview-icon {{ width: 16px; height: 16px; flex: 0 0 16px; }}
+  </style>
+</head>
+<body>
+<div class="app" data-theme="dark">
+  <aside id="primary-sidebar" class="sidebar" aria-label="Primary navigation" style="width:280px">
+    <div class="brand">
+      <button class="logo-btn desktop-sidebar-toggle" data-tooltip="Collapse sidebar" aria-label="Collapse sidebar"><span class="sidebar-preview-logo">OX</span></button>
+      <button id="mobile-sidebar-toggle" class="logo-btn mobile-sidebar-toggle" data-tooltip="Open sidebar" aria-label="Open sidebar"><span class="sidebar-preview-logo">OX</span></button>
+      <span class="brand-name">Oxide</span>
+    </div>
+    <div class="side-seg" role="group" aria-label="Sidebar view"><button class="on" aria-pressed="true">Threads</button><button aria-pressed="false">Workspace</button></div>
+    <nav class="nav" aria-label="Workspace actions">
+      <button class="nav-item" data-tooltip="New chat" aria-label="New chat"><svg class="sidebar-preview-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"></path></svg><span class="nav-label">New chat</span></button>
+      <button class="nav-item" data-tooltip="Search" aria-label="Search"><svg class="sidebar-preview-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><circle cx="11" cy="11" r="7"></circle><path d="m16 16 5 5"></path></svg><span class="nav-label">Search</span></button>
+      <button class="nav-item brain-nav" data-tooltip="Brain" aria-label="Brain"><svg class="sidebar-preview-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M9 4a3 3 0 0 0-3 3v1a3 3 0 0 0-2 3 3 3 0 0 0 2 3v1a3 3 0 0 0 3 3M15 4a3 3 0 0 1 3 3v1a3 3 0 0 1 2 3 3 3 0 0 1-2 3v1a3 3 0 0 1-3 3M9 4v14M15 4v14"></path></svg><span class="nav-label">Brain</span></button>
+    </nav>
+    <div class="section-row"><span class="section-label">Projects</span><button class="section-add" aria-label="Open folder">+</button></div>
+    <div class="projects">
+      <div class="section-label">Pinned</div>
+      <div class="thread-anchor"><button class="thread recent"><span class="thread-title">Refine release workflow</span></button><div class="row-actions"><button class="row-act-btn pinned" aria-label="Unpin">•</button></div></div>
+      <div class="project-group">
+        <div class="project current"><button class="proj-caret" aria-expanded="true">⌃</button><button class="project-main" aria-current="page"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M3 6h7l2 3h9v10H3z"></path></svg><span class="project-name">oxide</span></button><button class="project-add" aria-label="New chat">+</button><button class="project-del" aria-label="Hide project">×</button></div>
+        <div class="thread active" role="button" tabindex="0" aria-current="page"><span class="tab-prov">◈</span><span class="thread-title">Sidebar interaction polish</span><span class="unread-dot" aria-hidden="true"></span></div>
+        <div class="thread-anchor"><div class="thread recent sub" role="button" tabindex="0"><span class="sess-logo">◇</span><span class="thread-title">Audit keyboard states</span><span class="thread-time">2m</span></div><div class="row-actions"><button class="row-act-btn" aria-label="Pin">•</button><button class="row-act-btn" aria-label="More">•••</button></div></div>
+      </div>
+    </div>
+    <div class="usage-chip"><div class="usage-head">Usage remaining</div><div class="usage-row"><span class="usage-k">5h</span><span class="usage-bar"><span class="usage-fill" style="width:68%"></span></span><span class="usage-v">68%</span></div></div>
+    <button class="update-row ready" data-tooltip="Update Oxide"><span class="update-row-ic">↑</span><span class="update-row-label">Update</span><span class="update-row-ver">v0.0.167</span></button>
+    <button class="settings-btn" data-tooltip="Settings"><span>⚙</span><span>Settings</span></button>
+  </aside>
+  <button class="sidebar-drawer-backdrop" aria-label="Close sidebar"></button>
+  <div class="panel-resizer" role="separator" tabindex="0" aria-label="Resize sidebar"></div>
+  <main class="main sidebar-preview-main" tabindex="-1"><h1>Sidebar visual QA</h1><p>Use the Oxide logo to switch between the expanded sidebar and icon rail. Resize this page below 900px to exercise the explicit compact drawer and backdrop.</p><div class="sidebar-preview-card"><strong>Expected behavior</strong><p>The active thread has an accent rail, row actions keep a stable trailing slot, mixed icons share one optical box, and compact navigation never removes access to project history.</p></div></main>
+</div>
+<script>
+  const sidebar = document.getElementById('primary-sidebar');
+  const desktopToggle = document.querySelector('.desktop-sidebar-toggle');
+  const mobileToggle = document.getElementById('mobile-sidebar-toggle');
+  const backdrop = document.querySelector('.sidebar-drawer-backdrop');
+  const initialState = new URLSearchParams(location.search).get('state');
+  if (initialState === 'collapsed') sidebar.classList.add('collapsed');
+  if (initialState === 'drawer') sidebar.classList.add('drawer-open');
+  desktopToggle.addEventListener('click', () => sidebar.classList.toggle('collapsed'));
+  mobileToggle.addEventListener('click', () => sidebar.classList.toggle('drawer-open'));
+  backdrop.addEventListener('click', () => sidebar.classList.remove('drawer-open'));
+  document.addEventListener('keydown', event => {{ if (event.key === 'Escape') sidebar.classList.remove('drawer-open'); }});
+</script>
+</body>
+</html>
+"""
+    SIDEBAR_FIXTURE.write_text(fixture, encoding="utf-8")
+    SIDEBAR_COMPACT_FIXTURE.write_text(
+        """<!doctype html>
+<html><head><meta charset="utf-8"><title>Oxide Compact Sidebar Preview</title>
+<style>html,body{margin:0;width:100%;height:100%;background:#0d0d0f;display:grid;place-items:start center}iframe{width:760px;height:900px;border:0;background:#111}</style>
+</head><body><iframe src="sidebar.html" title="Compact sidebar drawer" onload="this.contentDocument.getElementById('primary-sidebar')?.classList.add('drawer-open')"></iframe></body></html>
+""",
+        encoding="utf-8",
+    )
 
 
 def run_runtime_visual_qa() -> None:
@@ -1462,8 +1544,11 @@ def main() -> int:
             [
                 'sidebar_tab.set("threads".to_string())',
                 'sidebar_tab.set("brain".to_string())',
-                'class: if sidebar_tab.read().as_str() != "workspace" { "on" }',
+                'class: if sidebar_tab.read().as_str() == "threads" { "on" }',
+                'role: "group"',
+                'aria_pressed: if sidebar_tab.read().as_str() == "threads"',
                 'class: if *sidebar_tab.read() == "brain" { "nav-item brain-nav on"',
+                'aria_current: if *sidebar_tab.read() == "brain" { "page" }',
                 '"brain" => rsx! {',
                 'd: "M4.22222 21.9948V18.4451C4.22222 17.1737',
                 'class: "brain-view"',
@@ -1477,14 +1562,14 @@ def main() -> int:
         )
         and nearby(
             gui,
-            'Icon { name: "search" } span { "Search" }',
+            'Icon { name: "search" } span { class: "nav-label", "Search" }',
             'class: if *sidebar_tab.read() == "brain" { "nav-item brain-nav on"',
             900,
         )
         and contains_all(
             css,
             [
-                ".nav-item.brain-nav.on {",
+                ".sidebar .nav-item.on,",
                 ".brain-layout {",
                 ".brain-map {",
                 ".brain-edge {",
@@ -1497,6 +1582,44 @@ def main() -> int:
             ],
         ),
         "Brain stays compact below Search while only the selected knowledge edge animates; workspace nodes, keyboard focus, and facts/skills inspector remain interactive",
+    )
+    require(
+        "sidebar navigation and compact drawer contract",
+        contains_all(
+            gui,
+            [
+                "let mut sidebar_drawer_open = use_signal(|| false);",
+                'id: "primary-sidebar"',
+                'class: "logo-btn desktop-sidebar-toggle"',
+                'class: "logo-btn mobile-sidebar-toggle"',
+                'aria_controls: "primary-sidebar"',
+                '"data-tooltip": "New chat"',
+                'class: "project-main"',
+                'role: "separator"',
+                'aria_orientation: "vertical"',
+                "let mut session_menu_pos = use_signal",
+                'aria_label: "More session actions"',
+                'Icon { name: "more" }',
+                'class: "sr-only"',
+                'Icon { name: "kanban" }',
+                'Icon { name: "automation" }',
+            ],
+        )
+        and contains_all(
+            css,
+            [
+                ".sidebar .nav-item.on,",
+                ".sidebar .thread-anchor:focus-within .row-actions",
+                ".sidebar .project:focus-within .project-add",
+                ".sidebar [data-tooltip]::after",
+                ".sidebar.drawer-open {",
+                ".desktop-sidebar-toggle { display: none; }",
+                ".mobile-sidebar-toggle { display: inline-flex; }",
+                ".app:has(.sidebar.drawer-open) .sidebar-drawer-backdrop",
+                ".sidebar ~ .panel-resizer:focus-visible",
+            ],
+        ),
+        "Sidebar exposes unambiguous active state, keyboard navigation, stable row actions, named icon rail controls, a dismissible compact drawer, and keyboard resizing",
     )
     require(
         "settings navigation scales to all destinations",
@@ -1517,8 +1640,8 @@ def main() -> int:
         contains_all(
             gui,
             [
-                'class: "logo-btn"',
-                'aria_label: "Collapse or expand sidebar"',
+                'class: "logo-btn desktop-sidebar-toggle"',
+                'aria_label: if *sidebar_collapsed.read()',
                 'role: "dialog"',
                 'aria_modal: "true"',
             ],
@@ -1562,6 +1685,8 @@ def main() -> int:
         "Fix feedback",
         "Board And Compact Layout",
         "Brain Source Graph",
+        "Sidebar Navigation And Compact Drawer",
+        "target/gui-visual-qa/sidebar.html",
         "Theme Contrast And Keyboard",
         "gui-native-visual-record.py",
     ]
@@ -1595,7 +1720,9 @@ def main() -> int:
     if css:
         write_fixture(css)
         write_brain_fixture(css)
+        write_sidebar_fixture(css)
         fixture_html = read(FIXTURE)
+        sidebar_fixture_html = read(SIDEBAR_FIXTURE)
         require(
             "browser fixture exposes the full visual surface",
             contains_all(
@@ -1607,8 +1734,29 @@ def main() -> int:
             ),
             f"{rel(FIXTURE)} grows with its packed QA states so browser scrolling reaches every component",
         )
+        require(
+            "browser fixture exposes sidebar interaction states",
+            contains_all(
+                sidebar_fixture_html,
+                [
+                    'class="sidebar"',
+                    "desktop-sidebar-toggle",
+                    "mobile-sidebar-toggle",
+                    "sidebar-drawer-backdrop",
+                    "data-tooltip=\"New chat\"",
+                    "thread active",
+                    "row-actions",
+                    "project-main",
+                    "sidebar.classList.toggle('collapsed')",
+                    "sidebar.classList.toggle('drawer-open')",
+                ],
+            ),
+            f"{rel(SIDEBAR_FIXTURE)} supports expanded, icon-rail, compact drawer, active-thread, and stable action-slot inspection",
+        )
         print(f"INFO fixture: {rel(FIXTURE)}")
         print(f"INFO brain fixture: {rel(BRAIN_FIXTURE)}")
+        print(f"INFO sidebar fixture: {rel(SIDEBAR_FIXTURE)}")
+        print(f"INFO compact sidebar fixture: {rel(SIDEBAR_COMPACT_FIXTURE)}")
 
     if args.runtime:
         run_runtime_visual_qa()

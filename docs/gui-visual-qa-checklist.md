@@ -134,6 +134,18 @@ It focuses on states that compile tests cannot prove.
 - Switch between Model, Automations, Sessions, and Updates; confirm the modal body keeps its position and does not flash to a backdrop-only frame.
 - Confirm long forms scroll inside the body while the title, navigation, and Save/Cancel actions remain stable.
 
+## Sidebar Navigation And Compact Drawer
+
+- Open `target/gui-visual-qa/sidebar.html` and `sidebar-compact.html` after running the static QA script; exercise expanded, collapsed, and sub-900px drawer states without rebuilding the native app.
+- Confirm Threads, Workspace, Brain, and Board never show contradictory active states; the current thread must remain visibly stronger than hover.
+- Traverse projects, current/open sessions, pinned sessions, disclosure controls, and row actions using only Tab/Shift-Tab/Enter/Space.
+- Confirm Pin, Archive, Add, and Hide actions become visible on keyboard focus before activation and do not shift the thread title.
+- Collapse the desktop sidebar and verify every icon-only action has a delayed tooltip, accessible name, stable 16px optical slot, and no clipped MCP logo.
+- Resize below 900px, open the sidebar from the logo rail, select a session, and confirm the drawer closes while the main view remains in place.
+- Reopen the compact drawer, then close it with Escape and the backdrop. Confirm Projects, Chats, Usage, Update, and Settings remain reachable.
+- Resize the desktop sidebar with Left/Right/Home/End on the separator and confirm the announced value remains between 170px and 440px.
+- Open a session menu near the bottom of the project list and confirm it stays inside the viewport instead of clipping in the scroller.
+
 ## Theme Contrast And Keyboard
 
 - Repeat the Board, Settings, sidebar, and command palette checks in dark, light, and system themes.

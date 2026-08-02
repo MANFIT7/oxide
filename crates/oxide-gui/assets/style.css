@@ -4087,6 +4087,11 @@ textarea:focus-visible, select:focus-visible, [tabindex]:focus-visible {
   width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0;
   background: var(--danger, #e5534b);
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--danger, #e5534b) 25%, transparent);
+  animation: sidebar-status-pop var(--dur-fast) var(--ease-enter) both;
+}
+@keyframes sidebar-status-pop {
+  from { opacity: 0; transform: scale(.72); }
+  to { opacity: 1; transform: scale(1); }
 }
 
 /* Changes panel: file-jump chip strip (click = scroll to that file's diff). */
@@ -4364,7 +4369,7 @@ details.activity-card.has-out .activity-sum { padding: 2px 4px; }
 .center.with-preview { padding-right: 0; }
 .app.pip .main { margin: 0; }
 .app.pip .center { border-radius: 0; border: none; box-shadow: none; }
-.sidebar.collapsed + .panel-resizer + .main { margin-left: 8px; }
+.sidebar.collapsed ~ .panel-resizer + .main { margin-left: 8px; }
 
 /* dock kanan (env-panel): kartu terpisah, flex sibling dari .center */
 .env-panel {
@@ -4779,6 +4784,8 @@ details.changes-file[open] .diff-body { animation: disclosure-in 220ms ease-out;
 .activity-status {
   position: relative;
   isolation: isolate;
+  position: relative;
+  z-index: 6;
   display: inline-flex;
   width: 11px;
   height: 11px;
@@ -5230,8 +5237,8 @@ details.has-out .activity-out-n::after { content: none; }
   .sidebar .settings-btn,
   .sidebar .update-row { justify-content: center; gap: 0; padding-inline: 0; }
   .sidebar .nav-item.ws-item { display: flex; }
-  .sidebar + .panel-resizer { display: none; }
-  .sidebar + .panel-resizer + .main { margin-left: 8px; }
+  .sidebar ~ .panel-resizer { display: none; }
+  .sidebar ~ .panel-resizer + .main { margin-left: 8px; }
 }
 
 @media (max-width: 680px) {
@@ -5240,6 +5247,498 @@ details.has-out .activity-out-n::after { content: none; }
   .brain-stat span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .brain-map-card { min-height: 340px; }
   .brain-map { min-height: 310px; }
+}
+
+/* ══ Canonical sidebar interaction contract ════════════════════════════════
+   Keep one late cascade for hierarchy, active/hover state, rail parity, and
+   compact-drawer behavior. Earlier sidebar passes remain as historical base
+   styles; this block is the authoritative interaction layer. */
+.sr-only {
+  position: absolute !important;
+  width: 1px !important;
+  height: 1px !important;
+  padding: 0 !important;
+  margin: -1px !important;
+  overflow: hidden !important;
+  clip: rect(0, 0, 0, 0) !important;
+  white-space: nowrap !important;
+  border: 0 !important;
+}
+.sidebar {
+  --sidebar-rail: 60px;
+  --sidebar-row: 32px;
+  --sidebar-icon-slot: 16px;
+  isolation: isolate;
+  transition:
+    width var(--dur-med) var(--ease-standard),
+    padding var(--dur-med) var(--ease-standard),
+    box-shadow var(--dur-med) var(--ease-standard);
+}
+.sidebar .logo:hover { transform: none; }
+
+.sidebar .brand {
+  min-height: 32px;
+  padding: 5px 10px 13px;
+}
+.sidebar .nav {
+  gap: 2px;
+  padding-inline: 6px;
+}
+.sidebar .nav-item,
+.sidebar .settings-btn,
+.sidebar .update-row {
+  min-height: var(--sidebar-row);
+  border-radius: 8px;
+  transition:
+    background-color var(--dur-fast) var(--ease-standard),
+    color var(--dur-fast) var(--ease-standard),
+    box-shadow var(--dur-fast) var(--ease-standard);
+}
+.sidebar .nav-item {
+  height: var(--sidebar-row);
+  gap: 9px;
+  padding: 0 8px;
+  font-size: 13.5px;
+  font-weight: 500;
+}
+.sidebar .settings-btn,
+.sidebar .update-row {
+  gap: 9px;
+  margin-inline: 6px;
+  width: calc(100% - 12px);
+  padding: 0 8px;
+  font-size: 13px;
+}
+.sidebar .section-row {
+  min-height: 26px;
+  margin: 11px 8px 2px;
+}
+.sidebar .section-label {
+  margin: 0;
+  padding: 0;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: .065em;
+}
+.sidebar .projects { padding-inline: 8px; }
+.sidebar .project {
+  min-height: 30px;
+  margin: 9px 0 2px;
+  padding-inline: 7px;
+  gap: 8px;
+}
+.sidebar .project-main {
+  min-width: 0;
+  flex: 1;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.sidebar .proj-caret {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font: inherit;
+}
+.sidebar .project:focus-within .project-add,
+.sidebar .project:focus-within .project-del {
+  opacity: 1;
+}
+.sidebar button.thread {
+  width: 100%;
+  border: 0;
+  background: transparent;
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.sidebar .thread {
+  min-height: 30px;
+  gap: 7px;
+  border-radius: 8px;
+}
+.sidebar .thread-title { font-size: 12.5px; }
+
+/* One optical slot keeps mixed custom/provider glyphs aligned even when their
+   paths have different intrinsic bounds. Glyphs remain slightly smaller than
+   the slot so complex marks do not look heavier than simple line icons. */
+.sidebar .nav-item > svg,
+.sidebar .settings-btn > svg,
+.sidebar .update-row-ic,
+.sidebar .project-main > svg,
+.sidebar .section-add,
+.sidebar .project-add,
+.sidebar .project-del,
+.sidebar .sess-logo,
+.sidebar .sess-branch {
+  width: var(--sidebar-icon-slot);
+  height: var(--sidebar-icon-slot);
+  flex: 0 0 var(--sidebar-icon-slot);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.sidebar .nav-item > svg,
+.sidebar .settings-btn > svg,
+.sidebar .update-row-ic > svg,
+.sidebar .project-main > svg {
+  width: 16px;
+  height: 16px;
+  stroke-width: 1.8;
+}
+.sidebar .nav-item.brain-nav > svg { stroke-width: 1.6; }
+.sidebar .nav-logo {
+  width: var(--sidebar-icon-slot);
+  height: var(--sidebar-icon-slot);
+  flex: 0 0 var(--sidebar-icon-slot);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.sidebar .nav-logo svg,
+.sidebar .sess-logo svg,
+.sidebar .sess-branch svg {
+  width: 14px;
+  height: 14px;
+}
+.sidebar .thread > .tab-prov,
+.sidebar .thread > .syn-spinner,
+.sidebar .thread > .tab-agent-dot {
+  width: var(--sidebar-icon-slot);
+  height: var(--sidebar-icon-slot);
+  flex: 0 0 var(--sidebar-icon-slot);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.sidebar .thread > .tab-agent-dot::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.sidebar .thread > .tab-agent-dot { background: transparent; }
+.sidebar .thread > .tab-agent-dot.attention { color: var(--warn, #d9a35c); }
+.sidebar .thread > .tab-agent-dot.review { color: var(--ok-strong, #00c853); }
+.sidebar .thread > .syn-spinner::before {
+  left: 6.8px;
+  top: 6.8px;
+}
+.sidebar .thread:has(.tab-prov, .sess-logo, .syn-spinner, .tab-agent-dot) > .sess-branch {
+  display: none;
+}
+
+/* Active is stronger than hover and includes a non-color cue. The inset rail
+   avoids colliding with the branch-line pseudo elements on nested sessions. */
+.sidebar .nav-item.on,
+.sidebar .thread.active {
+  color: var(--text);
+  background: color-mix(in srgb, var(--text) 10%, transparent);
+  box-shadow: inset 2px 0 0 color-mix(in srgb, var(--syn-accent) 82%, transparent);
+}
+.sidebar .nav-item.on { font-weight: 600; }
+.sidebar .thread.active .thread-title { font-weight: 600; }
+.sidebar .nav-item.brain-nav.on svg { color: var(--syn-accent); }
+.sidebar .project.current {
+  background: color-mix(in srgb, var(--text) 4%, transparent);
+}
+.sidebar .project.current .project-name { font-weight: 650; }
+.sidebar .nav-item:not(.on):hover,
+.sidebar .thread:not(.active):hover,
+.sidebar .thread-anchor:focus-within .thread:not(.active),
+.sidebar .settings-btn:hover {
+  color: var(--text);
+  background: color-mix(in srgb, var(--text) 6%, transparent);
+}
+
+/* Reserve the trailing action slot at rest. Hover/focus only cross-fades its
+   contents, so titles and ellipses never jump when archive/delete appears. */
+.sidebar .thread-anchor { position: relative; }
+.sidebar .thread-anchor .thread.recent,
+.sidebar .thread-anchor:hover .thread.recent,
+.sidebar .thread-anchor:focus-within .thread.recent,
+.sidebar .thread-anchor:has(.pinned) .thread.recent {
+  padding-right: 52px;
+}
+.sidebar .thread-anchor .thread-time,
+.sidebar .thread-anchor:hover .thread-time,
+.sidebar .thread-anchor:focus-within .thread-time,
+.sidebar .thread-anchor:has(.pinned) .thread-time {
+  position: absolute;
+  right: 8px;
+  width: 36px;
+  text-align: right;
+  transition: opacity var(--dur-fast) var(--ease-standard);
+}
+.sidebar .thread-anchor:hover .thread-time,
+.sidebar .thread-anchor:focus-within .thread-time,
+.sidebar .thread-anchor:has(.pinned) .thread-time {
+  opacity: 0;
+}
+.sidebar .row-actions {
+  right: 4px;
+  min-width: 44px;
+  justify-content: flex-end;
+  transition: opacity var(--dur-fast) var(--ease-standard);
+}
+.sidebar .thread-anchor:hover .row-actions,
+.sidebar .thread-anchor:focus-within .row-actions,
+.sidebar .thread-anchor:has(.pinned) .row-actions {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+/* The update row is part of navigation hierarchy, not a persistent success
+   banner. Keep the row neutral and reserve green for its availability glyph. */
+.sidebar .update-row.ready { color: var(--muted); }
+.sidebar .update-row.ready .update-row-ic { color: var(--ok-strong); }
+.sidebar .update-row.ready:hover {
+  color: var(--text);
+  background: color-mix(in srgb, var(--text) 6%, transparent);
+  border-color: transparent;
+}
+.sidebar .update-row-label { font-weight: 550; }
+
+/* Shared disclosure timing keeps project/sub-agent carets in phase with the
+   rail transition without animating large content heights. */
+.sidebar .proj-caret svg,
+.sidebar .sub-toggle-chev {
+  transform-origin: center;
+  transition: transform var(--dur-med) var(--ease-standard);
+}
+.sidebar ~ .panel-resizer {
+  width: 9px;
+  margin-inline: -4px;
+  outline: none;
+}
+.sidebar ~ .panel-resizer:focus-visible {
+  background: color-mix(in srgb, var(--syn-accent) 48%, transparent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--syn-accent) 28%, transparent);
+}
+
+/* Explicit rail: the same controls remain available at every desktop width. */
+.sidebar.collapsed {
+  width: var(--sidebar-rail) !important;
+  padding: 12px 6px;
+  overflow: visible;
+}
+.sidebar.collapsed .projects,
+.sidebar.collapsed .section-row,
+.sidebar.collapsed .chats-list,
+.sidebar.collapsed .side-seg,
+.sidebar.collapsed .usage-chip {
+  display: none !important;
+}
+.sidebar.collapsed .nav { padding-inline: 0; }
+.sidebar.collapsed .nav-item,
+.sidebar.collapsed .settings-btn,
+.sidebar.collapsed .update-row {
+  justify-content: center;
+  gap: 0;
+  padding-inline: 0;
+}
+.sidebar.collapsed .settings-btn,
+.sidebar.collapsed .update-row {
+  width: 100%;
+  margin-inline: 0;
+}
+.sidebar.collapsed .nav-item.ws-item { display: flex; }
+.sidebar .brand-name,
+.sidebar .nav-item > span:not(.nav-logo),
+.sidebar .settings-btn > span,
+.sidebar .update-row-label,
+.sidebar .update-row-ver {
+  max-width: 190px;
+  opacity: 1;
+  transform: translateX(0);
+  transition:
+    opacity var(--dur-fast) var(--ease-standard),
+    transform var(--dur-med) var(--ease-standard),
+    max-width var(--dur-med) var(--ease-standard);
+}
+.sidebar.collapsed .brand-name,
+.sidebar.collapsed .nav-item > span:not(.nav-logo),
+.sidebar.collapsed .settings-btn > span,
+.sidebar.collapsed .update-row-label,
+.sidebar.collapsed .update-row-ver {
+  width: 0;
+  max-width: 0;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  opacity: 0;
+  transform: translateX(-4px);
+  white-space: nowrap;
+}
+.sidebar.collapsed .nav-item > .nav-logo {
+  width: var(--sidebar-icon-slot);
+  max-width: var(--sidebar-icon-slot);
+  overflow: visible;
+  opacity: 1;
+  transform: none;
+}
+
+/* Visual tooltips read from the same per-control label as the accessible
+   markup, so icon order can change without silently changing its meaning. */
+.sidebar [data-tooltip] { position: relative; }
+.sidebar [data-tooltip]::after {
+  content: attr(data-tooltip);
+  position: absolute;
+  z-index: 70;
+  left: calc(100% + 10px);
+  top: 50%;
+  transform: translate(-3px, -50%);
+  width: max-content;
+  max-width: 180px;
+  padding: 5px 8px;
+  border: 1px solid var(--menu-border);
+  border-radius: 7px;
+  background: var(--menu-bg);
+  box-shadow: 0 8px 22px -12px rgba(0,0,0,.65);
+  color: var(--text);
+  font-size: 11.5px;
+  font-weight: 500;
+  line-height: 1.25;
+  white-space: nowrap;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition:
+    opacity var(--dur-fast) var(--ease-standard),
+    transform var(--dur-fast) var(--ease-standard),
+    visibility 0s linear var(--dur-fast);
+}
+.sidebar.collapsed [data-tooltip]:hover::after,
+.sidebar.collapsed [data-tooltip]:focus-visible::after {
+  opacity: 1;
+  visibility: visible;
+  transform: translate(0, -50%);
+  transition-delay: 320ms, 320ms, 0s;
+}
+
+/* Compact desktop: keep a stable 60px rail in flow, then open the full sidebar
+   as an overlay drawer. The explicit class is the touch-safe source of truth. */
+.sidebar-drawer-backdrop,
+.mobile-sidebar-toggle { display: none; }
+@media (max-width: 900px) {
+  .app { position: relative; }
+  .sidebar {
+    position: absolute;
+    inset: 0 auto 0 0;
+    z-index: 40;
+    width: var(--sidebar-rail) !important;
+    padding: 12px 6px;
+    overflow: visible;
+  }
+  .sidebar .nav-item > .nav-logo {
+    width: var(--sidebar-icon-slot);
+    max-width: var(--sidebar-icon-slot);
+    flex: 0 0 var(--sidebar-icon-slot);
+  }
+  .sidebar ~ .panel-resizer + .main { margin-left: calc(var(--sidebar-rail) + 8px); }
+
+  .desktop-sidebar-toggle { display: none; }
+  .mobile-sidebar-toggle { display: inline-flex; }
+
+  .sidebar.drawer-open {
+    width: min(280px, calc(100vw - 24px)) !important;
+    padding-inline: 8px;
+    overflow: hidden;
+    box-shadow:
+      inset -1px 0 0 color-mix(in srgb, var(--text) 8%, transparent),
+      18px 0 42px -24px rgba(0,0,0,.78);
+  }
+  .sidebar.drawer-open .brand {
+    justify-content: flex-start;
+    padding: 5px 10px 13px;
+  }
+  .sidebar.drawer-open .side-seg { display: flex !important; }
+  .sidebar:not(.ws-mode):not(.brain-mode).drawer-open .projects,
+  .sidebar:not(.ws-mode):not(.brain-mode).drawer-open .section-row,
+  .sidebar:not(.ws-mode):not(.brain-mode).drawer-open .chats-list {
+    display: flex !important;
+  }
+  .sidebar:not(.ws-mode):not(.brain-mode).drawer-open .projects,
+  .sidebar:not(.ws-mode):not(.brain-mode).drawer-open .chats-list {
+    flex-direction: column;
+  }
+  .sidebar:not(.ws-mode):not(.brain-mode).drawer-open .projects {
+    flex: 1;
+  }
+  .sidebar.drawer-open .usage-chip { display: block !important; }
+  .sidebar.drawer-open .nav { padding-inline: 6px; }
+  .sidebar.drawer-open .nav-item,
+  .sidebar.drawer-open .settings-btn,
+  .sidebar.drawer-open .update-row {
+    justify-content: flex-start;
+    gap: 9px;
+    padding-inline: 8px;
+  }
+  .sidebar.drawer-open .settings-btn,
+  .sidebar.drawer-open .update-row {
+    width: calc(100% - 12px);
+    margin-inline: 6px;
+  }
+  .sidebar:not(.ws-mode).drawer-open .nav-item.ws-item { display: none; }
+  .sidebar.ws-mode.drawer-open .nav-item.ws-item { display: flex; }
+  .sidebar.drawer-open .brand-name,
+  .sidebar.drawer-open .section-label,
+  .sidebar.drawer-open .nav-item > span:not(.nav-logo),
+  .sidebar.drawer-open .settings-btn > span,
+  .sidebar.drawer-open .update-row-label,
+  .sidebar.drawer-open .update-row-ver {
+    display: inline-block;
+    width: auto;
+    max-width: 190px;
+    overflow: hidden;
+    opacity: 1;
+    transform: none;
+    white-space: nowrap;
+  }
+  .sidebar.drawer-open [data-tooltip]::after {
+    display: none;
+  }
+  .sidebar:not(.drawer-open) [data-tooltip]:hover::after,
+  .sidebar:not(.drawer-open) [data-tooltip]:focus-visible::after {
+    opacity: 1;
+    visibility: visible;
+    transform: translate(0, -50%);
+    transition-delay: 320ms, 320ms, 0s;
+  }
+
+  /* A real backdrop makes the explicit drawer dismissible without relying on
+     hover state. Either the app relationship or an explicit .open state works. */
+  .sidebar-drawer-backdrop {
+    display: block;
+    position: absolute;
+    inset: 0;
+    z-index: 35;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    background: rgba(8, 10, 14, .42);
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
+    transition:
+      opacity var(--dur-med) var(--ease-standard),
+      visibility 0s linear var(--dur-med);
+  }
+  .app:has(.sidebar.drawer-open) .sidebar-drawer-backdrop,
+  .sidebar-drawer-backdrop.open {
+    opacity: 1;
+    visibility: visible;
+    pointer-events: auto;
+    transition-delay: 0s;
+  }
 }
 
 /* Every loading glyph is transparent. The only visible pixels belong to its
