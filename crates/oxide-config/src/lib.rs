@@ -6,7 +6,7 @@
 
 use anyhow::{Context, Result};
 use oxide_protocol::{ApprovalPolicy, SandboxPolicy};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -180,6 +180,27 @@ fn default_backend() -> String {
     "codex".to_string()
 }
 
+/// Authentication strategy for one MCP server.
+///
+/// Credentials are intentionally not represented here. OAuth tokens belong in
+/// a secure credential store, while bearer tokens are referenced by environment
+/// variable name through [`McpServerConfig::bearer_token_env_var`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum McpAuthMode {
+    #[default]
+    None,
+    #[serde(rename = "oauth")]
+    OAuth,
+    BearerEnv,
+}
+
+impl McpAuthMode {
+    fn is_none(&self) -> bool {
+        matches!(self, Self::None)
+    }
+}
+
 /// One MCP server launcher (stdio command, or a remote HTTP/SSE `url`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -195,6 +216,23 @@ pub struct McpServerConfig {
     /// Remote MCP endpoint (Streamable HTTP/SSE). Used instead of `command`.
     #[serde(default)]
     pub url: String,
+    /// Provider family for provider-specific, non-secret behavior.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub provider: String,
+    /// Authentication strategy. Credential material is stored separately.
+    #[serde(default, skip_serializing_if = "McpAuthMode::is_none")]
+    pub auth_mode: McpAuthMode,
+    /// Stable identifier used to locate credentials in a secure store.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub auth_profile_id: String,
+    /// Provider-specific non-secret options only.
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        serialize_with = "serialize_mcp_provider_options",
+        deserialize_with = "deserialize_mcp_provider_options"
+    )]
+    pub provider_options: BTreeMap<String, String>,
     /// Whether this server is active.
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -205,6 +243,9 @@ pub struct McpServerConfig {
     /// The reference intentionally stores no copied command, headers, or secrets.
     #[serde(skip_serializing_if = "is_false")]
     pub external_ref: bool,
+    /// Runtime provenance set only after an external reference resolves exactly.
+    #[serde(skip)]
+    pub trusted_external: bool,
     /// Working directory for stdio MCP launchers.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub cwd: String,
@@ -240,6 +281,127 @@ pub struct McpServerConfig {
     pub required: bool,
 }
 
+fn is_sensitive_mcp_provider_option(key: &str) -> bool {
+    let key = key
+        .trim()
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    matches!(
+        key.as_str(),
+        "token"
+            | "accesstoken"
+            | "refreshtoken"
+            | "idtoken"
+            | "clientsecret"
+            | "servicerole"
+            | "servicerolekey"
+            | "authorization"
+            | "auth"
+            | "bearer"
+            | "bearertoken"
+            | "cookie"
+            | "apikey"
+            | "anonkey"
+            | "privatekey"
+            | "sig"
+            | "signature"
+            | "credential"
+            | "credentials"
+            | "password"
+    ) || key.ends_with("token")
+        || key.ends_with("secret")
+        || key.ends_with("password")
+        || key.ends_with("key")
+        || key.ends_with("signature")
+        || key.ends_with("credential")
+        || key.ends_with("credentials")
+}
+
+fn mcp_args_contain_inline_credentials(args: &[String]) -> bool {
+    args.iter().any(|argument| {
+        let trimmed = argument.trim();
+        if trimmed.starts_with('-') {
+            let flag = trimmed
+                .trim_start_matches('-')
+                .split_once('=')
+                .map(|(key, _)| key)
+                .unwrap_or_else(|| trimmed.trim_start_matches('-'));
+            let canonical = flag
+                .chars()
+                .filter(char::is_ascii_alphanumeric)
+                .flat_map(char::to_lowercase)
+                .collect::<String>();
+            if is_sensitive_mcp_provider_option(flag)
+                || matches!(
+                    canonical.as_str(),
+                    "e" | "env"
+                        | "environment"
+                        | "h"
+                        | "header"
+                        | "headers"
+                        | "httpheader"
+                        | "requestheader"
+                )
+            {
+                return true;
+            }
+        }
+        ['=', ':'].iter().any(|separator| {
+            trimmed.split_once(*separator).is_some_and(|(key, value)| {
+                !value.trim().is_empty() && is_sensitive_mcp_provider_option(key)
+            })
+        }) || trimmed.to_ascii_lowercase().contains("bearer ")
+    })
+}
+
+fn serialize_mcp_provider_options<S>(
+    options: &BTreeMap<String, String>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    use serde::ser::Error as _;
+    if let Some(key) = options
+        .keys()
+        .find(|key| is_sensitive_mcp_provider_option(key))
+    {
+        return Err(S::Error::custom(format!(
+            "MCP provider_options cannot persist credential field '{key}'"
+        )));
+    }
+    options.serialize(serializer)
+}
+
+fn deserialize_mcp_provider_options<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<String, String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::Error as _;
+    let options = BTreeMap::<String, String>::deserialize(deserializer)?;
+    if let Some(key) = options
+        .keys()
+        .find(|key| is_sensitive_mcp_provider_option(key))
+    {
+        return Err(D::Error::custom(format!(
+            "MCP provider_options cannot contain credential field '{key}'"
+        )));
+    }
+    Ok(options)
+}
+
+pub fn is_valid_mcp_server_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains("__")
+        && name
+            .chars()
+            .all(|value| value.is_ascii_alphanumeric() || matches!(value, '-' | '_'))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum McpEnvVar {
@@ -267,9 +429,14 @@ impl Default for McpServerConfig {
             command: String::new(),
             args: Vec::new(),
             url: String::new(),
+            provider: String::new(),
+            auth_mode: McpAuthMode::None,
+            auth_profile_id: String::new(),
+            provider_options: BTreeMap::new(),
             enabled: true,
             source: String::new(),
             external_ref: false,
+            trusted_external: false,
             cwd: String::new(),
             env: BTreeMap::new(),
             env_vars: Vec::new(),
@@ -286,6 +453,10 @@ impl Default for McpServerConfig {
 }
 
 impl McpServerConfig {
+    pub fn is_oauth(&self) -> bool {
+        matches!(self.auth_mode, McpAuthMode::OAuth)
+    }
+
     pub fn tool_allowed(&self, bare_name: &str) -> bool {
         let explicitly_enabled = self.enabled_tools.is_empty()
             || self.enabled_tools.iter().any(|name| name == bare_name);
@@ -300,6 +471,9 @@ impl McpServerConfig {
             enabled: self.enabled,
             source: self.source.clone(),
             external_ref: true,
+            provider: self.provider.clone(),
+            auth_mode: self.auth_mode,
+            auth_profile_id: self.auth_profile_id.clone(),
             startup_timeout_sec: self.startup_timeout_sec,
             tool_timeout_sec: self.tool_timeout_sec,
             enabled_tools: self.enabled_tools.clone(),
@@ -426,6 +600,63 @@ impl Config {
         self.model.clone()
     }
 
+    /// Validate that an application-managed write cannot replicate inline MCP
+    /// credentials. Legacy manual configs must migrate those values to
+    /// environment references before a GUI rewrites the MCP section.
+    pub fn validate_managed_mcp_persistence(&self) -> std::result::Result<(), String> {
+        let mut names = std::collections::HashSet::with_capacity(self.mcp_servers.len());
+        for server in &self.mcp_servers {
+            if !is_valid_mcp_server_name(&server.name) {
+                return Err(format!("MCP server name '{}' is invalid", server.name));
+            }
+            if !names.insert(server.name.as_str()) {
+                return Err(format!(
+                    "duplicate MCP server name '{}'; server names must be unique",
+                    server.name
+                ));
+            }
+            if !server.env.is_empty() {
+                return Err(format!(
+                    "MCP server '{}' contains inline environment values; move them to env_vars before saving",
+                    server.name
+                ));
+            }
+            if !server.http_headers.is_empty() {
+                return Err(format!(
+                    "MCP server '{}' contains inline HTTP headers; move them to env_http_headers before saving",
+                    server.name
+                ));
+            }
+            if mcp_args_contain_inline_credentials(&server.args) {
+                return Err(format!(
+                    "MCP server '{}' contains a credential-like command argument; use an environment reference before saving",
+                    server.name
+                ));
+            }
+            if !server.url.trim().is_empty() {
+                let endpoint = url::Url::parse(&server.url).map_err(|error| {
+                    format!("MCP server '{}' has an invalid URL: {error}", server.name)
+                })?;
+                if !endpoint.username().is_empty() || endpoint.password().is_some() {
+                    return Err(format!(
+                        "MCP server '{}' URL contains inline credentials; use an environment reference before saving",
+                        server.name
+                    ));
+                }
+                if endpoint
+                    .query_pairs()
+                    .any(|(key, _)| is_sensitive_mcp_provider_option(&key))
+                {
+                    return Err(format!(
+                        "MCP server '{}' URL contains a credential query parameter; use native OAuth or an environment reference before saving",
+                        server.name
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Runtime approval policy after applying product modes such as Plan.
     pub fn effective_approval_policy(&self) -> ApprovalPolicy {
         self.effective_permissions().0
@@ -502,6 +733,13 @@ mod tests {
             command: "npx".into(),
             args: vec!["-y".into(), "server".into()],
             source: "Codex user config".into(),
+            provider: "github".into(),
+            auth_mode: McpAuthMode::OAuth,
+            auth_profile_id: "github-main".into(),
+            provider_options: BTreeMap::from([
+                ("access_token".into(), "must-not-copy".into()),
+                ("project".into(), "oxide".into()),
+            ]),
             env: BTreeMap::from([("GITHUB_TOKEN".into(), "secret".into())]),
             http_headers: BTreeMap::from([("Authorization".into(), "Bearer secret".into())]),
             required: true,
@@ -513,6 +751,10 @@ mod tests {
         assert!(server.external_ref);
         assert_eq!(server.name, "github");
         assert_eq!(server.source, "Codex user config");
+        assert_eq!(server.provider, "github");
+        assert!(server.is_oauth());
+        assert_eq!(server.auth_profile_id, "github-main");
+        assert!(server.provider_options.is_empty());
         assert!(server.command.is_empty());
         assert!(server.args.is_empty());
         assert!(server.env.is_empty());
@@ -520,6 +762,195 @@ mod tests {
         assert!(server.required);
         let serialized = toml::to_string(&server).unwrap();
         assert!(!serialized.contains("secret"));
+        assert!(!serialized.contains("must-not-copy"));
+        assert!(!serialized.contains("access_token"));
+        assert!(!serialized.contains("refresh_token"));
+    }
+
+    #[test]
+    fn legacy_mcp_config_defaults_to_no_native_auth() {
+        let server: McpServerConfig = toml::from_str(
+            r#"
+name = "legacy"
+url = "https://example.com/mcp"
+bearer_token_env_var = "LEGACY_MCP_TOKEN"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(server.auth_mode, McpAuthMode::None);
+        assert!(server.provider.is_empty());
+        assert!(server.auth_profile_id.is_empty());
+        assert!(server.provider_options.is_empty());
+        assert_eq!(server.bearer_token_env_var, "LEGACY_MCP_TOKEN");
+
+        let serialized = toml::to_string(&server).unwrap();
+        assert!(!serialized.contains("auth_mode"));
+        let restored: McpServerConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(restored.auth_mode, McpAuthMode::None);
+        assert_eq!(restored.bearer_token_env_var, "LEGACY_MCP_TOKEN");
+    }
+
+    #[test]
+    fn oauth_mcp_config_roundtrips_without_token_fields() {
+        let server: McpServerConfig = toml::from_str(
+            r#"
+name = "supabase"
+url = "https://mcp.supabase.com/mcp"
+provider = "supabase"
+auth_mode = "oauth"
+auth_profile_id = "supabase-main"
+provider_options = { project_ref = "project-123", read_only = "true" }
+"#,
+        )
+        .unwrap();
+
+        assert!(server.is_oauth());
+        assert_eq!(server.provider, "supabase");
+        assert_eq!(server.auth_profile_id, "supabase-main");
+        assert_eq!(
+            server
+                .provider_options
+                .get("project_ref")
+                .map(String::as_str),
+            Some("project-123")
+        );
+
+        let serialized = toml::to_string(&server).unwrap();
+        assert!(serialized.contains("auth_mode = \"oauth\""));
+        assert!(!serialized.contains("access_token"));
+        assert!(!serialized.contains("refresh_token"));
+
+        let restored: McpServerConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(restored.auth_mode, McpAuthMode::OAuth);
+        assert_eq!(restored.provider, server.provider);
+        assert_eq!(restored.auth_profile_id, server.auth_profile_id);
+        assert_eq!(restored.provider_options, server.provider_options);
+    }
+
+    #[test]
+    fn managed_persistence_accepts_references_and_rejects_inline_mcp_secrets() {
+        let mut config = Config::default();
+        config.mcp_servers.push(McpServerConfig {
+            name: "private".into(),
+            env_vars: vec![McpEnvVar::Name("DATABASE_URL".into())],
+            env_http_headers: BTreeMap::from([("Authorization".into(), "MCP_TOKEN".into())]),
+            bearer_token_env_var: "MCP_TOKEN".into(),
+            ..Default::default()
+        });
+        assert!(config.validate_managed_mcp_persistence().is_ok());
+
+        let mut inline_env = config.clone();
+        inline_env.mcp_servers[0]
+            .env
+            .insert("DATABASE_URL".into(), "postgres://secret".into());
+        assert!(inline_env.validate_managed_mcp_persistence().is_err());
+
+        let mut inline_header = config.clone();
+        inline_header.mcp_servers[0]
+            .http_headers
+            .insert("Authorization".into(), "Bearer secret".into());
+        assert!(inline_header.validate_managed_mcp_persistence().is_err());
+
+        let mut inline_arg = config.clone();
+        inline_arg.mcp_servers[0].args = vec!["--api-key=secret".into()];
+        assert!(inline_arg.validate_managed_mcp_persistence().is_err());
+
+        let mut inline_header_arg = config.clone();
+        inline_header_arg.mcp_servers[0].args =
+            vec!["-H".into(), "Authorization: Bearer secret".into()];
+        assert!(inline_header_arg
+            .validate_managed_mcp_persistence()
+            .is_err());
+
+        let mut inline_env_arg = config.clone();
+        inline_env_arg.mcp_servers[0].args = vec!["--env".into(), "TOKEN=secret".into()];
+        assert!(inline_env_arg.validate_managed_mcp_persistence().is_err());
+
+        let mut inline_url = config.clone();
+        inline_url.mcp_servers[0].url = "https://mcp.example/mcp?accessToken=secret".into();
+        assert!(inline_url.validate_managed_mcp_persistence().is_err());
+
+        let mut signed_url = config;
+        signed_url.mcp_servers[0].url = "https://mcp.example/mcp?X-Amz-Signature=secret".into();
+        assert!(signed_url.validate_managed_mcp_persistence().is_err());
+    }
+
+    #[test]
+    fn unknown_mcp_auth_mode_is_rejected() {
+        let result = toml::from_str::<McpServerConfig>(
+            r#"
+name = "invalid"
+auth_mode = "custom"
+"#,
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn provider_options_reject_credential_material() {
+        let parsed = toml::from_str::<McpServerConfig>(
+            r#"
+name = "unsafe"
+provider_options = { project_ref = "safe", access_token = "must-not-persist" }
+"#,
+        );
+        assert!(parsed
+            .unwrap_err()
+            .to_string()
+            .contains("cannot contain credential field 'access_token'"));
+
+        let server = McpServerConfig {
+            name: "unsafe".to_string(),
+            provider_options: BTreeMap::from([(
+                "client_secret".to_string(),
+                "must-not-persist".to_string(),
+            )]),
+            ..McpServerConfig::default()
+        };
+        assert!(toml::to_string(&server).is_err());
+
+        for key in [
+            "accessToken",
+            "clientSecret",
+            "apiKey",
+            "serviceRoleKey",
+            "private_key",
+            "providerToken",
+        ] {
+            let source = format!(
+                "name = \"unsafe\"\nprovider_options = {{ {key} = \"must-not-persist\" }}\n"
+            );
+            assert!(toml::from_str::<McpServerConfig>(&source).is_err(), "{key}");
+        }
+    }
+
+    #[test]
+    fn mcp_server_names_preserve_namespace_boundaries() {
+        assert!(is_valid_mcp_server_name("supabase-main"));
+        assert!(is_valid_mcp_server_name("supabase_main"));
+        assert!(!is_valid_mcp_server_name("foo__bar"));
+        assert!(!is_valid_mcp_server_name("contains space"));
+        assert!(!is_valid_mcp_server_name(""));
+    }
+
+    #[test]
+    fn trusted_external_provenance_cannot_be_loaded_from_toml() {
+        let server: McpServerConfig = toml::from_str(
+            r#"
+name = "spoofed"
+url = "https://attacker.example/mcp"
+source = "Claude Desktop"
+trusted_external = true
+"#,
+        )
+        .unwrap();
+
+        assert!(!server.trusted_external);
+        assert!(!toml::to_string(&server)
+            .unwrap()
+            .contains("trusted_external"));
     }
 
     #[test]

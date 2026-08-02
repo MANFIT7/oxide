@@ -1175,6 +1175,32 @@ impl OxideDesktop {
                     request_id: None,
                 });
             }
+            Event::McpAuthStatus {
+                name,
+                state,
+                detail,
+            } => {
+                self.timeline.push(TimelineItem {
+                    title: format!("MCP {name} authorization: {state}"),
+                    detail,
+                    state: if state == "authorized" {
+                        TimelineState::Done
+                    } else if state == "error" {
+                        TimelineState::Error
+                    } else {
+                        TimelineState::Running
+                    },
+                    request_id: None,
+                });
+            }
+            Event::McpAuthorizationUrl { name, .. } => {
+                self.timeline.push(TimelineItem {
+                    title: format!("MCP {name} authorization"),
+                    detail: "Continue authorization in the primary desktop browser".to_string(),
+                    state: TimelineState::Running,
+                    request_id: None,
+                });
+            }
             Event::BrowserTargetChanged { url, note, .. } => {
                 self.browser_target_url = url.clone();
                 self.browser_action_note = if note.trim().is_empty() {
@@ -7944,11 +7970,30 @@ fn run_git_stdout(workspace: &Path, args: &[&str]) -> Result<String, String> {
 }
 
 fn save_project_config(config: &Config) -> anyhow::Result<()> {
+    use std::io::Write as _;
+
     let workspace = workspace_of(config);
     std::fs::create_dir_all(&workspace)?;
     let path = workspace.join("oxide.toml");
+    config
+        .validate_managed_mcp_persistence()
+        .map_err(anyhow::Error::msg)?;
     let text = toml::to_string_pretty(config)?;
-    std::fs::write(path, text)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path)?;
+    file.write_all(text.as_bytes())?;
+    file.sync_all()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    }
     Ok(())
 }
 
@@ -9695,20 +9740,49 @@ mod tests {
     fn save_project_config_writes_oxide_toml() {
         let tmp = unique_tmp("config");
         std::fs::create_dir_all(&tmp).unwrap();
-        let cfg = Config {
+        let mut cfg = Config {
             workspace: Some(tmp.clone()),
             provider: "codex".to_string(),
             model: "gpt-5.5".to_string(),
             reasoning_effort: "high".to_string(),
             ..Default::default()
         };
+        cfg.mcp_servers.push(oxide_config::McpServerConfig {
+            name: "private".to_string(),
+            env: std::collections::BTreeMap::from([(
+                "DATABASE_URL".to_string(),
+                "postgres://inline-secret".to_string(),
+            )]),
+            http_headers: std::collections::BTreeMap::from([(
+                "Authorization".to_string(),
+                "Bearer inline-secret".to_string(),
+            )]),
+            env_vars: vec![oxide_config::McpEnvVar::Name("DATABASE_URL".to_string())],
+            ..Default::default()
+        });
 
+        let error = save_project_config(&cfg).unwrap_err();
+        assert!(error.to_string().contains("inline environment values"));
+        cfg.mcp_servers[0].env.clear();
+        cfg.mcp_servers[0].http_headers.clear();
         save_project_config(&cfg).unwrap();
 
         let written = std::fs::read_to_string(tmp.join("oxide.toml")).unwrap();
         assert!(written.contains("provider = \"codex\""));
         assert!(written.contains("model = \"gpt-5.5\""));
         assert!(written.contains("reasoning_effort = \"high\""));
+        assert!(written.contains("DATABASE_URL"));
+        assert!(!written.contains("inline-secret"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(tmp.join("oxide.toml"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
         std::fs::remove_dir_all(tmp).ok();
     }
 

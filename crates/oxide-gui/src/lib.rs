@@ -18,8 +18,8 @@ use oxide_config::Config;
 use oxide_core::{automation, EngineHandle};
 use oxide_protocol::{
     ApprovalDecision, ApprovalPolicy, BrowserControlAction, DesignEdit, DesignPatchProposal,
-    DesignSelection, Event, Op, RuntimePermissions, SandboxPolicy, SubagentControlAction, UiNode,
-    UiNodeKind, UiSpec, UiTone,
+    DesignSelection, Event, McpControlAction, Op, RuntimePermissions, SandboxPolicy,
+    SubagentControlAction, UiNode, UiNodeKind, UiSpec, UiTone,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -123,6 +123,44 @@ fn open_in_editor(app: &'static str, path: std::path::PathBuf) {
             .arg(&path)
             .status();
     });
+}
+
+/// Open an OAuth authorization URL without invoking a shell. Only browser-safe
+/// HTTP(S) URLs are accepted so an MCP server cannot launch an arbitrary local
+/// scheme through an authorization response.
+fn open_external_http_url(url: String) -> Result<(), String> {
+    let url = url.trim().to_string();
+    if url.contains('\0') || !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err("authorization URL must use http:// or https://".to_string());
+    }
+
+    std::thread::Builder::new()
+        .name("oxide-open-oauth".to_string())
+        .spawn(move || {
+            #[cfg(target_os = "macos")]
+            let result = std::process::Command::new("open")
+                .arg("--")
+                .arg(&url)
+                .status();
+            #[cfg(target_os = "windows")]
+            let result = std::process::Command::new("rundll32")
+                .arg("url.dll,FileProtocolHandler")
+                .arg(&url)
+                .status();
+            #[cfg(all(unix, not(target_os = "macos")))]
+            let result = std::process::Command::new("xdg-open").arg(&url).status();
+            #[cfg(not(any(unix, target_os = "windows")))]
+            let result: std::io::Result<std::process::ExitStatus> = Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "opening external URLs is unsupported on this platform",
+            ));
+
+            if let Err(error) = result {
+                eprintln!("failed to open MCP authorization URL: {error}");
+            }
+        })
+        .map(|_| ())
+        .map_err(|error| format!("cannot start browser opener: {error}"))
 }
 
 /// Resolve only the `oxide-term` binary bundled next to the current executable.
@@ -1977,6 +2015,10 @@ enum EngineCmd {
         permissions: CapturedPermissions,
     },
     Reconfigure(Config),
+    UpdateMcpServers {
+        config: Config,
+        followup: Option<(String, McpControlAction)>,
+    },
     ReloadHarnesses,
     /// Activate tab `id`: swap the VIEW to its transcript/config. Engines are
     /// per-tab — the tab being left keeps its turn running in the background.
@@ -2004,6 +2046,10 @@ enum EngineCmd {
         action: SubagentControlAction,
     },
     BrowserControl(BrowserControlAction),
+    McpControl {
+        name: String,
+        action: McpControlAction,
+    },
     Interrupt,
 }
 
@@ -2272,6 +2318,7 @@ enum VisualFixtureMode {
     Verification,
     Board,
     Settings,
+    Mcp,
 }
 
 impl VisualFixtureMode {
@@ -2282,6 +2329,7 @@ impl VisualFixtureMode {
             Some("verification") => Some(Self::Verification),
             Some("board") => Some(Self::Board),
             Some("settings") => Some(Self::Settings),
+            Some("mcp") => Some(Self::Mcp),
             _ => None,
         }
     }
@@ -2290,7 +2338,9 @@ impl VisualFixtureMode {
 fn visual_fixture_messages(mode: Option<VisualFixtureMode>) -> Vec<ChatMsg> {
     if matches!(
         mode,
-        None | Some(VisualFixtureMode::Board) | Some(VisualFixtureMode::Settings)
+        None | Some(VisualFixtureMode::Board)
+            | Some(VisualFixtureMode::Settings)
+            | Some(VisualFixtureMode::Mcp)
     ) {
         return Vec::new();
     }
@@ -3613,26 +3663,133 @@ fn apply_access_preset(config: &mut Config, preset: AccessPreset) {
     };
 }
 
-fn persist_config_preferences(config: &Config) {
-    let ws = workspace_of(config);
+fn config_for_persistence(config: &Config) -> Config {
     let mut persist = config.clone();
     persist.resume_path = None;
     persist.resume = false;
-    if let Ok(serialized) = toml::to_string(&persist) {
-        let _ = write_atomic(&ws.join("oxide.toml"), &serialized);
-        if let Some(home) = std::env::var_os("HOME") {
-            let global_dir = std::path::PathBuf::from(home).join(".config/oxide");
-            let _ = std::fs::create_dir_all(&global_dir);
-            let _ = write_atomic(&global_dir.join("config.toml"), &serialized);
+    persist
+}
+
+fn serialize_config(config: &Config) -> std::io::Result<String> {
+    let serialized = toml::to_string(&config_for_persistence(config))
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    Ok(serialized)
+}
+
+fn persist_config_preferences_at(path: &Path, config: &Config) -> std::io::Result<()> {
+    let mut value = toml::Value::try_from(config_for_persistence(config))
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let table = value.as_table_mut().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "serialized Oxide config is not a TOML table",
+        )
+    })?;
+    if path.exists() {
+        let existing = std::fs::read_to_string(path)?;
+        let existing = toml::from_str::<toml::Value>(&existing)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        if let Some(mcp_servers) = existing.get("mcp_servers") {
+            table.insert("mcp_servers".to_string(), mcp_servers.clone());
+        } else {
+            table.remove("mcp_servers");
         }
+    } else {
+        table.remove("mcp_servers");
     }
+    let serialized = toml::to_string(&value)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    write_atomic(path, &serialized)
+}
+
+fn persist_managed_mcp_config(previous: &Config, config: &Config) -> std::io::Result<()> {
+    let path = workspace_of(config).join("oxide.toml");
+    let has_workspace_mcp_layer = if path.exists() {
+        let existing = std::fs::read_to_string(&path)?;
+        let existing = toml::from_str::<toml::Value>(&existing)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        existing.get("mcp_servers").is_some()
+    } else {
+        false
+    };
+    if !has_workspace_mcp_layer && !previous.mcp_servers.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "MCP servers inherited from the global config cannot be copied into this workspace; define a workspace MCP section first",
+        ));
+    }
+    config
+        .validate_managed_mcp_persistence()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::PermissionDenied, error))?;
+    write_atomic(&path, &serialize_config(config)?)
+}
+
+fn persist_global_preferences(config: &Config) -> std::io::Result<()> {
+    let home = std::env::var_os("HOME")
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "HOME is not set"))?;
+    let global_dir = std::path::PathBuf::from(home).join(".config/oxide");
+    std::fs::create_dir_all(&global_dir)?;
+    persist_config_preferences_at(&global_dir.join("config.toml"), config)
+}
+
+fn try_persist_config_preferences(config: &Config) -> std::io::Result<()> {
+    let workspace_path = workspace_of(config).join("oxide.toml");
+    let home = std::env::var_os("HOME")
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "HOME is not set"))?;
+    let global_dir = std::path::PathBuf::from(home).join(".config/oxide");
+    std::fs::create_dir_all(&global_dir)?;
+    persist_config_preferences_transaction(&workspace_path, &global_dir.join("config.toml"), config)
+}
+
+fn persist_config_preferences_transaction(
+    workspace_path: &Path,
+    global_path: &Path,
+    config: &Config,
+) -> std::io::Result<()> {
+    let previous_workspace = match std::fs::read(workspace_path) {
+        Ok(contents) => Some(contents),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    persist_config_preferences_at(workspace_path, config)?;
+    if let Err(error) = persist_config_preferences_at(global_path, config) {
+        let rollback = match previous_workspace {
+            Some(contents) => std::str::from_utf8(&contents)
+                .map_err(|utf8_error| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, utf8_error)
+                })
+                .and_then(|contents| write_atomic(workspace_path, contents)),
+            None => match std::fs::remove_file(workspace_path) {
+                Ok(()) => Ok(()),
+                Err(remove_error) if remove_error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(remove_error) => Err(remove_error),
+            },
+        };
+        return match rollback {
+            Ok(()) => Err(error),
+            Err(rollback_error) => Err(std::io::Error::new(
+                error.kind(),
+                format!("{error}; workspace rollback failed: {rollback_error}"),
+            )),
+        };
+    }
+    Ok(())
+}
+
+fn set_config_if_persisted(mut cfg: Signal<Config>, config: Config) -> std::io::Result<()> {
+    try_persist_config_preferences(&config)?;
+    cfg.set(config);
+    Ok(())
 }
 
 fn set_plan_mode(mut cfg: Signal<Config>, mut plan_mode: Signal<bool>, enabled: bool) {
     let mut config = cfg.read().clone();
     config.plan_mode = enabled;
+    if let Err(error) = try_persist_config_preferences(&config) {
+        eprintln!("oxide: could not persist plan mode: {error}");
+        return;
+    }
     publish_runtime_permissions(&config);
-    persist_config_preferences(&config);
     cfg.set(config);
     plan_mode.set(enabled);
 }
@@ -4917,6 +5074,210 @@ mod tests {
         assert_eq!(toast_aria_role("err"), "alert");
         assert_eq!(toast_aria_role("ok"), "status");
     }
+
+    #[test]
+    fn custom_mcp_editor_drops_hidden_secrets_when_the_target_changes() {
+        let original = oxide_config::McpServerConfig {
+            command: String::new(),
+            url: "https://old.example/mcp".to_string(),
+            auth_mode: oxide_config::McpAuthMode::BearerEnv,
+            bearer_token_env_var: "OLD_TOKEN".to_string(),
+            ..oxide_config::McpServerConfig::default()
+        };
+
+        assert!(!mcp_hidden_http_headers_must_clear(
+            Some(&original),
+            "",
+            "https://old.example/mcp",
+            oxide_config::McpAuthMode::BearerEnv,
+            "OLD_TOKEN",
+        ));
+        assert!(mcp_hidden_http_headers_must_clear(
+            Some(&original),
+            "",
+            "https://new.example/mcp",
+            oxide_config::McpAuthMode::BearerEnv,
+            "OLD_TOKEN",
+        ));
+        assert!(mcp_hidden_http_headers_must_clear(
+            Some(&original),
+            "",
+            "https://old.example/mcp",
+            oxide_config::McpAuthMode::OAuth,
+            "",
+        ));
+        assert!(mcp_hidden_http_headers_must_clear(
+            Some(&original),
+            "",
+            "https://old.example/mcp",
+            oxide_config::McpAuthMode::BearerEnv,
+            "NEW_TOKEN",
+        ));
+        assert!(!mcp_hidden_stdio_env_must_clear(Some(&original), ""));
+
+        let local = oxide_config::McpServerConfig {
+            command: "old-server".to_string(),
+            ..oxide_config::McpServerConfig::default()
+        };
+        assert!(mcp_hidden_stdio_env_must_clear(Some(&local), "new-server"));
+    }
+
+    #[test]
+    fn custom_mcp_urls_reject_inline_credential_parameters() {
+        assert!(validate_mcp_remote_url(
+            "https://mcp.example/mcp?project_ref=demo&read_only=true",
+            true,
+        )
+        .is_ok());
+        assert!(
+            validate_mcp_remote_url("https://mcp.example/mcp?api_key=inline-secret", false,)
+                .is_err()
+        );
+        assert!(validate_mcp_remote_url(
+            "https://mcp.example/mcp?accessToken=inline-secret",
+            false,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn preference_persistence_preserves_its_own_mcp_layer_without_copying_merged_servers() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "oxide-gui-layered-config-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let existing_path = root.join("oxide.toml");
+        write_atomic(
+            &existing_path,
+            "theme = \"dark\"\n[[mcp_servers]]\nname = \"legacy\"\ncommand = \"legacy-server\"\nargs = [\"--token=inline-secret\"]\n",
+        )
+        .unwrap();
+
+        let mut config = Config::default();
+        config.theme = "light".to_string();
+        config.mcp_servers.push(oxide_config::McpServerConfig {
+            name: "merged-global-server".to_string(),
+            command: "safe-server".to_string(),
+            ..oxide_config::McpServerConfig::default()
+        });
+
+        persist_config_preferences_at(&existing_path, &config).unwrap();
+        let existing = std::fs::read_to_string(&existing_path).unwrap();
+        assert!(existing.contains("theme = \"light\""));
+        assert!(existing.contains("name = \"legacy\""));
+        assert!(existing.contains("inline-secret"));
+        assert!(!existing.contains("merged-global-server"));
+
+        let new_path = root.join("new-config.toml");
+        persist_config_preferences_at(&new_path, &config).unwrap();
+        let created = std::fs::read_to_string(&new_path).unwrap();
+        assert!(created.contains("theme = \"light\""));
+        assert!(!created.contains("mcp_servers"));
+        assert!(!created.contains("merged-global-server"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn preference_transaction_rolls_back_workspace_when_global_write_fails() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "oxide-gui-config-rollback-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let workspace_path = root.join("oxide.toml");
+        write_atomic(&workspace_path, "theme = \"dark\"\n").unwrap();
+        let not_a_directory = root.join("not-a-directory");
+        write_atomic(&not_a_directory, "blocked\n").unwrap();
+
+        let mut config = Config::default();
+        config.theme = "light".to_string();
+        let error = persist_config_preferences_transaction(
+            &workspace_path,
+            &not_a_directory.join("config.toml"),
+            &config,
+        )
+        .unwrap_err();
+
+        assert!(!error.to_string().is_empty());
+        let restored = std::fs::read_to_string(&workspace_path).unwrap();
+        assert!(restored.contains("theme = \"dark\""));
+        assert!(!restored.contains("theme = \"light\""));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn managed_mcp_persistence_never_copies_an_inherited_global_layer() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "oxide-gui-mcp-layer-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let inherited = oxide_config::McpServerConfig {
+            name: "global-provider".to_string(),
+            command: "safe-server".to_string(),
+            ..oxide_config::McpServerConfig::default()
+        };
+        let previous = Config {
+            workspace: Some(root.clone()),
+            mcp_servers: vec![inherited.clone()],
+            ..Config::default()
+        };
+        let mut next = previous.clone();
+        next.mcp_servers.push(oxide_config::McpServerConfig {
+            name: "workspace-provider".to_string(),
+            command: "safe-server".to_string(),
+            ..oxide_config::McpServerConfig::default()
+        });
+
+        let error = persist_managed_mcp_config(&previous, &next).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("inherited from the global config"));
+        assert!(!root.join("oxide.toml").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn oauth_followup_spawns_an_engine_for_an_empty_target_tab() {
+        assert!(should_spawn_mcp_followup_engine(true, true, false));
+        assert!(!should_spawn_mcp_followup_engine(true, true, true));
+        assert!(!should_spawn_mcp_followup_engine(false, true, false));
+        assert!(!should_spawn_mcp_followup_engine(true, false, false));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_config_writes_use_private_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "oxide-gui-private-write-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("oxide.toml");
+        write_atomic(&path, "theme = \"dark\"\n").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 fn toast_icon_name(kind: &str) -> &'static str {
@@ -5285,14 +5646,46 @@ fn thread_json_load<T: serde::de::DeserializeOwned + Default>(
 /// or force-quit mid-flush leaves a torn file. For config/board files that torn
 /// state is fatal downstream (`Config::load` refuses to start on a parse error).
 pub(crate) fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
-    let tmp = path.with_extension("oxide-tmp");
-    std::fs::write(&tmp, contents)?;
-    std::fs::rename(&tmp, path).or_else(|_| {
-        // Cross-device or rename race — land the bytes directly, drop the temp.
-        let direct = std::fs::write(path, contents);
+    use std::io::Write as _;
+
+    static TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("oxide");
+    let sequence = TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = parent.join(format!(
+        ".{file_name}.{}.{}.oxide-tmp",
+        std::process::id(),
+        sequence
+    ));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&tmp)?;
+    if let Err(error) = file
+        .write_all(contents.as_bytes())
+        .and_then(|_| file.sync_all())
+    {
         let _ = std::fs::remove_file(&tmp);
-        direct
-    })
+        return Err(error);
+    }
+    drop(file);
+    if let Err(error) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
 }
 
 fn thread_json_save<T: serde::Serialize>(ws: &Path, dir: &str, stem: &str, v: &T) {
@@ -5997,6 +6390,12 @@ struct McpUiStatus {
     detail: String,
 }
 
+#[derive(Clone, Default)]
+struct McpAuthUiStatus {
+    state: String,
+    detail: String,
+}
+
 #[derive(Clone, Default, PartialEq, Eq)]
 struct BrowserUiSession {
     state: String,
@@ -6016,7 +6415,26 @@ fn app() -> Element {
     let visual_fixture = VisualFixtureMode::from_env();
 
     // Live, editable configuration.
-    let mut cfg = use_signal(|| initial.clone());
+    let fixture_config = {
+        let mut fixture = initial.clone();
+        if matches!(visual_fixture, Some(VisualFixtureMode::Mcp)) {
+            fixture.mcp_servers = vec![oxide_config::McpServerConfig {
+                name: "supabase-workspace".to_string(),
+                url: "https://mcp.supabase.com/mcp?project_ref=oxide-demo&read_only=true&features=database%2Cdocs".to_string(),
+                provider: "supabase".to_string(),
+                auth_mode: oxide_config::McpAuthMode::OAuth,
+                auth_profile_id: "supabase-oxide-demo".to_string(),
+                provider_options: std::collections::BTreeMap::from([
+                    ("project_ref".to_string(), "oxide-demo".to_string()),
+                    ("read_only".to_string(), "true".to_string()),
+                    ("features".to_string(), "database,docs".to_string()),
+                ]),
+                ..oxide_config::McpServerConfig::default()
+            }];
+        }
+        fixture
+    };
+    let mut cfg = use_signal(move || fixture_config);
     let ws0 = workspace_of(&initial);
 
     // Chat state.
@@ -6063,7 +6481,7 @@ fn app() -> Element {
         use_signal(move || matches!(visual_fixture, Some(VisualFixtureMode::Settings)));
     let mut settings_initial_tab = use_signal(|| "model".to_string());
     let mut show_skills = use_signal(|| false);
-    let mut show_mcp = use_signal(|| false);
+    let mut show_mcp = use_signal(move || matches!(visual_fixture, Some(VisualFixtureMode::Mcp)));
     let mut show_theme_menu = use_signal(|| false);
     let mut theme_menu_pos = use_signal(|| (12.0f64, 44.0f64));
     // Cmd-K command palette.
@@ -6091,7 +6509,39 @@ fn app() -> Element {
     let mut palette_sel = use_signal(|| 0usize);
     let mut pinned = use_signal(|| false);
     let win = dioxus::desktop::use_window();
-    let mut mcp_status = use_signal(std::collections::HashMap::<String, McpUiStatus>::new);
+    let mut mcp_status = use_signal(move || {
+        let mut value = std::collections::HashMap::new();
+        if matches!(visual_fixture, Some(VisualFixtureMode::Mcp)) {
+            value.insert(
+                (0, "supabase-workspace".to_string()),
+                McpUiStatus {
+                    status: "connected".to_string(),
+                    tool_count: 4,
+                    tools: vec![
+                        "list_tables".to_string(),
+                        "execute_sql".to_string(),
+                        "search_docs".to_string(),
+                        "get_advisors".to_string(),
+                    ],
+                    detail: "OAuth session ready · read-only".to_string(),
+                },
+            );
+        }
+        value
+    });
+    let mut mcp_auth_status = use_signal(move || {
+        let mut value = std::collections::HashMap::new();
+        if matches!(visual_fixture, Some(VisualFixtureMode::Mcp)) {
+            value.insert(
+                (0, "supabase-workspace".to_string()),
+                McpAuthUiStatus {
+                    state: "authorized".to_string(),
+                    detail: "Credentials stored in macOS Keychain".to_string(),
+                },
+            );
+        }
+        value
+    });
     // ChatGPT subscription usage: (plan, 5h %, weekly %, 5h reset s, weekly reset s).
     // (family "gpt"/"claude", plan, 5h-remaining %, weekly-remaining %, 5h reset, weekly reset).
     // Family-tagged so the card never shows one provider's quota while another is active.
@@ -7563,6 +8013,15 @@ fn app() -> Element {
                                 &conf.model,
                                 &conf.reasoning_effort,
                             );
+                            if let Err(error) = try_persist_config_preferences(&conf) {
+                                push_toast(
+                                    toasts,
+                                    toast_seq,
+                                    "err",
+                                    &format!("Could not save settings: {error}"),
+                                );
+                                continue;
+                            }
                             cfg.set(conf.clone());
                             // Provider the active tab had BEFORE this reconfigure — used to
                             // drop stale usage when the quota source changes (e.g. ChatGPT to Claude).
@@ -7576,7 +8035,6 @@ fn app() -> Element {
                             // it makes a later launch (possibly in another folder) silently
                             // continue an old session instead of starting clean.
                             let ws = workspace_of(&conf);
-                            persist_config_preferences(&conf);
                             // Only wipe the transcript when switching PROJECT — a
                             // model/effort/fast/access change must not erase the chat.
                             let same_ws = ws == cur_ws;
@@ -7638,6 +8096,118 @@ fn app() -> Element {
                             // generation guard — no channel drain needed.
                             spawn_tab_engine!(aid, conf);
                             messages.set(kept);
+                        }
+                        Some(EngineCmd::UpdateMcpServers { config: conf, followup }) => {
+                            let previous = cfg.read().clone();
+                            if let Err(error) = persist_managed_mcp_config(&previous, &conf) {
+                                let detail = format!("Could not save MCP configuration: {error}");
+                                push_toast(toasts, toast_seq, "err", &detail);
+                                mcp_auth_status.write().insert(
+                                    (view_tab, "configuration".to_string()),
+                                    McpAuthUiStatus {
+                                        state: "error".to_string(),
+                                        detail,
+                                    },
+                                );
+                                continue;
+                            }
+                            cfg.set(conf.clone());
+                            let workspace = workspace_of(&conf);
+                            let target_tabs = tabs
+                                .peek()
+                                .iter()
+                                .filter(|tab| tab.ws == workspace)
+                                .map(|tab| tab.id)
+                                .collect::<HashSet<_>>();
+                            if should_spawn_mcp_followup_engine(
+                                followup.is_some(),
+                                target_tabs.contains(&view_tab),
+                                handles.contains_key(&view_tab),
+                            ) {
+                                spawn_tab_engine!(view_tab, conf.clone());
+                            }
+                            mcp_status
+                                .write()
+                                .retain(|(tab_id, _), _| !target_tabs.contains(tab_id));
+                            mcp_auth_status
+                                .write()
+                                .retain(|(tab_id, _), _| !target_tabs.contains(tab_id));
+                            let updates = target_tabs
+                                .iter()
+                                .filter_map(|tab_id| {
+                                    handles.get(tab_id).cloned().map(|handle| {
+                                        let tab_id = *tab_id;
+                                        let servers = conf.mcp_servers.clone();
+                                        async move {
+                                            (tab_id, handle.update_mcp_servers(servers).await)
+                                        }
+                                    })
+                                })
+                                .collect::<Vec<_>>();
+                            let mut view_update_succeeded =
+                                target_tabs.contains(&view_tab) && handles.contains_key(&view_tab);
+                            for (tab_id, result) in futures::future::join_all(updates).await {
+                                if let Err(error) = result {
+                                    if tab_id == view_tab {
+                                        view_update_succeeded = false;
+                                    }
+                                    mcp_auth_status.write().insert(
+                                        (tab_id, "configuration".to_string()),
+                                        McpAuthUiStatus {
+                                            state: "error".to_string(),
+                                            detail: format!("Could not apply MCP configuration: {error}"),
+                                        },
+                                    );
+                                }
+                            }
+                            if view_update_succeeded {
+                                if let Some((name, action)) = followup {
+                                    let (state, detail) = match action {
+                                        McpControlAction::Authorize => (
+                                            "authorizing",
+                                            "Preparing secure OAuth authorization…",
+                                        ),
+                                        McpControlAction::Reconnect => (
+                                            "connecting",
+                                            "Reconnecting with the stored OAuth profile…",
+                                        ),
+                                        McpControlAction::Disconnect => (
+                                            "disconnecting",
+                                            "Disconnecting the OAuth profile…",
+                                        ),
+                                        McpControlAction::Test => (
+                                            "testing",
+                                            "Testing the MCP provider…",
+                                        ),
+                                    };
+                                    mcp_auth_status.write().insert(
+                                        (view_tab, name.clone()),
+                                        McpAuthUiStatus {
+                                            state: state.to_string(),
+                                            detail: detail.to_string(),
+                                        },
+                                    );
+                                    if let Some(handle) = handles.get(&view_tab) {
+                                        if let Err(error) = handle
+                                            .submit(Op::McpControl {
+                                                name: name.clone(),
+                                                action,
+                                            })
+                                            .await
+                                        {
+                                            mcp_auth_status.write().insert(
+                                                (view_tab, name),
+                                                McpAuthUiStatus {
+                                                    state: "error".to_string(),
+                                                    detail: format!(
+                                                        "Could not run MCP follow-up: {error}"
+                                                    ),
+                                                },
+                                            );
+                                        }
+                                    }
+                                }
+                            }
                         }
                         Some(EngineCmd::SwitchTab { id, conf, msgs }) => {
                             if !handles.contains_key(&id) && !msgs.is_empty() {
@@ -7743,6 +8313,10 @@ fn app() -> Element {
                             parked_q.remove(&id);
                             bg_buffers.remove(&id);
                             browser_sessions.write().remove(&id);
+                            mcp_status.write().retain(|(tab_id, _), _| *tab_id != id);
+                            mcp_auth_status
+                                .write()
+                                .retain(|(tab_id, _), _| *tab_id != id);
                             busy_tabs.write().remove(&id);
                             tab_statuses.write().remove(&id);
                         }
@@ -7783,6 +8357,11 @@ fn app() -> Element {
                         Some(EngineCmd::BrowserControl(action)) => {
                             if let Some(h) = handles.get(&view_tab) {
                                 let _ = h.submit(Op::BrowserControl { action }).await;
+                            }
+                        }
+                        Some(EngineCmd::McpControl { name, action }) => {
+                            if let Some(h) = handles.get(&view_tab) {
+                                let _ = h.submit(Op::McpControl { name, action }).await;
                             }
                         }
                         Some(EngineCmd::SetHistory(msgs)) => {
@@ -7865,7 +8444,100 @@ fn app() -> Element {
                                     },
                                 );
                             }
+                            Event::McpServerStatus {
+                                name,
+                                status,
+                                tool_count,
+                                tools,
+                                detail,
+                            } => {
+                                mcp_status.write().insert(
+                                    (ev_tid, name.clone()),
+                                    McpUiStatus {
+                                        status: status.clone(),
+                                        tool_count: *tool_count,
+                                        tools: tools.clone(),
+                                        detail: detail.clone(),
+                                    },
+                                );
+                            }
+                            Event::McpAuthStatus {
+                                name,
+                                state,
+                                detail,
+                            } => {
+                                mcp_auth_status.write().insert(
+                                    (ev_tid, name.clone()),
+                                    McpAuthUiStatus {
+                                        state: state.clone(),
+                                        detail: detail.clone(),
+                                    },
+                                );
+                            }
+                            Event::McpAuthorizationUrl { name, url } => {
+                                let next = match open_external_http_url(url.clone()) {
+                                    Ok(()) => McpAuthUiStatus {
+                                        state: "authorizing".to_string(),
+                                        detail: "Continue authorization in your browser".to_string(),
+                                    },
+                                    Err(error) => McpAuthUiStatus {
+                                        state: "error".to_string(),
+                                        detail: error,
+                                    },
+                                };
+                                mcp_auth_status.write().insert((ev_tid, name.clone()), next);
+                            }
                             _ => {}
+                        }
+                        if let Event::McpAuthStatus { name, state, detail } = &ev {
+                            if state.eq_ignore_ascii_case("authorized")
+                                && detail.starts_with("Credentials stored")
+                            {
+                                let workspace = tabs
+                                    .peek()
+                                    .iter()
+                                    .find(|tab| tab.id == ev_tid)
+                                    .map(|tab| tab.ws.clone());
+                                if let Some(workspace) = workspace {
+                                    let siblings = tabs
+                                        .peek()
+                                        .iter()
+                                        .filter(|tab| tab.id != ev_tid && tab.ws == workspace)
+                                        .filter_map(|tab| {
+                                            handles
+                                                .get(&tab.id)
+                                                .cloned()
+                                                .map(|handle| (tab.id, handle))
+                                        })
+                                        .collect::<Vec<_>>();
+                                    for (tab_id, handle) in siblings {
+                                        mcp_auth_status.write().insert(
+                                            (tab_id, name.clone()),
+                                            McpAuthUiStatus {
+                                                state: "connecting".to_string(),
+                                                detail: "Applying the new OAuth session…".to_string(),
+                                            },
+                                        );
+                                        if let Err(error) = handle
+                                            .submit(Op::McpControl {
+                                                name: name.clone(),
+                                                action: McpControlAction::Reconnect,
+                                            })
+                                            .await
+                                        {
+                                            mcp_auth_status.write().insert(
+                                                (tab_id, name.clone()),
+                                                McpAuthUiStatus {
+                                                    state: "error".to_string(),
+                                                    detail: format!(
+                                                        "Could not apply OAuth session to this tab: {error}"
+                                                    ),
+                                                },
+                                            );
+                                        }
+                                    }
+                                }
+                            }
                         }
                         // Events from a BACKGROUND tab go to its buffered transcript;
                         // only the view-bound tab writes to the live view below.
@@ -8304,14 +8976,6 @@ fn app() -> Element {
                                 }
                             }
                             Event::ContextWindow { limit } => context_limit.set(Some(limit)),
-                            Event::McpServerStatus { name, status, tool_count, tools, detail } => {
-                                mcp_status.write().insert(name.clone(), McpUiStatus {
-                                    status,
-                                    tool_count,
-                                    tools,
-                                    detail,
-                                });
-                            }
                             // ── Inspector capture ──────────────────────────
                             Event::Ready { harness } => {
                                 timeline.write().push(TimelineItem { title: "Engine ready".into(), sub: format!("Harness: {harness}") });
@@ -9279,17 +9943,18 @@ fn app() -> Element {
                     panel_drag.set(None);
                     // Persist the new widths.
                     let mut cfg = cfg;
-                    let mut c = cfg.read().clone();
+                    let previous = cfg.read().clone();
+                    let mut c = previous.clone();
                     c.sidebar_width = *sidebar_w.read();
                     c.inspector_width = *insp_w.read();
                     c.env_width = *rpanel_w.read();
-                    cfg.set(c.clone());
-                    if let Ok(t) = toml::to_string(&c) {
-                        let _ = std::fs::write(workspace_of(&c).join("oxide.toml"), &t);
-                        if let Some(home) = std::env::var_os("HOME") {
-                            let d = std::path::PathBuf::from(home).join(".config/oxide");
-                            let _ = std::fs::create_dir_all(&d);
-                            let _ = std::fs::write(d.join("config.toml"), &t);
+                    match try_persist_config_preferences(&c) {
+                        Ok(()) => cfg.set(c),
+                        Err(error) => {
+                            sidebar_w.set(previous.sidebar_width);
+                            insp_w.set(previous.inspector_width);
+                            rpanel_w.set(previous.env_width);
+                            push_toast(toasts, toast_seq, "err", &format!("Could not save panel layout: {error}"));
                         }
                     }
                 }
@@ -10150,9 +10815,18 @@ fn app() -> Element {
                         event.prevent_default();
                         sidebar_w.set(next);
                         let mut config = cfg.read().clone();
+                        let previous = config.sidebar_width;
                         config.sidebar_width = next;
-                        cfg.set(config.clone());
-                        persist_config_preferences(&config);
+                        match try_persist_config_preferences(&config) {
+                            Ok(()) => {
+                                let mut cfg = cfg;
+                                cfg.set(config);
+                            }
+                            Err(error) => {
+                                sidebar_w.set(previous);
+                                push_toast(toasts, toast_seq, "err", &format!("Could not save sidebar width: {error}"));
+                            }
+                        }
                     }
                 },
             }
@@ -13161,7 +13835,14 @@ fn app() -> Element {
                 SkillsModal { workspace: workspace.clone(), on_close: move |_| show_skills.set(false) }
             }
             if *show_mcp.read() {
-                McpModal { cfg, engine, status: mcp_status, on_close: move |_| show_mcp.set(false) }
+                McpModal {
+                    cfg,
+                    engine,
+                    tab_id: tabs.read().get(*active_tab.read()).map(|tab| tab.id).unwrap_or(0),
+                    status: mcp_status,
+                    auth_status: mcp_auth_status,
+                    on_close: move |_| show_mcp.set(false)
+                }
             }
             // Pill What's New (Synara): sekali-tampil setelah update berhasil;
             // klik → buka halaman rilis, dismiss → majukan penanda.
@@ -13514,14 +14195,195 @@ fn optional_positive_u64(input: &str, label: &str) -> Result<Option<u64>, String
         .ok_or_else(|| format!("{label} must be a positive number"))
 }
 
+fn validate_mcp_remote_url(input: &str, sends_credentials: bool) -> Result<(), String> {
+    let endpoint =
+        reqwest::Url::parse(input).map_err(|error| format!("Invalid MCP URL: {error}"))?;
+    if !endpoint.username().is_empty() || endpoint.password().is_some() {
+        return Err("MCP URLs cannot contain embedded credentials.".to_string());
+    }
+    if endpoint.fragment().is_some() {
+        return Err("MCP URLs cannot contain a fragment.".to_string());
+    }
+    if !matches!(endpoint.scheme(), "http" | "https") {
+        return Err("Remote MCP URLs must use HTTP or HTTPS.".to_string());
+    }
+    if endpoint
+        .query_pairs()
+        .any(|(key, _)| mcp_url_query_key_is_sensitive(&key))
+    {
+        return Err(
+            "MCP URLs cannot contain credential query parameters. Use native OAuth or an environment reference."
+                .to_string(),
+        );
+    }
+    let host = endpoint.host_str().unwrap_or_default();
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback());
+    if sends_credentials && endpoint.scheme() != "https" && !loopback {
+        return Err("Bearer credentials require HTTPS, except on loopback.".to_string());
+    }
+    Ok(())
+}
+
+fn mcp_url_query_key_is_sensitive(key: &str) -> bool {
+    let canonical = key
+        .chars()
+        .filter(|value| value.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    [
+        "authorization",
+        "bearer",
+        "cookie",
+        "credential",
+        "password",
+        "privatetoken",
+        "privatekey",
+        "secret",
+        "servicerolekey",
+        "sig",
+        "signature",
+        "token",
+    ]
+    .iter()
+    .any(|value| canonical == *value || canonical.ends_with(value))
+        || canonical == "apikey"
+        || canonical.ends_with("apikey")
+}
+
+fn mcp_hidden_http_headers_must_clear(
+    original: Option<&oxide_config::McpServerConfig>,
+    command: &str,
+    url: &str,
+    auth_mode: oxide_config::McpAuthMode,
+    bearer_env: &str,
+) -> bool {
+    original.is_some_and(|server| {
+        server.url != url
+            || server.command != command
+            || server.auth_mode != auth_mode
+            || server.bearer_token_env_var != bearer_env
+    })
+}
+
+fn mcp_hidden_stdio_env_must_clear(
+    original: Option<&oxide_config::McpServerConfig>,
+    command: &str,
+) -> bool {
+    original.is_some_and(|server| server.command != command)
+}
+
+fn mcp_external_identity_matches(
+    trusted: &oxide_config::McpServerConfig,
+    discovered: &oxide_config::McpServerConfig,
+) -> bool {
+    trusted.name == discovered.name && trusted.source == discovered.source
+}
+
+fn mcp_auth_is_authorized(state: &str) -> bool {
+    matches!(
+        state.to_ascii_lowercase().as_str(),
+        "authorized" | "authenticated" | "connected" | "ready"
+    )
+}
+
+fn mcp_auth_is_loading(state: &str) -> bool {
+    matches!(
+        state.to_ascii_lowercase().as_str(),
+        "authorizing"
+            | "discovering"
+            | "waiting_for_browser"
+            | "waiting_for_callback"
+            | "refreshing"
+            | "testing"
+            | "connecting"
+            | "disconnecting"
+    )
+}
+
+fn new_mcp_auth_profile_id(provider: &str) -> String {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{provider}:{timestamp:x}:{sequence:x}")
+}
+
+fn supabase_project_ref(server: &oxide_config::McpServerConfig) -> String {
+    server
+        .provider_options
+        .get("project_ref")
+        .cloned()
+        .or_else(|| {
+            server
+                .url
+                .split_once('?')
+                .map(|(_, query)| query)
+                .and_then(|query| {
+                    query
+                        .split('&')
+                        .find_map(|part| part.strip_prefix("project_ref=").map(str::to_string))
+                })
+        })
+        .unwrap_or_default()
+}
+
+fn apply_mcp_servers(
+    cfg: Signal<Config>,
+    engine: Coroutine<EngineCmd>,
+    servers: Vec<oxide_config::McpServerConfig>,
+) {
+    let mut next = cfg.read().clone();
+    next.mcp_servers = servers;
+    engine.send(EngineCmd::UpdateMcpServers {
+        config: next,
+        followup: None,
+    });
+}
+
+fn should_spawn_mcp_followup_engine(
+    has_followup: bool,
+    targets_view_tab: bool,
+    has_engine_handle: bool,
+) -> bool {
+    has_followup && targets_view_tab && !has_engine_handle
+}
+
+fn apply_mcp_servers_with_followup(
+    cfg: Signal<Config>,
+    engine: Coroutine<EngineCmd>,
+    servers: Vec<oxide_config::McpServerConfig>,
+    name: String,
+    action: McpControlAction,
+) {
+    let mut next = cfg.read().clone();
+    next.mcp_servers = servers;
+    engine.send(EngineCmd::UpdateMcpServers {
+        config: next,
+        followup: Some((name, action)),
+    });
+}
+
 #[component]
 fn McpModal(
     cfg: Signal<Config>,
     engine: Coroutine<EngineCmd>,
-    status: Signal<std::collections::HashMap<String, McpUiStatus>>,
+    tab_id: u64,
+    status: Signal<std::collections::HashMap<(u64, String), McpUiStatus>>,
+    mut auth_status: Signal<std::collections::HashMap<(u64, String), McpAuthUiStatus>>,
     on_close: EventHandler<()>,
 ) -> Element {
-    let mut editing_name = use_signal(|| None::<String>);
+    let mut active_section = use_signal(|| "installed".to_string());
+    let mut confirm_remove = use_signal(|| None::<String>);
+    let mut expanded_tools = use_signal(|| None::<String>);
+    let mut tool_query = use_signal(String::new);
+
+    let mut manual_open = use_signal(|| false);
+    let mut editing_server = use_signal(|| None::<oxide_config::McpServerConfig>);
     let mut name = use_signal(String::new);
     let mut command = use_signal(String::new);
     let mut args = use_signal(String::new);
@@ -13529,219 +14391,691 @@ fn McpModal(
     let mut cwd = use_signal(String::new);
     let mut env_vars = use_signal(String::new);
     let mut bearer_env = use_signal(String::new);
+    let mut manual_oauth = use_signal(|| false);
     let mut enabled_tools = use_signal(String::new);
     let mut disabled_tools = use_signal(String::new);
     let mut startup_timeout = use_signal(String::new);
     let mut tool_timeout = use_signal(String::new);
     let mut required = use_signal(|| false);
     let mut form_message = use_signal(String::new);
+
+    let mut supabase_open = use_signal(|| false);
+    let mut supabase_editing = use_signal(|| None::<oxide_config::McpServerConfig>);
+    let mut supabase_name = use_signal(|| "supabase".to_string());
+    let mut supabase_project = use_signal(String::new);
+    let mut supabase_read_only = use_signal(|| true);
+    let mut supabase_write_confirmed = use_signal(|| false);
+    let mut supabase_message = use_signal(String::new);
+
     let servers = cfg.read().mcp_servers.clone();
     let workspace = workspace_of(&cfg.read());
     let discovered = oxide_core::discover_external_mcp_for_workspace(&workspace);
     let imported: Vec<oxide_config::McpServerConfig> = discovered
         .iter()
-        .filter(|external| !servers.iter().any(|server| server.name == external.name))
+        .filter(|external| {
+            !servers.iter().any(|server| {
+                server.external_ref && mcp_external_identity_matches(server, external)
+            })
+        })
         .cloned()
         .collect();
+
     rsx! {
         div { class: "modal-overlay", onclick: move |_| on_close.call(()),
-            div { class: "modal skills-modal", role: "dialog", aria_modal: "true", aria_label: "MCP servers", onclick: move |event| event.stop_propagation(),
+            div { class: "modal mcp-manager-modal", role: "dialog", aria_modal: "true", aria_label: "MCP provider manager", onclick: move |event| event.stop_propagation(),
                 div { class: "modal-head",
-                    h2 { "MCP servers" }
-                    button { class: "board-btn", onclick: move |_| engine.send(EngineCmd::Reconfigure(cfg.read().clone())), "Reconnect" }
+                    div { class: "mcp-modal-title",
+                        span { class: "mcp-title-mark", aria_hidden: "true", Icon { name: "plugins" } }
+                        div {
+                            h2 { "MCP providers" }
+                            p { "Connect tools directly to Oxide. Credentials stay in the system keychain." }
+                        }
+                    }
                     button { class: "term-x", onclick: move |_| on_close.call(()), Icon { name: "x" } }
                 }
-                div { class: "modal-body skills-body",
-                    if servers.is_empty() {
-                        div { class: "insp-empty", "No trusted MCP servers. Trust a discovered server or add one below." }
+                nav { class: "mcp-manager-tabs", aria_label: "MCP provider sections",
+                    button {
+                        class: if active_section.read().as_str() == "installed" { "mcp-manager-tab active" } else { "mcp-manager-tab" },
+                        aria_pressed: if active_section.read().as_str() == "installed" { "true" } else { "false" },
+                        onclick: move |_| active_section.set("installed".to_string()),
+                        "Installed" span { class: "mcp-tab-count", "{servers.len()}" }
                     }
-                    for (index, server) in servers.iter().enumerate() {
-                        {
-                            let current_status = status.read().get(&server.name).cloned();
-                            let connected = current_status.as_ref().map(|value| value.status == "connected").unwrap_or(false);
-                            let tool_names = current_status.as_ref().map(|value| value.tools.join(", ")).unwrap_or_default();
-                            let resolved = if server.external_ref {
-                                discovered.iter().find(|external| external.name == server.name)
-                            } else {
-                                None
-                            };
-                            let display = resolved.unwrap_or(server);
-                            let command_line = if !display.url.is_empty() {
-                                display.url.clone()
-                            } else {
-                                format!("{} {}", display.command, display.args.join(" ")).trim().to_string()
-                            };
-                            let tag = if server.external_ref { "external" } else if display.url.is_empty() { "local" } else { "http" };
-                            let list_for_remove = servers.clone();
-                            let editable = server.clone();
-                            rsx! {
-                                div { class: "mcp-item",
-                                    div { class: "mcp-top",
-                                        span { class: if connected { "mcp-dot on" } else { "mcp-dot" } }
-                                        span { class: "skill-name", "{server.name}" }
-                                        span { class: "mcp-tag", "{tag}" }
-                                        if !server.external_ref {
-                                            button { class: "mcp-remove", onclick: move |_| {
-                                                editing_name.set(Some(editable.name.clone()));
-                                                name.set(editable.name.clone());
-                                                command.set(editable.command.clone());
-                                                args.set(serde_json::to_string(&editable.args).unwrap_or_default());
-                                                url.set(editable.url.clone());
-                                                cwd.set(editable.cwd.clone());
-                                                env_vars.set(editable.env_vars.iter().map(|value| value.name()).collect::<Vec<_>>().join(", "));
-                                                bearer_env.set(editable.bearer_token_env_var.clone());
-                                                enabled_tools.set(editable.enabled_tools.join(", "));
-                                                disabled_tools.set(editable.disabled_tools.join(", "));
-                                                startup_timeout.set(editable.startup_timeout_sec.map(|value| value.to_string()).unwrap_or_default());
-                                                tool_timeout.set(editable.tool_timeout_sec.map(|value| value.to_string()).unwrap_or_default());
-                                                required.set(editable.required);
-                                                form_message.set(String::new());
-                                            }, "Edit" }
+                    button {
+                        class: if active_section.read().as_str() == "catalog" { "mcp-manager-tab active" } else { "mcp-manager-tab" },
+                        aria_pressed: if active_section.read().as_str() == "catalog" { "true" } else { "false" },
+                        onclick: move |_| active_section.set("catalog".to_string()),
+                        "Provider catalog"
+                    }
+                    button {
+                        class: if active_section.read().as_str() == "discovered" { "mcp-manager-tab active" } else { "mcp-manager-tab" },
+                        aria_pressed: if active_section.read().as_str() == "discovered" { "true" } else { "false" },
+                        onclick: move |_| active_section.set("discovered".to_string()),
+                        "Discovered" span { class: "mcp-tab-count", "{imported.len()}" }
+                    }
+                }
+                div { class: "modal-body mcp-manager-body",
+                    if active_section.read().as_str() == "installed" {
+                        section { class: "mcp-pane", aria_label: "Installed MCP providers",
+                            div { class: "mcp-pane-head",
+                                div {
+                                    h3 { "Installed providers" }
+                                    p { "Review access, connection health, and exposed tools." }
+                                }
+                                if !servers.is_empty() {
+                                    button { class: "mcp-btn subtle", onclick: move |_| {
+                                        for server in cfg.read().mcp_servers.iter().filter(|server| server.enabled) {
+                                            engine.send(EngineCmd::McpControl { name: server.name.clone(), action: McpControlAction::Reconnect });
                                         }
-                                        button { class: "mcp-remove", onclick: move |_| {
-                                            let mut list = list_for_remove.clone();
-                                            list.remove(index);
-                                            let mut next = cfg.read().clone();
-                                            next.mcp_servers = list;
-                                            cfg.set(next.clone());
-                                            engine.send(EngineCmd::Reconfigure(next));
-                                        }, "Remove" }
-                                    }
-                                    if server.external_ref && !server.source.is_empty() { div { class: "mcp-src", "{server.source}" } }
-                                    div { class: "mcp-cmd", "{command_line}" }
-                                    if let Some(current_status) = current_status {
-                                        div { class: "mcp-st", "{current_status.status} · {current_status.tool_count} tool(s) · {current_status.detail}" }
-                                        if !current_status.tools.is_empty() {
-                                            div { class: "mcp-src", "{tool_names}" }
+                                    }, Icon { name: "refresh" } "Reconnect all" }
+                                }
+                            }
+                            if servers.is_empty() {
+                                div { class: "mcp-empty",
+                                    span { class: "mcp-empty-icon", Icon { name: "plugins" } }
+                                    h3 { "No providers connected" }
+                                    p { "Start with Supabase, add a custom server, or trust one discovered from another agent." }
+                                    button { class: "mcp-btn primary", onclick: move |_| active_section.set("catalog".to_string()), "Browse providers" }
+                                }
+                            }
+                            for (index, server) in servers.iter().enumerate() {
+                                {
+                                    let status_key = (tab_id, server.name.clone());
+                                    let current_status = status.read().get(&status_key).cloned();
+                                    let current_auth = auth_status.read().get(&status_key).cloned().unwrap_or_default();
+                                    let resolved = if server.external_ref {
+                                        discovered.iter().find(|external| mcp_external_identity_matches(server, external))
+                                    } else { None };
+                                    let display = resolved.unwrap_or(server);
+                                    let connected = server.enabled && current_status.as_ref().map(|value| value.status == "connected").unwrap_or(false);
+                                    let status_error = current_status.as_ref().map(|value| {
+                                        let state = value.status.to_ascii_lowercase();
+                                        state.contains("error") || state.contains("failed")
+                                    }).unwrap_or(false) || current_auth.state.eq_ignore_ascii_case("error");
+                                    let auth_loading = mcp_auth_is_loading(&current_auth.state);
+                                    let authorized = mcp_auth_is_authorized(&current_auth.state);
+                                    let is_oauth = matches!(server.auth_mode, oxide_config::McpAuthMode::OAuth);
+                                    let command_line = if !display.url.is_empty() {
+                                        display.url.clone()
+                                    } else {
+                                        format!("{} {}", display.command, display.args.join(" ")).trim().to_string()
+                                    };
+                                    let transport = if server.external_ref { "external" } else if display.url.is_empty() { "stdio" } else { "http" };
+                                    let provider_label = if server.provider.is_empty() { "Custom MCP".to_string() } else { server.provider.clone() };
+                                    let remove_message = if is_oauth {
+                                        format!("Remove {}? Its OAuth connection will be disconnected.", server.name)
+                                    } else {
+                                        format!("Remove {} from Oxide?", server.name)
+                                    };
+                                    let card_class = if !server.enabled { "mcp-provider-card disabled" } else if status_error { "mcp-provider-card error" } else { "mcp-provider-card" };
+                                    let list_for_remove = servers.clone();
+                                    let editable = server.clone();
+                                    let server_name_for_toggle = server.name.clone();
+                                    let server_source_for_toggle = server.source.clone();
+                                    let tools_open = expanded_tools.read().as_deref() == Some(server.name.as_str());
+                                    let query = tool_query.read().trim().to_ascii_lowercase();
+                                    let visible_tools: Vec<String> = current_status.as_ref().map(|value| {
+                                        value.tools.iter().filter(|tool| query.is_empty() || tool.to_ascii_lowercase().contains(&query)).cloned().collect()
+                                    }).unwrap_or_default();
+                                    rsx! {
+                                        article { class: "{card_class}",
+                                            header { class: "mcp-card-head",
+                                                div { class: if connected { "mcp-provider-mark connected".to_string() } else { "mcp-provider-mark".to_string() },
+                                                    if server.provider.eq_ignore_ascii_case("supabase") { "S" } else { Icon { name: "plugins" } }
+                                                }
+                                                div { class: "mcp-card-identity",
+                                                    div { class: "mcp-card-title-line",
+                                                        h4 { "{server.name}" }
+                                                        span { class: "mcp-provider-label", "{provider_label}" }
+                                                    }
+                                                    div { class: "mcp-health-line",
+                                                        span { class: if connected { "mcp-dot on".to_string() } else if status_error { "mcp-dot error".to_string() } else if auth_loading { "mcp-dot loading".to_string() } else { "mcp-dot".to_string() } }
+                                                        span {
+                                                            if !server.enabled { "Paused" }
+                                                            else if auth_loading { "{current_auth.state}" }
+                                                            else if let Some(value) = current_status.as_ref() { "{value.status}" }
+                                                            else { "Not tested" }
+                                                        }
+                                                    }
+                                                }
+                                                label { class: "mcp-switch", title: if server.enabled { "Disable provider".to_string() } else { "Enable provider".to_string() },
+                                                    input { r#type: "checkbox", checked: server.enabled, onchange: move |event| {
+                                                        let mut list = cfg.read().mcp_servers.clone();
+                                                        if let Some(item) = list.iter_mut().find(|item| item.name == server_name_for_toggle && item.source == server_source_for_toggle) {
+                                                            item.enabled = event.checked();
+                                                        }
+                                                        apply_mcp_servers(cfg, engine, list);
+                                                    } }
+                                                    span { class: "mcp-switch-track" }
+                                                }
+                                            }
+                                            div { class: "mcp-card-meta",
+                                                span { "{transport}" }
+                                                if is_oauth { span { "OAuth" } }
+                                                if server.provider_options.get("read_only").map(String::as_str) == Some("true") { span { class: "safe", "Read-only" } }
+                                                if server.required { span { class: "warn", "Required" } }
+                                                if current_status.as_ref().map(|value| value.tool_count > 0).unwrap_or(false) {
+                                                    span { "{current_status.as_ref().map(|value| value.tool_count).unwrap_or(0)} tools" }
+                                                }
+                                            }
+                                            if server.external_ref && !server.source.is_empty() {
+                                                div { class: "mcp-origin", "Resolved from {server.source}" }
+                                            }
+                                            div { class: "mcp-endpoint", title: "{command_line}", "{command_line}" }
+                                            if !current_auth.detail.is_empty() {
+                                                div { class: if current_auth.state.eq_ignore_ascii_case("error") { "mcp-inline-state error".to_string() } else { "mcp-inline-state".to_string() },
+                                                    if auth_loading { span { class: "mcp-mini-loader", aria_hidden: "true" } }
+                                                    "{current_auth.detail}"
+                                                }
+                                            } else if let Some(value) = current_status.as_ref() {
+                                                if !value.detail.is_empty() {
+                                                    div { class: if status_error { "mcp-inline-state error".to_string() } else { "mcp-inline-state".to_string() }, "{value.detail}" }
+                                                }
+                                            }
+                                            div { class: "mcp-card-actions",
+                                                button { class: "mcp-btn", disabled: !server.enabled, onclick: {
+                                                    let server_name = server.name.clone();
+                                                    move |_| {
+                                                        auth_status.write().insert((tab_id, server_name.clone()), McpAuthUiStatus { state: "testing".to_string(), detail: "Testing endpoint and permissions…".to_string() });
+                                                        engine.send(EngineCmd::McpControl { name: server_name.clone(), action: McpControlAction::Test });
+                                                    }
+                                                }, "Test" }
+                                                if is_oauth {
+                                                    if authorized {
+                                                        button { class: "mcp-btn", disabled: auth_loading, onclick: {
+                                                            let server_name = server.name.clone();
+                                                            move |_| engine.send(EngineCmd::McpControl { name: server_name.clone(), action: McpControlAction::Disconnect })
+                                                        }, "Disconnect" }
+                                                    } else {
+                                                        button { class: "mcp-btn primary", disabled: auth_loading || !server.enabled, onclick: {
+                                                            let server_name = server.name.clone();
+                                                            move |_| {
+                                                                auth_status.write().insert((tab_id, server_name.clone()), McpAuthUiStatus { state: "authorizing".to_string(), detail: "Preparing secure OAuth authorization…".to_string() });
+                                                                engine.send(EngineCmd::McpControl { name: server_name.clone(), action: McpControlAction::Authorize });
+                                                            }
+                                                        }, "Authorize" }
+                                                    }
+                                                }
+                                                button { class: "mcp-btn icon", title: "Reconnect", aria_label: "Reconnect provider", disabled: !server.enabled, onclick: {
+                                                    let server_name = server.name.clone();
+                                                    move |_| engine.send(EngineCmd::McpControl { name: server_name.clone(), action: McpControlAction::Reconnect })
+                                                }, Icon { name: "refresh" } }
+                                                if !server.external_ref {
+                                                    button { class: "mcp-btn", onclick: move |_| {
+                                                        if editable.provider.eq_ignore_ascii_case("supabase") {
+                                                            let read_only = editable.provider_options.get("read_only").map(String::as_str) != Some("false");
+                                                            supabase_name.set(editable.name.clone());
+                                                            supabase_project.set(supabase_project_ref(&editable));
+                                                            supabase_read_only.set(read_only);
+                                                            supabase_write_confirmed.set(false);
+                                                            supabase_message.set(String::new());
+                                                            supabase_editing.set(Some(editable.clone()));
+                                                            supabase_open.set(true);
+                                                            manual_open.set(false);
+                                                        } else {
+                                                            name.set(editable.name.clone());
+                                                            command.set(editable.command.clone());
+                                                            args.set(serde_json::to_string(&editable.args).unwrap_or_default());
+                                                            url.set(editable.url.clone());
+                                                            cwd.set(editable.cwd.clone());
+                                                            env_vars.set(editable.env_vars.iter().map(|value| value.name()).collect::<Vec<_>>().join(", "));
+                                                            bearer_env.set(editable.bearer_token_env_var.clone());
+                                                            manual_oauth.set(matches!(editable.auth_mode, oxide_config::McpAuthMode::OAuth));
+                                                            enabled_tools.set(editable.enabled_tools.join(", "));
+                                                            disabled_tools.set(editable.disabled_tools.join(", "));
+                                                            startup_timeout.set(editable.startup_timeout_sec.map(|value| value.to_string()).unwrap_or_default());
+                                                            tool_timeout.set(editable.tool_timeout_sec.map(|value| value.to_string()).unwrap_or_default());
+                                                            required.set(editable.required);
+                                                            editing_server.set(Some(editable.clone()));
+                                                            form_message.set(String::new());
+                                                            manual_open.set(true);
+                                                            supabase_open.set(false);
+                                                        }
+                                                        active_section.set("catalog".to_string());
+                                                    }, "Edit" }
+                                                }
+                                                button { class: "mcp-btn icon danger", title: "Remove", aria_label: "Remove provider", onclick: {
+                                                    let server_name = server.name.clone();
+                                                    move |_| confirm_remove.set(Some(server_name.clone()))
+                                                }, Icon { name: "trash" } }
+                                                if current_status.as_ref().map(|value| !value.tools.is_empty()).unwrap_or(false) {
+                                                    button { class: if tools_open { "mcp-btn tools active".to_string() } else { "mcp-btn tools".to_string() }, onclick: {
+                                                        let server_name = server.name.clone();
+                                                        move |_| {
+                                                            if expanded_tools.read().as_deref() == Some(server_name.as_str()) {
+                                                                expanded_tools.set(None);
+                                                            } else {
+                                                                expanded_tools.set(Some(server_name.clone()));
+                                                                tool_query.set(String::new());
+                                                            }
+                                                        }
+                                                    }, "Tools" Icon { name: "chevron" } }
+                                                }
+                                            }
+                                            if confirm_remove.read().as_deref() == Some(server.name.as_str()) {
+                                                div { class: "mcp-confirm-row",
+                                                    div { Icon { name: "alert" } span { "{remove_message}" } }
+                                                    button { class: "mcp-btn danger", onclick: move |_| {
+                                                        let mut list = list_for_remove.clone();
+                                                        list.remove(index);
+                                                        apply_mcp_servers(cfg, engine, list);
+                                                        confirm_remove.set(None);
+                                                    }, "Remove" }
+                                                    button { class: "mcp-btn subtle", onclick: move |_| confirm_remove.set(None), "Cancel" }
+                                                }
+                                            }
+                                            if tools_open {
+                                                div { class: "mcp-tools-panel",
+                                                    div { class: "mcp-tool-search",
+                                                        Icon { name: "search" }
+                                                        input { placeholder: "Search available tools…", value: "{tool_query}", oninput: move |event| tool_query.set(event.value()) }
+                                                    }
+                                                    if visible_tools.is_empty() {
+                                                        div { class: "mcp-tools-empty", if query.is_empty() { "No tools reported by this provider." } else { "No tools match this search." } }
+                                                    }
+                                                    for tool in visible_tools.iter() {
+                                                        {
+                                                            let blocked = !server.tool_allowed(tool);
+                                                            let tool_name = tool.clone();
+                                                            let item_name = server.name.clone();
+                                                            let item_source = server.source.clone();
+                                                            rsx! {
+                                                                button { class: if blocked { "mcp-tool-row disabled".to_string() } else { "mcp-tool-row".to_string() }, aria_pressed: (!blocked).to_string(), onclick: move |_| {
+                                                                    let mut list = cfg.read().mcp_servers.clone();
+                                                                    if let Some(item) = list.iter_mut().find(|item| item.name == item_name && item.source == item_source) {
+                                                                        if blocked {
+                                                                            item.disabled_tools.retain(|name| name != &tool_name);
+                                                                            if !item.enabled_tools.is_empty() && !item.enabled_tools.iter().any(|name| name == &tool_name) {
+                                                                                item.enabled_tools.push(tool_name.clone());
+                                                                                item.enabled_tools.sort();
+                                                                            }
+                                                                        } else if !item.disabled_tools.iter().any(|name| name == &tool_name) {
+                                                                            item.disabled_tools.push(tool_name.clone());
+                                                                            item.disabled_tools.sort();
+                                                                        }
+                                                                    }
+                                                                    apply_mcp_servers(cfg, engine, list);
+                                                                },
+                                                                    span { class: "mcp-tool-check", if blocked { Icon { name: "x" } } else { Icon { name: "check" } } }
+                                                                    span { class: "mcp-tool-name", "{tool}" }
+                                                                    span { class: "mcp-tool-state", if blocked { "Blocked" } else { "Allowed" } }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 }
                             }
                         }
-                    }
-                    if !imported.is_empty() {
-                        div { class: "mcp-section", "Discovered from Codex / Claude" }
-                        for external in imported.iter() {
-                            {
-                                let current_status = status.read().get(&external.name).cloned();
-                                let line = if external.url.is_empty() { format!("{} {}", external.command, external.args.join(" ")) } else { external.url.clone() };
-                                let source = if external.source.is_empty() { "external config".to_string() } else { external.source.clone() };
-                                let to_trust = external.clone();
-                                rsx! {
-                                    div { class: "mcp-item",
-                                        div { class: "mcp-top",
-                                            span { class: "mcp-dot" }
-                                            span { class: "skill-name", "{external.name}" }
-                                            span { class: "mcp-tag", "untrusted" }
-                                            button { class: "mcp-remove", onclick: move |_| {
+                    } else if active_section.read().as_str() == "catalog" {
+                        section { class: "mcp-pane", aria_label: "MCP provider catalog",
+                            div { class: "mcp-pane-head",
+                                div {
+                                    h3 { "Provider catalog" }
+                                    p { "Provider-aware setup with safe defaults. Supabase is available first." }
+                                }
+                            }
+                            div { class: "mcp-catalog-grid",
+                                article { class: "mcp-catalog-card featured",
+                                    div { class: "mcp-catalog-top",
+                                        span { class: "mcp-catalog-mark supabase", "S" }
+                                        span { class: "mcp-catalog-state", "Available" }
+                                    }
+                                    h4 { "Supabase" }
+                                    p { "Database and documentation tools scoped to one project, authorized with OAuth." }
+                                    ul {
+                                        li { Icon { name: "check" } "Read-only by default" }
+                                        li { Icon { name: "check" } "Tokens stored in system keychain" }
+                                        li { Icon { name: "check" } "No service-role key in config" }
+                                    }
+                                    button { class: "mcp-btn primary wide", onclick: move |_| {
+                                        supabase_open.set(true);
+                                        manual_open.set(false);
+                                        supabase_editing.set(None);
+                                        supabase_name.set(if cfg.read().mcp_servers.iter().any(|server| server.name == "supabase") { "supabase-2".to_string() } else { "supabase".to_string() });
+                                        supabase_project.set(String::new());
+                                        supabase_read_only.set(true);
+                                        supabase_write_confirmed.set(false);
+                                        supabase_message.set(String::new());
+                                    }, "Connect Supabase" }
+                                }
+                                article { class: "mcp-catalog-card",
+                                    div { class: "mcp-catalog-top",
+                                        span { class: "mcp-catalog-mark", Icon { name: "terminal" } }
+                                        span { class: "mcp-catalog-state neutral", "Advanced" }
+                                    }
+                                    h4 { "Custom MCP server" }
+                                    p { "Add a local stdio command or a remote HTTP endpoint with explicit environment references." }
+                                    ul {
+                                        li { Icon { name: "check" } "Local stdio or HTTP" }
+                                        li { Icon { name: "check" } "Tool allow and deny controls" }
+                                        li { Icon { name: "check" } "Native OAuth or bearer env" }
+                                    }
+                                    button { class: "mcp-btn wide", onclick: move |_| {
+                                        manual_open.set(true);
+                                        supabase_open.set(false);
+                                        editing_server.set(None);
+                                        name.set(String::new()); command.set(String::new()); args.set(String::new()); url.set(String::new());
+                                        cwd.set(String::new()); env_vars.set(String::new()); bearer_env.set(String::new());
+                                        manual_oauth.set(false);
+                                        enabled_tools.set(String::new()); disabled_tools.set(String::new());
+                                        startup_timeout.set(String::new()); tool_timeout.set(String::new()); required.set(false);
+                                        form_message.set(String::new());
+                                    }, "Configure custom server" }
+                                }
+                            }
+                            if *supabase_open.read() {
+                                div { class: "mcp-setup-panel",
+                                    div { class: "mcp-setup-heading",
+                                        div {
+                                            span { class: "mcp-setup-kicker", if supabase_editing.read().is_some() { "Edit provider" } else { "New connection" } }
+                                            h3 { "Connect Supabase" }
+                                            p { "Oxide stores only non-secret project settings here. OAuth credentials go to the system keychain." }
+                                        }
+                                        button { class: "mcp-btn icon", aria_label: "Close Supabase setup", onclick: move |_| { supabase_open.set(false); supabase_message.set(String::new()); }, Icon { name: "x" } }
+                                    }
+                                    div { class: "mcp-form-grid",
+                                        label { class: "mcp-field",
+                                            span { "Connection name" }
+                                            input { autofocus: true, value: "{supabase_name}", placeholder: "supabase", oninput: move |event| supabase_name.set(event.value()) }
+                                            small { "Used as the MCP tool namespace." }
+                                        }
+                                        label { class: "mcp-field",
+                                            span { "Project reference" }
+                                            input { value: "{supabase_project}", placeholder: "abcdefghijklmnopqrst", spellcheck: "false", oninput: move |event| supabase_project.set(event.value()) }
+                                            small { "Find it in Supabase project settings. This is not a secret." }
+                                        }
+                                    }
+                                    div { class: "mcp-permission-box",
+                                        div { class: "mcp-permission-head",
+                                            div {
+                                                strong { "Database access" }
+                                                p { if *supabase_read_only.read() { "Queries are restricted to read-only operations." } else { "Write operations may be available to the agent." } }
+                                            }
+                                            label { class: "mcp-switch labeled",
+                                                span { "Read-only" }
+                                                input { r#type: "checkbox", checked: *supabase_read_only.read(), onchange: move |event| {
+                                                    supabase_read_only.set(event.checked());
+                                                    if event.checked() { supabase_write_confirmed.set(false); }
+                                                } }
+                                                span { class: "mcp-switch-track" }
+                                            }
+                                        }
+                                        div { class: "mcp-feature-row",
+                                            span { "Enabled features" }
+                                            span { class: "mcp-feature-chip", "database" }
+                                            span { class: "mcp-feature-chip", "docs" }
+                                        }
+                                        if !*supabase_read_only.read() {
+                                            label { class: "mcp-write-warning",
+                                                input { r#type: "checkbox", checked: *supabase_write_confirmed.read(), onchange: move |event| supabase_write_confirmed.set(event.checked()) }
+                                                span { Icon { name: "alert" } strong { "Allow write-capable access" } " I understand this may change project data and permissions depend on my Supabase account." }
+                                            }
+                                        }
+                                    }
+                                    if !supabase_message.read().is_empty() {
+                                        div { class: "mcp-form-message", Icon { name: "info" } "{supabase_message}" }
+                                    }
+                                    div { class: "mcp-setup-actions",
+                                        button { class: "mcp-btn primary", onclick: move |_| {
+                                            let connection_name = supabase_name.read().trim().to_string();
+                                            let project_ref = supabase_project.read().trim().to_string();
+                                            if !oxide_config::is_valid_mcp_server_name(&connection_name) {
+                                                supabase_message.set("Connection name may use letters, numbers, '-' or '_', but not '__'.".to_string());
+                                                return;
+                                            }
+                                            if project_ref.is_empty() || !project_ref.chars().all(|value| value.is_ascii_alphanumeric() || value == '-' || value == '_') {
+                                                supabase_message.set("Enter a valid Supabase project reference.".to_string());
+                                                return;
+                                            }
+                                            if !*supabase_read_only.read() && !*supabase_write_confirmed.read() {
+                                                supabase_message.set("Confirm write-capable access before continuing.".to_string());
+                                                return;
+                                            }
+                                            let original = supabase_editing.read().clone();
+                                            let original_name = original.as_ref().map(|server| server.name.clone());
+                                            let mut list = cfg.read().mcp_servers.clone();
+                                            if list.iter().any(|server| server.name == connection_name && original_name.as_deref() != Some(connection_name.as_str())) {
+                                                supabase_message.set(format!("A provider named '{connection_name}' already exists."));
+                                                return;
+                                            }
+                                            if let Some(original) = original.as_ref() {
+                                                list.retain(|server| !(server.name == original.name && server.source == original.source));
+                                            }
+                                            let previous_project = original.as_ref().map(supabase_project_ref).unwrap_or_default();
+                                            let read_only = *supabase_read_only.read();
+                                            let provider_url = format!("https://mcp.supabase.com/mcp?project_ref={project_ref}&read_only={read_only}&features=database%2Cdocs");
+                                            let needs_authorization = original.as_ref().map(|server| server.auth_profile_id.is_empty() || server.url != provider_url).unwrap_or(true);
+                                            let mut saved = original.unwrap_or_default();
+                                            saved.name = connection_name.clone();
+                                            saved.command.clear();
+                                            saved.args.clear();
+                                            saved.url = provider_url;
+                                            saved.provider = "supabase".to_string();
+                                            saved.auth_mode = oxide_config::McpAuthMode::OAuth;
+                                            if saved.auth_profile_id.is_empty() || previous_project != project_ref {
+                                                saved.auth_profile_id = new_mcp_auth_profile_id("supabase");
+                                            }
+                                            saved.provider_options = std::collections::BTreeMap::from([
+                                                ("project_ref".to_string(), project_ref.clone()),
+                                                ("read_only".to_string(), read_only.to_string()),
+                                                ("features".to_string(), "database,docs".to_string()),
+                                            ]);
+                                            saved.enabled = true;
+                                            saved.source.clear();
+                                            saved.external_ref = false;
+                                            saved.cwd.clear();
+                                            saved.env.clear();
+                                            saved.env_vars.clear();
+                                            saved.bearer_token_env_var.clear();
+                                            saved.http_headers.clear();
+                                            saved.env_http_headers.clear();
+                                            list.push(saved);
+                                            list.sort_by(|left, right| left.name.cmp(&right.name));
+                                            let action = if needs_authorization { McpControlAction::Authorize } else { McpControlAction::Reconnect };
+                                            apply_mcp_servers_with_followup(cfg, engine, list, connection_name, action);
+                                            supabase_editing.set(None);
+                                            supabase_open.set(false);
+                                            active_section.set("installed".to_string());
+                                        }, if supabase_editing.read().is_some() { "Save connection" } else { "Add and authorize" } }
+                                        button { class: "mcp-btn subtle", onclick: move |_| { supabase_open.set(false); supabase_message.set(String::new()); }, "Cancel" }
+                                    }
+                                }
+                            }
+                            if *manual_open.read() {
+                                div { class: "mcp-setup-panel",
+                                    div { class: "mcp-setup-heading",
+                                        div {
+                                            span { class: "mcp-setup-kicker", if editing_server.read().is_some() { "Edit server" } else { "Advanced setup" } }
+                                            h3 { "Custom MCP server" }
+                                            p { "Set exactly one transport. Store secret values in environment variables, never in this form." }
+                                        }
+                                        button { class: "mcp-btn icon", aria_label: "Close custom setup", onclick: move |_| { manual_open.set(false); form_message.set(String::new()); }, Icon { name: "x" } }
+                                    }
+                                    div { class: "mcp-form-grid",
+                                        label { class: "mcp-field", span { "Server name" } input { autofocus: true, placeholder: "my-server", value: "{name}", oninput: move |event| name.set(event.value()) } }
+                                        label { class: "mcp-field", span { "Local command" } input { placeholder: "npx", value: "{command}", oninput: move |event| command.set(event.value()) } }
+                                        label { class: "mcp-field full", span { "Arguments" } input { placeholder: "quoted shell syntax or JSON array", value: "{args}", oninput: move |event| args.set(event.value()) } }
+                                        div { class: "mcp-field-divider", span { "or" } }
+                                        label { class: "mcp-field full", span { "Remote MCP URL" } input { placeholder: "https://example.com/mcp", value: "{url}", oninput: move |event| url.set(event.value()) } }
+                                        label { class: "mcp-field", span { "Working directory" } input { placeholder: "Optional", value: "{cwd}", oninput: move |event| cwd.set(event.value()) } }
+                                        label { class: "mcp-field", span { "Forward environment names" } input { placeholder: "GITHUB_TOKEN, API_HOST", value: "{env_vars}", oninput: move |event| env_vars.set(event.value()) } }
+                                        label { class: "mcp-field full", span { "Bearer token environment variable" } input { disabled: *manual_oauth.read(), placeholder: "MCP_ACCESS_TOKEN", value: "{bearer_env}", oninput: move |event| bearer_env.set(event.value()) } small { if *manual_oauth.read() { "Disabled while native OAuth is selected." } else { "Only the variable name is saved." } } }
+                                        label { class: "mcp-field", span { "Enabled tools" } input { placeholder: "Optional, comma-separated", value: "{enabled_tools}", oninput: move |event| enabled_tools.set(event.value()) } }
+                                        label { class: "mcp-field", span { "Blocked tools" } input { placeholder: "Optional, comma-separated", value: "{disabled_tools}", oninput: move |event| disabled_tools.set(event.value()) } }
+                                        label { class: "mcp-field", span { "Startup timeout" } input { placeholder: "Seconds", value: "{startup_timeout}", oninput: move |event| startup_timeout.set(event.value()) } }
+                                        label { class: "mcp-field", span { "Tool timeout" } input { placeholder: "Seconds", value: "{tool_timeout}", oninput: move |event| tool_timeout.set(event.value()) } }
+                                    }
+                                    label { class: "mcp-required-row",
+                                        input { r#type: "checkbox", checked: *manual_oauth.read(), onchange: move |event| {
+                                            manual_oauth.set(event.checked());
+                                            if event.checked() { bearer_env.set(String::new()); }
+                                        } }
+                                        span { strong { "Native OAuth (PKCE)" } " Discover OAuth metadata, authorize in the browser, and store tokens in the system keychain. Remote URL only." }
+                                    }
+                                    label { class: "mcp-required-row",
+                                        input { r#type: "checkbox", checked: *required.read(), onchange: move |event| required.set(event.checked()) }
+                                        span { strong { "Required provider" } " Block turns when this server is unavailable." }
+                                    }
+                                    if !form_message.read().is_empty() { div { class: "mcp-form-message", Icon { name: "info" } "{form_message}" } }
+                                    div { class: "mcp-setup-actions",
+                                        button { class: "mcp-btn primary", onclick: move |_| {
+                                            let server_name = name.read().trim().to_string();
+                                            let server_command = command.read().trim().to_string();
+                                            let server_url = url.read().trim().to_string();
+                                            if !oxide_config::is_valid_mcp_server_name(&server_name) {
+                                                form_message.set("Name may use letters, numbers, '-' or '_', but not '__'.".to_string());
+                                                return;
+                                            }
+                                            if server_command.is_empty() == server_url.is_empty() {
+                                                form_message.set("Set exactly one of local command or remote URL.".to_string());
+                                                return;
+                                            }
+                                            let bearer_name = bearer_env.read().trim().to_string();
+                                            let oauth_enabled = *manual_oauth.read();
+                                            if oauth_enabled && server_url.is_empty() {
+                                                form_message.set("Native OAuth requires a remote MCP URL.".to_string());
+                                                return;
+                                            }
+                                            if oauth_enabled && !bearer_name.is_empty() {
+                                                form_message.set("Choose either native OAuth or a bearer environment variable.".to_string());
+                                                return;
+                                            }
+                                            if !server_url.is_empty() {
+                                                if let Err(error) = validate_mcp_remote_url(&server_url, oauth_enabled || !bearer_name.is_empty()) {
+                                                    form_message.set(error);
+                                                    return;
+                                                }
+                                            }
+                                            let parsed_args = match parse_mcp_args(&args.read()) { Ok(value) => value, Err(error) => { form_message.set(error); return; } };
+                                            let startup = match optional_positive_u64(&startup_timeout.read(), "Startup timeout") { Ok(value) => value, Err(error) => { form_message.set(error); return; } };
+                                            let timeout = match optional_positive_u64(&tool_timeout.read(), "Tool timeout") { Ok(value) => value, Err(error) => { form_message.set(error); return; } };
+                                            let original = editing_server.read().clone();
+                                            let original_name = original.as_ref().map(|server| server.name.clone());
+                                            let auth_mode = if oauth_enabled {
+                                                oxide_config::McpAuthMode::OAuth
+                                            } else if bearer_name.is_empty() {
+                                                oxide_config::McpAuthMode::None
+                                            } else {
+                                                oxide_config::McpAuthMode::BearerEnv
+                                            };
+                                            let needs_authorization = oauth_enabled && original.as_ref().map(|server| {
+                                                !matches!(server.auth_mode, oxide_config::McpAuthMode::OAuth)
+                                                    || server.auth_profile_id.is_empty()
+                                                    || server.url != server_url
+                                            }).unwrap_or(true);
+                                            let endpoint_or_auth_changed = mcp_hidden_http_headers_must_clear(
+                                                original.as_ref(),
+                                                &server_command,
+                                                &server_url,
+                                                auth_mode,
+                                                &bearer_name,
+                                            );
+                                            let command_changed = mcp_hidden_stdio_env_must_clear(original.as_ref(), &server_command);
+                                            let mut list = cfg.read().mcp_servers.clone();
+                                            if list.iter().any(|server| server.name == server_name && original_name.as_deref() != Some(server_name.as_str())) {
+                                                form_message.set(format!("A server named '{server_name}' already exists."));
+                                                return;
+                                            }
+                                            if let Some(original) = original.as_ref() {
+                                                list.retain(|server| !(server.name == original.name && server.source == original.source));
+                                            }
+                                            let mut saved = original.unwrap_or_default();
+                                            saved.name = server_name.clone();
+                                            saved.command = server_command;
+                                            saved.args = parsed_args;
+                                            saved.url = server_url;
+                                            saved.enabled = true;
+                                            saved.source.clear();
+                                            saved.external_ref = false;
+                                            saved.cwd = cwd.read().trim().to_string();
+                                            saved.env_vars = comma_values(&env_vars.read()).into_iter().map(oxide_config::McpEnvVar::Name).collect();
+                                            saved.auth_mode = auth_mode;
+                                            if oauth_enabled {
+                                                saved.bearer_token_env_var.clear();
+                                                if needs_authorization {
+                                                    saved.auth_profile_id = new_mcp_auth_profile_id("oauth");
+                                                }
+                                            } else {
+                                                saved.bearer_token_env_var = bearer_name;
+                                                saved.auth_profile_id.clear();
+                                            }
+                                            if endpoint_or_auth_changed {
+                                                saved.http_headers.clear();
+                                                saved.env_http_headers.clear();
+                                            }
+                                            if command_changed {
+                                                saved.env.clear();
+                                            }
+                                            saved.startup_timeout_sec = startup;
+                                            saved.tool_timeout_sec = timeout;
+                                            saved.enabled_tools = comma_values(&enabled_tools.read());
+                                            saved.disabled_tools = comma_values(&disabled_tools.read());
+                                            saved.required = *required.read();
+                                            list.push(saved);
+                                            list.sort_by(|left, right| left.name.cmp(&right.name));
+                                            if oauth_enabled {
+                                                let action = if needs_authorization { McpControlAction::Authorize } else { McpControlAction::Reconnect };
+                                                apply_mcp_servers_with_followup(cfg, engine, list, server_name, action);
+                                            } else {
+                                                apply_mcp_servers(cfg, engine, list);
+                                            }
+                                            editing_server.set(None);
+                                            manual_open.set(false);
+                                            active_section.set("installed".to_string());
+                                        }, if editing_server.read().is_some() { "Save changes" } else { "Add server" } }
+                                        button { class: "mcp-btn subtle", onclick: move |_| { manual_open.set(false); editing_server.set(None); form_message.set(String::new()); }, "Cancel" }
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        section { class: "mcp-pane", aria_label: "Discovered MCP providers",
+                            div { class: "mcp-pane-head",
+                                div {
+                                    h3 { "Discovered providers" }
+                                    p { "Imported references resolve from their original Codex or Claude config. Review before trusting." }
+                                }
+                            }
+                            div { class: "mcp-trust-note", Icon { name: "shield" } div { strong { "Trust boundary" } p { "Oxide stores only the provider name and exact source reference. Commands, headers, and credentials remain in the source config." } } }
+                            if imported.is_empty() {
+                                div { class: "mcp-empty compact",
+                                    span { class: "mcp-empty-icon", Icon { name: "search" } }
+                                    h3 { "No untrusted providers found" }
+                                    p { "Oxide checked the Codex and Claude configuration for this workspace." }
+                                }
+                            }
+                            for external in imported.iter() {
+                                {
+                                    let source = if external.source.is_empty() { "external config".to_string() } else { external.source.clone() };
+                                    let line = if external.url.is_empty() { format!("{} {}", external.command, external.args.join(" ")).trim().to_string() } else { external.url.clone() };
+                                    let to_trust = external.clone();
+                                    let name_taken = servers.iter().any(|server| server.name == external.name);
+                                    rsx! {
+                                        article { class: "mcp-discovered-card",
+                                            div { class: "mcp-provider-mark", Icon { name: "plugins" } }
+                                            div { class: "mcp-discovered-copy",
+                                                div { class: "mcp-card-title-line", h4 { "{external.name}" } span { class: "mcp-provider-label", "Untrusted" } }
+                                                div { class: "mcp-origin", "{source}" }
+                                                div { class: "mcp-endpoint", title: "{line}", "{line}" }
+                                                if name_taken { div { class: "mcp-inline-state error", "The name '{external.name}' is already in use. Rename it in the source config before trusting." } }
+                                            }
+                                            button { class: "mcp-btn", disabled: name_taken, title: if name_taken { "Resolve the name conflict first" } else { "Trust this exact source reference" }, onclick: move |_| {
                                                 let mut reference = to_trust.as_external_reference();
                                                 reference.enabled = true;
                                                 let mut list = cfg.read().mcp_servers.clone();
-                                                if !list.iter().any(|item| item.name == reference.name) {
+                                                if !list.iter().any(|item| mcp_external_identity_matches(item, &to_trust)) {
                                                     list.push(reference);
                                                     list.sort_by(|left, right| left.name.cmp(&right.name));
+                                                    apply_mcp_servers(cfg, engine, list);
+                                                    active_section.set("installed".to_string());
                                                 }
-                                                let mut next = cfg.read().clone();
-                                                next.mcp_servers = list;
-                                                cfg.set(next.clone());
-                                                engine.send(EngineCmd::Reconfigure(next));
-                                            }, "Trust" }
-                                        }
-                                        div { class: "mcp-src", "{source}" }
-                                        div { class: "mcp-cmd", "{line}" }
-                                        if let Some(current_status) = current_status {
-                                            div { class: "mcp-st", "{current_status.status} · {current_status.detail}" }
+                                            }, Icon { name: "shield" } "Trust" }
                                         }
                                     }
                                 }
-                            }
-                        }
-                    }
-                    div { class: "mcp-section", if editing_name.read().is_some() { "Edit server" } else { "Add server" } }
-                    div { class: "mcp-add",
-                        input { class: "field-input", placeholder: "name (letters, numbers, - and _)", value: "{name}", oninput: move |event| name.set(event.value()) }
-                        input { class: "field-input", style: "margin-top:6px", placeholder: "command (local stdio, e.g. npx)", value: "{command}", oninput: move |event| command.set(event.value()) }
-                        input { class: "field-input", style: "margin-top:6px", placeholder: "args (quoted shell syntax or JSON array)", value: "{args}", oninput: move |event| args.set(event.value()) }
-                        input { class: "field-input", style: "margin-top:6px", placeholder: "or remote MCP URL", value: "{url}", oninput: move |event| url.set(event.value()) }
-                        input { class: "field-input", style: "margin-top:6px", placeholder: "working directory (optional)", value: "{cwd}", oninput: move |event| cwd.set(event.value()) }
-                        input { class: "field-input", style: "margin-top:6px", placeholder: "forward env names, comma-separated", value: "{env_vars}", oninput: move |event| env_vars.set(event.value()) }
-                        input { class: "field-input", style: "margin-top:6px", placeholder: "bearer token env var (HTTP)", value: "{bearer_env}", oninput: move |event| bearer_env.set(event.value()) }
-                        input { class: "field-input", style: "margin-top:6px", placeholder: "enabled tools, comma-separated (optional)", value: "{enabled_tools}", oninput: move |event| enabled_tools.set(event.value()) }
-                        input { class: "field-input", style: "margin-top:6px", placeholder: "disabled tools, comma-separated (optional)", value: "{disabled_tools}", oninput: move |event| disabled_tools.set(event.value()) }
-                        div { style: "display:flex;gap:6px;margin-top:6px",
-                            input { class: "field-input", placeholder: "startup timeout seconds", value: "{startup_timeout}", oninput: move |event| startup_timeout.set(event.value()) }
-                            input { class: "field-input", placeholder: "tool timeout seconds", value: "{tool_timeout}", oninput: move |event| tool_timeout.set(event.value()) }
-                        }
-                        label { class: "field toggle-field", style: "margin-top:6px",
-                            input { r#type: "checkbox", checked: *required.read(), onchange: move |event| required.set(event.checked()) }
-                            span { class: "field-label", "Block turns when this server is unavailable" }
-                        }
-                        if !form_message.read().is_empty() { div { class: "mcp-st", "{form_message}" } }
-                        div { style: "display:flex;gap:6px;margin-top:8px",
-                            button { class: "board-btn", onclick: move |_| {
-                                let server_name = name.read().trim().to_string();
-                                let server_command = command.read().trim().to_string();
-                                let server_url = url.read().trim().to_string();
-                                if server_name.is_empty() || !server_name.chars().all(|value| value.is_ascii_alphanumeric() || value == '-' || value == '_') {
-                                    form_message.set("Name may only contain letters, numbers, '-' and '_'".to_string());
-                                    return;
-                                }
-                                if server_command.is_empty() == server_url.is_empty() {
-                                    form_message.set("Set exactly one of command or URL".to_string());
-                                    return;
-                                }
-                                let parsed_args = match parse_mcp_args(&args.read()) {
-                                    Ok(value) => value,
-                                    Err(error) => { form_message.set(error); return; }
-                                };
-                                let startup = match optional_positive_u64(&startup_timeout.read(), "Startup timeout") {
-                                    Ok(value) => value,
-                                    Err(error) => { form_message.set(error); return; }
-                                };
-                                let timeout = match optional_positive_u64(&tool_timeout.read(), "Tool timeout") {
-                                    Ok(value) => value,
-                                    Err(error) => { form_message.set(error); return; }
-                                };
-                                let old_name = editing_name.read().clone();
-                                let mut list = cfg.read().mcp_servers.clone();
-                                if list.iter().any(|item| item.name == server_name && old_name.as_deref() != Some(server_name.as_str())) {
-                                    form_message.set(format!("A server named '{server_name}' already exists"));
-                                    return;
-                                }
-                                if let Some(old_name) = old_name { list.retain(|item| item.name != old_name); }
-                                list.push(oxide_config::McpServerConfig {
-                                    name: server_name,
-                                    command: server_command,
-                                    args: parsed_args,
-                                    url: server_url,
-                                    cwd: cwd.read().trim().to_string(),
-                                    env_vars: comma_values(&env_vars.read()).into_iter().map(oxide_config::McpEnvVar::Name).collect(),
-                                    bearer_token_env_var: bearer_env.read().trim().to_string(),
-                                    startup_timeout_sec: startup,
-                                    tool_timeout_sec: timeout,
-                                    enabled_tools: comma_values(&enabled_tools.read()),
-                                    disabled_tools: comma_values(&disabled_tools.read()),
-                                    required: *required.read(),
-                                    ..oxide_config::McpServerConfig::default()
-                                });
-                                list.sort_by(|left, right| left.name.cmp(&right.name));
-                                let mut next = cfg.read().clone();
-                                next.mcp_servers = list;
-                                cfg.set(next.clone());
-                                engine.send(EngineCmd::Reconfigure(next));
-                                editing_name.set(None);
-                                name.set(String::new()); command.set(String::new()); args.set(String::new()); url.set(String::new());
-                                cwd.set(String::new()); env_vars.set(String::new()); bearer_env.set(String::new());
-                                enabled_tools.set(String::new()); disabled_tools.set(String::new());
-                                startup_timeout.set(String::new()); tool_timeout.set(String::new()); required.set(false);
-                                form_message.set("Server saved and reconnecting".to_string());
-                            }, if editing_name.read().is_some() { "Save changes" } else { "+ Add server" } }
-                            if editing_name.read().is_some() {
-                                button { class: "mcp-remove", onclick: move |_| {
-                                    editing_name.set(None);
-                                    name.set(String::new()); command.set(String::new()); args.set(String::new()); url.set(String::new());
-                                    form_message.set(String::new());
-                                }, "Cancel" }
                             }
                         }
                     }
@@ -14122,58 +15456,32 @@ fn provider_title(provider: &str) -> &'static str {
 }
 
 /// Pin / unpin a session path and persist.
-fn toggle_pin(mut cfg: Signal<Config>, path: &str) {
+fn toggle_pin(_cfg: Signal<Config>, path: &str) {
     let now_pinned = oxide_core::db::meta(path)
         .map(|m| m.pinned)
         .unwrap_or(false);
     oxide_core::db::set_pinned(path, !now_pinned);
-    let c = cfg.read().clone();
-    let _ = &c;
-    cfg.set(c.clone());
-    if let Ok(s) = toml::to_string(&c) {
-        let ws = workspace_of(&c);
-        let _ = std::fs::write(ws.join("oxide.toml"), &s);
-        if let Some(home) = std::env::var_os("HOME") {
-            let d = std::path::PathBuf::from(home).join(".config/oxide");
-            let _ = std::fs::create_dir_all(&d);
-            let _ = std::fs::write(d.join("config.toml"), &s);
-        }
-    }
 }
 
 /// Toggle UI density (comfortable ↔ compact) and persist.
-fn toggle_density(mut cfg: Signal<Config>) {
+fn toggle_density(cfg: Signal<Config>) {
     let mut c = cfg.read().clone();
     c.density = if c.density == "compact" {
         "comfortable".to_string()
     } else {
         "compact".to_string()
     };
-    cfg.set(c.clone());
-    if let Ok(s) = toml::to_string(&c) {
-        let ws = workspace_of(&c);
-        let _ = std::fs::write(ws.join("oxide.toml"), &s);
-        if let Some(home) = std::env::var_os("HOME") {
-            let d = std::path::PathBuf::from(home).join(".config/oxide");
-            let _ = std::fs::create_dir_all(&d);
-            let _ = std::fs::write(d.join("config.toml"), &s);
-        }
+    if let Err(error) = set_config_if_persisted(cfg, c) {
+        eprintln!("oxide: could not persist density: {error}");
     }
 }
 
 /// Set the UI theme and persist (no engine reconfigure, so chat stays).
-fn set_theme(mut cfg: Signal<Config>, theme: &str) {
+fn set_theme(cfg: Signal<Config>, theme: &str) {
     let mut c = cfg.read().clone();
     c.theme = theme.to_string();
-    cfg.set(c.clone());
-    if let Ok(s) = toml::to_string(&c) {
-        let ws = workspace_of(&c);
-        let _ = std::fs::write(ws.join("oxide.toml"), &s);
-        if let Some(home) = std::env::var_os("HOME") {
-            let d = std::path::PathBuf::from(home).join(".config/oxide");
-            let _ = std::fs::create_dir_all(&d);
-            let _ = std::fs::write(d.join("config.toml"), &s);
-        }
+    if let Err(error) = set_config_if_persisted(cfg, c) {
+        eprintln!("oxide: could not persist theme: {error}");
     }
 }
 
@@ -14186,28 +15494,18 @@ fn mark_seen_version(mut cfg: Signal<Config>) {
         return;
     }
     c.last_seen_version = update::CURRENT.to_string();
-    cfg.set(c.clone());
-    if let Ok(s) = toml::to_string(&c) {
-        if let Some(home) = std::env::var_os("HOME") {
-            let d = std::path::PathBuf::from(home).join(".config/oxide");
-            let _ = std::fs::create_dir_all(&d);
-            let _ = std::fs::write(d.join("config.toml"), &s);
-        }
+    if let Err(error) = persist_global_preferences(&c) {
+        eprintln!("oxide: could not persist global preferences: {error}");
+    } else {
+        cfg.set(c);
     }
 }
 
-fn set_accent(mut cfg: Signal<Config>, accent: &str) {
+fn set_accent(cfg: Signal<Config>, accent: &str) {
     let mut c = cfg.read().clone();
     c.accent_color = accent.to_string();
-    cfg.set(c.clone());
-    if let Ok(s) = toml::to_string(&c) {
-        let ws = workspace_of(&c);
-        let _ = std::fs::write(ws.join("oxide.toml"), &s);
-        if let Some(home) = std::env::var_os("HOME") {
-            let d = std::path::PathBuf::from(home).join(".config/oxide");
-            let _ = std::fs::create_dir_all(&d);
-            let _ = std::fs::write(d.join("config.toml"), &s);
-        }
+    if let Err(error) = set_config_if_persisted(cfg, c) {
+        eprintln!("oxide: could not persist accent: {error}");
     }
 }
 
@@ -14969,9 +16267,11 @@ fn SettingsModal(
         }
         let chosen_ws = ws.read().clone();
         c.workspace = Some(chosen_ws.clone());
-        // Persist to <workspace>/oxide.toml.
-        if let Ok(s) = toml::to_string(&c) {
-            let _ = write_atomic(&chosen_ws.join("oxide.toml"), &s);
+        // Keep the user-managed MCP section byte-for-byte equivalent while
+        // settings update unrelated preferences.
+        if let Err(error) = persist_config_preferences_at(&chosen_ws.join("oxide.toml"), &c) {
+            eprintln!("oxide: could not persist workspace settings: {error}");
+            return;
         }
         cfg.set(c.clone());
         let mut uiw = ui;

@@ -116,11 +116,12 @@ enum ProviderAction {
 }
 
 fn main() -> Result<()> {
+    let log_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "warn,chromiumoxide=off,tungstenite=off".into())
+        // rmcp 3.1 logs OAuth codes and token responses at DEBUG.
+        .add_directive("rmcp::transport::auth=off".parse()?);
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "warn,chromiumoxide=off,tungstenite=off".into()),
-        )
+        .with_env_filter(log_filter)
         .with_writer(std::io::stderr)
         .init();
 
@@ -389,7 +390,14 @@ async fn run_exec(
             },
         };
         if json_events {
-            println!("{}", serde_json::to_string(&ev)?);
+            let safe_event = match &ev {
+                Event::McpAuthorizationUrl { name, .. } => Event::McpAuthorizationUrl {
+                    name: name.clone(),
+                    url: "[redacted]".to_string(),
+                },
+                _ => ev.clone(),
+            };
+            println!("{}", serde_json::to_string(&safe_event)?);
         }
         match ev {
             Event::Ready { harness } => {
@@ -637,6 +645,20 @@ async fn run_exec(
             } => {
                 if !json_events {
                     println!("[mcp] {name} {status} tools={tool_count}: {detail}");
+                }
+            }
+            Event::McpAuthStatus {
+                name,
+                state,
+                detail,
+            } => {
+                if !json_events {
+                    println!("[mcp-auth] {name} {state}: {detail}");
+                }
+            }
+            Event::McpAuthorizationUrl { name, .. } => {
+                if !json_events {
+                    println!("[mcp-auth] {name} authorization is ready in the graphical app");
                 }
             }
             Event::BrowserTargetChanged { url, note, .. } => {

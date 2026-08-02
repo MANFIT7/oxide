@@ -3,7 +3,7 @@
 //! at a time), which is sufficient for Oxide's list/call usage and keeps the
 //! framing trivial.
 
-use crate::Transport;
+use crate::{prepare_request_params, McpJsonRpcError, Transport};
 use anyhow::Context;
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -19,6 +19,7 @@ pub struct StdioTransport {
     next_id: AtomicU64,
     inner: Mutex<Io>,
     request_timeout: std::time::Duration,
+    protocol_version: std::sync::RwLock<String>,
     // Keep the child alive for the transport's lifetime; killed on drop.
     _child: Child,
 }
@@ -61,6 +62,7 @@ impl StdioTransport {
                 stdout: BufReader::new(stdout),
             }),
             request_timeout: options.request_timeout,
+            protocol_version: std::sync::RwLock::new(String::new()),
             _child: child,
         })
     }
@@ -117,6 +119,12 @@ fn mcp_process_command(
 impl Transport for StdioTransport {
     async fn call(&self, method: &str, params: Value) -> anyhow::Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let protocol_version = self
+            .protocol_version
+            .read()
+            .map(|value| value.clone())
+            .unwrap_or_default();
+        let params = prepare_request_params(params, &protocol_version)?;
         let req = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
 
         let mut io = self.inner.lock().await;
@@ -138,7 +146,7 @@ impl Transport for StdioTransport {
                 };
                 if msg.get("id").and_then(|v| v.as_u64()) == Some(id) {
                     if let Some(err) = msg.get("error") {
-                        anyhow::bail!("mcp error: {err}");
+                        return Err(McpJsonRpcError::from_value(err).into());
                     }
                     return Ok(msg.get("result").cloned().unwrap_or(Value::Null));
                 }
@@ -151,6 +159,12 @@ impl Transport for StdioTransport {
     }
 
     async fn notify(&self, method: &str, params: Value) -> anyhow::Result<()> {
+        let protocol_version = self
+            .protocol_version
+            .read()
+            .map(|value| value.clone())
+            .unwrap_or_default();
+        let params = prepare_request_params(params, &protocol_version)?;
         let msg = json!({ "jsonrpc": "2.0", "method": method, "params": params });
         let write = async {
             let mut io = self.inner.lock().await;
@@ -159,6 +173,12 @@ impl Transport for StdioTransport {
         match tokio::time::timeout(self.request_timeout, write).await {
             Ok(result) => result.with_context(|| format!("mcp notification {method} failed")),
             Err(_) => anyhow::bail!("mcp notification {method} timed out"),
+        }
+    }
+
+    fn set_protocol_version(&self, version: &str) {
+        if let Ok(mut current) = self.protocol_version.write() {
+            *current = version.to_string();
         }
     }
 }

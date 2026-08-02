@@ -31,7 +31,7 @@ mod store;
 mod tools;
 pub use tools::{Routed, ToolRouter};
 
-use oxide_config::{Config, McpEnvVar, McpServerConfig};
+use oxide_config::{is_valid_mcp_server_name, Config, McpAuthMode, McpEnvVar, McpServerConfig};
 use oxide_design::{
     build_design_token_contract, build_patch_instruction, extract_source_tokens,
     parse_design_markdown, review_design_selection, DesignPatchProposal, DesignReviewInput,
@@ -390,7 +390,9 @@ pub fn discover_external_mcp_for_workspace(workspace: &Path) -> Vec<McpServerCon
         return out;
     };
     let mut push = |server: McpServerConfig| {
-        if server.name.trim().is_empty() || (server.command.is_empty() && server.url.is_empty()) {
+        if !is_valid_mcp_server_name(&server.name)
+            || (server.command.is_empty() && server.url.is_empty())
+        {
             return;
         }
         if let Some(pos) = out.iter().position(|existing| existing.name == server.name) {
@@ -490,6 +492,7 @@ fn toml_mcp_server(name: &str, entry: &toml::Value, source: &str) -> McpServerCo
             .get("required")
             .and_then(|x| x.as_bool())
             .unwrap_or(false),
+        ..McpServerConfig::default()
     }
 }
 
@@ -583,6 +586,7 @@ fn json_mcp_server(name: &str, entry: &serde_json::Value, source: &str) -> McpSe
             .get("required")
             .and_then(|x| x.as_bool())
             .unwrap_or(false),
+        ..McpServerConfig::default()
     }
 }
 
@@ -699,6 +703,135 @@ fn duration_secs(value: Option<u64>, default_secs: u64) -> std::time::Duration {
     std::time::Duration::from_secs(value.filter(|secs| *secs > 0).unwrap_or(default_secs))
 }
 
+fn mcp_auth_profile_id(server: &McpServerConfig) -> String {
+    let family = if server.provider.trim().is_empty() {
+        "mcp"
+    } else {
+        server.provider.trim()
+    };
+    let family = family
+        .chars()
+        .filter(|value| value.is_ascii_alphanumeric() || matches!(value, '-' | '_'))
+        .take(32)
+        .collect::<String>();
+    let profile = if server.auth_profile_id.trim().is_empty() {
+        server.name.as_str()
+    } else {
+        server.auth_profile_id.trim()
+    };
+    use sha2::Digest as _;
+    let mut hasher = sha2::Sha256::new();
+    for value in [profile, server.provider.as_str(), server.url.trim()] {
+        hasher.update(value.as_bytes());
+        hasher.update([0]);
+    }
+    let digest = hasher.finalize();
+    let resource_hash = digest[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!(
+        "oxide:{}:{resource_hash}",
+        if family.is_empty() { "mcp" } else { &family }
+    )
+}
+
+fn mcp_authorization_required(server: &McpServerConfig, error: &anyhow::Error) -> bool {
+    if !matches!(server.auth_mode, McpAuthMode::OAuth) {
+        return false;
+    }
+    if auth_challenge_from_error(error).is_some() {
+        return true;
+    }
+    let detail = error.to_string().to_ascii_lowercase();
+    detail.contains("authorization is required")
+        || detail.contains("refresh token was rejected")
+        || detail.contains("token provider failed")
+}
+
+fn validate_native_mcp_provider(server: &McpServerConfig) -> anyhow::Result<()> {
+    if !server.provider.eq_ignore_ascii_case("supabase") {
+        return Ok(());
+    }
+    if !matches!(server.auth_mode, McpAuthMode::OAuth)
+        || !server.command.trim().is_empty()
+        || server.url.trim().is_empty()
+    {
+        anyhow::bail!("the built-in Supabase provider requires OAuth over remote HTTP");
+    }
+    let project_ref = server
+        .provider_options
+        .get("project_ref")
+        .map(String::as_str)
+        .unwrap_or_default();
+    let read_only = match server.provider_options.get("read_only").map(String::as_str) {
+        Some("true") => true,
+        Some("false") => false,
+        _ => anyhow::bail!("the Supabase provider requires read_only=true or read_only=false"),
+    };
+    let features = server
+        .provider_options
+        .get("features")
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|feature| !feature.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let preset = SupabasePresetBuilder::new(project_ref)
+        .and_then(|builder| builder.read_only(read_only).feature_names(features))?
+        .build();
+    let endpoint = reqwest::Url::parse(server.url.trim())?;
+    if endpoint.scheme() != "https"
+        || endpoint.host_str() != Some("mcp.supabase.com")
+        || endpoint.port().is_some()
+        || endpoint.path() != "/mcp"
+        || !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.fragment().is_some()
+    {
+        anyhow::bail!("the Supabase provider endpoint must be https://mcp.supabase.com/mcp");
+    }
+    let pairs = endpoint
+        .query_pairs()
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect::<Vec<_>>();
+    let query = pairs.iter().cloned().collect::<BTreeMap<_, _>>();
+    if pairs.len() != 3
+        || query.len() != 3
+        || query.get("project_ref").map(String::as_str) != Some(preset.project_ref())
+        || query.get("read_only").map(String::as_str)
+            != Some(if preset.read_only() { "true" } else { "false" })
+    {
+        anyhow::bail!("the Supabase provider URL must match its scoped provider options");
+    }
+    let query_features = query
+        .get("features")
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|feature| !feature.is_empty())
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
+    let preset_features = preset
+        .features()
+        .iter()
+        .map(|feature| feature.as_str())
+        .collect::<HashSet<_>>();
+    if query_features != preset_features {
+        anyhow::bail!("the Supabase provider URL feature set does not match provider options");
+    }
+    Ok(())
+}
+
+fn safe_mcp_error(error: &anyhow::Error) -> String {
+    redact_oauth_secrets(&error.to_string())
+}
+
 fn mcp_http_options(server: &McpServerConfig) -> HttpOptions {
     let has_auth_header = server
         .http_headers
@@ -706,8 +839,11 @@ fn mcp_http_options(server: &McpServerConfig) -> HttpOptions {
         .chain(server.env_http_headers.keys())
         .any(|key| key.eq_ignore_ascii_case("authorization"));
     let bearer_token = if server.url.trim().is_empty()
+        || !matches!(server.auth_mode, McpAuthMode::None)
         || !server.bearer_token_env_var.trim().is_empty()
         || has_auth_header
+        || !server.trusted_external
+        || !trusted_external_mcp_credential_source(&server.source)
     {
         String::new()
     } else {
@@ -720,6 +856,12 @@ fn mcp_http_options(server: &McpServerConfig) -> HttpOptions {
         env_headers: server.env_http_headers.clone(),
         request_timeout: duration_secs(server.tool_timeout_sec, 30),
     }
+}
+
+fn trusted_external_mcp_credential_source(source: &str) -> bool {
+    matches!(source, "Claude Desktop" | "Claude Code")
+        || source.starts_with("Claude Code ")
+        || source.starts_with("Codex ")
 }
 
 fn mcp_keychain_bearer_token(server: &str, url: &str) -> Option<String> {
@@ -889,6 +1031,10 @@ fn mcp_pool_key(server: &McpServerConfig) -> String {
         server.command.clone(),
         server.args.join("\u{1f}"),
         server.url.clone(),
+        server.provider.clone(),
+        format!("{:?}", server.auth_mode),
+        server.auth_profile_id.clone(),
+        server.trusted_external.to_string(),
         server.cwd.clone(),
         server.bearer_token_env_var.clone(),
         server
@@ -904,9 +1050,177 @@ fn mcp_pool_key(server: &McpServerConfig) -> String {
     key.push(format!("{:?}", server.env_vars));
     key.push(format!("{:?}", server.http_headers));
     key.push(format!("{:?}", server.env_http_headers));
+    key.push(format!("{:?}", server.provider_options));
     key.push(server.enabled_tools.join("\u{1f}"));
     key.push(server.disabled_tools.join("\u{1f}"));
     key.join("\u{1e}")
+}
+
+type McpConnectionPool = HashMap<String, (Arc<McpClient>, Vec<ToolSpec>)>;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct McpAuthProfileState {
+    epoch: u64,
+    revoked: bool,
+}
+
+fn mcp_auth_profile_states() -> &'static std::sync::Mutex<HashMap<String, McpAuthProfileState>> {
+    static STATES: std::sync::OnceLock<std::sync::Mutex<HashMap<String, McpAuthProfileState>>> =
+        std::sync::OnceLock::new();
+    STATES.get_or_init(Default::default)
+}
+
+fn mcp_auth_profile_state(profile_id: &str) -> McpAuthProfileState {
+    let states = mcp_auth_profile_states()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    states.get(profile_id).copied().unwrap_or_default()
+}
+
+fn revoke_mcp_auth_profile(profile_id: &str) -> u64 {
+    let mut states = mcp_auth_profile_states()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let state = states.entry(profile_id.to_string()).or_default();
+    state.epoch = state.epoch.saturating_add(1);
+    state.revoked = true;
+    state.epoch
+}
+
+fn authorize_mcp_auth_profile_epoch(profile_id: &str, expected_epoch: u64) -> bool {
+    let mut states = mcp_auth_profile_states()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let state = states.entry(profile_id.to_string()).or_default();
+    if state.epoch != expected_epoch || !state.revoked {
+        return false;
+    }
+    state.revoked = false;
+    true
+}
+
+fn mcp_auth_profile_operation_gates(
+) -> &'static std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>> {
+    static GATES: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    > = std::sync::OnceLock::new();
+    GATES.get_or_init(Default::default)
+}
+
+fn mcp_auth_profile_operation_gate(profile_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let mut gates = mcp_auth_profile_operation_gates()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Arc::clone(
+        gates
+            .entry(profile_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+    )
+}
+
+async fn clear_mcp_auth_profile_credentials(profile_id: &str) -> anyhow::Result<()> {
+    let gate = mcp_auth_profile_operation_gate(profile_id);
+    let _guard = gate.lock().await;
+    clear_native_credentials(profile_id.to_string())
+        .await
+        .map_err(anyhow::Error::from)
+}
+
+async fn guard_mcp_auth_completion<F, C, CFut>(
+    profile_id: &str,
+    epoch: u64,
+    completion: F,
+    cleanup: C,
+) -> Result<(), String>
+where
+    F: std::future::Future<Output = Result<(), String>>,
+    C: FnOnce() -> CFut,
+    CFut: std::future::Future<Output = Result<(), String>>,
+{
+    let gate = mcp_auth_profile_operation_gate(profile_id);
+    let _guard = gate.lock().await;
+    let state = mcp_auth_profile_state(profile_id);
+    if state.epoch != epoch || !state.revoked {
+        return Err("Authorization was superseded by a newer request".to_string());
+    }
+
+    let result = completion.await;
+    let current = mcp_auth_profile_state(profile_id);
+    if result.is_ok() && current.epoch == epoch && current.revoked {
+        return Ok(());
+    }
+
+    let cleanup_result = cleanup().await;
+    match (result, cleanup_result) {
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(cleanup_error)) => {
+            Err(format!("{error}; credential cleanup failed: {cleanup_error}"))
+        }
+        (Ok(()), Ok(())) => Err("Authorization was superseded by a newer request".to_string()),
+        (Ok(()), Err(cleanup_error)) => Err(format!(
+            "Authorization was superseded by a newer request; credential cleanup failed: {cleanup_error}"
+        )),
+    }
+}
+
+#[async_trait::async_trait]
+trait McpAuthCredentialCleanup: Send + Sync {
+    async fn clear(&self, profile_id: &str) -> anyhow::Result<()>;
+}
+
+struct NativeMcpAuthCredentialCleanup;
+
+#[async_trait::async_trait]
+impl McpAuthCredentialCleanup for NativeMcpAuthCredentialCleanup {
+    async fn clear(&self, profile_id: &str) -> anyhow::Result<()> {
+        clear_native_credentials(profile_id.to_string())
+            .await
+            .map_err(anyhow::Error::from)
+    }
+}
+
+struct EpochGatedMcpTokenProvider<P, C> {
+    profile_id: String,
+    epoch: u64,
+    inner: P,
+    cleanup: C,
+}
+
+#[async_trait::async_trait]
+impl<P, C> BearerTokenProvider for EpochGatedMcpTokenProvider<P, C>
+where
+    P: BearerTokenProvider + Send + Sync,
+    C: McpAuthCredentialCleanup,
+{
+    async fn bearer_token(&self) -> anyhow::Result<SecretString> {
+        let gate = mcp_auth_profile_operation_gate(&self.profile_id);
+        let _guard = gate.lock().await;
+        let state = mcp_auth_profile_state(&self.profile_id);
+        if state.epoch != self.epoch || state.revoked {
+            anyhow::bail!("MCP OAuth authorization is required");
+        }
+
+        let result = self.inner.bearer_token().await;
+        let current = mcp_auth_profile_state(&self.profile_id);
+        if current.epoch == self.epoch && !current.revoked {
+            return result;
+        }
+
+        let cleanup_result = self.cleanup.clear(&self.profile_id).await;
+        match cleanup_result {
+            Ok(()) => anyhow::bail!("MCP OAuth session was superseded while refreshing its token"),
+            Err(error) => anyhow::bail!(
+                "MCP OAuth session was superseded while refreshing its token; credential cleanup failed: {}",
+                redact_oauth_secrets(&error.to_string())
+            ),
+        }
+    }
+}
+
+fn mcp_connection_pool() -> &'static tokio::sync::Mutex<McpConnectionPool> {
+    static MCP_POOL: std::sync::OnceLock<tokio::sync::Mutex<McpConnectionPool>> =
+        std::sync::OnceLock::new();
+    MCP_POOL.get_or_init(Default::default)
 }
 
 /// hermes-style progressive tool disclosure: when the DEFERRABLE (MCP) tool
@@ -1160,6 +1474,118 @@ fn filter_mcp_tools(server: &McpServerConfig, tools: Vec<ToolSpec>) -> Vec<ToolS
         .collect()
 }
 
+fn mcp_tool_names_for_status(server: &McpServerConfig, tools: &[ToolSpec]) -> Vec<String> {
+    let prefix = format!("mcp__{}__", server.name);
+    tools
+        .iter()
+        .map(|tool| {
+            tool.name
+                .strip_prefix(&prefix)
+                .unwrap_or(&tool.name)
+                .to_string()
+        })
+        .collect()
+}
+
+async fn establish_mcp_server(
+    server: &McpServerConfig,
+    reuse_cached: bool,
+    cache_result: bool,
+) -> anyhow::Result<(Arc<McpClient>, Vec<ToolSpec>)> {
+    validate_native_mcp_provider(server)?;
+    if !is_valid_mcp_server_name(&server.name) {
+        anyhow::bail!(
+            "MCP server name '{}' must use letters, numbers, '-' or '_' and cannot contain '__'",
+            server.name
+        );
+    }
+    if matches!(server.auth_mode, McpAuthMode::OAuth)
+        && mcp_auth_profile_state(&mcp_auth_profile_id(server)).revoked
+    {
+        anyhow::bail!("MCP OAuth authorization is required");
+    }
+    let key = mcp_pool_key(server);
+    let pool = mcp_connection_pool();
+    if reuse_cached {
+        if let Some((client, _cached_tools)) = pool.lock().await.get(&key).cloned() {
+            let refreshed =
+                tokio::time::timeout(std::time::Duration::from_secs(5), client.list_tools()).await;
+            if let Ok(Ok(tools)) = refreshed {
+                return Ok((client, tools));
+            }
+            pool.lock().await.remove(&key);
+        }
+    }
+
+    let connect = async {
+        let client = if !server.url.is_empty() {
+            if matches!(server.auth_mode, McpAuthMode::OAuth) {
+                let profile_id = mcp_auth_profile_id(server);
+                let epoch = mcp_auth_profile_state(&profile_id).epoch;
+                let coordinator =
+                    native_oauth_coordinator(server.url.as_str(), profile_id.clone()).await?;
+                if coordinator.status() != OAuthCoordinatorStatus::Authorized {
+                    anyhow::bail!("MCP OAuth authorization is required");
+                }
+                McpClient::connect_http_with_token_provider(
+                    &server.name,
+                    &server.url,
+                    mcp_http_options(server),
+                    Arc::new(EpochGatedMcpTokenProvider {
+                        profile_id,
+                        epoch,
+                        inner: coordinator,
+                        cleanup: NativeMcpAuthCredentialCleanup,
+                    }),
+                )
+                .await?
+            } else {
+                McpClient::connect_http_with(&server.name, &server.url, mcp_http_options(server))
+                    .await?
+            }
+        } else {
+            let cwd = if server.cwd.trim().is_empty() {
+                None
+            } else {
+                Some(PathBuf::from(&server.cwd))
+            };
+            McpClient::connect_stdio_with(
+                &server.name,
+                &server.command,
+                &server.args,
+                StdioSpawnOptions {
+                    cwd,
+                    env: server.env.clone(),
+                    env_vars: server
+                        .env_vars
+                        .iter()
+                        .map(|env| env.name().to_string())
+                        .collect(),
+                    request_timeout: duration_secs(server.tool_timeout_sec, 60),
+                },
+            )
+            .await?
+        };
+        let tools = client.list_tools().await?;
+        Ok::<_, anyhow::Error>((Arc::new(client), tools))
+    };
+
+    let connected = tokio::time::timeout(duration_secs(server.startup_timeout_sec, 15), connect)
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "timed out after {}s",
+                duration_secs(server.startup_timeout_sec, 15).as_secs()
+            )
+        })??;
+    if cache_result {
+        pool.lock()
+            .await
+            .insert(key, (connected.0.clone(), connected.1.clone()));
+    }
+    Ok(connected)
+}
+
 fn resolve_external_mcp_reference(
     reference: &McpServerConfig,
     discovered: &[McpServerConfig],
@@ -1190,6 +1616,7 @@ fn resolve_external_mcp_reference(
         resolved.disabled_tools = reference.disabled_tools.clone();
     }
     resolved.external_ref = false;
+    resolved.trusted_external = true;
     Some(resolved)
 }
 
@@ -1198,10 +1625,15 @@ use context_checkpoint::{
 };
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use oxide_harness::{Harness, Registry, SkillRoute, ToolPolicyMode};
-use oxide_mcp::{is_mcp_tool, server_of, HttpOptions, McpClient, StdioSpawnOptions};
+use oxide_mcp::{
+    auth_challenge_from_error, clear_native_credentials, is_mcp_tool, native_oauth_coordinator,
+    redact_oauth_secrets, server_of, BearerTokenProvider, HttpOptions, LoopbackCallbackServer,
+    McpClient, OAuthCoordinatorStatus, OAuthStartRequest, SecretString, StdioSpawnOptions,
+    SupabasePresetBuilder,
+};
 use oxide_protocol::{
-    ApprovalDecision, ApprovalPolicy, BrowserControlAction, Event, Op, RuntimePermissions,
-    SandboxPolicy, SubagentControlAction, ToolSpec, TurnId, UiSpec,
+    ApprovalDecision, ApprovalPolicy, BrowserControlAction, Event, McpControlAction, Op,
+    RuntimePermissions, SandboxPolicy, SubagentControlAction, ToolSpec, TurnId, UiSpec,
 };
 use oxide_providers::{Message, Provider, Role, StreamItem, TurnRequest};
 use serde::Deserialize;
@@ -1229,6 +1661,62 @@ const BROADCAST_CAP: usize = 4096;
 /// per-engine counter so any subscriber can order + dedup, and a late or
 /// reconnecting one can ask for everything `after` a seq it already applied.
 pub type SeqEvent = (u64, Event);
+
+struct McpConfigUpdate {
+    servers: Vec<McpServerConfig>,
+    generations: HashMap<String, u64>,
+    done: tokio::sync::oneshot::Sender<()>,
+}
+
+#[derive(Clone)]
+struct McpRuntimePolicy {
+    generation: u64,
+    server: McpServerConfig,
+}
+
+#[derive(Default)]
+struct McpPolicySnapshot {
+    servers: HashMap<String, McpRuntimePolicy>,
+}
+
+fn validate_mcp_server_configs(servers: &[McpServerConfig]) -> Result<(), String> {
+    let mut names = HashSet::with_capacity(servers.len());
+    for server in servers {
+        if !is_valid_mcp_server_name(&server.name) {
+            return Err(format!(
+                "MCP server name '{}' must use letters, numbers, '-' or '_' and cannot contain '__'",
+                server.name
+            ));
+        }
+        if !names.insert(server.name.as_str()) {
+            return Err(format!(
+                "duplicate MCP server name '{}'; server names must be unique",
+                server.name
+            ));
+        }
+    }
+    Ok(())
+}
+
+impl McpPolicySnapshot {
+    fn from_servers(servers: &[McpServerConfig]) -> Result<Self, String> {
+        validate_mcp_server_configs(servers)?;
+        Ok(Self {
+            servers: servers
+                .iter()
+                .map(|server| {
+                    (
+                        server.name.clone(),
+                        McpRuntimePolicy {
+                            generation: 0,
+                            server: server.clone(),
+                        },
+                    )
+                })
+                .collect(),
+        })
+    }
+}
 
 /// Multi-subscriber event fan-out + replay log for ONE engine run.
 ///
@@ -1290,6 +1778,8 @@ impl EventBus {
 pub struct EngineHandle {
     op_tx: mpsc::Sender<Op>,
     browser_control_tx: mpsc::UnboundedSender<BrowserControlAction>,
+    mcp_config_tx: mpsc::UnboundedSender<McpConfigUpdate>,
+    mcp_policy: Arc<std::sync::RwLock<McpPolicySnapshot>>,
     bus: Arc<EventBus>,
 }
 
@@ -1301,11 +1791,73 @@ impl EngineHandle {
                 .map_err(|_| anyhow::anyhow!("engine task is gone"))?;
             return Ok(());
         }
+        if let Op::McpControl {
+            name,
+            action: McpControlAction::Disconnect | McpControlAction::Authorize,
+        } = &op
+        {
+            let oauth_profile = {
+                let mut snapshot = self
+                    .mcp_policy
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                snapshot.servers.get_mut(name).and_then(|policy| {
+                    policy.generation = policy.generation.saturating_add(1);
+                    matches!(policy.server.auth_mode, McpAuthMode::OAuth)
+                        .then(|| mcp_auth_profile_id(&policy.server))
+                })
+            };
+            if let Some(profile_id) = oauth_profile {
+                revoke_mcp_auth_profile(&profile_id);
+            }
+        }
         self.op_tx
             .send(op)
             .await
             .map_err(|_| anyhow::anyhow!("engine task is gone"))?;
         Ok(())
+    }
+
+    pub async fn update_mcp_servers(&self, servers: Vec<McpServerConfig>) -> anyhow::Result<()> {
+        validate_mcp_server_configs(&servers).map_err(anyhow::Error::msg)?;
+        let generations = {
+            let mut snapshot = self
+                .mcp_policy
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut next = HashMap::new();
+            for server in &servers {
+                let generation = snapshot
+                    .servers
+                    .get(&server.name)
+                    .map(|policy| policy.generation.saturating_add(1))
+                    .unwrap_or(1);
+                next.insert(
+                    server.name.clone(),
+                    McpRuntimePolicy {
+                        generation,
+                        server: server.clone(),
+                    },
+                );
+            }
+            snapshot.servers = next;
+            snapshot
+                .servers
+                .iter()
+                .map(|(name, policy)| (name.clone(), policy.generation))
+                .collect()
+        };
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        self.mcp_config_tx
+            .send(McpConfigUpdate {
+                servers,
+                generations,
+                done: done_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("engine task is gone"))?;
+        done_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("engine task stopped before applying MCP config"))
     }
 
     /// Attach an ADDITIONAL surface to this engine's live event stream: a snapshot
@@ -1423,11 +1975,24 @@ fn registry_from_config(config: &Config) -> anyhow::Result<Registry> {
 /// Start the engine task. Returns a handle to drive it and the event stream to
 /// subscribe to. The engine runs until [`Op::Shutdown`] or all handles drop.
 pub fn spawn(config: Config) -> anyhow::Result<(EngineHandle, mpsc::Receiver<Event>)> {
+    validate_mcp_server_configs(&config.mcp_servers).map_err(anyhow::Error::msg)?;
     let (op_tx, op_rx) = mpsc::channel(OP_QUEUE);
     let (browser_control_tx, browser_control_rx) = mpsc::unbounded_channel();
+    let (mcp_config_tx, mcp_config_rx) = mpsc::unbounded_channel();
+    let (mcp_auth_tx, mcp_auth_rx) = mpsc::unbounded_channel();
     let (event_tx, event_rx) = mpsc::channel(EVENT_QUEUE);
     let bus = EventBus::new();
     let registry = registry_from_config(&config)?;
+    let mcp_policy = Arc::new(std::sync::RwLock::new(
+        McpPolicySnapshot::from_servers(&config.mcp_servers).map_err(anyhow::Error::msg)?,
+    ));
+    let mcp_policy_generations = mcp_policy
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .servers
+        .iter()
+        .map(|(name, policy)| (name.clone(), policy.generation))
+        .collect();
 
     let workspace = config
         .workspace
@@ -1500,6 +2065,10 @@ pub fn spawn(config: Config) -> anyhow::Result<(EngineHandle, mpsc::Receiver<Eve
         session_store,
         subagent_parent: None,
         mcp_clients: Vec::new(),
+        mcp_policy: Arc::clone(&mcp_policy),
+        mcp_policy_generations,
+        mcp_connection_policy_generations: HashMap::new(),
+        mcp_auth_epochs: HashMap::new(),
         mcp_tools: Vec::new(),
         deferred_tools: Vec::new(),
         turns_since_review: 0,
@@ -1515,6 +2084,10 @@ pub fn spawn(config: Config) -> anyhow::Result<(EngineHandle, mpsc::Receiver<Eve
         browser: None,
         browser_control: BrowserControlState::AgentControlled,
         browser_control_rx: Some(browser_control_rx),
+        mcp_config_rx: Some(mcp_config_rx),
+        mcp_auth_tx: Some(mcp_auth_tx),
+        mcp_auth_rx: Some(mcp_auth_rx),
+        mcp_auth_tasks: HashMap::new(),
         ctx_window: None,
         read_files: std::collections::HashSet::new(),
         turn_edited: false,
@@ -1534,6 +2107,8 @@ pub fn spawn(config: Config) -> anyhow::Result<(EngineHandle, mpsc::Receiver<Eve
         EngineHandle {
             op_tx,
             browser_control_tx,
+            mcp_config_tx,
+            mcp_policy,
             bus,
         },
         event_rx,
@@ -1985,6 +2560,48 @@ async fn next_browser_control(
     }
 }
 
+struct McpAuthCompletion {
+    name: String,
+    profile_id: String,
+    epoch: u64,
+    result: Result<(), String>,
+}
+
+struct McpAuthTask {
+    epoch: u64,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for McpAuthTask {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+async fn next_mcp_auth_completion(
+    receiver: &mut Option<mpsc::UnboundedReceiver<McpAuthCompletion>>,
+) -> McpAuthCompletion {
+    match receiver.as_mut() {
+        Some(receiver) => match receiver.recv().await {
+            Some(completion) => completion,
+            None => std::future::pending::<McpAuthCompletion>().await,
+        },
+        None => std::future::pending::<McpAuthCompletion>().await,
+    }
+}
+
+async fn next_mcp_config_update(
+    receiver: &mut Option<mpsc::UnboundedReceiver<McpConfigUpdate>>,
+) -> McpConfigUpdate {
+    match receiver.as_mut() {
+        Some(receiver) => match receiver.recv().await {
+            Some(update) => update,
+            None => std::future::pending::<McpConfigUpdate>().await,
+        },
+        None => std::future::pending::<McpConfigUpdate>().await,
+    }
+}
+
 struct Engine {
     config: Config,
     registry: Registry,
@@ -2008,6 +2625,14 @@ struct Engine {
     checkpoints: Arc<Mutex<CheckpointStore>>,
     /// Connected MCP servers (one per configured launcher).
     mcp_clients: Vec<std::sync::Arc<McpClient>>,
+    /// Urgent policy snapshot shared with handles and active subagent workers.
+    mcp_policy: Arc<std::sync::RwLock<McpPolicySnapshot>>,
+    /// Policy generations applied to this engine's current configuration.
+    mcp_policy_generations: HashMap<String, u64>,
+    /// Policy generation captured when each server connection was established.
+    mcp_connection_policy_generations: HashMap<String, u64>,
+    /// OAuth profile generation captured when each server connected.
+    mcp_auth_epochs: HashMap<String, u64>,
     /// Namespaced tool specs discovered from all MCP servers.
     mcp_tools: Vec<ToolSpec>,
     /// Tools stripped from the model-visible array this turn (schema bloat) —
@@ -2045,6 +2670,14 @@ struct Engine {
     /// Dedicated urgent control lane. Main frontend handles get a sender that
     /// bypasses the bounded operation queue; detached worker engines use None.
     browser_control_rx: Option<mpsc::UnboundedReceiver<BrowserControlAction>>,
+    /// Dedicated config lane so MCP edits can be applied without replacing the engine.
+    mcp_config_rx: Option<mpsc::UnboundedReceiver<McpConfigUpdate>>,
+    /// Detached OAuth callback completion lane. Tokens stay in the credential
+    /// store; this channel carries only success/failure metadata back to the engine.
+    mcp_auth_tx: Option<mpsc::UnboundedSender<McpAuthCompletion>>,
+    mcp_auth_rx: Option<mpsc::UnboundedReceiver<McpAuthCompletion>>,
+    /// Active OAuth callback tasks, aborted on replacement, disconnect, or engine drop.
+    mcp_auth_tasks: HashMap<String, McpAuthTask>,
     /// Model context window (tokens), reported by the provider; drives the
     /// compaction budget at 75% (opencode-style).
     ctx_window: Option<u64>,
@@ -2316,6 +2949,10 @@ impl Engine {
         // Mirror to the multi-subscriber bus (seq + replay log) before handing the
         // event to the primary frontend channel.
         self.bus.publish(&ev);
+        let _ = self.event_tx.send(ev).await;
+    }
+
+    async fn emit_primary(&self, ev: Event) {
         let _ = self.event_tx.send(ev).await;
     }
 
@@ -2908,22 +3545,546 @@ impl Engine {
         })
     }
 
+    fn configured_mcp_server(&self, name: &str) -> Result<McpServerConfig, String> {
+        let mut matches = self
+            .config
+            .mcp_servers
+            .iter()
+            .filter(|server| server.name == name);
+        let configured = matches
+            .next()
+            .ok_or_else(|| format!("MCP server '{name}' is not configured"))?;
+        if matches.next().is_some() {
+            return Err(format!(
+                "MCP server '{name}' is configured more than once; refusing ambiguous dispatch"
+            ));
+        }
+        resolve_external_mcp_reference(
+            configured,
+            &discover_external_mcp_for_workspace(&self.workspace),
+        )
+        .ok_or_else(|| {
+            format!(
+                "trusted external MCP server '{name}' is no longer available from '{}'",
+                if configured.source.is_empty() {
+                    "external config"
+                } else {
+                    configured.source.as_str()
+                }
+            )
+        })
+    }
+
+    fn refresh_required_mcp_state(&mut self) {
+        self.required_mcp_unavailable = self
+            .config
+            .mcp_servers
+            .iter()
+            .filter(|server| server.enabled && server.required)
+            .any(|server| {
+                !self
+                    .mcp_clients
+                    .iter()
+                    .any(|client| client.server() == server.name)
+            });
+    }
+
+    async fn detach_mcp_server(&mut self, server: &McpServerConfig) {
+        mcp_connection_pool()
+            .lock()
+            .await
+            .remove(&mcp_pool_key(server));
+        self.mcp_clients
+            .retain(|client| client.server() != server.name);
+        self.mcp_connection_policy_generations.remove(&server.name);
+        self.mcp_auth_epochs.remove(&server.name);
+        self.mcp_tools
+            .retain(|tool| server_of(&tool.name) != Some(server.name.as_str()));
+        self.deferred_tools
+            .retain(|tool| server_of(&tool.name) != Some(server.name.as_str()));
+        self.mcp_instructions
+            .retain(|(name, _)| name != &server.name);
+        self.refresh_required_mcp_state();
+    }
+
+    async fn attach_mcp_server(
+        &mut self,
+        server: &McpServerConfig,
+        reuse_cached: bool,
+    ) -> anyhow::Result<(usize, Vec<ToolSpec>)> {
+        self.detach_mcp_server(server).await;
+        let (client, reported_tools) = establish_mcp_server(server, reuse_cached, true).await?;
+        let instructions = client.instructions().trim().to_string();
+        let exposed_tools = filter_mcp_tools(server, reported_tools.clone());
+        let exposed_count = exposed_tools.len();
+        self.mcp_clients.push(client);
+        self.mcp_connection_policy_generations.insert(
+            server.name.clone(),
+            self.mcp_policy_generations
+                .get(&server.name)
+                .copied()
+                .unwrap_or_default(),
+        );
+        if matches!(server.auth_mode, McpAuthMode::OAuth) {
+            self.mcp_auth_epochs.insert(
+                server.name.clone(),
+                mcp_auth_profile_state(&mcp_auth_profile_id(server)).epoch,
+            );
+        }
+        self.mcp_tools.extend(exposed_tools);
+        if !instructions.is_empty() {
+            self.mcp_instructions
+                .push((server.name.clone(), instructions));
+        }
+        self.refresh_required_mcp_state();
+        Ok((exposed_count, reported_tools))
+    }
+
+    async fn start_mcp_authorization(&mut self, server: &McpServerConfig, epoch: u64) {
+        if !matches!(server.auth_mode, McpAuthMode::OAuth) || server.url.trim().is_empty() {
+            self.emit(Event::McpAuthStatus {
+                name: server.name.clone(),
+                state: "unsupported".to_string(),
+                detail: "Native OAuth is available only for remote providers configured with auth_mode=oauth"
+                    .to_string(),
+            })
+            .await;
+            return;
+        }
+        if let Err(error) = validate_native_mcp_provider(server) {
+            self.emit(Event::McpAuthStatus {
+                name: server.name.clone(),
+                state: "error".to_string(),
+                detail: safe_mcp_error(&error),
+            })
+            .await;
+            return;
+        }
+        let Some(completion_tx) = self.mcp_auth_tx.clone() else {
+            self.emit(Event::McpAuthStatus {
+                name: server.name.clone(),
+                state: "error".to_string(),
+                detail: "OAuth is unavailable in detached worker engines".to_string(),
+            })
+            .await;
+            return;
+        };
+
+        self.emit(Event::McpAuthStatus {
+            name: server.name.clone(),
+            state: "discovering".to_string(),
+            detail: "Discovering the provider authorization server".to_string(),
+        })
+        .await;
+        let mut oauth = match native_oauth_coordinator(
+            server.url.as_str(),
+            mcp_auth_profile_id(server),
+        )
+        .await
+        {
+            Ok(coordinator) => coordinator,
+            Err(error) => {
+                self.emit(Event::McpAuthStatus {
+                    name: server.name.clone(),
+                    state: "error".to_string(),
+                    detail: redact_oauth_secrets(&error.to_string()),
+                })
+                .await;
+                return;
+            }
+        };
+        // Seed rmcp discovery from the provider's actual WWW-Authenticate
+        // challenge when available. Failure is expected for an unauthenticated
+        // OAuth endpoint and is never surfaced as a chat error here.
+        let mut probe_options = mcp_http_options(server);
+        probe_options.request_timeout = probe_options
+            .request_timeout
+            .min(std::time::Duration::from_secs(10));
+        let challenge =
+            match McpClient::connect_http_with(&server.name, &server.url, probe_options).await {
+                Ok(_) => None,
+                Err(error) => auth_challenge_from_error(&error).cloned(),
+            };
+        let callback_server = match LoopbackCallbackServer::bind().await {
+            Ok(callback) => callback,
+            Err(error) => {
+                self.emit(Event::McpAuthStatus {
+                    name: server.name.clone(),
+                    state: "error".to_string(),
+                    detail: redact_oauth_secrets(&error.to_string()),
+                })
+                .await;
+                return;
+            }
+        };
+        let mut request = OAuthStartRequest::new(callback_server.redirect_uri())
+            .with_client_name("Oxide MCP Client");
+        if let Some(challenge) = challenge {
+            request = request.with_challenge(challenge);
+        }
+        let launch = match oauth.start_authorization(request).await {
+            Ok(launch) => launch,
+            Err(error) => {
+                self.emit(Event::McpAuthStatus {
+                    name: server.name.clone(),
+                    state: "error".to_string(),
+                    detail: redact_oauth_secrets(&error.to_string()),
+                })
+                .await;
+                return;
+            }
+        };
+        self.emit(Event::McpAuthStatus {
+            name: server.name.clone(),
+            state: "waiting_for_browser".to_string(),
+            detail: format!(
+                "Waiting for the loopback callback ({:?} discovery)",
+                launch.discovery_source
+            ),
+        })
+        .await;
+        self.emit_primary(Event::McpAuthorizationUrl {
+            name: server.name.clone(),
+            url: launch.authorization_url,
+        })
+        .await;
+
+        let name = server.name.clone();
+        let profile_id = mcp_auth_profile_id(server);
+        let task_profile_id = profile_id.clone();
+        let handle = tokio::spawn(async move {
+            let result = async {
+                let callback = callback_server
+                    .wait_for_callback(std::time::Duration::from_secs(300))
+                    .await
+                    .map_err(|error| redact_oauth_secrets(&error.to_string()))?;
+                let cleanup_profile_id = task_profile_id.clone();
+                guard_mcp_auth_completion(
+                    &task_profile_id,
+                    epoch,
+                    async move {
+                        oauth
+                            .complete_callback(&callback)
+                            .await
+                            .map_err(|error| redact_oauth_secrets(&error.to_string()))
+                    },
+                    move || async move {
+                        clear_native_credentials(cleanup_profile_id)
+                            .await
+                            .map_err(|error| redact_oauth_secrets(&error.to_string()))
+                    },
+                )
+                .await
+            }
+            .await;
+            let _ = completion_tx.send(McpAuthCompletion {
+                name,
+                profile_id: task_profile_id,
+                epoch,
+                result,
+            });
+        });
+        self.mcp_auth_tasks
+            .insert(profile_id, McpAuthTask { epoch, handle });
+    }
+
+    async fn handle_mcp_control(&mut self, name: String, action: McpControlAction) {
+        let server = match self.configured_mcp_server(&name) {
+            Ok(server) => server,
+            Err(detail) => {
+                self.emit(Event::McpServerStatus {
+                    name,
+                    status: "error".to_string(),
+                    tool_count: 0,
+                    tools: Vec::new(),
+                    detail,
+                })
+                .await;
+                return;
+            }
+        };
+        if !server.enabled && !matches!(action, McpControlAction::Disconnect) {
+            self.emit(Event::McpServerStatus {
+                name: server.name.clone(),
+                status: "disabled".to_string(),
+                tool_count: 0,
+                tools: Vec::new(),
+                detail: "Enable this provider before connecting".to_string(),
+            })
+            .await;
+            return;
+        }
+
+        match action {
+            McpControlAction::Disconnect => {
+                if matches!(server.auth_mode, McpAuthMode::OAuth) {
+                    let profile_id = mcp_auth_profile_id(&server);
+                    self.mcp_auth_tasks.remove(&profile_id);
+                    revoke_mcp_auth_profile(&profile_id);
+                }
+                self.detach_mcp_server(&server).await;
+                let credential_result = if matches!(server.auth_mode, McpAuthMode::OAuth) {
+                    clear_mcp_auth_profile_credentials(&mcp_auth_profile_id(&server))
+                        .await
+                        .map_err(|error| redact_oauth_secrets(&error.to_string()))
+                } else {
+                    Ok(())
+                };
+                if matches!(server.auth_mode, McpAuthMode::OAuth) {
+                    let (state, detail) = match &credential_result {
+                        Ok(()) => (
+                            "not_authorized",
+                            "Credentials removed from the system credential vault".to_string(),
+                        ),
+                        Err(error) => (
+                            "error",
+                            format!("Connection closed, but credential removal failed: {error}"),
+                        ),
+                    };
+                    self.emit(Event::McpAuthStatus {
+                        name: server.name.clone(),
+                        state: state.to_string(),
+                        detail,
+                    })
+                    .await;
+                }
+                self.emit(Event::McpServerStatus {
+                    name: server.name,
+                    status: "disconnected".to_string(),
+                    tool_count: 0,
+                    tools: Vec::new(),
+                    detail: if credential_result.is_ok() {
+                        "Connection closed; saved configuration was kept".to_string()
+                    } else {
+                        "Connection closed; inspect the credential-vault error".to_string()
+                    },
+                })
+                .await;
+            }
+            McpControlAction::Test => {
+                self.emit(Event::McpServerStatus {
+                    name: server.name.clone(),
+                    status: "testing".to_string(),
+                    tool_count: 0,
+                    tools: Vec::new(),
+                    detail: "Checking endpoint and tools/list".to_string(),
+                })
+                .await;
+                match establish_mcp_server(&server, false, false).await {
+                    Ok((_client, tools)) => {
+                        if matches!(server.auth_mode, McpAuthMode::OAuth) {
+                            self.emit(Event::McpAuthStatus {
+                                name: server.name.clone(),
+                                state: "authorized".to_string(),
+                                detail: "Credentials loaded from the system credential vault"
+                                    .to_string(),
+                            })
+                            .await;
+                        }
+                        let tool_names = mcp_tool_names_for_status(&server, &tools);
+                        self.emit(Event::McpServerStatus {
+                            name: server.name,
+                            status: "available".to_string(),
+                            tool_count: tools.len(),
+                            tools: tool_names,
+                            detail: "Connection test passed; runtime connection was unchanged"
+                                .to_string(),
+                        })
+                        .await;
+                    }
+                    Err(error) => {
+                        let requires_auth = mcp_authorization_required(&server, &error);
+                        if requires_auth {
+                            self.emit(Event::McpAuthStatus {
+                                name: server.name.clone(),
+                                state: "authorization_required".to_string(),
+                                detail: "Authorize this provider before testing it".to_string(),
+                            })
+                            .await;
+                        }
+                        self.emit(Event::McpServerStatus {
+                            name: server.name,
+                            status: "error".to_string(),
+                            tool_count: 0,
+                            tools: Vec::new(),
+                            detail: if requires_auth {
+                                "Connection test requires authorization".to_string()
+                            } else {
+                                format!("Connection test failed: {}", safe_mcp_error(&error))
+                            },
+                        })
+                        .await;
+                    }
+                }
+            }
+            McpControlAction::Reconnect => {
+                self.emit(Event::McpServerStatus {
+                    name: server.name.clone(),
+                    status: "connecting".to_string(),
+                    tool_count: 0,
+                    tools: Vec::new(),
+                    detail: "Opening a fresh connection".to_string(),
+                })
+                .await;
+                match self.attach_mcp_server(&server, false).await {
+                    Ok((exposed_count, reported_tools)) => {
+                        if matches!(server.auth_mode, McpAuthMode::OAuth) {
+                            self.emit(Event::McpAuthStatus {
+                                name: server.name.clone(),
+                                state: "authorized".to_string(),
+                                detail: "Credentials loaded from the system credential vault"
+                                    .to_string(),
+                            })
+                            .await;
+                        }
+                        let tool_names = mcp_tool_names_for_status(&server, &reported_tools);
+                        let reported_count = reported_tools.len();
+                        self.emit(Event::McpServerStatus {
+                            name: server.name,
+                            status: "connected".to_string(),
+                            tool_count: reported_count,
+                            tools: tool_names,
+                            detail: format!(
+                                "Fresh connection established; {exposed_count} of {reported_count} tools exposed"
+                            ),
+                        })
+                        .await;
+                    }
+                    Err(error) => {
+                        let requires_auth = mcp_authorization_required(&server, &error);
+                        if requires_auth {
+                            self.emit(Event::McpAuthStatus {
+                                name: server.name.clone(),
+                                state: "authorization_required".to_string(),
+                                detail: "Authorize this provider before reconnecting".to_string(),
+                            })
+                            .await;
+                        }
+                        self.emit(Event::McpServerStatus {
+                            name: server.name,
+                            status: "error".to_string(),
+                            tool_count: 0,
+                            tools: Vec::new(),
+                            detail: if requires_auth {
+                                "Reconnect requires authorization".to_string()
+                            } else {
+                                format!("Reconnect failed: {}", safe_mcp_error(&error))
+                            },
+                        })
+                        .await;
+                    }
+                }
+            }
+            McpControlAction::Authorize => {
+                let profile_id = mcp_auth_profile_id(&server);
+                self.mcp_auth_tasks.remove(&profile_id);
+                let epoch = revoke_mcp_auth_profile(&profile_id);
+                self.detach_mcp_server(&server).await;
+                match clear_mcp_auth_profile_credentials(&profile_id).await {
+                    Ok(()) => self.start_mcp_authorization(&server, epoch).await,
+                    Err(error) => {
+                        self.emit(Event::McpAuthStatus {
+                            name: server.name,
+                            state: "error".to_string(),
+                            detail: format!(
+                                "Could not reset the credential profile: {}",
+                                redact_oauth_secrets(&error.to_string())
+                            ),
+                        })
+                        .await;
+                    }
+                }
+            }
+        }
+    }
+
+    async fn update_mcp_servers(&mut self, servers: Vec<McpServerConfig>) {
+        let retained_profiles = servers
+            .iter()
+            .filter(|server| matches!(server.auth_mode, McpAuthMode::OAuth))
+            .map(mcp_auth_profile_id)
+            .collect::<HashSet<_>>();
+        let retained_authorizations = servers
+            .iter()
+            .filter(|server| matches!(server.auth_mode, McpAuthMode::OAuth))
+            .map(|server| {
+                (
+                    mcp_auth_profile_id(server),
+                    server.name.clone(),
+                    server.url.clone(),
+                )
+            })
+            .collect::<HashSet<_>>();
+        let stale_tasks = self
+            .config
+            .mcp_servers
+            .iter()
+            .filter(|server| matches!(server.auth_mode, McpAuthMode::OAuth))
+            .filter_map(|server| {
+                let profile_id = mcp_auth_profile_id(server);
+                (!retained_authorizations.contains(&(
+                    profile_id.clone(),
+                    server.name.clone(),
+                    server.url.clone(),
+                )))
+                .then_some(profile_id)
+            })
+            .collect::<HashSet<_>>();
+        for profile_id in stale_tasks {
+            self.mcp_auth_tasks.remove(&profile_id);
+        }
+
+        let previous = self.config.mcp_servers.clone();
+        for server in &previous {
+            self.detach_mcp_server(server).await;
+            if matches!(server.auth_mode, McpAuthMode::OAuth) {
+                let profile_id = mcp_auth_profile_id(server);
+                if !retained_profiles.contains(&profile_id) {
+                    revoke_mcp_auth_profile(&profile_id);
+                    if let Err(error) = clear_mcp_auth_profile_credentials(&profile_id).await {
+                        self.emit(Event::McpAuthStatus {
+                            name: server.name.clone(),
+                            state: "error".to_string(),
+                            detail: format!(
+                                "Provider was removed, but credential cleanup failed: {}",
+                                redact_oauth_secrets(&error.to_string())
+                            ),
+                        })
+                        .await;
+                    }
+                }
+            }
+        }
+
+        self.config.mcp_servers = servers;
+    }
+
     /// Launch trusted/configured MCP servers and merge their tools. External
     /// Codex/Claude MCP servers are detected for the UI, but not auto-connected
     /// until the user adds/trusts them in Oxide's config.
     async fn connect_mcp_servers(&mut self) {
-        // Process-wide pool of live MCP connections, keyed by server config.
-        // Tab switches respawn the engine; without this every switch paid the
-        // full reconnect (npx cold start) for every server.
-        type Pool = std::collections::HashMap<
-            String,
-            (std::sync::Arc<McpClient>, Vec<oxide_protocol::ToolSpec>),
-        >;
-        static MCP_POOL: std::sync::OnceLock<tokio::sync::Mutex<Pool>> = std::sync::OnceLock::new();
-        let pool = MCP_POOL.get_or_init(Default::default);
+        // Tab switches respawn the engine; reuse healthy connections from the
+        // process pool instead of paying every stdio/HTTP cold start again.
+        let pool = mcp_connection_pool();
 
         self.required_mcp_unavailable = false;
+        self.mcp_clients.clear();
+        self.mcp_connection_policy_generations.clear();
+        self.mcp_auth_epochs.clear();
+        self.mcp_tools.clear();
+        self.deferred_tools.clear();
+        self.mcp_instructions.clear();
         let configured = self.config.mcp_servers.clone();
+        if let Err(detail) = validate_mcp_server_configs(&configured) {
+            self.required_mcp_unavailable = configured
+                .iter()
+                .any(|server| server.enabled && server.required);
+            self.emit(Event::Error {
+                message: format!("MCP configuration rejected: {detail}"),
+            })
+            .await;
+            return;
+        }
         let discovered = discover_external_mcp_for_workspace(&self.workspace);
         let configured_names: HashSet<String> = configured
             .iter()
@@ -2995,69 +4156,7 @@ impl Engine {
             .map(|srv| {
                 let srv = srv.clone();
                 async move {
-                    let key = mcp_pool_key(&srv);
-                    // Reuse a live pooled connection when it still answers.
-                    if let Some((client, _cached_tools)) = pool.lock().await.get(&key).cloned() {
-                        let refreshed = tokio::time::timeout(
-                            std::time::Duration::from_secs(5),
-                            client.list_tools(),
-                        )
-                        .await;
-                        if let Ok(Ok(tools)) = refreshed {
-                            let tools = filter_mcp_tools(&srv, tools);
-                            return (srv, Ok((client, tools)));
-                        }
-                        pool.lock().await.remove(&key);
-                    }
-                    let fut = async {
-                        let client = if !srv.url.is_empty() {
-                            McpClient::connect_http_with(
-                                &srv.name,
-                                &srv.url,
-                                mcp_http_options(&srv),
-                            )
-                            .await?
-                        } else {
-                            let cwd = if srv.cwd.trim().is_empty() {
-                                None
-                            } else {
-                                Some(std::path::PathBuf::from(&srv.cwd))
-                            };
-                            McpClient::connect_stdio_with(
-                                &srv.name,
-                                &srv.command,
-                                &srv.args,
-                                StdioSpawnOptions {
-                                    cwd,
-                                    env: srv.env.clone(),
-                                    env_vars: srv
-                                        .env_vars
-                                        .iter()
-                                        .map(|env| env.name().to_string())
-                                        .collect(),
-                                    request_timeout: duration_secs(srv.tool_timeout_sec, 60),
-                                },
-                            )
-                            .await?
-                        };
-                        let tools = filter_mcp_tools(&srv, client.list_tools().await?);
-                        Ok::<_, anyhow::Error>((std::sync::Arc::new(client), tools))
-                    };
-                    let res =
-                        match tokio::time::timeout(duration_secs(srv.startup_timeout_sec, 15), fut)
-                            .await
-                        {
-                            Ok(r) => r,
-                            Err(_) => Err(anyhow::anyhow!(
-                                "timed out after {}s",
-                                duration_secs(srv.startup_timeout_sec, 15).as_secs()
-                            )),
-                        };
-                    if let Ok((client, tools)) = &res {
-                        pool.lock()
-                            .await
-                            .insert(key, (client.clone(), tools.clone()));
-                    }
+                    let res = establish_mcp_server(&srv, true, true).await;
                     (srv, res)
                 }
             })
@@ -3069,20 +4168,48 @@ impl Engine {
                 (t, instructions)
             }) {
                 Ok((tools, instructions)) => {
-                    let tool_names = tools.iter().map(|tool| tool.name.clone()).collect();
+                    self.mcp_connection_policy_generations.insert(
+                        srv.name.clone(),
+                        self.mcp_policy_generations
+                            .get(&srv.name)
+                            .copied()
+                            .unwrap_or_default(),
+                    );
+                    if matches!(srv.auth_mode, McpAuthMode::OAuth) {
+                        self.mcp_auth_epochs.insert(
+                            srv.name.clone(),
+                            mcp_auth_profile_state(&mcp_auth_profile_id(&srv)).epoch,
+                        );
+                        self.emit(Event::McpAuthStatus {
+                            name: srv.name.clone(),
+                            state: "authorized".to_string(),
+                            detail: "Credentials loaded from the system credential vault"
+                                .to_string(),
+                        })
+                        .await;
+                    }
+                    let tool_names = mcp_tool_names_for_status(&srv, &tools);
+                    let reported_count = tools.len();
+                    let exposed_tools = filter_mcp_tools(&srv, tools);
+                    let exposed_count = exposed_tools.len();
                     self.emit(Event::McpServerStatus {
                         name: srv.name.clone(),
                         status: "connected".to_string(),
-                        tool_count: tools.len(),
+                        tool_count: reported_count,
                         tools: tool_names,
-                        detail: "tools/list succeeded".to_string(),
+                        detail: format!(
+                            "tools/list succeeded; {exposed_count} of {reported_count} tools exposed"
+                        ),
                     })
                     .await;
                     self.emit(Event::Info {
-                        text: format!("mcp '{}' connected: {} tool(s)", srv.name, tools.len()),
+                        text: format!(
+                            "mcp '{}' connected: {exposed_count} of {reported_count} tool(s) exposed",
+                            srv.name
+                        ),
                     })
                     .await;
-                    self.mcp_tools.extend(tools);
+                    self.mcp_tools.extend(exposed_tools);
                     if !instructions.trim().is_empty() {
                         self.mcp_instructions.push((srv.name.clone(), instructions));
                     }
@@ -3091,19 +4218,33 @@ impl Engine {
                     if srv.required {
                         self.required_mcp_unavailable = true;
                     }
+                    let requires_auth = mcp_authorization_required(&srv, &e);
+                    if requires_auth {
+                        self.emit(Event::McpAuthStatus {
+                            name: srv.name.clone(),
+                            state: "authorization_required".to_string(),
+                            detail: "Connect this provider to continue".to_string(),
+                        })
+                        .await;
+                    }
+                    let safe_error = safe_mcp_error(&e);
                     self.emit(Event::McpServerStatus {
                         name: srv.name.clone(),
                         status: "error".to_string(),
                         tool_count: 0,
                         tools: Vec::new(),
-                        detail: format!("connect failed: {e}"),
+                        detail: if requires_auth {
+                            "authorization required".to_string()
+                        } else {
+                            format!("connect failed: {safe_error}")
+                        },
                     })
                     .await;
                     self.emit(Event::Error {
                         message: if srv.required {
-                            format!("required mcp '{}' connect failed: {e}", srv.name)
+                            format!("required mcp '{}' connect failed: {safe_error}", srv.name)
                         } else {
-                            format!("mcp '{}' connect failed: {e}", srv.name)
+                            format!("mcp '{}' connect failed: {safe_error}", srv.name)
                         },
                     })
                     .await;
@@ -3600,6 +4741,64 @@ Rules:
         let Some(server) = server_of(name) else {
             return (format!("malformed mcp tool name '{name}'"), false);
         };
+        let policy = self
+            .mcp_policy
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .servers
+            .get(server)
+            .cloned();
+        let Some(policy) = policy else {
+            return (
+                format!("MCP provider '{server}' is no longer configured"),
+                false,
+            );
+        };
+        if !policy.server.enabled {
+            return (format!("MCP provider '{server}' is disabled"), false);
+        }
+        if self.mcp_connection_policy_generations.get(server).copied() != Some(policy.generation) {
+            return (
+                format!(
+                    "MCP provider '{server}' configuration changed; wait for its fresh connection"
+                ),
+                false,
+            );
+        }
+        let configured = match self.configured_mcp_server(server) {
+            Ok(configured) => configured,
+            Err(detail) => return (detail, false),
+        };
+        let prefix = format!("mcp__{server}__");
+        let Some(bare_name) = name.strip_prefix(&prefix) else {
+            return (format!("malformed mcp tool name '{name}'"), false);
+        };
+        if !policy.server.tool_allowed(bare_name) {
+            return (
+                format!("MCP tool '{bare_name}' is disabled for provider '{server}'"),
+                false,
+            );
+        }
+        if matches!(configured.auth_mode, McpAuthMode::OAuth) {
+            let state = mcp_auth_profile_state(&mcp_auth_profile_id(&configured));
+            let connected_epoch = self.mcp_auth_epochs.get(server).copied();
+            if state.revoked {
+                return (
+                    format!(
+                        "MCP provider '{server}' is disconnected; authorize it before calling tools"
+                    ),
+                    false,
+                );
+            }
+            if connected_epoch != Some(state.epoch) {
+                return (
+                    format!(
+                        "MCP provider '{server}' has a stale authorization session; reconnect it before calling tools"
+                    ),
+                    false,
+                );
+            }
+        }
         let Some(client) = self.mcp_clients.iter().find(|c| c.server() == server) else {
             return (format!("no connected mcp server '{server}'"), false);
         };
@@ -3737,6 +4936,69 @@ Rules:
                 action = next_browser_control(&mut self.browser_control_rx) => {
                     Op::BrowserControl { action }
                 },
+                update = next_mcp_config_update(&mut self.mcp_config_rx) => {
+                    let McpConfigUpdate { servers, generations, done } = update;
+                    self.mcp_policy_generations = generations;
+                    self.update_mcp_servers(servers).await;
+                    let _ = done.send(());
+                    self.connect_mcp_servers().await;
+                    continue;
+                },
+                completion = next_mcp_auth_completion(&mut self.mcp_auth_rx) => {
+                    let current_state = mcp_auth_profile_state(&completion.profile_id);
+                    if current_state.epoch != completion.epoch || !current_state.revoked {
+                        continue;
+                    }
+                    let is_current_task = self
+                        .mcp_auth_tasks
+                        .get(&completion.profile_id)
+                        .is_some_and(|task| task.epoch == completion.epoch);
+                    if !is_current_task {
+                        continue;
+                    }
+                    self.mcp_auth_tasks.remove(&completion.profile_id);
+                    match completion.result {
+                        Ok(()) => {
+                            let configured = self.configured_mcp_server(&completion.name).ok();
+                            let profile_matches = configured
+                                .as_ref()
+                                .is_some_and(|server| {
+                                    matches!(server.auth_mode, McpAuthMode::OAuth)
+                                        && mcp_auth_profile_id(server) == completion.profile_id
+                                });
+                            if !profile_matches {
+                                let _ = clear_mcp_auth_profile_credentials(
+                                    &completion.profile_id,
+                                )
+                                .await;
+                                continue;
+                            }
+                            if !authorize_mcp_auth_profile_epoch(
+                                &completion.profile_id,
+                                completion.epoch,
+                            ) {
+                                continue;
+                            }
+                            self.emit(Event::McpAuthStatus {
+                                name: completion.name.clone(),
+                                state: "authorized".to_string(),
+                                detail: "Credentials stored in the system credential vault".to_string(),
+                            }).await;
+                            self.handle_mcp_control(
+                                completion.name,
+                                McpControlAction::Reconnect,
+                            ).await;
+                        }
+                        Err(detail) => {
+                            self.emit(Event::McpAuthStatus {
+                                name: completion.name,
+                                state: "error".to_string(),
+                                detail,
+                            }).await;
+                        }
+                    }
+                    continue;
+                },
                 Some(done) = bg_rx.recv() => Op::UserTurn {
                     text: done,
                     permissions: Some(RuntimePermissions {
@@ -3827,6 +5089,19 @@ Rules:
                     }
                     Op::SetHarness { id } => self.set_harness(id).await,
                     Op::ReloadHarnesses => self.reload_harnesses().await,
+                    Op::McpControl { name, action } => {
+                        let generation = self
+                            .mcp_policy
+                            .read()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .servers
+                            .get(&name)
+                            .map(|policy| policy.generation);
+                        if let Some(generation) = generation {
+                            self.mcp_policy_generations.insert(name.clone(), generation);
+                        }
+                        self.handle_mcp_control(name, action).await;
+                    }
                     Op::Interrupt => {
                         // No turn in flight here; nothing to interrupt.
                         self.emit(Event::Info {
@@ -4985,6 +6260,10 @@ Produce a compact, self-contained answer (read files only when needed; do NOT ed
                 .or_else(|| self.subagent_parent.clone()),
             checkpoints: Arc::clone(&self.checkpoints),
             mcp_clients: self.mcp_clients.clone(),
+            mcp_policy: Arc::clone(&self.mcp_policy),
+            mcp_policy_generations: self.mcp_policy_generations.clone(),
+            mcp_connection_policy_generations: self.mcp_connection_policy_generations.clone(),
+            mcp_auth_epochs: self.mcp_auth_epochs.clone(),
             mcp_tools: self.mcp_tools.clone(),
             deferred_tools: Vec::new(),
             turns_since_review: 0,
@@ -5000,6 +6279,10 @@ Produce a compact, self-contained answer (read files only when needed; do NOT ed
             browser: None,
             browser_control: BrowserControlState::AgentControlled,
             browser_control_rx: None,
+            mcp_config_rx: None,
+            mcp_auth_tx: None,
+            mcp_auth_rx: None,
+            mcp_auth_tasks: HashMap::new(),
             ctx_window: self.ctx_window,
             read_files: self.read_files.clone(),
             turn_edited: false,
@@ -7730,17 +9013,58 @@ fn normalize_todo_status(status: &str) -> String {
 
 #[cfg(test)]
 mod map_test {
-    use oxide_config::{McpEnvVar, McpServerConfig};
-    use oxide_protocol::{BrowserControlAction, Op, ToolSpec};
+    use oxide_config::{McpAuthMode, McpEnvVar, McpServerConfig};
+    use oxide_mcp::{BearerTokenProvider, SecretString};
+    use oxide_protocol::{BrowserControlAction, McpControlAction, Op, ToolSpec};
+    use std::sync::Arc;
+
+    struct BlockingRefreshTokenProvider {
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        credential_present: Arc<std::sync::atomic::AtomicBool>,
+        refresh_completed: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl BearerTokenProvider for BlockingRefreshTokenProvider {
+        async fn bearer_token(&self) -> anyhow::Result<SecretString> {
+            self.started.notify_one();
+            self.release.notified().await;
+            self.credential_present
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.refresh_completed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(SecretString::new("stale-access-token"))
+        }
+    }
+
+    struct ObservedCredentialCleanup {
+        credential_present: Arc<std::sync::atomic::AtomicBool>,
+        cleanup_called: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl super::McpAuthCredentialCleanup for ObservedCredentialCleanup {
+        async fn clear(&self, _profile_id: &str) -> anyhow::Result<()> {
+            self.credential_present
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            self.cleanup_called
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
 
     #[tokio::test]
     async fn browser_control_bypasses_a_full_operation_queue() {
         let (op_tx, mut op_rx) = tokio::sync::mpsc::channel(1);
         op_tx.try_send(Op::Interrupt).unwrap();
         let (browser_control_tx, mut browser_control_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (mcp_config_tx, _mcp_config_rx) = tokio::sync::mpsc::unbounded_channel();
         let handle = super::EngineHandle {
             op_tx,
             browser_control_tx,
+            mcp_config_tx,
+            mcp_policy: Arc::new(std::sync::RwLock::new(super::McpPolicySnapshot::default())),
             bus: super::EventBus::new(),
         };
 
@@ -7759,6 +9083,310 @@ mod map_test {
             BrowserControlAction::TakeOver
         );
         assert!(matches!(op_rx.try_recv(), Ok(Op::Interrupt)));
+    }
+
+    #[tokio::test]
+    async fn mcp_disconnect_invalidates_policy_before_the_operation_queue_drains() {
+        let server = McpServerConfig {
+            name: "supabase".to_string(),
+            enabled: true,
+            ..McpServerConfig::default()
+        };
+        let policy = Arc::new(std::sync::RwLock::new(
+            super::McpPolicySnapshot::from_servers(std::slice::from_ref(&server)).unwrap(),
+        ));
+        let (op_tx, _op_rx) = tokio::sync::mpsc::channel(1);
+        op_tx.try_send(Op::Interrupt).unwrap();
+        let (browser_control_tx, _browser_control_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (mcp_config_tx, _mcp_config_rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = super::EngineHandle {
+            op_tx,
+            browser_control_tx,
+            mcp_config_tx,
+            mcp_policy: Arc::clone(&policy),
+            bus: super::EventBus::new(),
+        };
+
+        let submission = handle.submit(Op::McpControl {
+            name: server.name.clone(),
+            action: McpControlAction::Disconnect,
+        });
+        tokio::pin!(submission);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut submission)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            policy
+                .read()
+                .unwrap()
+                .servers
+                .get(&server.name)
+                .map(|value| value.generation),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_mcp_update_is_rejected_without_replacing_active_policy() {
+        let original = McpServerConfig {
+            name: "provider".to_string(),
+            url: "https://trusted.example/mcp".to_string(),
+            enabled: true,
+            ..McpServerConfig::default()
+        };
+        let policy = Arc::new(std::sync::RwLock::new(
+            super::McpPolicySnapshot::from_servers(std::slice::from_ref(&original)).unwrap(),
+        ));
+        let (op_tx, _op_rx) = tokio::sync::mpsc::channel(1);
+        let (browser_control_tx, _browser_control_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (mcp_config_tx, mut mcp_config_rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = super::EngineHandle {
+            op_tx,
+            browser_control_tx,
+            mcp_config_tx,
+            mcp_policy: Arc::clone(&policy),
+            bus: super::EventBus::new(),
+        };
+        let duplicate = McpServerConfig {
+            url: "https://attacker.example/mcp".to_string(),
+            ..original.clone()
+        };
+
+        let error = handle
+            .update_mcp_servers(vec![original.clone(), duplicate])
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("duplicate MCP server name"));
+        assert_eq!(
+            policy
+                .read()
+                .unwrap()
+                .servers
+                .get(&original.name)
+                .map(|entry| entry.server.url.as_str()),
+            Some(original.url.as_str())
+        );
+        assert!(matches!(
+            mcp_config_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn mcp_policy_snapshot_rejects_duplicate_names() {
+        let first = McpServerConfig {
+            name: "provider".to_string(),
+            url: "https://one.example/mcp".to_string(),
+            ..McpServerConfig::default()
+        };
+        let second = McpServerConfig {
+            url: "https://two.example/mcp".to_string(),
+            ..first.clone()
+        };
+
+        let error = super::McpPolicySnapshot::from_servers(&[first, second])
+            .err()
+            .expect("duplicate names must be rejected");
+
+        assert!(error.contains("duplicate MCP server name 'provider'"));
+    }
+
+    #[tokio::test]
+    async fn oauth_completion_revoked_mid_save_is_cleaned_and_cannot_authorize_new_epoch() {
+        let profile_id = format!(
+            "oauth-race-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let epoch = super::revoke_mcp_auth_profile(&profile_id);
+        let cleanup_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cleanup_observer = Arc::clone(&cleanup_called);
+        let completion_profile = profile_id.clone();
+
+        let result = super::guard_mcp_auth_completion(
+            &profile_id,
+            epoch,
+            async move {
+                super::revoke_mcp_auth_profile(&completion_profile);
+                Ok(())
+            },
+            move || async move {
+                cleanup_observer.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await;
+
+        assert!(result
+            .unwrap_err()
+            .contains("superseded by a newer request"));
+        assert!(cleanup_called.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!super::authorize_mcp_auth_profile_epoch(&profile_id, epoch));
+        let state = super::mcp_auth_profile_state(&profile_id);
+        assert!(state.revoked);
+        assert_ne!(state.epoch, epoch);
+    }
+
+    #[tokio::test]
+    async fn oauth_completion_already_superseded_does_not_touch_new_credentials() {
+        let profile_id = format!(
+            "oauth-stale-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let stale_epoch = super::revoke_mcp_auth_profile(&profile_id);
+        super::revoke_mcp_auth_profile(&profile_id);
+        let completion_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let completion_observer = Arc::clone(&completion_called);
+        let cleanup_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cleanup_observer = Arc::clone(&cleanup_called);
+
+        let result = super::guard_mcp_auth_completion(
+            &profile_id,
+            stale_epoch,
+            async move {
+                completion_observer.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+            move || async move {
+                cleanup_observer.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await;
+
+        assert!(result
+            .unwrap_err()
+            .contains("superseded by a newer request"));
+        assert!(!completion_called.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!cleanup_called.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn oauth_refresh_revoked_in_flight_cleans_stale_saved_credentials() {
+        let profile_id = format!(
+            "oauth-refresh-race-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let epoch = super::mcp_auth_profile_state(&profile_id).epoch;
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let credential_present = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let refresh_completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cleanup_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let provider = super::EpochGatedMcpTokenProvider {
+            profile_id: profile_id.clone(),
+            epoch,
+            inner: BlockingRefreshTokenProvider {
+                started: Arc::clone(&started),
+                release: Arc::clone(&release),
+                credential_present: Arc::clone(&credential_present),
+                refresh_completed: Arc::clone(&refresh_completed),
+            },
+            cleanup: ObservedCredentialCleanup {
+                credential_present: Arc::clone(&credential_present),
+                cleanup_called: Arc::clone(&cleanup_called),
+            },
+        };
+
+        let refresh = tokio::spawn(async move { provider.bearer_token().await });
+        started.notified().await;
+        super::revoke_mcp_auth_profile(&profile_id);
+        release.notify_one();
+        let error = refresh.await.unwrap().unwrap_err();
+
+        assert!(error.to_string().contains("superseded while refreshing"));
+        assert!(refresh_completed.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(cleanup_called.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!credential_present.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(super::mcp_auth_profile_state(&profile_id).revoked);
+    }
+
+    #[test]
+    fn oauth_profiles_are_bound_to_the_resource_endpoint() {
+        let original = McpServerConfig {
+            name: "primary".to_string(),
+            url: "https://provider.example/mcp?project=one".to_string(),
+            provider: "example".to_string(),
+            auth_mode: McpAuthMode::OAuth,
+            auth_profile_id: "connection-1".to_string(),
+            ..McpServerConfig::default()
+        };
+        let mut renamed = original.clone();
+        renamed.name = "renamed".to_string();
+        let mut other_resource = original.clone();
+        other_resource.url = "https://attacker.example/mcp?project=one".to_string();
+
+        assert_eq!(
+            super::mcp_auth_profile_id(&original),
+            super::mcp_auth_profile_id(&renamed)
+        );
+        assert_ne!(
+            super::mcp_auth_profile_id(&original),
+            super::mcp_auth_profile_id(&other_resource)
+        );
+    }
+
+    #[test]
+    fn foreign_keychain_reuse_requires_a_trusted_discovered_source() {
+        assert!(!super::trusted_external_mcp_credential_source(""));
+        assert!(!super::trusted_external_mcp_credential_source(
+            "workspace config"
+        ));
+        assert!(super::trusted_external_mcp_credential_source(
+            "Claude Desktop"
+        ));
+        assert!(super::trusted_external_mcp_credential_source(
+            "Codex project config"
+        ));
+
+        let spoofed = McpServerConfig {
+            name: "known-server".to_string(),
+            url: "https://attacker.example/mcp".to_string(),
+            source: "Claude Desktop".to_string(),
+            trusted_external: false,
+            ..McpServerConfig::default()
+        };
+        assert!(super::mcp_http_options(&spoofed).bearer_token.is_empty());
+    }
+
+    #[test]
+    fn supabase_provider_is_pinned_to_its_scoped_official_endpoint() {
+        let server = McpServerConfig {
+            name: "supabase".to_string(),
+            url: "https://mcp.supabase.com/mcp?project_ref=project-1&read_only=true&features=database%2Cdocs".to_string(),
+            provider: "supabase".to_string(),
+            auth_mode: McpAuthMode::OAuth,
+            auth_profile_id: "connection-1".to_string(),
+            provider_options: std::collections::BTreeMap::from([
+                ("project_ref".to_string(), "project-1".to_string()),
+                ("read_only".to_string(), "true".to_string()),
+                ("features".to_string(), "database,docs".to_string()),
+            ]),
+            ..McpServerConfig::default()
+        };
+        assert!(super::validate_native_mcp_provider(&server).is_ok());
+
+        let mut attacker = server.clone();
+        attacker.url = "https://attacker.example/mcp?project_ref=project-1&read_only=true&features=database%2Cdocs".to_string();
+        assert!(super::validate_native_mcp_provider(&attacker).is_err());
+
+        let mut wrong_project = server;
+        wrong_project.url = "https://mcp.supabase.com/mcp?project_ref=project-2&read_only=true&features=database%2Cdocs".to_string();
+        assert!(super::validate_native_mcp_provider(&wrong_project).is_err());
     }
 
     #[test]
@@ -8091,6 +9719,7 @@ attributes:
             Some("secret")
         );
         assert!(!resolved.external_ref);
+        assert!(resolved.trusted_external);
         let persisted = toml::to_string(&reference).unwrap();
         assert!(!persisted.contains("secret"));
     }

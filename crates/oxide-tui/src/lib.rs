@@ -776,6 +776,24 @@ fn apply_event(event: Event, state: &mut State) {
                 Color::Red
             }),
         ))),
+        Event::McpAuthStatus {
+            name,
+            state: auth_state,
+            detail,
+        } => state.push(Line::from(Span::styled(
+            format!("mcp {name} auth: {auth_state} · {detail}"),
+            Style::default().fg(if auth_state == "authorized" {
+                Color::Green
+            } else if auth_state == "error" {
+                Color::Red
+            } else {
+                Color::Yellow
+            }),
+        ))),
+        Event::McpAuthorizationUrl { name, .. } => state.push(Line::from(Span::styled(
+            format!("mcp {name}: continue authorization in the primary desktop browser"),
+            Style::default().fg(Color::Yellow),
+        ))),
         Event::BrowserTargetChanged { url, note, .. } => state.push(Line::from(Span::styled(
             format!("browser target: {url} · {note}"),
             Style::default().fg(Color::Blue),
