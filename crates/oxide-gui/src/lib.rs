@@ -10065,12 +10065,26 @@ fn app() -> Element {
                         let err = *update_err.read();
                         let busy = *updating.read();
                         let row_cls = if err { "update-row err" } else if busy { "update-row busy" } else { "update-row ready" };
+                        let update_action_label = if busy {
+                            "Oxide update in progress"
+                        } else if err {
+                            "Retry Oxide update"
+                        } else {
+                            "Install Oxide update"
+                        };
+                        let update_tooltip = if busy {
+                            "Updating Oxide"
+                        } else if err {
+                            "Retry update"
+                        } else {
+                            "Update Oxide"
+                        };
                         let info_run = info.clone();
                         rsx! {
                             button { class: "{row_cls}",
                                 title: "v{info.version} — {info.notes}",
-                                aria_label: if busy { "Oxide update in progress" } else if err { "Retry Oxide update" } else { "Install Oxide update" },
-                                "data-tooltip": if busy { "Updating Oxide" } else if err { "Retry update" } else { "Update Oxide" },
+                                aria_label: "{update_action_label}",
+                                "data-tooltip": "{update_tooltip}",
                                 disabled: busy,
                                 onclick: move |_| {
                                     install_update(info_run.clone(), updating, update_err, update_pct);
