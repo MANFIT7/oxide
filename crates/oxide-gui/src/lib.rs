@@ -8989,7 +8989,7 @@ fn app() -> Element {
                         };
                         if let Some(existing) = annotations.iter_mut().find(|value| {
                             value.get("selector").and_then(|value| value.as_str()) == Some(selector)
-                                && restored_url.map_or(true, |url| {
+                                && restored_url.is_none_or(|url| {
                                     value.get("url").and_then(|value| value.as_str()) == Some(url)
                                 })
                         }) {
