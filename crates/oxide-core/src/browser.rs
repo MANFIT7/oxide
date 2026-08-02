@@ -14,6 +14,54 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::task::JoinHandle;
 
+const CLICK_NAVIGATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+const BROWSER_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+struct ProfileDirGuard {
+    path: Option<PathBuf>,
+}
+
+impl ProfileDirGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    fn disarm(&mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for ProfileDirGuard {
+    fn drop(&mut self) {
+        let Some(path) = self.path.take() else {
+            return;
+        };
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _ = remove_profile_dir(&path).await;
+            });
+        } else {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+}
+
+struct PumpGuard(Option<JoinHandle<()>>);
+
+impl PumpGuard {
+    fn into_inner(mut self) -> JoinHandle<()> {
+        self.0.take().expect("browser pump guard must own a task")
+    }
+}
+
+impl Drop for PumpGuard {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+        }
+    }
+}
+
 /// Locate an installed Chromium-based browser binary (macOS first).
 pub fn detect_browser() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("OXIDE_BROWSER_BIN") {
@@ -62,6 +110,7 @@ pub struct BrowserSession {
     page: Page,
     pump: JoinHandle<()>,
     profile_dir: PathBuf,
+    visible: bool,
 }
 
 impl BrowserSession {
@@ -79,6 +128,7 @@ impl BrowserSession {
             builder = builder.with_head();
         }
         let profile_dir = unique_browser_profile_dir();
+        let mut profile_guard = ProfileDirGuard::new(profile_dir.clone());
         builder = builder.user_data_dir(profile_dir.clone());
         if let Some((width, height)) = viewport {
             builder = builder.viewport(Viewport {
@@ -97,13 +147,18 @@ impl BrowserSession {
             .build()
             .map_err(|e| anyhow!("browser config: {e}"))?;
         let (browser, mut handler) = Browser::launch(config).await?;
-        let pump = tokio::spawn(async move { while handler.next().await.is_some() {} });
+        let pump = PumpGuard(Some(tokio::spawn(async move {
+            while handler.next().await.is_some() {}
+        })));
         let page = browser.new_page("about:blank").await?;
+        let pump = pump.into_inner();
+        profile_guard.disarm();
         Ok(Self {
             browser,
             page,
             pump,
             profile_dir,
+            visible: !headless,
         })
     }
 
@@ -111,10 +166,44 @@ impl BrowserSession {
     /// browser tools finishes. Keeping the session alive within a turn preserves
     /// navigate/read/click sequences without leaving an idle browser on the host.
     pub async fn close(mut self) -> Result<()> {
-        let close_result = self.browser.close().await;
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), &mut self.pump).await;
-        let _ = tokio::fs::remove_dir_all(&self.profile_dir).await;
-        close_result.map(|_| ()).map_err(Into::into)
+        let close_result =
+            match tokio::time::timeout(BROWSER_CLOSE_TIMEOUT, self.browser.close()).await {
+                Ok(result) => result.map(|_| ()).map_err(Into::into),
+                Err(_) => Err(anyhow!("browser close timed out")),
+            };
+        self.pump.abort();
+        let _ = (&mut self.pump).await;
+        let cleanup_result = remove_profile_dir(&self.profile_dir).await;
+
+        close_result?;
+        if let Err(error) = cleanup_result {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(anyhow!(
+                    "remove browser profile {}: {error}",
+                    self.profile_dir.display()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether Chromium was launched with a user-visible window.
+    pub fn is_visible(&self) -> bool {
+        self.visible
+    }
+
+    /// Current top-level page URL, best-effort for lifecycle events.
+    pub async fn current_url(&self) -> String {
+        match tokio::time::timeout(std::time::Duration::from_secs(1), self.page.url()).await {
+            Ok(Ok(Some(url))) => url,
+            _ => String::new(),
+        }
+    }
+
+    /// Focus the controlled page before handing it to a human.
+    pub async fn bring_to_front(&self) -> Result<()> {
+        self.page.bring_to_front().await?;
+        Ok(())
     }
 
     pub async fn navigate(&self, url: &str) -> Result<String> {
@@ -151,7 +240,10 @@ impl BrowserSession {
     pub async fn click(&self, selector: &str) -> Result<String> {
         let el = self.page.find_element(selector).await?;
         el.click().await?;
-        let _ = self.page.wait_for_navigation().await;
+        // Most clicks do not navigate. Never let that common case stall browser
+        // control or delay a human takeover behind an unbounded CDP wait.
+        let _ =
+            tokio::time::timeout(CLICK_NAVIGATION_TIMEOUT, self.page.wait_for_navigation()).await;
         Ok(format!("clicked {selector}"))
     }
 
@@ -190,6 +282,24 @@ impl BrowserSession {
     }
 }
 
+async fn remove_profile_dir(path: &std::path::Path) -> std::io::Result<()> {
+    let mut last_error = None;
+    // Chromium can briefly recreate lock/cache entries after Browser.close has
+    // acknowledged. Retry within the engine's 8s outer cleanup budget so Cancel
+    // actually removes the temporary profile instead of leaking it on macOS.
+    for attempt in 0..20 {
+        match tokio::fs::remove_dir_all(path).await {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+        if attempt < 19 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+    Err(last_error.expect("profile removal retry must record an error"))
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() > max {
         let t: String = s.chars().take(max).collect();
@@ -211,6 +321,12 @@ fn unique_browser_profile_dir() -> PathBuf {
 mod tests {
     use super::*;
     use chromiumoxide::cdp::browser_protocol::emulation::{MediaFeature, SetEmulatedMediaParams};
+
+    #[test]
+    fn click_navigation_wait_is_intentionally_short() {
+        assert!(CLICK_NAVIGATION_TIMEOUT <= std::time::Duration::from_secs(3));
+    }
+
     #[tokio::test]
     #[ignore] // needs an installed Chromium browser
     async fn smoke_navigate_read() {
@@ -219,6 +335,13 @@ mod tests {
         assert!(out.to_lowercase().contains("example domain"), "got: {out}");
         let js = s.eval("1+2").await.expect("eval");
         assert_eq!(js, "3");
+        let click_started = std::time::Instant::now();
+        s.click("h1").await.expect("click without navigation");
+        assert!(
+            click_started.elapsed() < std::time::Duration::from_secs(4),
+            "non-navigation click exceeded its short wait budget"
+        );
+        s.close().await.expect("close browser");
     }
 
     #[tokio::test]
@@ -556,5 +679,6 @@ JSON.stringify({
             Some("ox-shimmer")
         );
         assert_eq!(reduced["editShimmerAnimation"].as_str(), Some("shimmer"));
+        s.close().await.expect("close browser");
     }
 }

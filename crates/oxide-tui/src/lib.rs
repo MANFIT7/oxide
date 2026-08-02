@@ -465,7 +465,12 @@ async fn handle_key(key: KeyEvent, handle: &EngineHandle, state: &mut State) -> 
                     ),
                     Span::raw(text.clone()),
                 ]));
-                handle.submit(Op::UserTurn { text }).await?;
+                handle
+                    .submit(Op::UserTurn {
+                        text,
+                        permissions: None,
+                    })
+                    .await?;
             }
         }
         KeyCode::PageUp => state.scroll_target = state.scroll_target.saturating_add(10),
@@ -777,6 +782,18 @@ fn apply_event(event: Event, state: &mut State) {
         ))),
         Event::BrowserSnapshotRequested { url, note, .. } => state.push(Line::from(Span::styled(
             format!("browser snapshot requested: {url} · {note}"),
+            Style::default().fg(Color::Blue),
+        ))),
+        Event::BrowserSessionState {
+            state: ownership,
+            url,
+            detail,
+            visible,
+        } => state.push(Line::from(Span::styled(
+            format!(
+                "browser {ownership}{}: {url} · {detail}",
+                if visible { " (visible)" } else { " (headless)" }
+            ),
             Style::default().fg(Color::Blue),
         ))),
         Event::DesignSnapshotRequested { url, note, .. } => state.push(Line::from(Span::styled(

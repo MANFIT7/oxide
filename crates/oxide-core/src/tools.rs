@@ -155,6 +155,14 @@ impl ToolRouter {
         let Some(spec) = self.specs.get(tool) else {
             return Routed::Denied(format!("unknown tool '{tool}'"));
         };
+        // Read-only is a hard privilege cap, not an approval suggestion. This
+        // check deliberately precedes session approvals so Plan mode cannot be
+        // escalated by a stale "approve for session" decision.
+        if spec.mutating && matches!(self.sandbox, SandboxPolicy::ReadOnly) {
+            return Routed::Denied(format!(
+                "tool '{tool}' is unavailable while the runtime is read-only"
+            ));
+        }
         if self.session_approved.contains(tool) {
             return Routed::Run;
         }
@@ -782,6 +790,49 @@ mod tests {
             dir.to_path_buf(),
             &tools,
         )
+    }
+
+    #[test]
+    fn approval_policy_routes_safe_and_mutating_tools_correctly() {
+        let tmp = std::env::temp_dir();
+        let tools = vec![
+            ToolSpec::new("read_file", "read"),
+            ToolSpec::new("write_file", "write").mutating(true),
+        ];
+
+        for (policy, read_needs_approval, write_needs_approval) in [
+            (ApprovalPolicy::Always, true, true),
+            (ApprovalPolicy::OnRequest, false, true),
+            (ApprovalPolicy::Never, false, false),
+        ] {
+            let router =
+                ToolRouter::new(policy, SandboxPolicy::WorkspaceWrite, tmp.clone(), &tools);
+            assert_eq!(
+                matches!(router.route("read_file"), Routed::NeedsApproval),
+                read_needs_approval
+            );
+            assert_eq!(
+                matches!(router.route("write_file"), Routed::NeedsApproval),
+                write_needs_approval
+            );
+        }
+    }
+
+    #[test]
+    fn read_only_denies_mutation_even_after_session_approval() {
+        let tools = vec![ToolSpec::new("write_file", "write").mutating(true)];
+        let mut router = ToolRouter::new(
+            ApprovalPolicy::Never,
+            SandboxPolicy::ReadOnly,
+            std::env::temp_dir(),
+            &tools,
+        );
+        router.approve_for_session("write_file");
+
+        match router.route("write_file") {
+            Routed::Denied(reason) => assert!(reason.contains("read-only")),
+            _ => panic!("read-only must remain a hard privilege cap"),
+        }
     }
 
     #[tokio::test]

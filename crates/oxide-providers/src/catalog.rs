@@ -236,7 +236,7 @@ const CODEX_MODELS: &[ProviderModel] = &[
     ProviderModel {
         id: "gpt-5.6-sol",
         display_name: "GPT-5.6-Sol",
-        is_default: false,
+        is_default: true,
         is_fast: false,
         context_window: Some(372_000),
     },
@@ -255,9 +255,23 @@ const CODEX_MODELS: &[ProviderModel] = &[
         context_window: Some(372_000),
     },
     ProviderModel {
+        id: "gpt-5.5",
+        display_name: "GPT-5.5",
+        is_default: false,
+        is_fast: false,
+        context_window: Some(400_000),
+    },
+    ProviderModel {
+        id: "gpt-5.4",
+        display_name: "GPT-5.4",
+        is_default: false,
+        is_fast: true,
+        context_window: None,
+    },
+    ProviderModel {
         id: "gpt-5.3-codex",
         display_name: "GPT-5.3 Codex",
-        is_default: true,
+        is_default: false,
         is_fast: false,
         context_window: None,
     },
@@ -265,15 +279,29 @@ const CODEX_MODELS: &[ProviderModel] = &[
         id: "gpt-5.3-codex-spark",
         display_name: "GPT-5.3 Codex Spark",
         is_default: false,
-        is_fast: true,
+        is_fast: false,
         context_window: None,
     },
 ];
 const CLAUDE_MODELS: &[ProviderModel] = &[
     ProviderModel {
+        id: "claude-fable-5",
+        display_name: "Claude Fable 5",
+        is_default: true,
+        is_fast: false,
+        context_window: None,
+    },
+    ProviderModel {
+        id: "claude-opus-4-8",
+        display_name: "Claude Opus 4.8",
+        is_default: false,
+        is_fast: false,
+        context_window: None,
+    },
+    ProviderModel {
         id: "claude-sonnet-4-6",
         display_name: "Claude Sonnet 4.6",
-        is_default: true,
+        is_default: false,
         is_fast: true,
         context_window: None,
     },
@@ -295,7 +323,7 @@ const CLAUDE_MODELS: &[ProviderModel] = &[
         id: "haiku",
         display_name: "Claude Code Haiku alias",
         is_default: false,
-        is_fast: true,
+        is_fast: false,
         context_window: None,
     },
 ];
@@ -325,7 +353,7 @@ const CHATGPT_MODELS: &[ProviderModel] = &[
         id: "gpt-5.6-luna",
         display_name: "GPT-5.6-Luna",
         is_default: false,
-        is_fast: false,
+        is_fast: true,
         context_window: Some(372_000),
     },
 ];
@@ -817,6 +845,7 @@ fn expand_home(path: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     #[test]
     fn catalog_lists_runtime_provider_ids() {
@@ -848,6 +877,129 @@ mod tests {
     }
 
     #[test]
+    fn provider_and_model_ids_are_unique() {
+        let mut provider_ids = HashSet::new();
+
+        for provider in list_providers() {
+            assert!(
+                provider_ids.insert(provider.id),
+                "duplicate provider id: {}",
+                provider.id
+            );
+
+            let mut model_ids = HashSet::new();
+            for model in provider.models {
+                assert!(
+                    model_ids.insert(model.id),
+                    "duplicate model id for {}: {}",
+                    provider.id,
+                    model.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_provider_has_one_default_and_one_fast_model() {
+        for provider in list_providers() {
+            let defaults: Vec<&str> = provider
+                .models
+                .iter()
+                .filter(|model| model.is_default)
+                .map(|model| model.id)
+                .collect();
+            let fast: Vec<&str> = provider
+                .models
+                .iter()
+                .filter(|model| model.is_fast)
+                .map(|model| model.id)
+                .collect();
+
+            assert_eq!(
+                defaults.len(),
+                1,
+                "{} must have exactly one default model; found {defaults:?}",
+                provider.id
+            );
+            assert_eq!(
+                fast.len(),
+                1,
+                "{} must have exactly one fast model; found {fast:?}",
+                provider.id
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_contains_every_production_gui_model_pair() {
+        let expected = [
+            (
+                "chatgpt",
+                &["gpt-5.5", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"][..],
+            ),
+            (
+                "codex",
+                &[
+                    "gpt-5.6-sol",
+                    "gpt-5.6-terra",
+                    "gpt-5.6-luna",
+                    "gpt-5.5",
+                    "gpt-5.4",
+                ][..],
+            ),
+            (
+                "claude",
+                &["claude-fable-5", "claude-opus-4-8", "claude-sonnet-4-6"][..],
+            ),
+        ];
+
+        for (provider_id, expected_models) in expected {
+            let actual: HashSet<&str> = list_provider_models(provider_id)
+                .expect("production provider must exist")
+                .iter()
+                .map(|model| model.id)
+                .collect();
+
+            for model_id in expected_models {
+                assert!(
+                    actual.contains(model_id),
+                    "missing production pair: {provider_id}/{model_id}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_cli_model_ids_remain_available() {
+        let codex: HashSet<&str> = list_provider_models("codex")
+            .expect("codex provider must exist")
+            .iter()
+            .map(|model| model.id)
+            .collect();
+        let claude: HashSet<&str> = list_provider_models("claude")
+            .expect("claude provider must exist")
+            .iter()
+            .map(|model| model.id)
+            .collect();
+
+        assert!(codex.contains("gpt-5.3-codex"));
+        assert!(codex.contains("gpt-5.3-codex-spark"));
+        assert!(claude.contains("sonnet"));
+        assert!(claude.contains("opus"));
+        assert!(claude.contains("haiku"));
+    }
+
+    #[test]
+    fn production_provider_default_and_fast_models_match_gui_intent() {
+        assert_eq!(default_model_for_provider("chatgpt"), Some("gpt-5.5"));
+        assert_eq!(fast_model_for_provider("chatgpt"), Some("gpt-5.6-luna"));
+        assert_eq!(default_model_for_provider("codex"), Some("gpt-5.6-sol"));
+        assert_eq!(fast_model_for_provider("codex"), Some("gpt-5.4"));
+        assert_eq!(default_model_for_provider("claude"), Some("claude-fable-5"));
+        assert_eq!(fast_model_for_provider("claude"), Some("claude-sonnet-4-6"));
+    }
+
+    #[test]
     fn public_model_and_capability_lookup_uses_provider_id() {
         let models = list_provider_models("codex").expect("codex models");
         let caps = list_provider_capabilities("codex").expect("codex caps");
@@ -855,11 +1007,10 @@ mod tests {
         assert!(models.iter().any(|model| model.id == "gpt-5.6-sol"));
         assert!(models.iter().any(|model| model.id == "gpt-5.6-terra"));
         assert!(models.iter().any(|model| model.id == "gpt-5.6-luna"));
+        assert!(models.iter().any(|model| model.id == "gpt-5.5"));
+        assert!(models.iter().any(|model| model.id == "gpt-5.4"));
         assert!(models.iter().any(|model| model.id == "gpt-5.3-codex"));
-        assert_eq!(
-            fast_model_for_provider("codex"),
-            Some("gpt-5.3-codex-spark")
-        );
+        assert_eq!(fast_model_for_provider("codex"), Some("gpt-5.4"));
         assert!(caps.contains(&ProviderCapability::NativeCliTools));
         assert_eq!(list_provider_models("unknown"), None);
     }
@@ -872,6 +1023,7 @@ mod tests {
         assert!(models.iter().any(|model| model.id == "gpt-5.6-terra"));
         assert!(models.iter().any(|model| model.id == "gpt-5.6-luna"));
         assert_eq!(default_model_for_provider("chatgpt"), Some("gpt-5.5"));
+        assert_eq!(fast_model_for_provider("chatgpt"), Some("gpt-5.6-luna"));
     }
 
     #[test]

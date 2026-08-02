@@ -26,6 +26,7 @@ It focuses on states that compile tests cannot prove.
 - Confirm the agent and tool Braille sequence advances one fixed-width cell at a time without rotating, resizing, or shifting adjacent text.
 - While a command streams output, confirm its card opens automatically, stays near four lines tall, follows the newest line, and fades the old-output edge without moving the outer transcript sideways.
 - Expand and collapse Reasoning or a completed tool with output; confirm the real content height tweens smoothly, the caret stays synchronized, and a transcript already pinned to the bottom follows the tween without recapturing manual scrollback.
+- In both the main transcript and split pane, scroll upward during a stream; confirm new tokens do not yank the reader back down, `Jump to latest` appears, and clicking it restores tail-follow for only that transcript.
 - Stream an answer containing a very long unbroken code line (e.g. ask for a one-line shell pipeline over 200 chars); confirm the transcript never pans sideways — the code block scrolls internally while prose wraps.
 
 ## Compact Orchestration Surfaces
@@ -36,13 +37,14 @@ It focuses on states that compile tests cannot prove.
 - Confirm `Changing N files` stays one row and its branch button opens full file detail in the Environment `Diff` tab.
 - Confirm collapsing either disclosure returns it to approximately 40px without losing task or subagent state.
 
-## Host Reduce Motion Override
+## Host Reduce Motion
 
 - Enable macOS Reduce Motion and repeat a streaming prompt.
-- Confirm the pre-token shimmer, Braille sequence, status-label sweep, and background-process rings continue at their normal cadence.
-- Confirm the streaming rail, tool halo, disclosure, toast, tab-switch, and panel transitions remain active.
-- Confirm status text and animated glyphs remain aligned without shifting surrounding content.
-- Disable Reduce Motion again and confirm cadence and layout are unchanged; Oxide motion is intentionally independent of this host preference.
+- Confirm shimmer, pulse, streaming-rail breathing, entrance motion, disclosure tweening, smooth scrolling, and hover/press scaling stop.
+- Confirm reasoning, tool, edit, and background-process states remain legible through static text, icons, and color instead of motion alone.
+- Confirm only the slow stepped indicator for actively running work continues; settled rows and decorative surfaces must remain still.
+- Confirm opening panels, dialogs, disclosures, and tabs remains immediate and does not hide content or change the final layout.
+- Disable Reduce Motion and confirm the normal motion cadence returns without shifting surrounding content.
 
 ## Review Surface
 
@@ -71,7 +73,7 @@ It focuses on states that compile tests cannot prove.
 - Archive a chat or project and confirm the expanded toast keeps its `Undo` action on a separate row without text overlap.
 - Stack two or more toasts and confirm they remain readable within the window width in dark, light, and system themes.
 - Confirm clicking the toast body does not dismiss it; only the dismiss button, action, or timeout should close it.
-- Enable Reduce Motion and confirm toast entrance/lifecycle animation remains active and its content stays readable.
+- Enable Reduce Motion and confirm toast entrance/lifecycle animation stops while its content, action, and dismiss control remain readable and usable.
 
 ## Agents Window
 
@@ -90,6 +92,22 @@ It focuses on states that compile tests cannot prove.
 - Click `Open dev server` and confirm it opens the same localhost URL in the system browser.
 - Click `Stop dev server` and confirm the process exits and the server list refreshes without leaving a stale running row.
 
+## Browser Ownership And Annotations
+
+- Disable headless browser automation in Settings, start a browser tool, and confirm the Browser pane shows the live URL, `Agent controlled`, `Take over`, and `Cancel browser`.
+- Click `Take over` while navigation or a click is running; confirm only that browser operation pauses, the Chromium window comes forward, and the agent turn/composer remains active.
+- Click `Resume agent`; confirm the existing session continues instead of opening a fresh profile. Click `Cancel browser`; confirm Chromium closes while the agent turn continues.
+- Repeat with headless automation enabled; confirm Take over is disabled, the surface says `Headless`, and Resume/Cancel remain truthful.
+- In a proxied local preview, enable `Annotate`, select multiple elements, and confirm stable numbered outlines plus one multi-element context chip appear.
+- Navigate or reload the preview; confirm selectors are restored, missing targets are reported, and the annotation numbers/context remain intact. `Clear` must remove every outline and `Add to prompt` must reattach retained annotations after a send.
+- Switch repeatedly among Diff, Terminal, Browser, and Files; confirm the preview URL/scroll position, expanded diffs, file inspector state, and PTY processes survive tab switches without remount flashes.
+
+## Provider Catalog
+
+- Open the model picker and confirm only current production choices are shown for ChatGPT, Codex, and Claude; legacy aliases must remain loadable from an old config but not appear as primary choices.
+- Confirm provider readiness is visible. A missing CLI/login must disable selection with an actionable diagnostic instead of silently saving an unusable provider.
+- Toggle Fast and switch providers; confirm default/fast models come from the catalog and effort is clamped to the chosen model's supported ceiling.
+
 ## Board And Compact Layout
 
 - Open Board with the Environment dock both open and closed at 1280×820, 1024×768, and the narrowest supported window width.
@@ -103,7 +121,7 @@ It focuses on states that compile tests cannot prove.
 
 - Open `Brain` from the compact navigation item directly below `Search`; confirm the `Threads | Workspace` switcher remains two options wide and the chat/TUI surface yields to the graph without leaving overlapping message-trail or Environment controls.
 - Confirm every known project folder appears in the inspector and up to eight workspace nodes remain readable around the central Oxide Memory node.
-- Confirm dashed knowledge edges flow continuously and the central halo pulses without moving node labels or changing the graph layout.
+- Confirm only the selected knowledge edge uses restrained motion; the central halo and unselected graph remain static so node labels never shift or trigger full-map repainting.
 - Click workspace nodes and navigate them with Tab plus Enter/Space; confirm the active edge/node updates and the facts/skills inspector follows the selected workspace.
 - Open a learned skill and confirm its `.oxide/memory/skills/*.md` file opens in the editor, then return to Brain without losing the graph state.
 - Check a workspace with no memory and confirm it shows a zero-memory node and clear empty inspector instead of disappearing.
@@ -140,7 +158,11 @@ It focuses on states that compile tests cannot prove.
 - No activity row remains running after turn error/finish.
 - Streaming and tool status motion stays compositor-only and never restarts on every token update.
 - No reasoning panel jumps below the answer on completion.
-- Edit/remove slot text continues animating cleanly when Reduce Motion is enabled.
+- Edit/remove slot text settles immediately and stays legible when Reduce Motion is enabled.
+- Browser takeover/resume/cancel never interrupts the owning agent turn, and headless sessions never pretend to be user-controllable.
+- Numbered preview annotations survive reload/navigation and can be explicitly reattached or cleared.
+- Diff, Terminal, Browser, and Files panes preserve state across dock-tab switches.
+- Model choices and readiness are sourced from the provider catalog; legacy aliases are compatibility-only.
 - Structured UI artifacts render from the native catalog and never expose arbitrary HTML/JS.
 - Toasts use the top-center compact/expanded notification surface with semantic icons and explicit dismissal.
 - Agents Window controls stay local-only: no cloud sync/index/background execution dependency is required.

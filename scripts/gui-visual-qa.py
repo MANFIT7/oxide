@@ -21,9 +21,11 @@ GUI = ROOT / "crates/oxide-gui/src/lib.rs"
 CSS = ROOT / "crates/oxide-gui/assets/style.css"
 PROTOCOL = ROOT / "crates/oxide-protocol/src/lib.rs"
 PROVIDER = ROOT / "crates/oxide-providers/src/lib.rs"
+PROVIDER_CATALOG = ROOT / "crates/oxide-providers/src/catalog.rs"
 CHATGPT = ROOT / "crates/oxide-providers/src/chatgpt.rs"
 CORE = ROOT / "crates/oxide-core/src/lib.rs"
 BROWSER = ROOT / "crates/oxide-core/src/browser.rs"
+PREVIEW_PROXY = ROOT / "crates/oxide-gui/src/preview_proxy.rs"
 DB = ROOT / "crates/oxide-core/src/db.rs"
 STORE = ROOT / "crates/oxide-core/src/store.rs"
 CHECKLIST = ROOT / "docs/gui-visual-qa-checklist.md"
@@ -222,6 +224,31 @@ Finished dev profile</pre>
           <span class="env-card-badge nowrap">1 running</span>
         </button>
       </div>
+      <div class="preview-panel preview-fixture">
+        <div class="preview-bar">
+          <input class="preview-addr" aria-label="Preview URL" value="http://127.0.0.1:4173/">
+          <button class="preview-btn">Scan</button>
+          <button class="preview-btn pick">Pick</button>
+          <button class="preview-btn on">Done</button>
+          <button class="preview-btn">Design</button>
+          <button class="preview-btn">Reload</button>
+        </div>
+        <div class="preview-session" role="status" aria-live="polite">
+          <span class="preview-session-state human_controlled">Your control</span>
+          <span class="preview-session-detail">https://example.test/dashboard · Browser control handed to the user</span>
+          <div class="preview-session-actions"><button class="preview-btn on">Resume agent</button><button class="preview-btn">Cancel browser</button></div>
+        </div>
+        <div class="annotation-bar" role="status" aria-live="polite">
+          <span class="annotation-count">2 pinned</span>
+          <span class="annotation-status">Numbered annotations survive navigation</span>
+          <button class="preview-btn annotation-clear" disabled>Attached</button>
+          <button class="preview-btn">Clear</button>
+        </div>
+        <div class="preview-frame fixture-preview-canvas">
+          <div class="fixture-preview-card"><span class="fixture-annotation">1</span><strong>Revenue overview</strong><span>Responsive dashboard card</span></div>
+          <button class="fixture-preview-action"><span class="fixture-annotation">2</span>Export report</button>
+        </div>
+      </div>
       <div class="agents-window">
         <div class="agents-hero">
           <div>
@@ -281,10 +308,17 @@ Finished dev profile</pre>
   <title>Oxide GUI Visual QA Fixture</title>
   <style>
 {escaped_css}
-    body {{ margin: 0; min-height: 100vh; background: #0d0d0f; color: #f4f4f5; }}
-    .chat {{ max-width: 920px; margin: 0 auto; padding: 40px 24px; }}
+    html, body {{ margin: 0; min-height: 100%; height: auto; background: #0d0d0f; color: #f4f4f5; }}
+    body > .app {{ width: 100%; height: auto; min-height: 100vh; overflow: visible; }}
+    body > .app > .chat {{ width: min(920px, 100%); max-width: none; margin: 0 auto; padding: 40px 24px; box-sizing: border-box; }}
     .avatar {{ width: 28px; height: 28px; border-radius: 50%; background: #22242a; flex: none; }}
     .fixture-skill-menu {{ position: relative; inset: auto; width: 100%; margin-bottom: 10px; box-shadow: none; }}
+    .preview-fixture {{ height: 390px; min-height: 390px; margin-top: 18px; border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }}
+    .fixture-preview-canvas {{ position: relative; display: grid; place-content: center; gap: 22px; min-height: 180px; padding: 30px; box-sizing: border-box; background: #f6f5f2; color: #202124; }}
+    .fixture-preview-card, .fixture-preview-action {{ position: relative; border: 2px solid #6073cc; border-radius: 10px; background: white; color: #202124; box-shadow: 0 12px 28px rgba(23, 28, 45, .12); }}
+    .fixture-preview-card {{ display: grid; gap: 4px; min-width: 260px; padding: 18px; }}
+    .fixture-preview-action {{ justify-self: end; padding: 9px 14px; }}
+    .fixture-annotation {{ position: absolute; left: -2px; top: -22px; min-width: 20px; height: 20px; padding: 0 5px; box-sizing: border-box; border-radius: 6px 6px 6px 0; background: #6073cc; color: white; font: 600 11px/20px sans-serif; text-align: center; }}
   </style>
 </head>
 <body>
@@ -339,7 +373,7 @@ def write_brain_fixture(css: str) -> None:
       <div class="brain-layout">
         <div class="brain-map-card">
           <div class="brain-map-title"><span>Knowledge map</span><span>Click a workspace node to inspect what it learned</span></div>
-          <svg class="brain-map" viewBox="0 0 900 520" role="img">
+          <svg class="brain-map" viewBox="0 0 900 520" role="group" aria-label="Knowledge map">
             <line class="brain-edge active" data-edge="oxide" x1="450" y1="260" x2="450" y2="82" style="--edge-width:1.96px"></line>
             <line class="brain-edge" data-edge="synara" x1="450" y1="260" x2="742" y2="260" style="--edge-width:1.60px"></line>
             <line class="brain-edge" data-edge="provider" x1="450" y1="260" x2="450" y2="438" style="--edge-width:1.48px"></line>
@@ -347,10 +381,10 @@ def write_brain_fixture(css: str) -> None:
             <circle class="brain-core-halo" cx="450" cy="260" r="69"></circle>
             <circle class="brain-core" cx="450" cy="260" r="54"></circle>
             <text class="brain-core-mark" x="450" y="255">OX</text><text class="brain-core-label" x="450" y="278">Memory</text>
-            <g class="brain-node active" data-node="oxide" tabindex="0"><rect x="362" y="46" width="176" height="72" rx="18"></rect><circle class="brain-current-dot" cx="522" cy="61"></circle><text class="brain-node-name" x="450" y="74">oxide</text><text class="brain-node-count" x="450" y="95">12 memories</text><text class="brain-node-kinds" x="450" y="111">8 facts · 4 skills</text></g>
-            <g class="brain-node" data-node="synara" tabindex="0"><rect x="654" y="224" width="176" height="72" rx="18"></rect><text class="brain-node-name" x="742" y="252">synara</text><text class="brain-node-count" x="742" y="273">6 memories</text><text class="brain-node-kinds" x="742" y="289">4 facts · 2 skills</text></g>
-            <g class="brain-node" data-node="provider" tabindex="0"><rect x="362" y="402" width="176" height="72" rx="18"></rect><text class="brain-node-name" x="450" y="430">providers</text><text class="brain-node-count" x="450" y="451">4 memories</text><text class="brain-node-kinds" x="450" y="467">3 facts · 1 skill</text></g>
-            <g class="brain-node" data-node="harness" tabindex="0"><rect x="70" y="224" width="176" height="72" rx="18"></rect><text class="brain-node-name" x="158" y="252">harnesses</text><text class="brain-node-count" x="158" y="273">3 memories</text><text class="brain-node-kinds" x="158" y="289">3 facts · 0 skills</text></g>
+            <g class="brain-node active" role="button" aria-label="oxide, 12 memories, 8 facts, 4 skills" aria-pressed="true" data-node="oxide" tabindex="0"><rect x="362" y="46" width="176" height="72" rx="18"></rect><circle class="brain-current-dot" cx="522" cy="61"></circle><text class="brain-node-name" x="450" y="74">oxide</text><text class="brain-node-count" x="450" y="95">12 memories</text><text class="brain-node-kinds" x="450" y="111">8 facts · 4 skills</text></g>
+            <g class="brain-node" role="button" aria-label="synara, 6 memories, 4 facts, 2 skills" aria-pressed="false" data-node="synara" tabindex="0"><rect x="654" y="224" width="176" height="72" rx="18"></rect><text class="brain-node-name" x="742" y="252">synara</text><text class="brain-node-count" x="742" y="273">6 memories</text><text class="brain-node-kinds" x="742" y="289">4 facts · 2 skills</text></g>
+            <g class="brain-node" role="button" aria-label="providers, 4 memories, 3 facts, 1 skill" aria-pressed="false" data-node="provider" tabindex="0"><rect x="362" y="402" width="176" height="72" rx="18"></rect><text class="brain-node-name" x="450" y="430">providers</text><text class="brain-node-count" x="450" y="451">4 memories</text><text class="brain-node-kinds" x="450" y="467">3 facts · 1 skill</text></g>
+            <g class="brain-node" role="button" aria-label="harnesses, 3 memories, 3 facts, 0 skills" aria-pressed="false" data-node="harness" tabindex="0"><rect x="70" y="224" width="176" height="72" rx="18"></rect><text class="brain-node-name" x="158" y="252">harnesses</text><text class="brain-node-count" x="158" y="273">3 memories</text><text class="brain-node-kinds" x="158" y="289">3 facts · 0 skills</text></g>
           </svg>
         </div>
         <aside class="brain-inspector">
@@ -365,14 +399,22 @@ def write_brain_fixture(css: str) -> None:
 </div>
 <script>
   const labels = {{oxide:['oxide','12 memories'],synara:['synara','6 memories'],provider:['providers','4 memories'],harness:['harnesses','3 memories']}};
-  document.querySelectorAll('.brain-node').forEach(node => node.addEventListener('click', () => {{
-    document.querySelectorAll('.brain-node,.brain-edge').forEach(el => el.classList.remove('active'));
+  const activateBrainNode = node => {{
+    document.querySelectorAll('.brain-node').forEach(el => {{ el.classList.remove('active'); el.setAttribute('aria-pressed','false'); }});
+    document.querySelectorAll('.brain-edge').forEach(el => el.classList.remove('active'));
     node.classList.add('active');
+    node.setAttribute('aria-pressed','true');
     document.querySelector(`[data-edge="${{node.dataset.node}}"]`)?.classList.add('active');
     const [name, total] = labels[node.dataset.node];
     document.getElementById('brain-project-name').textContent = name;
     document.getElementById('brain-memory-total').textContent = total;
-  }}));
+  }};
+  document.querySelectorAll('.brain-node').forEach(node => {{
+    node.addEventListener('click', () => activateBrainNode(node));
+    node.addEventListener('keydown', event => {{
+      if (event.key === 'Enter' || event.key === ' ') {{ event.preventDefault(); activateBrainNode(node); }}
+    }});
+  }});
 </script>
 </body>
 </html>
@@ -416,9 +458,11 @@ def main() -> int:
     css = read(CSS)
     protocol = read(PROTOCOL)
     provider = read(PROVIDER)
+    provider_catalog = read(PROVIDER_CATALOG)
     chatgpt = read(CHATGPT)
     core = read(CORE)
     browser = read(BROWSER)
+    preview_proxy = read(PREVIEW_PROXY)
     db = read(DB)
     store = read(STORE)
     checklist = read(CHECKLIST)
@@ -485,13 +529,29 @@ def main() -> int:
         and "unicode-spinner-frame" not in css,
         f"{rel(GUI)} and {rel(CSS)} render each Braille spinner as one DOM node and only animate active lifecycle states",
     )
-    motion_override = "@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference)"
+    reduced_motion_query = "@media (prefers-reduced-motion: reduce)"
+    impossible_motion_query = (
+        "@media (prefers-reduced-motion: reduce) "
+        "and (prefers-reduced-motion: no-preference)"
+    )
     require(
-        "host motion preference does not disable Oxide motion",
-        css.count("@media (prefers-reduced-motion: reduce)") == css.count(motion_override)
-        and css.count(motion_override) > 0
-        and "Oxide intentionally keeps interface motion enabled" in css,
-        f"{rel(CSS)} makes every legacy reduced-motion fallback unreachable so host settings cannot freeze the UI",
+        "host reduced motion disables decorative motion",
+        impossible_motion_query not in css
+        and css.count(reduced_motion_query) > 0
+        and contains_all(
+            css,
+            [
+                "/* Canonical host Reduced Motion contract.",
+                "*, *::before, *::after {",
+                "animation: none !important;",
+                "transition: none !important;",
+                ".activity-card.running .activity-status .unicode-spinner.activity-spin::after,",
+                ".typing .unicode-spinner.status-spinner::after {",
+                "animation: oxide-unicode-frame 2.4s steps(10, end) infinite !important;",
+                "animation: bg-orbit-rot 2.4s steps(8, end) infinite !important;",
+            ],
+        ),
+        f"{rel(CSS)} honors the host preference, removes decorative/repeating motion, and keeps only slow stepped active-progress indicators",
     )
     require(
         "streaming tail motion is keyed and bounded",
@@ -571,7 +631,6 @@ def main() -> int:
             css,
             [
                 "@keyframes oxide-tool-enter",
-                "@keyframes oxide-tool-halo",
                 ".activity-status",
                 ".activity-card.has-out::details-content",
                 ".activity-card.has-out[open] .activity-caret",
@@ -580,15 +639,30 @@ def main() -> int:
         f"{rel(GUI)} and {rel(CSS)} cross-fade running/approval/success/failure in a fixed slot and keep disclosure state stable",
     )
     require(
+        "coalesced activity rows preserve stable render identity",
+        contains_all(
+            gui,
+            [
+                "struct ActivityRenderRow",
+                "id: m.id,",
+                "last.count += row.count;",
+                'key: "a-{row_key}"',
+                "fn coalesced_activity_rows_keep_the_first_stable_id()",
+            ],
+        ),
+        f"{rel(GUI)} keeps the first activity id through coalescing so streamed updates do not remount the wrong motion row",
+    )
+    require(
         "live command output follows the tail in a compact window",
         contains_all(
             gui,
             [
                 '"has-out live-output"',
-                "const followLiveOutputs = () => {",
-                "querySelectorAll('.activity-card.live-output[open] .activity-out')",
+                "const followLiveOutputs = (s) => {",
+                "s.querySelectorAll('.activity-card.live-output[open] .activity-out')",
+                "out.scrollHeight - out.scrollTop - out.clientHeight < 60",
                 "out.scrollTop = out.scrollHeight;",
-                "}).observe(document.body, { childList: true, subtree: true, characterData: true });",
+                "state.observer.observe(s, { childList: true, subtree: true, characterData: true });",
             ],
         )
         and contains_all(
@@ -603,14 +677,17 @@ def main() -> int:
         f"{rel(GUI)} and {rel(CSS)} auto-open active commands, coalesce tail-follow with transcript scrolling, and fade old output",
     )
     require(
-        "reasoning and tool disclosures tween measured height",
+        "reasoning and tool disclosures follow measured height",
         contains_all(
             gui,
             [
                 "card.matches('.activity-card.has-out, .thinking-box, .thought-row')",
-                "if (now - started < 240) requestAnimationFrame(followTween);",
+                "new ResizeObserver(() => state.stick())",
+                "card.addEventListener('transitionend', finish, { once: true });",
+                "getComputedStyle(card).getPropertyValue('--dur-slow')",
             ],
         )
+        and "if (now - started < 240) requestAnimationFrame(followTween);" not in gui
         and contains_all(
             css,
             [
@@ -697,9 +774,12 @@ def main() -> int:
                 'class: "thought-label-settled"',
                 'details { class: "{class}",',
                 "settling_thought.set(Some(thought_id));",
-                "from_millis(320)",
+                "onanimationend: move |event|",
+                'event.animation_name() == "oxide-thought-settled-in"',
+                "window.matchMedia('(prefers-reduced-motion: reduce)').matches",
             ],
         )
+        and "from_millis(320)" not in gui
         and contains_all(
             css,
             [
@@ -733,7 +813,7 @@ def main() -> int:
             [
                 ".unwrap_or(false);",
                 "active_thought_id != Some(m.id)",
-                "active_thought_id != Some(msg.id)",
+                "active_thought_id != Some(thought_id)",
                 "&& !has_running_activity",
                 "&& !live_answer_visible",
             ],
@@ -742,7 +822,7 @@ def main() -> int:
         f"{rel(GUI)} keeps Working collapsed by default, hides settled Thought while live Reasoning owns the turn, and suppresses redundant Thinking status",
     )
     require(
-        "motion policy keeps lifecycle polish active",
+        "motion policy preserves normal polish with a reduced fallback",
         contains_all(
             css,
             [
@@ -750,26 +830,30 @@ def main() -> int:
                 "@keyframes oxide-stream-word",
                 "@keyframes oxide-stream-rail",
                 "@keyframes oxide-thought-settled-in",
-                "@keyframes oxide-tool-halo",
                 "@keyframes oxide-unicode-frame",
-                motion_override,
+                "@keyframes surface-rise",
+                "animation:surface-rise .22s ease-out both;",
+                reduced_motion_query,
+                "/* Canonical host Reduced Motion contract.",
             ],
-        ),
-        f"{rel(CSS)} keeps stream, tool, and Unicode lifecycle motion active under every host motion preference",
+        )
+        and "@keyframes oxide-tool-halo" not in css,
+        f"{rel(CSS)} retains normal lifecycle polish while the canonical host fallback removes nonessential motion",
     )
     require(
-        "pending edit shimmer remains active",
+        "pending edit shimmer becomes a legible static status",
         contains_all(
             css,
             [
                 ".edits-row.pending .edits-rowcounts.shimmer {",
                 "animation: shimmer 1.7s linear infinite;",
                 ".slot-char",
-                motion_override,
+                ".edits-row.pending .edits-rowcounts.shimmer {",
+                "-webkit-text-fill-color: currentColor;",
             ],
         )
         and 'class: "edits-rowcounts shimmer slot-status"' in gui,
-        f"{rel(CSS)} and {rel(GUI)} keep the transcript edit state animated regardless of host motion preference",
+        f"{rel(CSS)} and {rel(GUI)} keep the transcript edit state visible without shimmer when host Reduced Motion is enabled",
     )
     require(
         "composer orchestration surfaces stay compact",
@@ -873,19 +957,140 @@ def main() -> int:
         f"{rel(GUI)} renders up to four workspace-confined screenshot/image citations as lazy Codex-style cards that open the existing image viewer",
     )
     require(
-        "browser automation closes with its owning turn",
+        "browser automation ownership stays browser-scoped",
         contains_all(
             browser,
             [
                 "pub async fn close(mut self) -> Result<()>",
-                "self.browser.close().await",
-                "remove_dir_all(&self.profile_dir).await",
+                "self.browser.close()).await",
+                "remove_profile_dir(&self.profile_dir).await",
+                "tokio::fs::remove_dir_all(path).await",
             ],
         )
-        and contains_all(core, ["async fn finish_turn(&mut self, turn: TurnId)", "self.close_browser().await;"])
+        and contains_all(
+            protocol,
+            [
+                "pub enum BrowserControlAction",
+                "TakeOver,",
+                "Resume,",
+                "Cancel,",
+                "BrowserSessionState {",
+            ],
+        )
+        and contains_all(
+            core,
+            [
+                "browser_control_tx: mpsc::UnboundedSender<BrowserControlAction>",
+                "async fn finish_turn(&mut self, turn: TurnId)",
+                "if self.browser_control == BrowserControlState::HumanControlled",
+                'self.close_browser("Browser session closed at the end of the turn")',
+                "async fn apply_browser_control(&mut self, action: BrowserControlAction)",
+            ],
+        )
+        and contains_all(
+            gui,
+            [
+                "EngineCmd::BrowserControl(BrowserControlAction::TakeOver)",
+                "EngineCmd::BrowserControl(BrowserControlAction::Resume)",
+                "EngineCmd::BrowserControl(BrowserControlAction::Cancel)",
+                "browser_session.is_open() && !browser_session.visible",
+            ],
+        )
         and core.count("self.finish_turn(turn).await;") >= 6
         and core.count("self.emit(Event::TurnFinished { turn }).await;") == 1,
-        f"{rel(BROWSER)} closes Chromium and deletes its temporary profile at the shared {rel(CORE)} turn-finish boundary",
+        f"{rel(BROWSER)}, {rel(CORE)}, and {rel(GUI)} keep takeover/resume/cancel independent from the owning turn and expose headless state truthfully",
+    )
+    require(
+        "preview annotations persist across navigation",
+        contains_all(
+            preview_proxy,
+            [
+                "oxide-annotate-on",
+                "oxide-annotations-clear",
+                "oxide-annotations-restore",
+                "data-oxide-annotation",
+                "renderAnnotations",
+                "CSS.escape",
+                "pageKey(entry.url)",
+                "addAnnotation(el,requested)",
+                "skipped:skipped",
+            ],
+        )
+        and contains_all(
+            gui,
+            [
+                "fn preview_annotations_context(",
+                "e.source !== frame.contentWindow",
+                "oxide-annotations-restored",
+                "preview_annotations.write().clear();",
+                '("url", "url")',
+                "annotations:{annotations}",
+                "Add to prompt",
+            ],
+        ),
+        f"{rel(PREVIEW_PROXY)} and {rel(GUI)} keep numbered element context mounted, scoped to the preview frame, restorable, and explicitly attachable",
+    )
+    require(
+        "environment views remain mounted between tabs",
+        contains_all(
+            gui,
+            [
+                'key: "env-changes"',
+                'key: "env-preview"',
+                'key: "env-files"',
+                'key: "env-term"',
+                '"env-pane env-pane-on"',
+                '"env-pane env-pane-off"',
+            ],
+        )
+        and contains_all(
+            css,
+            [
+                ".env-pane {",
+                ".env-pane-on {",
+                ".env-pane-off {",
+                "pointer-events: none;",
+            ],
+        ),
+        f"{rel(GUI)} and {rel(CSS)} preserve preview, diff, files, and PTY DOM state while inactive panes are visually and interactively hidden",
+    )
+    require(
+        "model picker is catalog-backed and readiness-aware",
+        "MODEL_PRESETS" not in gui
+        and contains_all(
+            gui,
+            [
+                "oxide_providers::list_providers()",
+                "oxide_providers::list_provider_models(preset.provider)",
+                "oxide_providers::diagnose_provider",
+                "fn production_model_presets()",
+                "fn legacy_config_model_is_rendered_without_entering_production_picker()",
+            ],
+        )
+        and contains_all(
+            provider_catalog,
+            [
+                'id: "gpt-5.6-sol"',
+                'id: "gpt-5.4"',
+                'id: "claude-fable-5"',
+                "fn catalog_contains_every_production_gui_model_pair()",
+            ],
+        ),
+        f"{rel(GUI)} derives selectable production models and readiness from {rel(PROVIDER_CATALOG)} while retaining legacy config aliases",
+    )
+    require(
+        "brain graph exposes keyboard selection semantics",
+        contains_all(
+            gui,
+            [
+                'role: "group"',
+                '"aria-label": "Interactive workspace knowledge map"',
+                '"aria-pressed": "{is_selected}"',
+                "event.prevent_default();",
+                'aria_live: "polite"',
+            ],
+        ),
+        f"{rel(GUI)} exposes the SVG workspace map as an interactive group with selected-state announcements and Enter/Space behavior",
     )
     require(
         "slash command palette is keyboard-first",
@@ -996,20 +1201,28 @@ def main() -> int:
         contains_all(
             gui,
             [
+                'const transcriptSelector = \'[data-oxide-transcript]\';',
+                '"data-oxide-transcript": "main"',
+                '"data-oxide-transcript": "pane"',
                 "bottomDistance",
                 "hasSelection",
                 "typingTarget",
-                # Direction-based unstick: an upward wheel releases the follow
-                # IMMEDIATELY (a distance threshold was unreachable mid-stream).
-                "ev.deltaY < 0",
-                # Re-arm only at the true bottom, never by proximity.
-                "if (d < 8) window.__oxstick = true;",
-                "requestAnimationFrame(() =>",
-                "window.__oxstick !== false",
+                "jumpScroll: false",
+                "const finishJump = () => {",
+                "const cancelJump = () => {",
+                "if (state.jumpScroll) {",
+                "cancelJump();",
+                "const trackJump = () => {",
+                "setSticky(s, state, bottomDistance(s) < 8);",
+                "detach(target)",
+                "jump(target, behavior)",
+                "state.observer.observe(s, { childList: true, subtree: true, characterData: true });",
+                "}).observe(shell, { childList: true, subtree: true });",
             ],
         )
+        and "}).observe(document.body, { childList: true, subtree: true, characterData: true });" not in gui
         and contains_all(css, [".scroll", "overflow-anchor: none"]),
-        "streaming autoscroll stays smooth without pulling the reader away from scrollback",
+        "main and split transcripts keep independent sticky state, detach on reader intent, and avoid a document-wide token observer",
     )
     accept_block = re.search(
         r'button \{ class: "review-accept"[\s\S]{0,320}accepted\.write\(\)\.insert\(cp\);[\s\S]{0,180}SlotText \{ text: "Accept"\.to_string\(\)',
@@ -1134,7 +1347,7 @@ def main() -> int:
                 '"Bugbot review"',
                 "new_agent_tab(tabs, active_tab, messages, cfg, engine, next_tab_id",
                 "switch_tab(tabs, active_tab, messages, cfg, engine, idx)",
-                'display: "/review (Bugbot)".into()',
+                'EngineCmd::submit(prompt, "/review (Bugbot)".into())',
             ],
         )
         and contains_all(
@@ -1382,6 +1595,18 @@ def main() -> int:
     if css:
         write_fixture(css)
         write_brain_fixture(css)
+        fixture_html = read(FIXTURE)
+        require(
+            "browser fixture exposes the full visual surface",
+            contains_all(
+                fixture_html,
+                [
+                    "body > .app { width: 100%; height: auto; min-height: 100vh; overflow: visible; }",
+                    "body > .app > .chat { width: min(920px, 100%);",
+                ],
+            ),
+            f"{rel(FIXTURE)} grows with its packed QA states so browser scrolling reaches every component",
+        )
         print(f"INFO fixture: {rel(FIXTURE)}")
         print(f"INFO brain fixture: {rel(BRAIN_FIXTURE)}")
 

@@ -1433,6 +1433,7 @@ impl OxideDesktop {
             Event::FileDiff { .. }
             | Event::HookFired { .. }
             | Event::QuestionAsked { .. }
+            | Event::BrowserSessionState { .. }
             | Event::RateLimit { .. } => {}
         }
     }
@@ -1503,9 +1504,10 @@ impl OxideDesktop {
             text: String::new(),
         });
         self.streaming = true;
-        let _ = self
-            .engine_tx
-            .send(RuntimeCmd::Op(Op::UserTurn { text: engine_text }));
+        let _ = self.engine_tx.send(RuntimeCmd::Op(Op::UserTurn {
+            text: engine_text,
+            permissions: None,
+        }));
     }
 
     fn reconfigure(&mut self) {

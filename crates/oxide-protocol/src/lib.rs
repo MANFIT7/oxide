@@ -24,6 +24,31 @@ impl std::fmt::Display for TurnId {
     }
 }
 
+/// Effective permission cap attached to one turn by a frontend.
+///
+/// This keeps product modes frontend-agnostic: the engine sees only approval
+/// and sandbox constraints, never UI concepts such as a composer toggle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimePermissions {
+    pub approval_policy: ApprovalPolicy,
+    pub sandbox: SandboxPolicy,
+}
+
+/// Human/agent ownership changes for the automation browser.
+///
+/// These controls are intentionally browser-scoped: they never interrupt the
+/// surrounding agent turn or alter its permission policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserControlAction {
+    /// Stop the active browser operation and leave the live session to the user.
+    TakeOver,
+    /// Return an existing browser session to agent automation.
+    Resume,
+    /// Close the browser and delete its temporary profile without stopping the turn.
+    Cancel,
+}
+
 /// Operations a frontend submits into the engine.
 ///
 /// This is the *only* way a frontend drives the agent. Because it is a message
@@ -32,9 +57,15 @@ impl std::fmt::Display for TurnId {
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Op {
     /// User submitted a prompt; run one agent turn.
-    UserTurn { text: String },
+    UserTurn {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        permissions: Option<RuntimePermissions>,
+    },
     /// Stop the in-flight turn as soon as possible.
     Interrupt,
+    /// Change ownership of the automation browser without interrupting the turn.
+    BrowserControl { action: BrowserControlAction },
     /// Control a specific sub-agent worker while a turn is running.
     SubagentControl {
         worker_id: String,
@@ -277,6 +308,18 @@ pub enum Event {
         turn: TurnId,
         url: String,
         note: String,
+    },
+    /// Authoritative automation-browser ownership/lifecycle state.
+    ///
+    /// `state` is one of `agent_controlled`, `human_controlled`, or `closed`.
+    BrowserSessionState {
+        state: String,
+        #[serde(default)]
+        url: String,
+        #[serde(default)]
+        detail: String,
+        /// Whether the Chromium session has a user-visible window.
+        visible: bool,
     },
     /// Agent requested the frontend Design Workbench to capture a visual target.
     DesignSnapshotRequested {
@@ -753,6 +796,47 @@ mod tests {
         assert_eq!(value["turn"], 8);
         assert_eq!(value["url"], "http://localhost:3000/dashboard");
         assert_eq!(value["note"], "Capture dashboard state");
+    }
+
+    #[test]
+    fn browser_control_operations_serialize_typed_actions() {
+        for (action, expected) in [
+            (BrowserControlAction::TakeOver, "take_over"),
+            (BrowserControlAction::Resume, "resume"),
+            (BrowserControlAction::Cancel, "cancel"),
+        ] {
+            let op = Op::BrowserControl { action };
+            let value = serde_json::to_value(&op).unwrap();
+
+            assert_eq!(value["op"], "browser_control");
+            assert_eq!(value["action"], expected);
+
+            let decoded: Op = serde_json::from_value(value).unwrap();
+            assert!(matches!(
+                decoded,
+                Op::BrowserControl {
+                    action: decoded_action
+                } if decoded_action == action
+            ));
+        }
+    }
+
+    #[test]
+    fn browser_session_state_event_serializes_contract() {
+        let event = Event::BrowserSessionState {
+            state: "human_controlled".to_string(),
+            url: "https://example.com/account".to_string(),
+            detail: "Browser control handed to the user".to_string(),
+            visible: true,
+        };
+
+        let value = serde_json::to_value(&event).unwrap();
+
+        assert_eq!(value["event"], "browser_session_state");
+        assert_eq!(value["state"], "human_controlled");
+        assert_eq!(value["url"], "https://example.com/account");
+        assert_eq!(value["detail"], "Browser control handed to the user");
+        assert_eq!(value["visible"], true);
     }
 
     #[test]

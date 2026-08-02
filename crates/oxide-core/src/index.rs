@@ -316,10 +316,27 @@ fn query(idx: &CodeIndex, q: &str) -> String {
 /// files, run the query, and persist ONLY when something changed. The in-memory
 /// cache removes the multi-second JSON parse+rewrite per search on big repos.
 pub fn search(ws: &Path, q: &str) -> String {
+    search_with_persistence(ws, q, true)
+}
+
+/// Search without touching the workspace cache. Used by read-only/Plan turns:
+/// the index may refresh in memory, but `.oxide/index/code.json` is unchanged.
+pub fn search_read_only(ws: &Path, q: &str) -> String {
+    search_with_persistence(ws, q, false)
+}
+
+fn search_with_persistence(ws: &Path, q: &str, persist: bool) -> String {
     type Slot = std::sync::Arc<std::sync::Mutex<CodeIndex>>;
     static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, Slot>>> =
         std::sync::OnceLock::new();
-    let key = ws.display().to_string();
+    // Read-only refreshes use a separate in-memory slot. Otherwise they would
+    // mark the shared slot clean without persisting it, and a later writable
+    // search could incorrectly skip creating/updating the disk cache.
+    let key = if persist {
+        ws.display().to_string()
+    } else {
+        format!("{}\0read-only", ws.display())
+    };
     let dir = ws.join(".oxide/index");
     let path = dir.join("code.json");
 
@@ -347,7 +364,7 @@ pub fn search(ws: &Path, q: &str) -> String {
     let before = idx.files.len();
     let dirty = update(ws, &mut idx);
     let result = query(&idx, q);
-    if dirty || idx.files.len() != before {
+    if persist && (dirty || idx.files.len() != before) {
         let _ = std::fs::create_dir_all(&dir);
         if let Ok(b) = serde_json::to_vec(&*idx) {
             let _ = std::fs::write(&path, b);
@@ -372,5 +389,27 @@ mod tests {
             "got: {}",
             &out[..out.len().min(200)]
         );
+    }
+
+    #[test]
+    fn read_only_search_does_not_persist_workspace_cache() {
+        let ws = std::env::temp_dir().join(format!("oxide-index-read-only-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(ws.join("src")).unwrap();
+        std::fs::write(
+            ws.join("src/example.rs"),
+            "fn permission_boundary() -> bool { true }\n",
+        )
+        .unwrap();
+
+        let output = search_read_only(&ws, "permission boundary");
+
+        assert!(output.contains("example.rs"));
+        assert!(!ws.join(".oxide/index/code.json").exists());
+
+        let persistent_output = search(&ws, "permission boundary");
+        assert!(persistent_output.contains("example.rs"));
+        assert!(ws.join(".oxide/index/code.json").exists());
+        let _ = std::fs::remove_dir_all(&ws);
     }
 }

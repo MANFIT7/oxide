@@ -1297,15 +1297,14 @@ svg { width: 17px; height: 17px; flex-shrink: 0; }
   font-size: 11px; font-weight: 500; color: var(--faint);
   font-variant-numeric: tabular-nums; opacity: .75;
 }
-/* Oxide intentionally keeps interface motion enabled even when the host asks
-   for reduced motion. The contradictory query preserves the old fallbacks as
-   documentation while making them unreachable under every media state. */
-@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference) {
+/* Respect the host motion preference while keeping lifecycle state readable. */
+@media (prefers-reduced-motion: reduce) {
   .thinking-glow { animation: none; color: var(--muted); -webkit-text-fill-color: currentColor; }
 }
 
 /* Verification Center */
 .verify-center { display:flex; flex-direction:column; gap:10px; }
+@keyframes surface-rise { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: none; } }
 .verify-item { display:flex; gap:10px; padding:11px 12px; border:1px solid var(--border); border-radius:10px; background:color-mix(in srgb,var(--panel) 88%,transparent); animation:surface-rise .22s ease-out both; }
 .verify-item.done { border-color:color-mix(in srgb,#49b37b 35%,var(--border)); }
 .verify-item.failed { border-color:color-mix(in srgb,#e06464 45%,var(--border)); }
@@ -1773,7 +1772,7 @@ svg { width: 17px; height: 17px; flex-shrink: 0; }
   .board-actions { justify-content: flex-start; }
 }
 
-@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference) {
+@media (prefers-reduced-motion: reduce) {
   .board-card { animation: none; transition: none; }
   .board-card:hover { transform: none; }
   .board-btn { transition: none; }
@@ -2209,7 +2208,7 @@ details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
   color: transparent;
   animation: ox-shimmer 1.7s linear infinite;
 }
-@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference) {
+@media (prefers-reduced-motion: reduce) {
   .status-shimmer { animation: none; color: var(--muted); -webkit-text-fill-color: currentColor; }
 }
 
@@ -2322,14 +2321,14 @@ details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
   align-items: center;
 }
 @keyframes slot-roll-up {
-  from { opacity: 0; transform: translateY(105%) rotateX(-58deg); filter: blur(2px); }
-  60% { opacity: 1; filter: blur(0); }
-  to { opacity: 1; transform: translateY(0) rotateX(0); filter: blur(0); }
+  from { opacity: 0; transform: translateY(105%) rotateX(-58deg); }
+  60% { opacity: 1; }
+  to { opacity: 1; transform: translateY(0) rotateX(0); }
 }
 @keyframes slot-roll-down {
-  from { opacity: 0; transform: translateY(-105%) rotateX(58deg); filter: blur(2px); }
-  60% { opacity: 1; filter: blur(0); }
-  to { opacity: 1; transform: translateY(0) rotateX(0); filter: blur(0); }
+  from { opacity: 0; transform: translateY(-105%) rotateX(58deg); }
+  60% { opacity: 1; }
+  to { opacity: 1; transform: translateY(0) rotateX(0); }
 }
 
 /* active-tab streaming dot */
@@ -2481,12 +2480,32 @@ details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
 
 /* in-app preview panel (ara-style port detection + local preview) */
 .preview-panel { display: flex; flex-direction: column; height: 100%; background: var(--bg); border-left: 1px solid var(--border); }
-.preview-bar { display: flex; align-items: center; gap: 6px; padding: 8px 10px; border-bottom: 1px solid var(--border); }
-.preview-addr { flex: 1; background: var(--surface-hi); border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px; font-size: 12.5px; color: var(--text); font-family: ui-monospace, Menlo, monospace; }
+.preview-bar { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+.preview-addr { flex: 1 1 220px; min-width: 150px; background: var(--surface-hi); border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px; font-size: 12.5px; color: var(--text); font-family: ui-monospace, Menlo, monospace; }
 .preview-addr:focus { outline: none; border-color: var(--syn-accent); }
 .preview-btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; background: var(--surface-hi); border: 1px solid var(--border); color: var(--text); border-radius: 8px; padding: 6px 10px; font-size: 12px; cursor: pointer; white-space: nowrap; font-family: inherit; }
 .preview-btn svg { width: 13px; height: 13px; flex-shrink: 0; }
 .preview-btn:hover { border-color: var(--syn-accent); }
+.preview-btn.on { background: var(--syn-accent); color: #fff; border-color: var(--syn-accent); }
+.preview-btn:disabled { opacity: .48; cursor: not-allowed; border-color: var(--border); }
+.preview-session {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 7px;
+  min-height: 34px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--surface-hi) 74%, transparent);
+  font-size: 11.5px;
+}
+.preview-session-state { display: inline-flex; align-items: center; gap: 6px; color: var(--text); font-weight: 680; }
+.preview-session-state::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--faint); }
+.preview-session-state.agent_controlled::before { background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 14%, transparent); }
+.preview-session-state.human_controlled::before { background: var(--syn-accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--syn-accent) 14%, transparent); }
+.preview-session-state.cancelled::before { background: var(--danger); }
+.preview-session-detail { min-width: 0; flex: 1 1 170px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.preview-session-actions { display: inline-flex; align-items: center; gap: 6px; margin-left: auto; }
 .preview-ports { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px 10px; border-bottom: 1px solid var(--border); max-height: 84px; overflow-y: auto; }
 .preview-hint, .preview-empty { font-size: 12.5px; color: var(--muted); }
 .preview-empty { padding: 24px; text-align: center; margin: auto; }
@@ -2495,6 +2514,20 @@ details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
 .port-dot { width: 7px; height: 7px; border-radius: 50%; background: #00c853; box-shadow: 0 0 6px #00c853aa; }
 .port-cmd { color: var(--faint); font-size: 11px; }
 .preview-frame { flex: 1; width: 100%; border: 0; background: #fff; }
+
+.annotation-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--syn-accent) 7%, var(--bg));
+  color: var(--muted);
+  font-size: 11.5px;
+}
+.annotation-count { color: var(--text); font-weight: 700; }
+.annotation-status { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.annotation-clear { margin-left: auto; }
 
 /* picked-element chip (Cursor-style select-to-context) */
 .preview-btn.pick { border-color: var(--syn-accent); color: var(--syn-accent); }
@@ -2608,7 +2641,7 @@ details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
 .msg-act.danger { color: #fff; background: var(--danger, #fa423e); border-color: var(--danger, #fa423e); width: auto; padding: 0 8px; font-size: 11px; }
 /* edits-card undone state */
 .edits-undone { margin-left: auto; font-size: 12px; color: var(--muted); }
-@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference) {
+@media (prefers-reduced-motion: reduce) {
   .model-menu, .effort-menu, .plus-menu, .sel-menu, .access-menu, .palette, .modal,
   .theme-menu, .mention-menu, .thread-menu, .newtab-menu,
   .question-card, .approval-card, .edits-card, .todo-card, .workflow-card, .subagents-card, .queue-bar, .status-pill,
@@ -2627,7 +2660,7 @@ details.has-out:not([open]) .activity-out-n::after { content: " ▾"; }
 /* side panels slide in */
 @keyframes panel-in { from { opacity: 0; transform: translateX(14px); } to { opacity: 1; transform: none; } }
 .files-panel, .preview-panel { animation: panel-in .18s ease-out; }
-@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference) {
+@media (prefers-reduced-motion: reduce) {
   .files-panel, .preview-panel, .col.streaming .row.agent:last-of-type .agent-text::after { animation: none; }
   .send, .composer:focus-within { transition: none; }
 }
@@ -2854,7 +2887,7 @@ svg { stroke-width: 1.6; }
 .todo-row.completed .todo-box { border-color: rgba(64,201,119,.6); background: rgba(64,201,119,.10); }
 /* status pill text changes crossfade slightly */
 .status-pill { transition: opacity .2s ease; }
-@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference) { .countup { transition: none; } .edits-row-d { animation: none; } }
+@media (prefers-reduced-motion: reduce) { .countup { transition: none; } .edits-row-d { animation: none; } }
 .activity-count { margin-left: 6px; font-size: 11px; opacity: .55; font-variant-numeric: tabular-nums; }
 .activity-editcounts { margin-left: 8px; display: inline-flex; align-items: center; gap: 6px; font-size: 11px; font-variant-numeric: tabular-nums; }
 
@@ -2929,7 +2962,7 @@ details::details-content { overflow: clip; }
 .app[data-theme="light"] .git-badge.d { color: var(--danger); }
 .app[data-theme="light"] .git-badge.m { color: #b3591f; }
 .app[data-theme="light"] .menu-badge.fast { color: var(--ok); }
-@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference) {
+@media (prefers-reduced-motion: reduce) {
   .modal-overlay, .palette-overlay, .pane-mode-menu, .agent-tab.active::after { animation: none; }
   details::details-content { transition: none; }
 }
@@ -3001,13 +3034,16 @@ details::details-content { overflow: clip; }
   padding: 4px 8px;
 }
 .toast-action:hover { background: color-mix(in srgb, var(--notification-fg) 20%, transparent); }
-/* tab close: width collapse */
+/* Tab lifecycle stays compositor-only. The Rust close timer removes the node
+   after this short fade, so width and padding do not need to animate. */
 .agent-tab { transition: background .12s ease; }
-.agent-tab.closing { max-width: 0; min-width: 0; padding-left: 0; padding-right: 0; opacity: 0; overflow: hidden;
-  transition: max-width .15s ease, padding .15s ease, opacity .12s ease; }
-/* New tab slides in — mirror of the closing collapse (Cursor/Arc-style). */
+.agent-tab.closing {
+  opacity: 0; pointer-events: none; transform: translateY(-3px) scale(.98);
+  transition: opacity .12s ease, transform .15s var(--ease-exit);
+}
+/* New tabs reserve their layout once, then reveal through paint-only motion. */
 .agent-tab { animation: tab-in var(--dur-med) var(--ease-out); }
-@keyframes tab-in { from { max-width: 0; opacity: 0; transform: translateY(-3px); } to { max-width: 240px; opacity: 1; transform: none; } }
+@keyframes tab-in { from { opacity: 0; transform: translateY(-3px) scale(.98); } to { opacity: 1; transform: none; } }
 /* Switching tabs crossfades the transcript instead of an instant swap. */
 .col { animation: col-cross var(--dur-slow) var(--ease-standard); }
 @keyframes col-cross { from { opacity: .25; } to { opacity: 1; } }
@@ -3023,7 +3059,7 @@ details::details-content { overflow: clip; }
 /* composer grows smoothly with multi-line input (progressive enhancement) */
 .composer, #ce-input { interpolate-size: allow-keywords; transition: block-size .15s ease; }
 /* Rows animate only through the canonical motion layer at the end of the file. */
-@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference) {
+@media (prefers-reduced-motion: reduce) {
   .toast, .diff-card .dl, .row, .agent-tab, .col { animation: none; }
   .scroll.smooth { scroll-behavior: auto; }
   .agent-tab.closing { transition: none; }
@@ -3035,7 +3071,7 @@ details::details-content { overflow: clip; }
 .send { transition: opacity .12s ease, transform .16s cubic-bezier(.34,1.56,.64,1), border-radius .18s ease, background .12s ease; }
 .send.stop { border-radius: 9px; animation: stop-in .18s cubic-bezier(.22,1,.36,1); }
 @keyframes stop-in { from { transform: rotate(-90deg) scale(.7); } to { transform: none; } }
-@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference) { .send.stop { animation: none; } }
+@media (prefers-reduced-motion: reduce) { .send.stop { animation: none; } }
 
 /* follow-up prompt suggestions above the composer */
 .followups { position: relative; width: 100%; max-width: 760px; margin: 0 auto 6px; display: flex; flex-direction: column; animation: synara-msg-in .2s cubic-bezier(.22,1,.36,1); }
@@ -3082,7 +3118,7 @@ details::details-content { overflow: clip; }
 .app[data-theme="light"] .jump-bottom { box-shadow: 0 6px 18px rgba(20,20,20,.14); }
 .jump-bottom.show { pointer-events: auto; opacity: 1; transform: none; }
 .jump-bottom:hover { background: color-mix(in srgb, var(--text) 8%, var(--surface)); }
-@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference) { .jump-bottom { transition: none; } }
+@media (prefers-reduced-motion: reduce) { .jump-bottom { transition: none; } }
 
 /* ══ Environment pane (synara-style): Files / Terminals / Preview / Diffs ══ */
 .env-panel { position: absolute; top: 0; right: 0; bottom: 0; width: min(var(--rpanel, 46%), calc(100% - 220px)); z-index: 5;
@@ -3268,7 +3304,7 @@ details.bg-chip.bg-watch[open] { max-width: 100%; flex-basis: 100%; border-radiu
 .thought-body { margin-top: 6px; padding: 8px 12px; color: color-mix(in srgb, var(--text) 45%, transparent);
   font-size: 13px; line-height: 1.6; border-left: 2px solid color-mix(in srgb, var(--text) 20%, transparent);
   white-space: pre-wrap; max-height: 280px; overflow-y: auto; }
-@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference) {
+@media (prefers-reduced-motion: reduce) {
   .row.agent.agent-waiting {
     display: none;
     margin: 0;
@@ -3409,7 +3445,7 @@ details.bg-chip.bg-watch[open] { max-width: 100%; flex-basis: 100%; border-radiu
    reduce-motion (a frozen spinner reads as a hung task). */
 .bg-x { background: none; border: 0; color: var(--faint); cursor: pointer; font-size: 11px; padding: 0 2px; }
 .bg-x:hover { color: var(--text); }
-@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference) { .bg-dot { animation: none; } }
+@media (prefers-reduced-motion: reduce) { .bg-dot { animation: none; } }
 
 /* Long user prompts collapse (the sticky header stays small). Clamp the INNER
    text div with max-height + a fade mask — the mask is safe here (no
@@ -3426,7 +3462,7 @@ details.bg-chip.bg-watch[open] { max-width: 100%; flex-basis: 100%; border-radiu
   -webkit-mask-image: linear-gradient(to bottom, #000 52%, transparent 100%);
   mask-image: linear-gradient(to bottom, #000 52%, transparent 100%);
 }
-@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference) { .user-text { transition: none; } }
+@media (prefers-reduced-motion: reduce) { .user-text { transition: none; } }
 /* show more / less — centered under the faded cut. */
 .bubble-more {
   display: block; margin: 1px auto 0; padding: 2px 10px;
@@ -3468,7 +3504,7 @@ details.bg-chip.bg-watch[open] { max-width: 100%; flex-basis: 100%; border-radiu
   50% { box-shadow: 0 0 0 #fff; margin-top: -8px; transform: translate(6px, 6px); }
   100% { box-shadow: 12px 0 0 #fff; margin-top: 0; }
 }
-@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference) {
+@media (prefers-reduced-motion: reduce) {
   .side-loader, .side-loader::before, .side-loader::after { animation: none; }
 }
 
@@ -3501,7 +3537,7 @@ details.bg-chip.bg-watch[open] { max-width: 100%; flex-basis: 100%; border-radiu
   -webkit-text-fill-color: transparent;
   animation: shimmer 1.7s linear infinite;
 }
-@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference) { .edits-row.pending .edits-rowcounts.shimmer { animation: none; } }
+@media (prefers-reduced-motion: reduce) { .edits-row.pending .edits-rowcounts.shimmer { animation: none; } }
 
 /* Rust-native json-render-style artifacts. These are constrained UiSpec nodes
    rendered by Dioxus, not arbitrary HTML from the model. */
@@ -3524,7 +3560,7 @@ details.bg-chip.bg-watch[open] { max-width: 100%; flex-basis: 100%; border-radiu
 .ui-table-skel-head { display: flex; gap: 12px; font-size: 12px; color: var(--muted); font-weight: 600; }
 .ui-table-skel-rows { font-size: 12px; color: var(--faint); padding-top: 4px; }
 @keyframes ui-skel-pulse { 0%, 100% { opacity: .35; } 50% { opacity: .8; } }
-@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference) {
+@media (prefers-reduced-motion: reduce) {
   .ui-skel { animation: none; opacity: .5; }
 }
 .ui-spec-title {
@@ -3728,7 +3764,7 @@ details.bg-chip.bg-watch[open] { max-width: 100%; flex-basis: 100%; border-radiu
   -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 16px), rgba(0,0,0,.62));
   mask-image: linear-gradient(to bottom, #000 calc(100% - 16px), rgba(0,0,0,.62));
 }
-@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference) {
+@media (prefers-reduced-motion: reduce) {
   .agent-md.live { -webkit-mask-image: none; mask-image: none; }
 }
 
@@ -3736,7 +3772,7 @@ details.bg-chip.bg-watch[open] { max-width: 100%; flex-basis: 100%; border-radiu
 .diff-adds, .diff-dels, .status-elapsed, .usage-v, .edits-counts, .live-changes-counts,
 .bg-chip-text, .thread-time { font-variant-numeric: tabular-nums; }
 
-@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference) {
+@media (prefers-reduced-motion: reduce) {
   .row, .col > .row:last-child, .agent-md pre, .col.streaming .row.agent:last-of-type .agent-md,
   .question-card, .approval-card, .edits-card, .todo-card, .queue-bar, .ui-spec,
   .thinking-box, .attach-card, .elem-chip, .bg-bar, .composer-live-changes { animation: none; }
@@ -3846,9 +3882,10 @@ details.bg-chip.bg-watch[open] { max-width: 100%; flex-basis: 100%; border-radiu
   border-color: color-mix(in srgb, var(--syn-accent) 55%, transparent);
 }
 
-@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference) {
-  /* Reduce Motion keeps textual state visible, removes decorative loading
-     sweep rows, and leaves only the generic background-process ring active. */
+@media (prefers-reduced-motion: reduce) {
+  /* Keep textual state visible while decorative entrance and sweep motion is
+     removed. Functional progress indicators are restored by the canonical
+     Reduced Motion contract at the end of this file. */
   .toast, .palette, .palette-list .palette-item, .env-panel, .env-body > *,
   .queue-chip, .tab-state, .palette-status, .thread-anchor.restored .thread,
   .tab-dot.busy, .diff-reverted, .diff-kept, .status-shimmer, .typing,
@@ -3869,9 +3906,7 @@ details.bg-chip.bg-watch[open] { max-width: 100%; flex-basis: 100%; border-radiu
     mask: none;
     will-change: auto;
   }
-  .syn-spinner {
-    animation: syn-spin 1.6s linear infinite !important;
-  }
+  .syn-spinner { animation: none !important; }
   .status-shimmer {
     background: none;
     -webkit-text-fill-color: currentColor;
@@ -3943,7 +3978,7 @@ details.bg-chip.bg-watch[open] { max-width: 100%; flex-basis: 100%; border-radiu
 .activity-card.has-out[open] .activity-out { animation: oxide-reveal-down .2s var(--ease-out) both; }
 .act-group[open] > .row.activity { animation: oxide-reveal-down .18s var(--ease-out) both; }
 
-@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference) {
+@media (prefers-reduced-motion: reduce) {
   .activity-card.has-out[open] .activity-out,
   .act-group[open] > .row.activity { animation: none; }
 }
@@ -3958,7 +3993,7 @@ textarea:focus-visible, select:focus-visible, [tabindex]:focus-visible {
   outline-offset: 2px;
 }
 
-@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference) {
+@media (prefers-reduced-motion: reduce) {
   .activity-ic.ok, .activity-ic.fail { animation: none; }
   .pill:active, .row-act-btn:active, .copy-btn:active,
   .msg-copy:active, .followups-x:active, .queue-steer:active { transform: none; }
@@ -3993,7 +4028,7 @@ textarea:focus-visible, select:focus-visible, [tabindex]:focus-visible {
 }
 .native-term-reopen:hover { border-color: color-mix(in srgb, var(--syn-accent) 40%, var(--border)); }
 .native-term-reopen:active { transform: scale(.97); }
-@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference) { .native-term-reopen:active { transform: none; } }
+@media (prefers-reduced-motion: reduce) { .native-term-reopen:active { transform: none; } }
 .native-term-err { margin-top: 10px; font-size: 12px; line-height: 1.45; color: var(--danger, #c0392b); word-break: break-word; }
 
 /* ── Open-in-external-editor buttons (Files tab header + Editor head) ───── */
@@ -4038,7 +4073,7 @@ textarea:focus-visible, select:focus-visible, [tabindex]:focus-visible {
   animation: chunk-in .18s ease-out;
 }
 @keyframes chunk-in { from { opacity: 0; transform: translateY(2px); } to { opacity: 1; transform: none; } }
-@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference) {
+@media (prefers-reduced-motion: reduce) {
   .row.activity, .thinking-box, .queue-chip, .bg-chip, .agent-md:not(.live) > * { animation: none; }
 }
 
@@ -4097,7 +4132,7 @@ textarea:focus-visible, select:focus-visible, [tabindex]:focus-visible {
   -webkit-text-fill-color: transparent;
   animation: ox-shimmer 1.7s linear infinite;
 }
-@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference) {
+@media (prefers-reduced-motion: reduce) {
   .typing .typing-shimmer { animation: none; -webkit-text-fill-color: currentColor; color: var(--muted); }
 }
 
@@ -4110,7 +4145,7 @@ textarea:focus-visible, select:focus-visible, [tabindex]:focus-visible {
   -webkit-mask-image: linear-gradient(180deg, #000 calc(100% - 26px), rgba(0, 0, 0, 0.35) 100%);
   mask-image: linear-gradient(180deg, #000 calc(100% - 26px), rgba(0, 0, 0, 0.35) 100%);
 }
-@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference) {
+@media (prefers-reduced-motion: reduce) {
   .agent-md.live { -webkit-mask-image: none; mask-image: none; }
 }
 
@@ -4195,8 +4230,8 @@ details.activity-card.has-out .activity-sum { padding: 2px 4px; }
 /* Spinner alone while a tool runs — the tool icon next to it was redundant. */
 .activity-card.running .activity-tic { display: none; }
 @keyframes dotspin { from { transform: rotate(0); } to { transform: rotate(360deg); } }
-@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference) {
-  .activity-spin, .syn-spinner { animation: dotspin 2.4s steps(8) infinite; }
+@media (prefers-reduced-motion: reduce) {
+  .activity-spin, .syn-spinner { animation: none; }
 }
 
 /* Composer: big soft rounded field, round dark send button. */
@@ -4454,7 +4489,7 @@ details.activity-card.has-out .activity-sum { padding: 2px 4px; }
 .edits-row-d[open] .diff-body, .review-diff-d[open] .diff-body,
 details.changes-file[open] .diff-body { animation: disclosure-in 220ms ease-out; }
 
-@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference) {
+@media (prefers-reduced-motion: reduce) {
   .col > .row.user:last-child, .scroll, .hero,
   .edits-row-d[open] .diff-body, .review-diff-d[open] .diff-body,
   details.changes-file[open] .diff-body { animation: none; }
@@ -4485,7 +4520,7 @@ details.changes-file[open] .diff-body { animation: disclosure-in 220ms ease-out;
 .tab-agent-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; display: inline-block; }
 .tab-agent-dot.attention { background: var(--warn, #d9a35c); animation: terminal-run-pulse 640ms ease-in-out infinite; }
 .tab-agent-dot.review { background: var(--ok-strong, #00c853); }
-@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference) { .tab-agent-dot.attention { animation: none; } }
+@media (prefers-reduced-motion: reduce) { .tab-agent-dot.attention { animation: none; } }
 
 /* toggle lipat anak sub-agent di baris induk (Synara childCount + chevron) */
 .sub-toggle {
@@ -4690,10 +4725,6 @@ details.changes-file[open] .diff-body { animation: disclosure-in 220ms ease-out;
   from { opacity: 0; transform: translateY(3px); }
   to { opacity: 1; transform: none; }
 }
-@keyframes oxide-tool-halo {
-  0%, 100% { opacity: .12; transform: scale(.72); }
-  50% { opacity: .34; transform: scale(1); }
-}
 
 .row.agent { position: relative; }
 .row.agent::before {
@@ -4826,7 +4857,7 @@ details.changes-file[open] .diff-body { animation: disclosure-in 220ms ease-out;
 .activity-card.has-out[open] .activity-caret { transform: rotate(180deg); color: var(--muted); }
 details.has-out .activity-out-n::after { content: none; }
 
-@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference) {
+@media (prefers-reduced-motion: reduce) {
   .row.agent.streaming-message::before {
     animation: none;
     opacity: .42;
@@ -4858,7 +4889,7 @@ details.has-out .activity-out-n::after { content: none; }
   border-color: color-mix(in srgb, var(--text) 16%, transparent);
 }
 
-@media (prefers-reduced-motion: reduce) and (prefers-reduced-motion: no-preference) {
+@media (prefers-reduced-motion: reduce) {
   .modal-overlay, .palette-overlay, .modal, .palette,
   .logo-btn, .board-card, .board-btn { animation: none; transition: none; }
   .logo-btn:active, .board-btn:active { transform: none; }
@@ -5053,6 +5084,164 @@ details.has-out .activity-out-n::after { content: none; }
 .thought-sum::after { content: none; }
 .thought-row[open] .thought-sum::after { content: none; }
 
+/* Compact workspace polish. Auxiliary composer surfaces scroll internally so
+   suggestions and attachments cannot crowd the transcript out of the card. */
+.composer-dock,
+.composer-stack { min-height: 0; }
+.composer-dock > .followups {
+  max-height: min(144px, 18dvh);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-right: 24px;
+  scrollbar-gutter: stable;
+}
+.composer-dock > .composer-live-changes {
+  max-height: min(88px, 12dvh);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.composer-stack > .queue-bar { flex: 0 0 auto; }
+.composer-stack .queue-menu {
+  max-height: min(240px, 32dvh);
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+.composer .attach-row {
+  max-height: min(136px, 18dvh);
+  overflow: auto;
+  overscroll-behavior: contain;
+  align-content: flex-start;
+  padding-right: 2px;
+  scrollbar-gutter: stable;
+}
+
+/* Environment views stay mounted between tab switches. Hidden panes keep
+   iframe/terminal state while leaving layout, focus, and hit testing alone. */
+.env-body { position: relative; overflow: hidden; }
+.env-pane {
+  position: absolute;
+  inset: 0;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  transition: opacity var(--dur-med) var(--ease-standard),
+              transform var(--dur-med) var(--ease-standard),
+              visibility 0s linear var(--dur-med);
+}
+.env-pane-on {
+  z-index: 1;
+  visibility: visible;
+  opacity: 1;
+  transform: none;
+  pointer-events: auto;
+  transition-delay: 0s;
+}
+.env-pane-off {
+  z-index: 0;
+  visibility: hidden;
+  opacity: 0;
+  transform: translateX(4px);
+  pointer-events: none;
+  animation: none !important;
+}
+.env-pane > .changes-panel,
+.env-pane > .preview-panel,
+.env-pane > .files-panel,
+.env-pane > .env-terms { flex: 1; min-height: 0; }
+
+/* Keep the notification rail reachable when several actionable toasts arrive
+   together; each toast still enters through transform and opacity only. */
+.toasts {
+  max-height: calc(100dvh - 32px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+}
+
+/* SVG node hover avoids animated filters, which repaint the entire graph. */
+.brain-node rect {
+  transition: fill var(--dur-fast) ease,
+              stroke var(--dur-fast) ease,
+              transform var(--dur-fast) var(--ease-out);
+}
+.brain-node:hover rect,
+.brain-node:focus-visible rect { filter: none; }
+.brain-node-name { font-size: 13px; font-weight: 700; }
+.brain-node-count { fill: color-mix(in srgb, var(--text) 70%, transparent); font-size: 10.25px; }
+.brain-node-kinds { fill: color-mix(in srgb, var(--text) 52%, transparent); font-size: 9.25px; }
+.brain-edge { opacity: .66; }
+
+@media (max-width: 980px) {
+  .brain-view { gap: 12px; padding: 16px; }
+  .brain-layout {
+    flex: 0 0 auto;
+    min-height: 0;
+    grid-template-columns: minmax(0, 1fr);
+    overflow: visible;
+  }
+  .brain-map-card { min-height: clamp(360px, 52dvh, 480px); }
+  .brain-map { min-height: 330px; }
+  .brain-inspector {
+    min-height: 240px;
+    max-height: min(420px, 44dvh);
+    scrollbar-gutter: stable;
+  }
+}
+
+/* At compact desktop widths the sidebar becomes an icon rail automatically.
+   The explicit collapse control remains useful again above this breakpoint. */
+@media (max-width: 900px) {
+  .sidebar {
+    width: 60px !important;
+    padding: 12px 6px;
+    overflow: hidden;
+  }
+  .sidebar .projects,
+  .sidebar .section-row,
+  .sidebar .chats-list,
+  .sidebar .side-seg,
+  .sidebar .usage-chip { display: none !important; }
+  .sidebar .brand-name,
+  .sidebar .section-label,
+  .sidebar .nav .nav-label,
+  .sidebar .nav-item > span:not(.nav-logo),
+  .sidebar .settings-btn span,
+  .sidebar .update-row-label,
+  .sidebar .update-row-ver {
+    display: inline-block;
+    width: 0;
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+    opacity: 0;
+    white-space: nowrap;
+  }
+  .sidebar .nav-item > .nav-logo {
+    display: inline-flex;
+    width: 18px;
+    margin: 0;
+    overflow: visible;
+    opacity: 1;
+  }
+  .sidebar .brand { justify-content: center; padding: 6px 0 12px; }
+  .sidebar .nav-item,
+  .sidebar .settings-btn,
+  .sidebar .update-row { justify-content: center; gap: 0; padding-inline: 0; }
+  .sidebar .nav-item.ws-item { display: flex; }
+  .sidebar + .panel-resizer { display: none; }
+  .sidebar + .panel-resizer + .main { margin-left: 8px; }
+}
+
+@media (max-width: 680px) {
+  .brain-stats { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .brain-stat { min-width: 0; padding-inline: 10px; }
+  .brain-stat span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .brain-map-card { min-height: 340px; }
+  .brain-map { min-height: 310px; }
+}
+
 /* Every loading glyph is transparent. The only visible pixels belong to its
    orbit/Braille frame; parent status slots must not add a tinted disc. */
 .syn-spinner,
@@ -5066,3 +5255,52 @@ details.has-out .activity-out-n::after { content: none; }
 }
 .activity-status::after { content: none !important; }
 
+/* Canonical host Reduced Motion contract. Keep status text and icons visible,
+   stop decorative/repeating motion, and retain only slow stepped progress
+   indicators for work that is actively running. This block stays last so
+   later component polish cannot accidentally re-enable motion. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation: none !important;
+    transition: none !important;
+    scroll-behavior: auto !important;
+    will-change: auto !important;
+  }
+
+  .thinking-glow,
+  .activity-card.running .activity-verb,
+  .composer-live-changes .live-changes-title,
+  .status-shimmer,
+  .typing .typing-shimmer,
+  .edits-row.pending .edits-rowcounts.shimmer {
+    background: none;
+    color: var(--muted);
+    -webkit-text-fill-color: currentColor;
+  }
+
+  .row.agent.streaming-message::before {
+    opacity: .42;
+    transform: scaleY(.72);
+  }
+  .agent-md.live {
+    -webkit-mask-image: none;
+    mask-image: none;
+  }
+  .unicode-spinner::after { transform: none; }
+
+  .activity-card.running .activity-status .unicode-spinner.activity-spin::after,
+  .typing .unicode-spinner.status-spinner::after {
+    animation: oxide-unicode-frame 2.4s steps(10, end) infinite !important;
+  }
+  .bg-orbit {
+    animation: bg-orbit-rot 2.4s steps(8, end) infinite !important;
+  }
+
+  .send:hover, .send:active, .toast-action:active,
+  .logo-btn:active, .board-btn:active, .board-card:hover,
+  .pill:active, .row-act-btn:active, .copy-btn:active,
+  .msg-copy:active, .followups-x:active, .queue-steer:active,
+  .native-term-reopen:active {
+    transform: none !important;
+  }
+}

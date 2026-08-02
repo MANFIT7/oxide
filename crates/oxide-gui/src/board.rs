@@ -3,7 +3,7 @@
 //! openai/symphony, but local-first and built on the Oxide engine.
 
 use oxide_config::Config;
-use oxide_protocol::{ApprovalPolicy, Event, Op};
+use oxide_protocol::{ApprovalDecision, Event, Op};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -212,6 +212,16 @@ pub async fn run_card(
     root: PathBuf,
 ) -> (String, String) {
     let branch = format!("oxide/card-{id}");
+    if matches!(
+        base.effective_sandbox(),
+        oxide_protocol::SandboxPolicy::ReadOnly
+    ) {
+        return (
+            "[blocked] board cards cannot provision a git worktree while the runtime is read-only"
+                .to_string(),
+            branch,
+        );
+    }
     let wt = root.join(format!(".oxide/worktrees/card-{id}"));
     if let Some(parent) = wt.parent() {
         if let Err(err) = tokio::fs::create_dir_all(parent).await {
@@ -283,7 +293,6 @@ pub async fn run_card(
     let mut cfg = base;
     cfg.workspace = Some(wt.clone());
     cfg.harness = "coding".to_string();
-    cfg.approval_policy = ApprovalPolicy::Never;
     cfg.persist = false;
     cfg.resume = false;
     cfg.orchestrate = false;
@@ -298,7 +307,12 @@ pub async fn run_card(
     } else {
         format!("{title}\n\n{desc}")
     };
-    let _ = handle.submit(Op::UserTurn { text: prompt }).await;
+    let _ = handle
+        .submit(Op::UserTurn {
+            text: prompt,
+            permissions: None,
+        })
+        .await;
 
     let mut out = String::new();
     while let Some(ev) = events.recv().await {
@@ -313,6 +327,15 @@ pub async fn run_card(
                 out.push_str(&format!("\n[ui] {title}\n"));
             }
             Event::Error { message } => out.push_str(&format!("\n[error] {message}")),
+            Event::ApprovalRequested { request_id, .. } => {
+                let _ = handle
+                    .submit(Op::ApprovalResponse {
+                        request_id,
+                        decision: ApprovalDecision::Reject,
+                    })
+                    .await;
+                out.push_str("\n[blocked] action requires interactive approval");
+            }
             Event::TurnFinished { .. } => break,
             Event::Shutdown => break,
             _ => {}

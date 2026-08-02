@@ -10,6 +10,7 @@ oxide-core = { workspace = true }
 oxide-config = { workspace = true }
 oxide-harness = { workspace = true }
 oxide-protocol = { workspace = true }
+oxide-providers = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
 anyhow = { workspace = true }

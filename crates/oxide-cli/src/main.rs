@@ -191,9 +191,11 @@ fn apply_permission_mode(config: &mut Config, safe: bool, skip_permissions: bool
     if skip_permissions {
         config.approval_policy = oxide_protocol::ApprovalPolicy::Never;
         config.sandbox = oxide_protocol::SandboxPolicy::DangerFullAccess;
+        config.plan_mode = false;
     } else if safe {
         config.approval_policy = oxide_protocol::ApprovalPolicy::OnRequest;
         config.sandbox = oxide_protocol::SandboxPolicy::WorkspaceWrite;
+        config.plan_mode = false;
     }
 }
 
@@ -226,33 +228,37 @@ mod permission_tests {
         let mut config = Config {
             approval_policy: oxide_protocol::ApprovalPolicy::Never,
             sandbox: oxide_protocol::SandboxPolicy::DangerFullAccess,
+            plan_mode: true,
             ..Config::default()
         };
 
         apply_permission_mode(&mut config, true, false);
 
         assert_eq!(
-            config.approval_policy,
+            config.effective_approval_policy(),
             oxide_protocol::ApprovalPolicy::OnRequest
         );
         assert_eq!(
-            config.sandbox,
+            config.effective_sandbox(),
             oxide_protocol::SandboxPolicy::WorkspaceWrite
         );
     }
 
     #[test]
     fn explicit_skip_permissions_preserves_full_access_workflow() {
-        let mut config = Config::default();
+        let mut config = Config {
+            plan_mode: true,
+            ..Config::default()
+        };
 
         apply_permission_mode(&mut config, false, true);
 
         assert_eq!(
-            config.approval_policy,
+            config.effective_approval_policy(),
             oxide_protocol::ApprovalPolicy::Never
         );
         assert_eq!(
-            config.sandbox,
+            config.effective_sandbox(),
             oxide_protocol::SandboxPolicy::DangerFullAccess
         );
     }
@@ -346,7 +352,12 @@ async fn run_exec(
     use oxide_protocol::{ApprovalDecision, Event, Op};
 
     let (handle, mut events) = oxide_core::spawn(config)?;
-    handle.submit(Op::UserTurn { text: prompt }).await?;
+    handle
+        .submit(Op::UserTurn {
+            text: prompt,
+            permissions: None,
+        })
+        .await?;
     let mut missing_answer: Option<String> = None;
 
     // Terminal Ctrl-C is delivered to THIS process only: the CLI child runs in
@@ -660,6 +671,22 @@ async fn run_exec(
                         review.score,
                         review.findings.len()
                     )
+                }
+            }
+            Event::BrowserSessionState {
+                state,
+                url,
+                detail,
+                visible,
+            } => {
+                if !json_events {
+                    let mode = if visible { "visible" } else { "headless" };
+                    let target = if url.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" · {url}")
+                    };
+                    println!("[browser] {state} · {mode}{target} · {detail}");
                 }
             }
             Event::Info { text } => {

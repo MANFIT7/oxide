@@ -1010,6 +1010,8 @@ async fn self_review_task(
         cli_resume: None,
         system_append: None,
         claude_agents: None,
+        approval_policy: ApprovalPolicy::Never,
+        sandbox: SandboxPolicy::ReadOnly,
     };
     let (tx, mut rx) = mpsc::channel(64);
     let worker = tokio::spawn(async move {
@@ -1198,7 +1200,8 @@ use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use oxide_harness::{Harness, Registry, SkillRoute, ToolPolicyMode};
 use oxide_mcp::{is_mcp_tool, server_of, HttpOptions, McpClient, StdioSpawnOptions};
 use oxide_protocol::{
-    ApprovalDecision, Event, Op, SubagentControlAction, ToolSpec, TurnId, UiSpec,
+    ApprovalDecision, ApprovalPolicy, BrowserControlAction, Event, Op, RuntimePermissions,
+    SandboxPolicy, SubagentControlAction, ToolSpec, TurnId, UiSpec,
 };
 use oxide_providers::{Message, Provider, Role, StreamItem, TurnRequest};
 use serde::Deserialize;
@@ -1286,11 +1289,18 @@ impl EventBus {
 #[derive(Clone)]
 pub struct EngineHandle {
     op_tx: mpsc::Sender<Op>,
+    browser_control_tx: mpsc::UnboundedSender<BrowserControlAction>,
     bus: Arc<EventBus>,
 }
 
 impl EngineHandle {
     pub async fn submit(&self, op: Op) -> anyhow::Result<()> {
+        if let Op::BrowserControl { action } = op {
+            self.browser_control_tx
+                .send(action)
+                .map_err(|_| anyhow::anyhow!("engine task is gone"))?;
+            return Ok(());
+        }
         self.op_tx
             .send(op)
             .await
@@ -1414,6 +1424,7 @@ fn registry_from_config(config: &Config) -> anyhow::Result<Registry> {
 /// subscribe to. The engine runs until [`Op::Shutdown`] or all handles drop.
 pub fn spawn(config: Config) -> anyhow::Result<(EngineHandle, mpsc::Receiver<Event>)> {
     let (op_tx, op_rx) = mpsc::channel(OP_QUEUE);
+    let (browser_control_tx, browser_control_rx) = mpsc::unbounded_channel();
     let (event_tx, event_rx) = mpsc::channel(EVENT_QUEUE);
     let bus = EventBus::new();
     let registry = registry_from_config(&config)?;
@@ -1474,6 +1485,7 @@ pub fn spawn(config: Config) -> anyhow::Result<(EngineHandle, mpsc::Receiver<Eve
         None
     };
 
+    let mcp_startup_deferred = matches!(config.effective_sandbox(), SandboxPolicy::ReadOnly);
     let engine = Engine {
         config,
         registry,
@@ -1499,7 +1511,10 @@ pub fn spawn(config: Config) -> anyhow::Result<(EngineHandle, mpsc::Receiver<Eve
         bg_task_seq: 0,
         mcp_instructions: Vec::new(),
         required_mcp_unavailable: false,
+        mcp_startup_deferred,
         browser: None,
+        browser_control: BrowserControlState::AgentControlled,
+        browser_control_rx: Some(browser_control_rx),
         ctx_window: None,
         read_files: std::collections::HashSet::new(),
         turn_edited: false,
@@ -1515,7 +1530,14 @@ pub fn spawn(config: Config) -> anyhow::Result<(EngineHandle, mpsc::Receiver<Eve
     };
 
     tokio::spawn(engine.run(op_rx));
-    Ok((EngineHandle { op_tx, bus }, event_rx))
+    Ok((
+        EngineHandle {
+            op_tx,
+            browser_control_tx,
+            bus,
+        },
+        event_rx,
+    ))
 }
 
 /// Stream idle limit per provider. CLI drivers (claude/codex) manage their OWN
@@ -1924,6 +1946,45 @@ enum VerifyOutcome {
     Skipped,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrowserControlState {
+    AgentControlled,
+    HumanControlled,
+}
+
+impl BrowserControlState {
+    fn as_event_state(self) -> &'static str {
+        match self {
+            Self::AgentControlled => "agent_controlled",
+            Self::HumanControlled => "human_controlled",
+        }
+    }
+}
+
+enum BrowserToolOutcome {
+    Completed(anyhow::Result<String>),
+    TimedOut,
+    Controlled(BrowserControlAction),
+}
+
+enum BrowserLaunchOutcome {
+    Launched(anyhow::Result<browser::BrowserSession>),
+    TimedOut,
+    Controlled(BrowserControlAction),
+}
+
+async fn next_browser_control(
+    receiver: &mut Option<mpsc::UnboundedReceiver<BrowserControlAction>>,
+) -> BrowserControlAction {
+    match receiver.as_mut() {
+        Some(receiver) => match receiver.recv().await {
+            Some(action) => action,
+            None => std::future::pending::<BrowserControlAction>().await,
+        },
+        None => std::future::pending::<BrowserControlAction>().await,
+    }
+}
+
 struct Engine {
     config: Config,
     registry: Registry,
@@ -1974,8 +2035,16 @@ struct Engine {
     mcp_instructions: Vec<(String, String)>,
     /// True when a configured required MCP server failed to connect.
     required_mcp_unavailable: bool,
+    /// Startup was intentionally skipped in read-only mode. The first later
+    /// writable turn reconnects MCP without requiring an app restart.
+    mcp_startup_deferred: bool,
     /// Lazily launched browser-automation session.
     browser: Option<browser::BrowserSession>,
+    /// Whether browser automation is owned by the agent or paused for a human.
+    browser_control: BrowserControlState,
+    /// Dedicated urgent control lane. Main frontend handles get a sender that
+    /// bypasses the bounded operation queue; detached worker engines use None.
+    browser_control_rx: Option<mpsc::UnboundedReceiver<BrowserControlAction>>,
     /// Model context window (tokens), reported by the provider; drives the
     /// compaction budget at 75% (opencode-style).
     ctx_window: Option<u64>,
@@ -2220,6 +2289,29 @@ fn subagent_profile_for(task: &str, provider: &str, effort: &str) -> WorkerProfi
 }
 
 impl Engine {
+    /// Detached workers cannot relay an approval response back to their private
+    /// op channel. Keep them useful for reads, but fail closed on mutation
+    /// unless the parent turn explicitly runs in the exact Full access pair.
+    fn constrain_detached_permissions(&mut self) {
+        let full_access = matches!(
+            (
+                self.config.effective_approval_policy(),
+                self.config.effective_sandbox(),
+            ),
+            (ApprovalPolicy::Never, SandboxPolicy::DangerFullAccess)
+        );
+        if !full_access {
+            self.force_read_only();
+        }
+    }
+
+    fn force_read_only(&mut self) {
+        self.config.approval_policy = ApprovalPolicy::Never;
+        self.config.sandbox = SandboxPolicy::ReadOnly;
+        self.config.plan_mode = false;
+        self.session_approved.clear();
+    }
+
     async fn emit(&self, ev: Event) {
         // Mirror to the multi-subscriber bus (seq + replay log) before handing the
         // event to the primary frontend channel.
@@ -2306,6 +2398,9 @@ impl Engine {
     /// conversation is never touched; failures are silent (best-effort).
     fn maybe_self_review(&mut self) {
         const SELF_REVIEW_INTERVAL: u32 = 5;
+        if matches!(self.config.effective_sandbox(), SandboxPolicy::ReadOnly) {
+            return;
+        }
         let cli_driver = matches!(
             self.config.provider.as_str(),
             "codex" | "claude" | "claude_interactive"
@@ -2541,33 +2636,180 @@ impl Engine {
             .collect()
     }
 
-    /// Finish browser automation with the turn that owns it. This keeps one
-    /// browser alive for multi-step navigate/read/click flows, then releases the
-    /// Chromium process and temporary profile before the frontend sees Done.
-    async fn close_browser(&mut self) {
-        if let Some(session) = self.browser.take() {
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(8), session.close()).await;
-        }
+    async fn emit_browser_session_state(&self, detail: impl Into<String>) {
+        let (url, visible) = match self.browser.as_ref() {
+            Some(session) => (session.current_url().await, session.is_visible()),
+            None => (String::new(), false),
+        };
+        self.emit(Event::BrowserSessionState {
+            state: self.browser_control.as_event_state().to_string(),
+            url,
+            detail: detail.into(),
+            visible,
+        })
+        .await;
+    }
+
+    /// Close Chromium and its temporary profile. Human takeover is the only
+    /// state allowed to keep a browser alive beyond the owning turn.
+    async fn close_browser(&mut self, detail: &str) {
+        let Some(session) = self.browser.take() else {
+            return;
+        };
+        let url = session.current_url().await;
+        let close_result =
+            tokio::time::timeout(std::time::Duration::from_secs(8), session.close()).await;
+        self.browser_control = BrowserControlState::AgentControlled;
+        let close_detail = match close_result {
+            Ok(Ok(())) => detail.to_string(),
+            Ok(Err(error)) => format!("{detail}; browser cleanup failed: {error}"),
+            Err(_) => format!("{detail}; browser cleanup timed out"),
+        };
+        self.emit(Event::BrowserSessionState {
+            state: "closed".to_string(),
+            url,
+            detail: close_detail,
+            visible: false,
+        })
+        .await;
     }
 
     async fn finish_turn(&mut self, turn: TurnId) {
-        self.close_browser().await;
+        for action in self.take_pending_browser_controls() {
+            self.apply_browser_control(action).await;
+        }
+        if self.browser_control == BrowserControlState::HumanControlled {
+            self.emit_browser_session_state(
+                "Turn finished while the browser remains under human control",
+            )
+            .await;
+        } else {
+            self.close_browser("Browser session closed at the end of the turn")
+                .await;
+        }
         self.emit(Event::TurnFinished { turn }).await;
+    }
+
+    /// Apply one browser-only control without changing turn, permission, or
+    /// provider state. This is also called by the urgent CDP-operation select.
+    async fn apply_browser_control(&mut self, action: BrowserControlAction) {
+        match action {
+            BrowserControlAction::TakeOver => {
+                self.browser_control = BrowserControlState::HumanControlled;
+                let focus_error = match self.browser.as_ref() {
+                    Some(session) if session.is_visible() => tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        session.bring_to_front(),
+                    )
+                    .await
+                    .ok()
+                    .and_then(Result::err),
+                    _ => None,
+                };
+                let detail = match (self.browser.as_ref(), focus_error) {
+                    (None, _) => {
+                        "Browser tools paused for human takeover; no session is currently open"
+                            .to_string()
+                    }
+                    (Some(session), _) if !session.is_visible() => {
+                        "Browser tools paused for human takeover; this session is headless"
+                            .to_string()
+                    }
+                    (Some(_), Some(error)) => {
+                        format!("Browser control handed to the user; focus failed: {error}")
+                    }
+                    (Some(_), None) => "Browser control handed to the user".to_string(),
+                };
+                self.emit_browser_session_state(detail).await;
+            }
+            BrowserControlAction::Resume => {
+                self.browser_control = BrowserControlState::AgentControlled;
+                self.emit_browser_session_state(if self.browser.is_some() {
+                    "Browser automation resumed"
+                } else {
+                    "Browser automation resumed; a new session will open on demand"
+                })
+                .await;
+            }
+            BrowserControlAction::Cancel => {
+                self.browser_control = BrowserControlState::AgentControlled;
+                if self.browser.is_some() {
+                    self.close_browser("Browser session cancelled by the user")
+                        .await;
+                } else {
+                    self.emit(Event::BrowserSessionState {
+                        state: "closed".to_string(),
+                        url: String::new(),
+                        detail: "No browser session was open".to_string(),
+                        visible: false,
+                    })
+                    .await;
+                }
+            }
+        }
+    }
+
+    fn take_pending_browser_controls(&mut self) -> Vec<BrowserControlAction> {
+        let Some(receiver) = self.browser_control_rx.as_mut() else {
+            return Vec::new();
+        };
+        let mut actions = Vec::new();
+        while let Ok(action) = receiver.try_recv() {
+            actions.push(action);
+        }
+        actions
     }
 
     /// Ensure the browser session is launched; returns a ref or an error string.
     async fn ensure_browser(&mut self) -> Result<&browser::BrowserSession, String> {
         if self.browser.is_none() {
-            match browser::BrowserSession::launch(self.config.browser_headless).await {
-                Ok(s) => self.browser = Some(s),
-                Err(e) => {
+            let headless = self.config.browser_headless;
+            let launch = browser::BrowserSession::launch(headless);
+            let outcome = tokio::select! {
+                biased;
+                action = next_browser_control(&mut self.browser_control_rx) => {
+                    BrowserLaunchOutcome::Controlled(action)
+                }
+                result = tokio::time::timeout(std::time::Duration::from_secs(20), launch) => {
+                    match result {
+                        Ok(result) => BrowserLaunchOutcome::Launched(result),
+                        Err(_) => BrowserLaunchOutcome::TimedOut,
+                    }
+                }
+            };
+            match outcome {
+                BrowserLaunchOutcome::Launched(Ok(session)) => self.browser = Some(session),
+                BrowserLaunchOutcome::Launched(Err(error)) => {
                     return Err(format!(
-                        "browser launch failed: {e} (is a Chromium-based browser installed?)"
-                    ))
+                        "browser launch failed: {error} (is a Chromium-based browser installed?)"
+                    ));
+                }
+                BrowserLaunchOutcome::TimedOut => {
+                    return Err("browser launch timed out after 20s".to_string());
+                }
+                BrowserLaunchOutcome::Controlled(action) => {
+                    self.apply_browser_control(action).await;
+                    return Err(match action {
+                        BrowserControlAction::TakeOver => {
+                            "browser launch stopped for human takeover; browser tools are paused until Resume"
+                        }
+                        BrowserControlAction::Resume => {
+                            "browser control changed during launch; retry the browser tool"
+                        }
+                        BrowserControlAction::Cancel => {
+                            "browser launch cancelled by the user; the agent turn may continue"
+                        }
+                    }
+                    .to_string());
                 }
             }
+            self.emit_browser_session_state("Browser session opened for agent automation")
+                .await;
         }
-        Ok(self.browser.as_ref().unwrap())
+        Ok(self
+            .browser
+            .as_ref()
+            .expect("browser session just launched"))
     }
 
     /// Handle a `browser_*` tool. Returns Some((output, ok)) if it was one.
@@ -2587,11 +2829,26 @@ impl Engine {
         ) {
             return None;
         }
+
+        for action in self.take_pending_browser_controls() {
+            self.apply_browser_control(action).await;
+        }
+        if self.browser_control == BrowserControlState::HumanControlled {
+            return Some((
+                "browser is under human control; send Resume before using browser tools"
+                    .to_string(),
+                false,
+            ));
+        }
+
         let shots_dir = self.workspace.join(".oxide/screenshots");
-        let sess = match self.ensure_browser().await {
-            Ok(s) => s,
-            Err(e) => return Some((e, false)),
-        };
+        if let Err(error) = self.ensure_browser().await {
+            return Some((error, false));
+        }
+        let sess = self
+            .browser
+            .as_ref()
+            .expect("browser session was ensured above");
         let sa = |k: &str| args[k].as_str().unwrap_or("").to_string();
         // Each browser operation gets a hard outer cap so a stalled CDP call
         // (hung navigation, click on a removed element, etc.) can't freeze the
@@ -2608,14 +2865,46 @@ impl Engine {
                 _ => Err(anyhow::anyhow!("unknown browser tool {name}")),
             }
         };
-        let res = tokio::time::timeout(std::time::Duration::from_secs(45), op_future).await;
-        Some(match res {
-            Ok(Ok(out)) => (out, true),
-            Ok(Err(e)) => (format!("browser error: {e}"), false),
-            Err(_) => (
+        let control_future = next_browser_control(&mut self.browser_control_rx);
+        let outcome = tokio::select! {
+            biased;
+            action = control_future => BrowserToolOutcome::Controlled(action),
+            result = tokio::time::timeout(std::time::Duration::from_secs(45), op_future) => {
+                match result {
+                    Ok(result) => BrowserToolOutcome::Completed(result),
+                    Err(_) => BrowserToolOutcome::TimedOut,
+                }
+            }
+        };
+
+        Some(match outcome {
+            BrowserToolOutcome::Completed(Ok(output)) => {
+                if matches!(name, "browser_navigate" | "browser_click") {
+                    self.emit_browser_session_state(format!("Browser operation completed: {name}"))
+                        .await;
+                }
+                (output, true)
+            }
+            BrowserToolOutcome::Completed(Err(error)) => (format!("browser error: {error}"), false),
+            BrowserToolOutcome::TimedOut => (
                 "browser timeout after 45s — page may be slow or stalled".to_string(),
                 false,
             ),
+            BrowserToolOutcome::Controlled(action) => {
+                self.apply_browser_control(action).await;
+                let output = match action {
+                    BrowserControlAction::TakeOver => {
+                        "browser operation stopped for human takeover; browser tools are paused until Resume"
+                    }
+                    BrowserControlAction::Resume => {
+                        "browser control changed while the operation was running; retry the browser tool"
+                    }
+                    BrowserControlAction::Cancel => {
+                        "browser session cancelled by the user; the agent turn may continue"
+                    }
+                };
+                (output.to_string(), false)
+            }
         })
     }
 
@@ -2838,6 +3127,12 @@ impl Engine {
         matcher: &str,
         payload: serde_json::Value,
     ) -> bool {
+        // Hooks are arbitrary shell commands and therefore outside the native
+        // tool router. A read-only runtime must skip them entirely or Plan mode
+        // could still mutate the workspace through lifecycle automation.
+        if matches!(self.config.effective_sandbox(), SandboxPolicy::ReadOnly) {
+            return false;
+        }
         let mut blocked = false;
         let audit_turn = payload.get("turn").and_then(|v| v.as_u64()).map(TurnId);
         for hook in hooks.commands_for(event, matcher) {
@@ -2942,6 +3237,17 @@ impl Engine {
     }
 
     async fn run_stop_lifecycle(&self, turn: TurnId, user_text: &str, interrupted: bool) {
+        if matches!(self.config.effective_sandbox(), SandboxPolicy::ReadOnly) {
+            self.emit_audit(
+                Some(turn),
+                "runtime",
+                "Read-only lifecycle",
+                "Skipped auto-lint, turn summary, and shell hooks",
+                "skipped",
+            )
+            .await;
+            return;
+        }
         let hooks = hooks::Hooks::load(&self.workspace);
         let payload = serde_json::json!({
             "turn": turn.0,
@@ -3122,7 +3428,8 @@ impl Engine {
         assistant_text: &str,
         edited_paths: &[String],
     ) {
-        if !matches!(source_provider, "codex" | "claude" | "claude_interactive")
+        if matches!(self.config.effective_sandbox(), SandboxPolicy::ReadOnly)
+            || !matches!(source_provider, "codex" | "claude" | "claude_interactive")
             || edited_paths.is_empty()
             || assistant_text.trim().is_empty()
         {
@@ -3187,6 +3494,8 @@ Rules:
             cli_resume: None,
             system_append: None,
             claude_agents: None,
+            approval_policy: ApprovalPolicy::Never,
+            sandbox: SandboxPolicy::ReadOnly,
         };
 
         let raw = match collect_provider_text_silent("chatgpt", req).await {
@@ -3338,11 +3647,19 @@ Rules:
                 .await;
             }
         }
-        self.connect_mcp_servers().await;
+        if matches!(self.config.effective_sandbox(), SandboxPolicy::ReadOnly) {
+            self.emit(Event::Info {
+                text: "MCP startup skipped while the runtime is read-only".to_string(),
+            })
+            .await;
+        } else {
+            self.connect_mcp_servers().await;
+            self.mcp_startup_deferred = false;
+        }
 
         // Skill curator (mechanical, at most once per 24h): stale skills move
         // to archive/ so the system-prompt index only carries live knowledge.
-        {
+        if !matches!(self.config.effective_sandbox(), SandboxPolicy::ReadOnly) {
             let ws = self.workspace.clone();
             tokio::task::spawn_blocking(move || {
                 let moved = memory::Memory::new(&ws).curate();
@@ -3374,8 +3691,12 @@ Rules:
                         counter,
                         notify,
                     } = d;
-                    // Dummy op channel: background subagents aren't steerable.
-                    let (_op_tx, mut op_rx2) = mpsc::channel::<Op>(8);
+                    worker.constrain_detached_permissions();
+                    // Background subagents aren't steerable and have no
+                    // approval UI. A closed channel makes any unexpected
+                    // approval request terminate instead of hanging forever.
+                    let (op_tx, mut op_rx2) = mpsc::channel::<Op>(8);
+                    drop(op_tx);
                     let (out, interrupted) = worker
                         .stream_agentic_collect(
                             &system,
@@ -3413,16 +3734,50 @@ Rules:
         loop {
             let op = tokio::select! {
                 op = op_rx.recv() => match op { Some(op) => op, None => break },
-                Some(done) = bg_rx.recv() => Op::UserTurn { text: done },
+                action = next_browser_control(&mut self.browser_control_rx) => {
+                    Op::BrowserControl { action }
+                },
+                Some(done) = bg_rx.recv() => Op::UserTurn {
+                    text: done,
+                    permissions: Some(RuntimePermissions {
+                        approval_policy: ApprovalPolicy::Never,
+                        sandbox: SandboxPolicy::ReadOnly,
+                    }),
+                },
             };
             {
                 match op {
-                    Op::UserTurn { text } => {
+                    Op::UserTurn { text, permissions } => {
+                        let previous_permissions = permissions.map(|runtime| {
+                            let previous = (
+                                self.config.approval_policy,
+                                self.config.sandbox,
+                                self.config.plan_mode,
+                            );
+                            // The pair is already the frontend's effective cap.
+                            // Disable the stored overlay for this turn so a stale
+                            // engine config cannot override a newly selected mode.
+                            self.config.approval_policy = runtime.approval_policy;
+                            self.config.sandbox = runtime.sandbox;
+                            self.config.plan_mode = false;
+                            previous
+                        });
+                        if self.mcp_startup_deferred
+                            && !matches!(self.config.effective_sandbox(), SandboxPolicy::ReadOnly)
+                        {
+                            self.connect_mcp_servers().await;
+                            self.mcp_startup_deferred = false;
+                        }
                         if self.maybe_side_question(&text) {
                             self.emit(Event::Info {
                                 text: "\u{1f4ac} btw \u{b7} answering on the side\u{2026}".into(),
                             })
                             .await;
+                            if let Some((approval, sandbox, plan_mode)) = previous_permissions {
+                                self.config.approval_policy = approval;
+                                self.config.sandbox = sandbox;
+                                self.config.plan_mode = plan_mode;
+                            }
                             continue;
                         }
                         if self.maybe_best_of(&text) {
@@ -3430,6 +3785,11 @@ Rules:
                                 text: "\u{1f3c6} best-of panel running \u{2014} parallel candidates + judge\u{2026}".into(),
                             })
                             .await;
+                            if let Some((approval, sandbox, plan_mode)) = previous_permissions {
+                                self.config.approval_policy = approval;
+                                self.config.sandbox = sandbox;
+                                self.config.plan_mode = plan_mode;
+                            }
                             continue;
                         }
                         // Capture the id this turn will use (run_turn reads self.next_turn
@@ -3459,6 +3819,11 @@ Rules:
                             // only — CLI agents run their own memory nudges).
                             self.maybe_self_review();
                         }
+                        if let Some((approval, sandbox, plan_mode)) = previous_permissions {
+                            self.config.approval_policy = approval;
+                            self.config.sandbox = sandbox;
+                            self.config.plan_mode = plan_mode;
+                        }
                     }
                     Op::SetHarness { id } => self.set_harness(id).await,
                     Op::ReloadHarnesses => self.reload_harnesses().await,
@@ -3468,6 +3833,9 @@ Rules:
                             text: "nothing to interrupt".into(),
                         })
                         .await;
+                    }
+                    Op::BrowserControl { action } => {
+                        self.apply_browser_control(action).await;
                     }
                     Op::SubagentControl { worker_id, .. } => {
                         self.emit(Event::Info {
@@ -3527,6 +3895,8 @@ Rules:
                 }
             }
         }
+        self.close_browser("Browser session closed during engine shutdown")
+            .await;
         self.emit(Event::Shutdown).await;
     }
 
@@ -3739,7 +4109,7 @@ Rules:
     /// orchestration pipeline (front planner to backend implementer).
     #[allow(clippy::too_many_arguments)]
     async fn stream_collect(
-        &self,
+        &mut self,
         provider_id: &str,
         system: &str,
         user: &str,
@@ -3766,6 +4136,8 @@ Rules:
             cli_resume: None,
             system_append: None,
             claude_agents: None,
+            approval_policy: self.config.effective_approval_policy(),
+            sandbox: self.config.effective_sandbox(),
         };
         let (tx, mut rx) = mpsc::channel::<StreamItem>(STREAM_QUEUE);
         let provider = oxide_providers::build(provider_id);
@@ -3776,14 +4148,26 @@ Rules:
         let idle = idle_timeout_for(provider_id);
         let mut timed_out = false;
         let mut saw_done = false;
-        while let Some(item) = match tokio::time::timeout(idle, rx.recv()).await {
-            Ok(it) => it,
-            Err(_) => {
-                timed_out = true;
-                task.abort();
-                None
-            }
-        } {
+        let mut idle_deadline = tokio::time::Instant::now() + idle;
+        loop {
+            let idle_sleep = tokio::time::sleep_until(idle_deadline);
+            tokio::pin!(idle_sleep);
+            let item = tokio::select! {
+                action = next_browser_control(&mut self.browser_control_rx) => {
+                    self.apply_browser_control(action).await;
+                    continue;
+                }
+                item = rx.recv() => item,
+                _ = &mut idle_sleep => {
+                    timed_out = true;
+                    task.abort();
+                    break;
+                }
+            };
+            let Some(item) = item else {
+                break;
+            };
+            idle_deadline = tokio::time::Instant::now() + idle;
             match item {
                 StreamItem::FileChanged(_) => {}
                 // Sub-agent background jobs aren't surfaced individually.
@@ -3988,11 +4372,12 @@ Rules:
             "{system}\n\n{}",
             worker_profile_system_block(&profile, tools.len())
         );
-        let cli_baseline = if cli_driver {
-            git_baseline_tree(&self.workspace).await
-        } else {
-            None
-        };
+        let cli_baseline =
+            if cli_driver && !matches!(self.config.effective_sandbox(), SandboxPolicy::ReadOnly) {
+                git_baseline_tree(&self.workspace).await
+            } else {
+                None
+            };
         let mut cli_changed: Vec<String> = Vec::new();
         let mut out = String::new();
         let mut interrupted = false;
@@ -4020,6 +4405,8 @@ Rules:
                 cli_resume: None,
                 system_append: None,
                 claude_agents: None,
+                approval_policy: self.config.effective_approval_policy(),
+                sandbox: self.config.effective_sandbox(),
             };
 
             let (stream_tx, mut stream_rx) = mpsc::channel::<StreamItem>(STREAM_QUEUE);
@@ -4032,6 +4419,9 @@ Rules:
             let mut steered = false;
             loop {
                 tokio::select! {
+                    action = next_browser_control(&mut self.browser_control_rx) => {
+                        self.apply_browser_control(action).await;
+                    }
                     item = stream_rx.recv() => {
                         match item {
                             Some(StreamItem::TextDelta(t)) => {
@@ -4140,7 +4530,7 @@ Rules:
                         match op {
                             Some(Op::Interrupt) => { interrupted = true; break; }
                             Some(Op::Shutdown) => { interrupted = true; break; }
-                            Some(Op::UserTurn { text }) => {
+                            Some(Op::UserTurn { text, .. }) => {
                                 self.compact_state.observe_user(&text);
                                 self.session.push(Message::new(Role::User, text.clone()));
                                 self.emit(Event::Info { text: format!("Steering worker: {text}") }).await;
@@ -4378,7 +4768,7 @@ Rules:
         if q.is_empty() {
             return true;
         }
-        let (worker, done_tx, spawn_tx) = match (
+        let (mut worker, done_tx, spawn_tx) = match (
             self.subagent_worker_engine(),
             self.bg_done_tx.clone(),
             self.bg_spawn_tx.clone(),
@@ -4386,6 +4776,7 @@ Rules:
             (Ok(w), Some(d), Some(sp)) => (w, d, sp),
             _ => return false,
         };
+        worker.force_read_only();
         self.bg_task_seq += 1;
         let handle = format!("btw-{}", self.bg_task_seq);
         let profile = subagent_profile_for(
@@ -4445,13 +4836,17 @@ Answer directly and concisely (a few sentences; read files only when truly neede
         let mut workers = Vec::new();
         for lens in LENSES.iter().take(n) {
             match self.subagent_worker_engine() {
-                Ok(w) => workers.push((w, lens.to_string())),
+                Ok(mut worker) => {
+                    worker.force_read_only();
+                    workers.push((worker, lens.to_string()));
+                }
                 Err(_) => return false,
             }
         }
-        let Ok(judge) = self.subagent_worker_engine() else {
+        let Ok(mut judge) = self.subagent_worker_engine() else {
             return false;
         };
+        judge.force_read_only();
         let profile = subagent_profile_for(
             &format!("explorer: {task}"),
             &self.config.provider,
@@ -4479,7 +4874,8 @@ Answer directly and concisely (a few sentences; read files only when truly neede
                             "You are candidate {i} in a best-of-N panel. Approach the task with the lens: {lens}. \
 Produce a compact, self-contained answer (read files only when needed; do NOT edit anything)."
                         );
-                        let (_tx, mut rx) = mpsc::channel::<Op>(8);
+                        let (tx, mut rx) = mpsc::channel::<Op>(8);
+                        drop(tx);
                         let (out, _) = w
                             .stream_agentic_collect(
                                 &system,
@@ -4504,7 +4900,8 @@ Produce a compact, self-contained answer (read files only when needed; do NOT ed
                 "Task given to all candidates:\n{task}\n{candidates}\n\nJudge: pick the BEST candidate (say which and why in 1-2 sentences), then present the winning answer, improved with the best ideas from the others."
             );
             let mut judge = judge;
-            let (_tx, mut rx) = mpsc::channel::<Op>(8);
+            let (tx, mut rx) = mpsc::channel::<Op>(8);
+            drop(tx);
             let (verdict, _) = judge
                 .stream_agentic_collect(
                     "You are the judge of a best-of-N panel. Be decisive and concise.",
@@ -4599,7 +4996,10 @@ Produce a compact, self-contained answer (read files only when needed; do NOT ed
             bg_task_seq: 0,
             mcp_instructions: self.mcp_instructions.clone(),
             required_mcp_unavailable: self.required_mcp_unavailable,
+            mcp_startup_deferred: self.mcp_startup_deferred,
             browser: None,
+            browser_control: BrowserControlState::AgentControlled,
+            browser_control_rx: None,
             ctx_window: self.ctx_window,
             read_files: self.read_files.clone(),
             turn_edited: false,
@@ -4698,6 +5098,9 @@ Produce a compact, self-contained answer (read files only when needed; do NOT ed
         let mut parent_ops_open = true;
         while !handles.is_empty() {
             tokio::select! {
+                action = next_browser_control(&mut self.browser_control_rx) => {
+                    self.apply_browser_control(action).await;
+                }
                 joined = handles.next() => {
                     match joined {
                         Some(Ok(result)) => results.push(result),
@@ -4727,7 +5130,10 @@ Produce a compact, self-contained answer (read files only when needed; do NOT ed
                                     SubagentControlAction::Steer { text } => (
                                         "steer_sent",
                                         compact_chars(&text, 300),
-                                        Op::UserTurn { text },
+                                        Op::UserTurn {
+                                            text,
+                                            permissions: None,
+                                        },
                                     ),
                                 };
                                 let _ = worker_tx.send(routed).await;
@@ -5357,11 +5763,12 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
         let mut cli_changed: Vec<String> = Vec::new();
         // Git baseline tree of the workspace BEFORE the CLI runs, so its edits
         // can be reverted (the engine never sees the CLI's write moments).
-        let cli_baseline: Option<String> = if cli_driver {
-            git_baseline_tree(&self.workspace).await
-        } else {
-            None
-        };
+        let cli_baseline: Option<String> =
+            if cli_driver && !matches!(self.config.effective_sandbox(), SandboxPolicy::ReadOnly) {
+                git_baseline_tree(&self.workspace).await
+            } else {
+                None
+            };
         let mut verifies = 0u8;
         let mut budget_stop_reminded = false;
         self.turn_edited = false;
@@ -5402,6 +5809,8 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                     .and_then(|s| db::cli_session(&s.id)),
                 system_append: cli_system_append.clone(),
                 claude_agents: cli_claude_agents.clone(),
+                approval_policy: self.config.effective_approval_policy(),
+                sandbox: self.config.effective_sandbox(),
             };
 
             let (stream_tx, mut stream_rx) = mpsc::channel::<StreamItem>(STREAM_QUEUE);
@@ -5418,6 +5827,9 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
             let mut saw_done = false;
             loop {
                 tokio::select! {
+                    action = next_browser_control(&mut self.browser_control_rx) => {
+                        self.apply_browser_control(action).await;
+                    }
                     item = stream_rx.recv() => {
                         // No engine-side idle cap: each provider manages its own
                         // timeout. HTTP/SSE clients have a read_timeout (a real
@@ -5566,7 +5978,7 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                             }
                             // Steering: a message sent mid-turn is injected into the
                             // conversation; the next agentic round picks it up.
-                            Some(Op::UserTurn { text }) => {
+                            Some(Op::UserTurn { text, .. }) => {
                                 if self.maybe_side_question(&text) {
                                     self.emit(Event::Info { text: "\u{1f4ac} btw \u{b7} answering on the side\u{2026}".to_string() }).await;
                                     continue;
@@ -5697,7 +6109,7 @@ For non-trivial work (multiple files, multiple tool steps, or anything that may 
                         op = op_rx.recv() => match op {
                             Some(Op::Interrupt) => { interrupted = true; self.user_interrupted = true; }
                             Some(Op::Shutdown) | None => { interrupted = true; }
-                            Some(Op::UserTurn { text }) => {
+                            Some(Op::UserTurn { text, .. }) => {
                                 if let Some(store) = &self.session_store {
                                     let _ = store.append("user", &text);
                                 }
@@ -5975,6 +6387,8 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
                         cli_resume: None,
                         system_append: None,
                         claude_agents: None,
+                        approval_policy: ApprovalPolicy::Never,
+                        sandbox: SandboxPolicy::ReadOnly,
                     };
                     let (stx, mut srx) = mpsc::channel::<StreamItem>(64);
                     let task = tokio::spawn(async move { provider.stream(req, stx).await });
@@ -6043,6 +6457,8 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
                             cli_resume: None,
                             system_append: None,
                             claude_agents: None,
+                            approval_policy: ApprovalPolicy::Never,
+                            sandbox: SandboxPolicy::ReadOnly,
                         };
                         let (stx, mut srx) = mpsc::channel::<StreamItem>(64);
                         let task = tokio::spawn(async move { provider.stream(req, stx).await });
@@ -6348,7 +6764,14 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
             })
             .await;
             let answer = loop {
-                match op_rx.recv().await {
+                let op = tokio::select! {
+                    action = next_browser_control(&mut self.browser_control_rx) => {
+                        self.apply_browser_control(action).await;
+                        continue;
+                    }
+                    op = op_rx.recv() => op,
+                };
+                match op {
                     Some(Op::QuestionAnswer {
                         request_id: rid,
                         answer,
@@ -6356,7 +6779,7 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
                     // A typed message while a question is pending IS the answer —
                     // frontends without a dedicated answer UI (TUI, panes) would
                     // otherwise deadlock here.
-                    Some(Op::UserTurn { text }) => break text,
+                    Some(Op::UserTurn { text, .. }) => break text,
                     Some(Op::Interrupt) | Some(Op::Shutdown) | None => {
                         self.session.push(Message::tool_result(
                             "interrupted before answering",
@@ -6409,8 +6832,8 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
 
         let routing_tools = tools_for_routing(self.all_tools(), !self.deferred_tools.is_empty());
         let mut router = ToolRouter::new(
-            self.config.approval_policy,
-            self.config.sandbox,
+            self.config.effective_approval_policy(),
+            self.config.effective_sandbox(),
             self.workspace.clone(),
             &routing_tools,
         );
@@ -6449,7 +6872,14 @@ qualifies, just finish; do not save trivia.\n</system-reminder>"));
 
                 // Block the turn until the frontend answers (or interrupts).
                 loop {
-                    match op_rx.recv().await {
+                    let op = tokio::select! {
+                        action = next_browser_control(&mut self.browser_control_rx) => {
+                            self.apply_browser_control(action).await;
+                            continue;
+                        }
+                        op = op_rx.recv() => op,
+                    };
+                    match op {
                         Some(Op::ApprovalResponse {
                             request_id: rid,
                             decision,
@@ -6581,6 +7011,13 @@ Do NOT read it again. Proceed now: make the edits with the edit/write_file tools
             }
         }
 
+        // Browser ownership changes are independent from the tool currently in
+        // flight. Drain them before dispatch so a queued takeover gates browser
+        // tools immediately; long non-browser tools are reconciled again below.
+        for action in self.take_pending_browser_controls() {
+            self.apply_browser_control(action).await;
+        }
+
         // Structured Git broker, then browser automation, memory, MCP, and native sandbox.
         let (output, ok) = if let Some(result) =
             git_tools::execute(&self.workspace, &name, &arguments).await
@@ -6630,7 +7067,7 @@ Do NOT read it again. Proceed now: make the edits with the edit/write_file tools
         } else if name == "design_read_system" {
             let path = arguments["path"].as_str().unwrap_or("DESIGN.md");
             match sandbox::check_read(
-                self.config.sandbox,
+                self.config.effective_sandbox(),
                 &self.workspace,
                 std::path::Path::new(path),
             ) {
@@ -6783,7 +7220,15 @@ Do NOT read it again. Proceed now: make the edits with the edit/write_file tools
             let q = arguments["query"].as_str().unwrap_or("").to_string();
             // Persistent incremental index (Augment-style): instant after the first
             // build, refreshes only changed files.
-            let job = tokio::task::spawn_blocking(move || (index::search(&ws, &q), true));
+            let read_only = matches!(self.config.effective_sandbox(), SandboxPolicy::ReadOnly);
+            let job = tokio::task::spawn_blocking(move || {
+                let output = if read_only {
+                    index::search_read_only(&ws, &q)
+                } else {
+                    index::search(&ws, &q)
+                };
+                (output, true)
+            });
             match tokio::time::timeout(std::time::Duration::from_secs(20), job).await {
                 Ok(Ok(r)) => r,
                 Ok(Err(_)) => ("codebase_search: internal error".into(), false),
@@ -6867,7 +7312,7 @@ Do NOT read it again. Proceed now: make the edits with the edit/write_file tools
             if code.trim().is_empty() {
                 ("execute_code: 'code' is required".to_string(), false)
             } else {
-                ptc::run(&self.workspace, self.config.sandbox, &code).await
+                ptc::run(&self.workspace, self.config.effective_sandbox(), &code).await
             }
         } else if name == "session_search" {
             let q = arguments["query"].as_str().unwrap_or("").trim().to_string();
@@ -6913,6 +7358,9 @@ Do NOT read it again. Proceed now: make the edits with the edit/write_file tools
         } else {
             router.execute(&name, &arguments).await
         };
+        for action in self.take_pending_browser_controls() {
+            self.apply_browser_control(action).await;
+        }
         // hermes verify-on-stop evidence: a passing test/lint/build via the
         // engine's own shell tool proves the edits were verified this turn.
         let verification_call = name == "shell"
@@ -7283,7 +7731,47 @@ fn normalize_todo_status(status: &str) -> String {
 #[cfg(test)]
 mod map_test {
     use oxide_config::{McpEnvVar, McpServerConfig};
-    use oxide_protocol::ToolSpec;
+    use oxide_protocol::{BrowserControlAction, Op, ToolSpec};
+
+    #[tokio::test]
+    async fn browser_control_bypasses_a_full_operation_queue() {
+        let (op_tx, mut op_rx) = tokio::sync::mpsc::channel(1);
+        op_tx.try_send(Op::Interrupt).unwrap();
+        let (browser_control_tx, mut browser_control_rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = super::EngineHandle {
+            op_tx,
+            browser_control_tx,
+            bus: super::EventBus::new(),
+        };
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            handle.submit(Op::BrowserControl {
+                action: BrowserControlAction::TakeOver,
+            }),
+        )
+        .await
+        .expect("urgent browser control must not wait for the normal queue")
+        .unwrap();
+
+        assert_eq!(
+            browser_control_rx.try_recv().unwrap(),
+            BrowserControlAction::TakeOver
+        );
+        assert!(matches!(op_rx.try_recv(), Ok(Op::Interrupt)));
+    }
+
+    #[test]
+    fn browser_control_state_has_stable_event_values() {
+        assert_eq!(
+            super::BrowserControlState::AgentControlled.as_event_state(),
+            "agent_controlled"
+        );
+        assert_eq!(
+            super::BrowserControlState::HumanControlled.as_event_state(),
+            "human_controlled"
+        );
+    }
 
     #[tokio::test]
     async fn event_bus_snapshot_then_live_tail_by_seq() {

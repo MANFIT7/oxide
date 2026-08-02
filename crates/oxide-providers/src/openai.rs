@@ -268,6 +268,8 @@ mod tests {
             cli_resume: None,
             system_append: None,
             claude_agents: None,
+            approval_policy: oxide_protocol::ApprovalPolicy::Never,
+            sandbox: oxide_protocol::SandboxPolicy::ReadOnly,
         }
     }
 

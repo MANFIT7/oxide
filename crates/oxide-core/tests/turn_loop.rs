@@ -2,7 +2,7 @@
 //! loop is frontend-agnostic and the echo provider streams a full turn.
 
 use oxide_config::Config;
-use oxide_protocol::{Event, Op};
+use oxide_protocol::{BrowserControlAction, Event, Op, RuntimePermissions};
 
 #[tokio::test]
 async fn echo_turn_streams_and_finishes() {
@@ -18,6 +18,7 @@ async fn echo_turn_streams_and_finishes() {
     handle
         .submit(Op::UserTurn {
             text: "halo oxide".into(),
+            permissions: None,
         })
         .await
         .unwrap();
@@ -49,6 +50,54 @@ async fn echo_turn_streams_and_finishes() {
 }
 
 #[tokio::test]
+async fn browser_takeover_is_applied_while_provider_is_streaming() {
+    let (handle, mut events) = oxide_core::spawn(Config::default()).expect("spawn engine");
+    assert!(matches!(events.recv().await, Some(Event::Ready { .. })));
+
+    handle
+        .submit(Op::UserTurn {
+            text: (0..160)
+                .map(|_| "keep-streaming")
+                .collect::<Vec<_>>()
+                .join(" "),
+            permissions: None,
+        })
+        .await
+        .unwrap();
+
+    while let Some(event) = events.recv().await {
+        if matches!(event, Event::AgentMessageDelta { .. }) {
+            break;
+        }
+    }
+
+    handle
+        .submit(Op::BrowserControl {
+            action: BrowserControlAction::TakeOver,
+        })
+        .await
+        .unwrap();
+
+    let state = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            match events.recv().await {
+                Some(Event::BrowserSessionState { state, .. }) => break state,
+                Some(Event::TurnFinished { .. }) => {
+                    panic!("turn finished before takeover was applied")
+                }
+                Some(_) => {}
+                None => panic!("event stream closed before takeover was applied"),
+            }
+        }
+    })
+    .await
+    .expect("takeover should be applied without waiting for provider completion");
+    assert_eq!(state, "human_controlled");
+
+    handle.submit(Op::Shutdown).await.unwrap();
+}
+
+#[tokio::test]
 async fn mock_provider_tool_call_writes_file_in_sandbox() {
     let tmp = std::env::temp_dir().join(format!("oxide-engine-{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
@@ -66,6 +115,7 @@ async fn mock_provider_tool_call_writes_file_in_sandbox() {
     handle
         .submit(Op::UserTurn {
             text: "make a file".into(),
+            permissions: None,
         })
         .await
         .unwrap();
@@ -96,6 +146,83 @@ async fn mock_provider_tool_call_writes_file_in_sandbox() {
 }
 
 #[tokio::test]
+async fn read_only_turn_cannot_write_or_create_checkpoint() {
+    let tmp = std::env::temp_dir().join(format!("oxide-engine-read-only-{}", std::process::id()));
+    std::fs::remove_dir_all(&tmp).ok();
+    std::fs::create_dir_all(&tmp).unwrap();
+    std::fs::create_dir_all(tmp.join(".oxide")).unwrap();
+    std::fs::write(
+        tmp.join(".oxide/hooks.toml"),
+        "stop = [\"touch plan_hook_marker\"]\n",
+    )
+    .unwrap();
+
+    let config = Config {
+        provider: "mock".into(),
+        approval_policy: oxide_protocol::ApprovalPolicy::Never,
+        sandbox: oxide_protocol::SandboxPolicy::DangerFullAccess,
+        workspace: Some(tmp.clone()),
+        persist: false,
+        ..Default::default()
+    };
+    let (handle, mut events) = oxide_core::spawn(config).expect("spawn");
+    let _ = events.recv().await;
+
+    handle
+        .submit(Op::UserTurn {
+            text: "make a file".into(),
+            permissions: Some(RuntimePermissions {
+                approval_policy: oxide_protocol::ApprovalPolicy::Never,
+                sandbox: oxide_protocol::SandboxPolicy::ReadOnly,
+            }),
+        })
+        .await
+        .unwrap();
+
+    let mut patched = false;
+    let mut checkpointed = false;
+    while let Some(event) = events.recv().await {
+        match event {
+            Event::PatchApplied { .. } => patched = true,
+            Event::CheckpointCreated { .. } => checkpointed = true,
+            Event::TurnFinished { .. } => break,
+            _ => {}
+        }
+    }
+
+    assert!(!patched, "read-only turn must not apply a patch");
+    assert!(
+        !checkpointed,
+        "read-only turn must not create a write checkpoint"
+    );
+    assert!(!tmp.join("oxide_mock.txt").exists());
+    assert!(
+        !tmp.join("plan_hook_marker").exists(),
+        "read-only turn must not execute lifecycle shell hooks"
+    );
+
+    handle
+        .submit(Op::UserTurn {
+            text: "make a file after leaving read-only".into(),
+            permissions: None,
+        })
+        .await
+        .unwrap();
+    while let Some(event) = events.recv().await {
+        if matches!(event, Event::TurnFinished { .. }) {
+            break;
+        }
+    }
+    assert!(
+        tmp.join("plan_hook_marker").exists(),
+        "the next turn must restore baseline access and resume lifecycle hooks"
+    );
+
+    handle.submit(Op::Shutdown).await.unwrap();
+    std::fs::remove_dir_all(&tmp).ok();
+}
+
+#[tokio::test]
 async fn mock_provider_renders_ui_spec_artifact() {
     let tmp = std::env::temp_dir().join(format!("oxide-engine-ui-spec-{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
@@ -114,6 +241,7 @@ async fn mock_provider_renders_ui_spec_artifact() {
     handle
         .submit(Op::UserTurn {
             text: "render ui spec artifact".into(),
+            permissions: None,
         })
         .await
         .unwrap();
@@ -166,6 +294,7 @@ async fn orchestrated_subagents_run_backend_tool_calls() {
     handle
         .submit(Op::UserTurn {
             text: "make a file through subagents".into(),
+            permissions: None,
         })
         .await
         .unwrap();
@@ -233,6 +362,7 @@ async fn checkpoint_then_rewind_undoes_write() {
     handle
         .submit(Op::UserTurn {
             text: "write".into(),
+            permissions: None,
         })
         .await
         .unwrap();

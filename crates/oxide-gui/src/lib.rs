@@ -17,8 +17,9 @@ use futures::StreamExt;
 use oxide_config::Config;
 use oxide_core::{automation, EngineHandle};
 use oxide_protocol::{
-    ApprovalDecision, ApprovalPolicy, DesignEdit, DesignPatchProposal, DesignSelection, Event, Op,
-    SandboxPolicy, SubagentControlAction, UiNode, UiNodeKind, UiSpec, UiTone,
+    ApprovalDecision, ApprovalPolicy, BrowserControlAction, DesignEdit, DesignPatchProposal,
+    DesignSelection, Event, Op, RuntimePermissions, SandboxPolicy, SubagentControlAction, UiNode,
+    UiNodeKind, UiSpec, UiTone,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -277,6 +278,7 @@ fn copy_terminal_attach_to_clipboard(text: &str) -> Result<(), String> {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ModelPreset {
     provider: &'static str,
     model: &'static str,
@@ -287,120 +289,193 @@ struct ModelPreset {
     fast: bool,
 }
 
-/// Current production-ready choices per implemented provider.
-const MODEL_PRESETS: &[ModelPreset] = &[
-    ModelPreset {
-        provider: "chatgpt",
-        model: "gpt-5.5",
-        provider_label: "ChatGPT subscription",
-        label: "GPT-5.5",
-        summary: "Your ChatGPT Plus/Pro — no API key, no CLI",
-        badge: "Subs",
-        fast: false,
-    },
-    ModelPreset {
-        provider: "chatgpt",
-        model: "gpt-5.6-sol",
-        provider_label: "ChatGPT subscription",
-        label: "GPT-5.6-Sol",
-        summary: "Latest frontier agentic coding model",
-        badge: "Subs",
-        fast: false,
-    },
-    ModelPreset {
-        provider: "chatgpt",
-        model: "gpt-5.6-terra",
-        provider_label: "ChatGPT subscription",
-        label: "GPT-5.6-Terra",
-        summary: "Balanced agentic coding model for everyday work",
-        badge: "Subs",
-        fast: false,
-    },
-    ModelPreset {
-        provider: "chatgpt",
-        model: "gpt-5.6-luna",
-        provider_label: "ChatGPT subscription",
-        label: "GPT-5.6-Luna",
-        summary: "Fast and affordable agentic coding model",
-        badge: "Subs",
-        fast: false,
-    },
-    ModelPreset {
-        provider: "codex",
-        model: "gpt-5.6-sol",
-        provider_label: "Codex",
-        label: "GPT-5.6-Sol",
-        summary: "Latest frontier agentic coding model",
-        badge: "New",
-        fast: false,
-    },
-    ModelPreset {
-        provider: "codex",
-        model: "gpt-5.6-terra",
-        provider_label: "Codex",
-        label: "GPT-5.6-Terra",
-        summary: "Balanced agentic coding model for everyday work",
-        badge: "Balanced",
-        fast: false,
-    },
-    ModelPreset {
-        provider: "codex",
-        model: "gpt-5.6-luna",
-        provider_label: "Codex",
-        label: "GPT-5.6-Luna",
-        summary: "Fast and affordable agentic coding model",
-        badge: "Efficient",
-        fast: false,
-    },
-    ModelPreset {
-        provider: "codex",
-        model: "gpt-5.5",
-        provider_label: "Codex",
-        label: "GPT-5.5",
-        summary: "Best for complex coding agents",
-        badge: "Smart",
-        fast: false,
-    },
-    ModelPreset {
-        provider: "codex",
-        model: "gpt-5.4",
-        provider_label: "Codex",
-        label: "GPT-5.4",
-        summary: "Faster frontier coding and subagents",
-        badge: "Fast",
-        fast: true,
-    },
-    ModelPreset {
-        provider: "claude",
-        model: "claude-fable-5",
-        provider_label: "Claude Code",
-        label: "Fable 5",
-        summary: "Anthropic's newest frontier coding model",
-        badge: "New",
-        fast: false,
-    },
-    ModelPreset {
-        provider: "claude",
-        model: "claude-opus-4-8",
-        provider_label: "Claude Code",
-        label: "Opus 4.8",
-        summary: "Deep coding and agentic reasoning",
-        badge: "Smart",
-        fast: false,
-    },
-    ModelPreset {
-        provider: "claude",
-        model: "claude-sonnet-4-6",
-        provider_label: "Claude Code",
-        label: "Sonnet 4.6",
-        summary: "Balanced speed and intelligence",
-        badge: "Fast",
-        fast: true,
-    },
-    // API-key providers (OpenAI/Anthropic) intentionally omitted — Oxide is a
-    // GUI wrapper around the user's logged-in CLIs + ChatGPT subscription, with
-    // no raw API-key entry (Synara-style).
-];
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GuiProvider {
+    id: &'static str,
+    label: &'static str,
+    diagnostic: oxide_providers::ProviderDiagnostic,
+}
+
+fn is_production_gui_provider(id: &str) -> bool {
+    matches!(id, "chatgpt" | "codex" | "claude")
+}
+
+fn is_production_gui_model(provider: &str, model: &str) -> bool {
+    match provider {
+        "chatgpt" => matches!(
+            model,
+            "gpt-5.5" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna"
+        ),
+        "codex" => matches!(
+            model,
+            "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna" | "gpt-5.5" | "gpt-5.4"
+        ),
+        "claude" => matches!(
+            model,
+            "claude-fable-5" | "claude-opus-4-8" | "claude-sonnet-4-6"
+        ),
+        _ => false,
+    }
+}
+
+fn is_settings_fallback_provider(id: &str) -> bool {
+    matches!(id, "echo" | "mock")
+}
+
+fn gui_provider_rank(id: &str) -> usize {
+    match id {
+        "chatgpt" => 0,
+        "codex" => 1,
+        "claude" => 2,
+        "echo" => 3,
+        "mock" => 4,
+        _ => usize::MAX,
+    }
+}
+
+fn provider_label(id: &str, catalog_label: &'static str) -> &'static str {
+    match id {
+        "chatgpt" => "ChatGPT subscription",
+        "codex" => "Codex",
+        "claude" => "Claude Code",
+        _ => catalog_label,
+    }
+}
+
+fn gui_providers(include_fallbacks: bool) -> Vec<GuiProvider> {
+    let mut providers: Vec<GuiProvider> = oxide_providers::list_providers()
+        .iter()
+        .filter(|provider| {
+            is_production_gui_provider(provider.id)
+                || (include_fallbacks && is_settings_fallback_provider(provider.id))
+        })
+        .filter_map(|provider| {
+            oxide_providers::diagnose_provider(provider.id).map(|diagnostic| GuiProvider {
+                id: provider.id,
+                label: provider_label(provider.id, provider.display_name),
+                diagnostic,
+            })
+        })
+        .collect();
+    providers.sort_by_key(|provider| gui_provider_rank(provider.id));
+    providers
+}
+
+fn model_presentation(
+    provider: &str,
+    model: &str,
+    catalog_label: &'static str,
+) -> (&'static str, &'static str, &'static str) {
+    match (provider, model) {
+        ("chatgpt", "gpt-5.5") => (
+            "GPT-5.5",
+            "Your ChatGPT Plus/Pro — no API key, no CLI",
+            "Subs",
+        ),
+        ("chatgpt", "gpt-5.6-sol") => (
+            "GPT-5.6-Sol",
+            "Latest frontier agentic coding model",
+            "Subs",
+        ),
+        ("chatgpt", "gpt-5.6-terra") => (
+            "GPT-5.6-Terra",
+            "Balanced agentic coding model for everyday work",
+            "Subs",
+        ),
+        ("chatgpt", "gpt-5.6-luna") => (
+            "GPT-5.6-Luna",
+            "Fast and affordable agentic coding model",
+            "Subs",
+        ),
+        ("codex", "gpt-5.6-sol") => ("GPT-5.6-Sol", "Latest frontier agentic coding model", "New"),
+        ("codex", "gpt-5.6-terra") => (
+            "GPT-5.6-Terra",
+            "Balanced agentic coding model for everyday work",
+            "Balanced",
+        ),
+        ("codex", "gpt-5.6-luna") => (
+            "GPT-5.6-Luna",
+            "Fast and affordable agentic coding model",
+            "Efficient",
+        ),
+        ("codex", "gpt-5.5") => ("GPT-5.5", "Best for complex coding agents", "Smart"),
+        ("codex", "gpt-5.4") => ("GPT-5.4", "Faster frontier coding and subagents", "Fast"),
+        ("claude", "claude-fable-5") => {
+            ("Fable 5", "Anthropic's newest frontier coding model", "New")
+        }
+        ("claude", "claude-opus-4-8") => ("Opus 4.8", "Deep coding and agentic reasoning", "Smart"),
+        ("claude", "claude-sonnet-4-6") => {
+            ("Sonnet 4.6", "Balanced speed and intelligence", "Fast")
+        }
+        ("codex", "gpt-5.3-codex" | "gpt-5.3-codex-spark")
+        | ("claude", "sonnet" | "opus" | "haiku") => (
+            catalog_label,
+            "Legacy model retained for existing configurations",
+            "Legacy",
+        ),
+        _ => (
+            catalog_label,
+            "Available from the provider catalog",
+            "Catalog",
+        ),
+    }
+}
+
+fn catalog_model_preset(provider: &str, model: &str) -> Option<ModelPreset> {
+    let provider_info = oxide_providers::provider_info(provider)?;
+    let model_info = provider_info
+        .models
+        .iter()
+        .find(|entry| entry.id == model)?;
+    let (label, summary, badge) =
+        model_presentation(provider_info.id, model_info.id, model_info.display_name);
+
+    Some(ModelPreset {
+        provider: provider_info.id,
+        model: model_info.id,
+        provider_label: provider_label(provider_info.id, provider_info.display_name),
+        label,
+        summary,
+        badge,
+        fast: model_info.is_fast,
+    })
+}
+
+fn model_presets(include_fallbacks: bool) -> Vec<ModelPreset> {
+    let mut presets: Vec<ModelPreset> = oxide_providers::list_providers()
+        .iter()
+        .filter(|provider| {
+            is_production_gui_provider(provider.id)
+                || (include_fallbacks && is_settings_fallback_provider(provider.id))
+        })
+        .flat_map(|provider| {
+            provider
+                .models
+                .iter()
+                .filter(move |model| {
+                    is_production_gui_model(provider.id, model.id)
+                        || (include_fallbacks && is_settings_fallback_provider(provider.id))
+                })
+                .filter_map(move |model| catalog_model_preset(provider.id, model.id))
+        })
+        .collect();
+    presets.sort_by_key(|preset| gui_provider_rank(preset.provider));
+    presets
+}
+
+fn provider_readiness_label(status: oxide_providers::DiagnosticStatus) -> &'static str {
+    match status {
+        oxide_providers::DiagnosticStatus::Ready => "Ready",
+        oxide_providers::DiagnosticStatus::Warning => "Check",
+        oxide_providers::DiagnosticStatus::Missing => "Missing",
+    }
+}
+
+fn provider_is_selectable(id: &str) -> bool {
+    oxide_providers::diagnose_provider(id)
+        .map(|diagnostic| diagnostic.status != oxide_providers::DiagnosticStatus::Missing)
+        .unwrap_or(false)
+}
 
 struct EffortPreset {
     value: &'static str,
@@ -471,16 +546,41 @@ fn clamp_effort(provider: &str, model: &str, effort: &str) -> String {
         .unwrap_or_else(|| "medium".into())
 }
 
-fn selected_model(provider: &str, model: &str) -> Option<&'static ModelPreset> {
-    MODEL_PRESETS
-        .iter()
-        .find(|p| p.provider == provider && p.model == model)
+fn selected_model(provider: &str, model: &str) -> Option<ModelPreset> {
+    catalog_model_preset(provider, model)
 }
 
-fn fast_model_for(provider: &str) -> Option<&'static ModelPreset> {
-    MODEL_PRESETS
-        .iter()
-        .find(|p| p.provider == provider && p.fast)
+fn default_model_for(provider: &str) -> Option<ModelPreset> {
+    let default = oxide_providers::default_model_for_provider(provider)?;
+    selected_model(provider, default)
+}
+
+fn fast_model_for(provider: &str) -> Option<ModelPreset> {
+    let fast = oxide_providers::fast_model_for_provider(provider)?;
+    model_presets(true)
+        .into_iter()
+        .find(|p| p.provider == provider && p.model == fast)
+}
+
+fn production_model_presets() -> Vec<ModelPreset> {
+    model_presets(false)
+}
+
+fn provider_models(provider: &str, include_fallbacks: bool) -> Vec<ModelPreset> {
+    model_presets(include_fallbacks)
+        .into_iter()
+        .filter(|preset| preset.provider == provider)
+        .collect()
+}
+
+fn settings_provider_models(provider: &str, current_model: &str) -> Vec<ModelPreset> {
+    let mut presets = provider_models(provider, true);
+    if let Some(current) = selected_model(provider, current_model) {
+        if !presets.iter().any(|preset| preset.model == current.model) {
+            presets.push(current);
+        }
+    }
+    presets
 }
 
 fn model_matches(preset: &ModelPreset, query: &str) -> bool {
@@ -1189,27 +1289,38 @@ fn activity_group_display(rows: &[(String, bool, bool)]) -> (&'static str, Strin
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ActivityRenderRow {
+    /// Stable transcript identity. Coalesced rows keep the first matching
+    /// message id so appending another update never remounts the existing DOM.
+    id: u64,
+    text: String,
+    running: bool,
+    ok: bool,
+    count: usize,
+}
+
 /// Coalesce consecutive same-file edit rows into one. Three back-to-back
 /// `Edit /path/main.rs` activity rows collapse to a single entry carrying a
 /// repeat count, so the stream shows one animated `+/−` row instead of N
 /// identical tool rows. Non-edit rows (and edits to a different file) pass
-/// through with count 1. Returns `(text, running, ok, count)`.
-fn coalesce_activity_rows(rows: Vec<(String, bool, bool)>) -> Vec<(String, bool, bool, usize)> {
-    let mut out: Vec<(String, bool, bool, usize)> = Vec::with_capacity(rows.len());
-    for (text, running, ok) in rows {
-        let view = activity_view(&text);
+/// through with count 1. The first row's id is deliberately preserved.
+fn coalesce_activity_rows(rows: Vec<ActivityRenderRow>) -> Vec<ActivityRenderRow> {
+    let mut out: Vec<ActivityRenderRow> = Vec::with_capacity(rows.len());
+    for row in rows {
+        let view = activity_view(&row.text);
         if matches!(view.kind, ActivityKind::FileChange) && !view.detail.is_empty() {
             if let Some(last) = out.last_mut() {
-                let lview = activity_view(&last.0);
+                let lview = activity_view(&last.text);
                 if matches!(lview.kind, ActivityKind::FileChange) && lview.detail == view.detail {
-                    last.1 |= running; // any still running keeps the row live
-                    last.2 &= ok; // all must succeed for the row to read done
-                    last.3 += 1;
+                    last.running |= row.running; // any still running keeps the row live
+                    last.ok &= row.ok; // all must succeed for the row to read done
+                    last.count += row.count;
                     continue;
                 }
             }
         }
-        out.push((text, running, ok, 1));
+        out.push(row);
     }
     out
 }
@@ -1379,6 +1490,55 @@ fn design_selection_from_value(value: &serde_json::Value) -> DesignSelection {
         html: design_string(value, "html"),
         styles,
     }
+}
+
+fn append_preview_element_context(
+    context: &mut String,
+    value: &serde_json::Value,
+    heading: Option<&str>,
+) {
+    if let Some(heading) = heading {
+        context.push_str(heading);
+        context.push('\n');
+    }
+    for (key, label) in [
+        ("url", "url"),
+        ("selector", "selector"),
+        ("component", "component"),
+        ("source", "source"),
+        ("text", "text"),
+        ("html", "html"),
+    ] {
+        let value = value.get(key).and_then(|item| item.as_str()).unwrap_or("");
+        if value.is_empty() {
+            continue;
+        }
+        if key == "component" {
+            context.push_str(&format!("- {label}: <{value}>\n"));
+        } else {
+            context.push_str(&format!("- {label}: {value}\n"));
+        }
+    }
+}
+
+fn preview_selection_context(value: &serde_json::Value) -> String {
+    let mut context = String::from("Selected UI element to change:\n");
+    append_preview_element_context(&mut context, value, None);
+    context
+}
+
+fn preview_annotations_context(values: &[serde_json::Value]) -> String {
+    let mut ordered = values.to_vec();
+    ordered.sort_by_key(|value| value.get("annotation").and_then(|item| item.as_u64()));
+    let mut context = format!("Annotated UI elements ({}):\n", ordered.len());
+    for value in &ordered {
+        let number = value
+            .get("annotation")
+            .and_then(|item| item.as_u64())
+            .unwrap_or(0);
+        append_preview_element_context(&mut context, value, Some(&format!("Annotation #{number}")));
+    }
+    context
 }
 
 fn upsert_design_edit(
@@ -1775,6 +1935,38 @@ fn SlotText(text: String, #[props(default)] reverse: bool) -> Element {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct CapturedPermissions {
+    permissions: RuntimePermissions,
+    epoch: u64,
+}
+
+impl CapturedPermissions {
+    fn current() -> Self {
+        let (permissions, epoch) = runtime_permission_snapshot();
+        Self { permissions, epoch }
+    }
+
+    fn fail_closed(self) -> RuntimePermissions {
+        fail_closed_stale_permissions(self.permissions, self.epoch)
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct QueuedPrompt {
+    text: String,
+    permissions: CapturedPermissions,
+}
+
+impl QueuedPrompt {
+    fn capture(text: String) -> Self {
+        Self {
+            text,
+            permissions: CapturedPermissions::current(),
+        }
+    }
+}
+
 /// Commands sent into the engine coroutine.
 enum EngineCmd {
     /// `engine` is the full prompt (with mention/skill/MCP context); `display`
@@ -1782,6 +1974,7 @@ enum EngineCmd {
     Submit {
         engine: String,
         display: String,
+        permissions: CapturedPermissions,
     },
     Reconfigure(Config),
     ReloadHarnesses,
@@ -1810,7 +2003,26 @@ enum EngineCmd {
         worker_id: String,
         action: SubagentControlAction,
     },
+    BrowserControl(BrowserControlAction),
     Interrupt,
+}
+
+impl EngineCmd {
+    fn submit(engine: String, display: String) -> Self {
+        Self::Submit {
+            engine,
+            display,
+            permissions: CapturedPermissions::current(),
+        }
+    }
+
+    fn submit_captured(engine: String, display: String, permissions: CapturedPermissions) -> Self {
+        Self::Submit {
+            engine,
+            display,
+            permissions,
+        }
+    }
 }
 
 /// One agent session tab (its own provider + transcript) within a workspace.
@@ -2742,10 +2954,11 @@ fn mention_label(token: &str) -> String {
 async fn submit_ce(
     streaming: Signal<bool>,
     engine: Coroutine<EngineCmd>,
-    mut plan_mode: Signal<bool>,
+    cfg: Signal<Config>,
+    plan_mode: Signal<bool>,
     mut pursue_goal: Signal<bool>,
     mut goal_text: Signal<String>,
-    mut queue: Signal<Vec<String>>,
+    mut queue: Signal<Vec<QueuedPrompt>>,
     mut attachments: Signal<Vec<String>>,
     mut text_attachments: Signal<Vec<TextAttachment>>,
     mut picked_element: Signal<Option<String>>,
@@ -2823,7 +3036,7 @@ async fn submit_ce(
                 return;
             }
             "plan" => {
-                plan_mode.set(true);
+                set_plan_mode(cfg, plan_mode, true);
                 if args.is_empty() {
                     clear().await;
                     return;
@@ -2846,12 +3059,9 @@ why it's wrong, and the concrete fix. If the diff is clean, say so plainly.{}\n\
                     diff
                 );
                 if *streaming.read() {
-                    queue.write().push(prompt);
+                    queue.write().push(QueuedPrompt::capture(prompt));
                 } else {
-                    engine.send(EngineCmd::Submit {
-                        engine: prompt,
-                        display: "/review (Bugbot)".into(),
-                    });
+                    engine.send(EngineCmd::submit(prompt, "/review (Bugbot)".into()));
                 }
                 return;
             }
@@ -3017,13 +3227,10 @@ why it's wrong, and the concrete fix. If the diff is clean, say so plainly.{}\n\
     // `/btw` side questions bypass the queue: the engine answers them in a
     // detached worker while the running turn continues untouched.
     let is_btw = text.trim_start().starts_with("/btw");
-    if !steer && !is_btw && *streaming.read() {
-        queue.write().push(text);
+    if !is_btw && *streaming.read() && (!steer || *plan_mode.read()) {
+        queue.write().push(QueuedPrompt::capture(text));
     } else {
-        engine.send(EngineCmd::Submit {
-            engine: text,
-            display,
-        });
+        engine.send(EngineCmd::submit(text, display));
     }
 }
 
@@ -3139,6 +3346,18 @@ fn discover_skills(ws: &Path) -> Vec<(&'static str, String, String)> {
 
 /// Launch all To-Do cards in parallel, each in its own git worktree.
 fn run_board(mut board: Signal<board::Board>, cfg: Signal<Config>, root: PathBuf) {
+    let runtime = cfg.read();
+    let full_access = matches!(
+        (
+            runtime.effective_approval_policy(),
+            runtime.effective_sandbox(),
+        ),
+        (ApprovalPolicy::Never, SandboxPolicy::DangerFullAccess)
+    );
+    drop(runtime);
+    if !full_access {
+        return;
+    }
     let todo: Vec<(u64, String, String)> = board
         .read()
         .cards
@@ -3212,7 +3431,7 @@ fn run_automation_turn(
     trigger: &'static str,
     engine: Coroutine<EngineCmd>,
     streaming: Signal<bool>,
-    queue: Signal<Vec<String>>,
+    queue: Signal<Vec<QueuedPrompt>>,
     runs: Signal<Vec<automation::AutomationRunSpec>>,
     status: Signal<String>,
 ) {
@@ -3232,7 +3451,7 @@ fn run_automation_turn_with(
     payload: Option<String>,
     engine: Coroutine<EngineCmd>,
     streaming: Signal<bool>,
-    mut queue: Signal<Vec<String>>,
+    mut queue: Signal<Vec<QueuedPrompt>>,
     mut runs: Signal<Vec<automation::AutomationRunSpec>>,
     mut status: Signal<String>,
 ) {
@@ -3247,13 +3466,10 @@ fn run_automation_turn_with(
                     automation::build_run_prompt_full(&workspace, &spec, payload.as_deref()).await;
                 let label = format!("Run automation: {}", spec.name);
                 if *streaming.read() {
-                    queue.write().push(prompt);
+                    queue.write().push(QueuedPrompt::capture(prompt));
                     status.set(format!("Queued automation: {}", spec.name));
                 } else {
-                    engine.send(EngineCmd::Submit {
-                        engine: prompt,
-                        display: label,
-                    });
+                    engine.send(EngineCmd::submit(prompt, label));
                     status.set(format!("Started automation: {}", spec.name));
                 }
             });
@@ -3368,6 +3584,59 @@ fn relative_ms(value: u64) -> String {
 }
 
 /// Set the permission mode (approval policy + sandbox) and reconfigure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccessPreset {
+    ApprovalRequired,
+    Auto,
+    FullAccess,
+}
+
+fn access_preset(config: &Config) -> AccessPreset {
+    if matches!(config.approval_policy, ApprovalPolicy::Never)
+        && matches!(config.sandbox, SandboxPolicy::DangerFullAccess)
+    {
+        AccessPreset::FullAccess
+    } else if matches!(config.approval_policy, ApprovalPolicy::OnRequest)
+        && matches!(config.sandbox, SandboxPolicy::WorkspaceWrite)
+    {
+        AccessPreset::Auto
+    } else {
+        AccessPreset::ApprovalRequired
+    }
+}
+
+fn apply_access_preset(config: &mut Config, preset: AccessPreset) {
+    (config.approval_policy, config.sandbox) = match preset {
+        AccessPreset::ApprovalRequired => (ApprovalPolicy::Always, SandboxPolicy::WorkspaceWrite),
+        AccessPreset::Auto => (ApprovalPolicy::OnRequest, SandboxPolicy::WorkspaceWrite),
+        AccessPreset::FullAccess => (ApprovalPolicy::Never, SandboxPolicy::DangerFullAccess),
+    };
+}
+
+fn persist_config_preferences(config: &Config) {
+    let ws = workspace_of(config);
+    let mut persist = config.clone();
+    persist.resume_path = None;
+    persist.resume = false;
+    if let Ok(serialized) = toml::to_string(&persist) {
+        let _ = write_atomic(&ws.join("oxide.toml"), &serialized);
+        if let Some(home) = std::env::var_os("HOME") {
+            let global_dir = std::path::PathBuf::from(home).join(".config/oxide");
+            let _ = std::fs::create_dir_all(&global_dir);
+            let _ = write_atomic(&global_dir.join("config.toml"), &serialized);
+        }
+    }
+}
+
+fn set_plan_mode(mut cfg: Signal<Config>, mut plan_mode: Signal<bool>, enabled: bool) {
+    let mut config = cfg.read().clone();
+    config.plan_mode = enabled;
+    publish_runtime_permissions(&config);
+    persist_config_preferences(&config);
+    cfg.set(config);
+    plan_mode.set(enabled);
+}
+
 fn set_access_mode(
     mut cfg: Signal<Config>,
     engine: Coroutine<EngineCmd>,
@@ -3376,8 +3645,13 @@ fn set_access_mode(
     sandbox: SandboxPolicy,
 ) {
     let mut c = cfg.read().clone();
+    let previous = (c.effective_approval_policy(), c.effective_sandbox());
     c.approval_policy = approval;
     c.sandbox = sandbox;
+    let next = (c.effective_approval_policy(), c.effective_sandbox());
+    if previous != next {
+        publish_runtime_permissions(&c);
+    }
     cfg.set(c.clone());
     engine.send(EngineCmd::Reconfigure(c));
     show_access.set(false);
@@ -3747,9 +4021,65 @@ fn build_projects(current: &Path, recents: &[PathBuf]) -> Vec<ProjectGroup> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn access_preset_roundtrips_all_three_modes() {
+        for preset in [
+            AccessPreset::ApprovalRequired,
+            AccessPreset::Auto,
+            AccessPreset::FullAccess,
+        ] {
+            let mut config = Config::default();
+            apply_access_preset(&mut config, preset);
+            assert_eq!(access_preset(&config), preset);
+
+            let serialized = toml::to_string(&config).unwrap();
+            let restored: Config = toml::from_str(&serialized).unwrap();
+            assert_eq!(access_preset(&restored), preset);
+        }
+    }
+
+    #[test]
+    fn plan_mode_preserves_the_baseline_access_preset() {
+        let mut config = Config::default();
+        apply_access_preset(&mut config, AccessPreset::FullAccess);
+        config.plan_mode = true;
+
+        assert_eq!(config.effective_approval_policy(), ApprovalPolicy::Never);
+        assert_eq!(config.effective_sandbox(), SandboxPolicy::ReadOnly);
+        assert_eq!(access_preset(&config), AccessPreset::FullAccess);
+
+        config.plan_mode = false;
+        assert_eq!(config.effective_approval_policy(), ApprovalPolicy::Never);
+        assert_eq!(config.effective_sandbox(), SandboxPolicy::DangerFullAccess);
+    }
+
+    #[test]
+    fn permission_publication_atomically_invalidates_old_captures() {
+        let original = runtime_permission_snapshot().0;
+        let mut config = Config::default();
+        apply_access_preset(&mut config, AccessPreset::FullAccess);
+        publish_runtime_permissions(&config);
+        let full = CapturedPermissions::current();
+        assert_eq!(full.permissions.sandbox, SandboxPolicy::DangerFullAccess);
+
+        config.plan_mode = true;
+        publish_runtime_permissions(&config);
+        let read_only = CapturedPermissions::current();
+
+        assert_ne!(full.epoch, read_only.epoch);
+        assert_eq!(read_only.permissions.sandbox, SandboxPolicy::ReadOnly);
+        assert_eq!(full.fail_closed().sandbox, SandboxPolicy::ReadOnly);
+
+        publish_runtime_permissions(&Config {
+            approval_policy: original.approval_policy,
+            sandbox: original.sandbox,
+            ..Config::default()
+        });
+    }
+
     fn model_ids(provider: &str) -> Vec<&'static str> {
-        MODEL_PRESETS
-            .iter()
+        production_model_presets()
+            .into_iter()
             .filter(|preset| preset.provider == provider)
             .map(|preset| preset.model)
             .collect()
@@ -4085,6 +4415,83 @@ mod tests {
     }
 
     #[test]
+    fn production_picker_is_catalog_backed_and_excludes_legacy_aliases() {
+        let providers: Vec<&str> = gui_providers(false)
+            .into_iter()
+            .map(|provider| provider.id)
+            .collect();
+        assert_eq!(providers, vec!["chatgpt", "codex", "claude"]);
+
+        for preset in production_model_presets() {
+            let catalog_models = oxide_providers::list_provider_models(preset.provider)
+                .expect("GUI provider must exist in catalog");
+            assert!(catalog_models.iter().any(|model| model.id == preset.model));
+        }
+
+        assert_eq!(
+            model_ids("codex"),
+            vec![
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-5.6-luna",
+                "gpt-5.5",
+                "gpt-5.4",
+            ]
+        );
+        assert_eq!(
+            model_ids("claude"),
+            vec!["claude-fable-5", "claude-opus-4-8", "claude-sonnet-4-6",]
+        );
+        assert!(!model_ids("codex").contains(&"gpt-5.3-codex"));
+        assert!(!model_ids("claude").contains(&"sonnet"));
+    }
+
+    #[test]
+    fn legacy_config_model_is_rendered_without_entering_production_picker() {
+        let legacy = selected_model("codex", "gpt-5.3-codex")
+            .expect("legacy catalog model must remain renderable");
+        assert_eq!(legacy.badge, "Legacy");
+        assert_eq!(legacy.model, "gpt-5.3-codex");
+
+        let settings = settings_provider_models("codex", legacy.model);
+        assert_eq!(
+            settings
+                .iter()
+                .filter(|preset| preset.model == legacy.model)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn preview_annotation_context_is_numbered_and_selector_complete() {
+        let annotations = vec![
+            serde_json::json!({
+                "annotation": 2,
+                "url": "http://127.0.0.1:4010/reports",
+                "selector": "button.export",
+                "text": "Export report"
+            }),
+            serde_json::json!({
+                "annotation": 1,
+                "url": "http://127.0.0.1:4010/dashboard",
+                "selector": "section.revenue",
+                "component": "RevenueCard"
+            }),
+        ];
+
+        let context = preview_annotations_context(&annotations);
+
+        assert!(context.starts_with("Annotated UI elements (2):"));
+        assert!(context.find("Annotation #1") < context.find("Annotation #2"));
+        assert!(context.contains("- url: http://127.0.0.1:4010/dashboard"));
+        assert!(context.contains("- selector: section.revenue"));
+        assert!(context.contains("- component: <RevenueCard>"));
+        assert!(context.contains("- selector: button.export"));
+        assert!(context.contains("- url: http://127.0.0.1:4010/reports"));
+    }
+
+    #[test]
     fn gpt_5_6_effort_levels_match_model_capabilities() {
         assert!(effort_levels("codex", "gpt-5.6-sol")
             .iter()
@@ -4178,6 +4585,33 @@ mod tests {
         let acts: Vec<_> = turns[0].groups.iter().filter(|g| g.activity).collect();
         assert_eq!(acts.len(), 1);
         assert_eq!(acts[0].indices, vec![1, 3, 5]);
+    }
+
+    #[test]
+    fn coalesced_activity_rows_keep_the_first_stable_id() {
+        let rows = vec![
+            ActivityRenderRow {
+                id: 41,
+                text: "edit\tEdit\tsrc/lib.rs".into(),
+                running: false,
+                ok: true,
+                count: 1,
+            },
+            ActivityRenderRow {
+                id: 42,
+                text: "edit\tEdit\tsrc/lib.rs".into(),
+                running: true,
+                ok: true,
+                count: 1,
+            },
+        ];
+
+        let coalesced = coalesce_activity_rows(rows);
+
+        assert_eq!(coalesced.len(), 1);
+        assert_eq!(coalesced[0].id, 41);
+        assert_eq!(coalesced[0].count, 2);
+        assert!(coalesced[0].running);
     }
 
     #[test]
@@ -4786,7 +5220,7 @@ fn queue_preview(text: &str) -> String {
         .collect()
 }
 
-fn restore_queued_prompt(mut queue: Signal<Vec<String>>, index: usize) {
+fn restore_queued_prompt(mut queue: Signal<Vec<QueuedPrompt>>, index: usize) {
     let full = {
         let mut queued = queue.write();
         (index < queued.len()).then(|| queued.remove(index))
@@ -4794,7 +5228,7 @@ fn restore_queued_prompt(mut queue: Signal<Vec<String>>, index: usize) {
     let Some(full) = full else {
         return;
     };
-    let full = strip_scaffold(&full);
+    let full = strip_scaffold(&full.text);
     let js = format!(
         "const e=document.getElementById('ce-input'); if(e){{ e.textContent={}; e.focus(); const r=document.createRange(); r.selectNodeContents(e); r.collapse(false); const s=window.getSelection(); s.removeAllRanges(); s.addRange(r); e.dispatchEvent(new InputEvent('input',{{bubbles:true}})); }} return true;",
         serde_json::to_string(&full).unwrap_or_default()
@@ -4804,17 +5238,22 @@ fn restore_queued_prompt(mut queue: Signal<Vec<String>>, index: usize) {
     });
 }
 
-fn steer_queued_prompt(mut queue: Signal<Vec<String>>, engine: Coroutine<EngineCmd>, index: usize) {
-    let text = {
+fn steer_queued_prompt(
+    mut queue: Signal<Vec<QueuedPrompt>>,
+    engine: Coroutine<EngineCmd>,
+    index: usize,
+) {
+    let queued_prompt = {
         let mut queued = queue.write();
         (index < queued.len()).then(|| queued.remove(index))
     };
-    if let Some(text) = text {
-        let display = queued_display_text(&text);
-        engine.send(EngineCmd::Submit {
-            engine: text,
+    if let Some(queued_prompt) = queued_prompt {
+        let display = queued_display_text(&queued_prompt.text);
+        engine.send(EngineCmd::submit_captured(
+            queued_prompt.text,
             display,
-        });
+            queued_prompt.permissions,
+        ));
     }
 }
 
@@ -4890,20 +5329,7 @@ fn reveal_and_jump_to_msg(
 fn scroll_chat_bottom() {
     spawn(async move {
         let _ = dioxus::document::eval(
-            "for (const delay of [0, 40, 140]) setTimeout(()=>requestAnimationFrame(()=>{const s=document.querySelector('.scroll'); if(s) s.scrollTo({top:s.scrollHeight, behavior:'auto'});}),delay);",
-        )
-        .await;
-    });
-}
-
-/// Keep the transcript pinned only when the user was already reading the tail.
-fn scroll_chat_bottom_if_sticky() {
-    spawn(async move {
-        let _ = dioxus::document::eval(
-            // Coalesce per-event follow-scrolls into one rAF (the __oxstickQ latch):
-            // a streaming turn calls this on every delta, and stacking a scroll per
-            // event on top of the MutationObserver snap is what makes the tail jitter.
-            "if(window.__oxstickQ)return;window.__oxstickQ=1;requestAnimationFrame(()=>{window.__oxstickQ=0;const s=document.querySelector('.scroll'); if(!s) return; const d=s.scrollHeight-s.scrollTop-s.clientHeight; if(window.__oxstick!==false || d < 180) s.scrollTop=s.scrollHeight;});",
+            "for(const delay of [0,40,140])setTimeout(()=>requestAnimationFrame(()=>{const c=window.__oxTranscript;if(c){c.jump(c.main(),'auto');return;}const s=document.getElementById('main-transcript');if(s){window.__oxstick=true;s.scrollTo({top:s.scrollHeight,behavior:'auto'});}}),delay);",
         )
         .await;
     });
@@ -5559,10 +5985,7 @@ fn submit_hermes_prompt(
     next.harness = "hermes".to_string();
     cfg.set(next.clone());
     engine.send(EngineCmd::Reconfigure(next));
-    engine.send(EngineCmd::Submit {
-        engine: prompt,
-        display,
-    });
+    engine.send(EngineCmd::submit(prompt, display));
     status.set("Hermes evolve started".to_string());
 }
 
@@ -5572,6 +5995,20 @@ struct McpUiStatus {
     tool_count: usize,
     tools: Vec<String>,
     detail: String,
+}
+
+#[derive(Clone, Default, PartialEq, Eq)]
+struct BrowserUiSession {
+    state: String,
+    url: String,
+    detail: String,
+    visible: bool,
+}
+
+impl BrowserUiSession {
+    fn is_open(&self) -> bool {
+        !self.state.is_empty() && self.state != "closed"
+    }
 }
 
 fn app() -> Element {
@@ -5663,6 +6100,10 @@ fn app() -> Element {
     let mut preview_url = use_signal(String::new);
     let mut preview_ports = use_signal(Vec::<(u16, String)>::new);
     let mut picked_element = use_signal(|| Option::<String>::None);
+    let mut preview_annotations = use_signal(Vec::<serde_json::Value>::new);
+    let mut annotation_mode = use_signal(|| false);
+    let mut annotation_status = use_signal(String::new);
+    let mut browser_sessions = use_signal(HashMap::<u64, BrowserUiSession>::new);
     // Design Mode (Cursor 3.0): selected element + live style edits.
     let mut design_mode = use_signal(|| false);
     let mut design_sel = use_signal(|| Option::<serde_json::Value>::None);
@@ -5754,7 +6195,7 @@ fn app() -> Element {
     let mut closing_tab = use_signal(|| None::<u64>);
     // Suggested follow-up prompts shown above the composer after a turn.
     let mut followups = use_signal(Vec::<String>::new);
-    let mut queue = use_signal(Vec::<String>::new);
+    let mut queue = use_signal(Vec::<QueuedPrompt>::new);
     // Synara-style top-center toast stack (auto-dismiss).
     let toasts = use_signal(Vec::<ToastSpec>::new);
     let toast_seq = use_signal(|| 0u64);
@@ -5817,7 +6258,8 @@ fn app() -> Element {
     let mut show_compare = use_signal(|| false);
 
     // Composer modes (shared across both Composer instances).
-    let plan_mode = use_signal(|| false);
+    let initial_plan_mode = cfg.read().plan_mode;
+    let plan_mode = use_signal(move || initial_plan_mode);
     let pursue_goal = use_signal(|| false);
 
     // Inspector (right panel) state — ported from the desktop command center.
@@ -6330,135 +6772,269 @@ fn app() -> Element {
         });
     });
 
-    // Autoscroll via ONE persistent MutationObserver (installed once) instead of
-    // a JS eval round-trip per streaming delta.
+    // Each mounted transcript owns one bounded observer and one independent
+    // sticky state. The lightweight shell observer only discovers transcript
+    // mounts/unmounts; it never watches token-level character mutations.
     use_future(move || async move {
         let _ = dioxus::document::eval(
             r#"
-            if (!window.__oxscroll) {
+            if (!window.__oxTranscript) {
               window.__oxscroll = 1;
-              let cur = null, inner = null;
-              let liveOutputQueued = false;
-              const followLiveOutputs = () => {
-                if (liveOutputQueued) return;
-                liveOutputQueued = true;
-                requestAnimationFrame(() => {
-                  liveOutputQueued = false;
-                  document.querySelectorAll('.activity-card.live-output[open] .activity-out').forEach((out) => {
+              const transcriptSelector = '[data-oxide-transcript]';
+              const states = new Map();
+              const main = () => document.querySelector('[data-oxide-transcript="main"]');
+              const bottomDistance = (s) => Math.max(0, s.scrollHeight - s.scrollTop - s.clientHeight);
+              const parseCssTime = (value) => {
+                const text = String(value || '').trim();
+                const n = parseFloat(text);
+                if (!Number.isFinite(n)) return 0;
+                return text.endsWith('ms') ? n : n * 1000;
+              };
+              const hasSelection = (s) => {
+                const sel = window.getSelection && window.getSelection();
+                if (!sel || !String(sel).length) return false;
+                const anchor = sel.anchorNode;
+                return !!anchor && s.contains(anchor.nodeType === 1 ? anchor : anchor.parentElement);
+              };
+              const typingTarget = (s) => {
+                const el = document.activeElement;
+                if (!el || !s.contains(el)) return false;
+                const tag = String(el.tagName || '').toLowerCase();
+                return tag === 'input' || tag === 'textarea' || el.isContentEditable;
+              };
+              const setSticky = (s, state, sticky) => {
+                state.sticky = sticky;
+                if (s === main()) window.__oxstick = sticky;
+              };
+              const update = (s, state) => {
+                const distance = bottomDistance(s);
+                if (distance < 8) setSticky(s, state, true);
+                const button = s.querySelector('.jump-bottom');
+                if (button) button.classList.toggle('show', distance > 120);
+              };
+              const followLiveOutputs = (s) => {
+                s.querySelectorAll('.activity-card.live-output[open] .activity-out').forEach((out) => {
+                  if (out.scrollHeight - out.scrollTop - out.clientHeight < 60) {
                     out.scrollTop = out.scrollHeight;
-                  });
+                  }
                 });
               };
-              const rebind = () => {
-                const s = document.querySelector('.scroll');
-                if (s === cur) return;
-                cur = s;
-                if (inner) { inner.disconnect(); inner = null; }
-                if (!s) return;
-                let ignoreScroll = false;
-                const bottomDistance = () => Math.max(0, s.scrollHeight - s.scrollTop - s.clientHeight);
-                const hasSelection = () => {
-                  const sel = window.getSelection && window.getSelection();
-                  return !!sel && String(sel).length > 0;
+              const bind = (s) => {
+                if (!s) return null;
+                const existing = states.get(s);
+                if (existing) return existing;
+                const state = {
+                  sticky: true,
+                  ignoreScroll: false,
+                  jumpScroll: false,
+                  stickQueued: false,
+                  disclosureStop: null,
                 };
-                const typingTarget = () => {
-                  const el = document.activeElement;
-                  if (!el || !s.contains(el)) return false;
-                  const tag = String(el.tagName || '').toLowerCase();
-                  return tag === 'input' || tag === 'textarea' || el.isContentEditable;
+                const finishJump = () => {
+                  state.jumpScroll = false;
+                  state.ignoreScroll = false;
+                  setSticky(s, state, true);
+                  update(s, state);
                 };
-                const upd = () => {
-                  const d = bottomDistance();
-                  // RE-ARM only at the true bottom. Stickiness must never be
-                  // derived from distance alone: during a stream the snap runs
-                  // per frame, so a distance threshold re-captured the user
-                  // before their upward gesture could ever escape (the
-                  // "can't scroll up while running" trap).
-                  if (d < 8) window.__oxstick = true;
-                  const b = s.querySelector('.jump-bottom');
-                  if (b) b.classList.toggle('show', d > 300);
+                const cancelJump = () => {
+                  state.jumpScroll = false;
+                  state.ignoreScroll = false;
                 };
-                // Coalesce the snap into ONE rAF per frame. A streaming turn fires a
-                // characterData mutation per token; snapping + reading layout on each
-                // forces a reflow per token = visible tail jitter. Batching to one
-                // snap-per-frame keeps the tail glued smoothly (Synara's "snap in
-                // layout timing" lesson, adapted to the MutationObserver model).
-                let stickQueued = false;
-                const stick = () => {
-                  if (stickQueued) return;
-                  stickQueued = true;
+                const scrollToEnd = (behavior) => {
+                  state.ignoreScroll = true;
+                  s.scrollTo({ top: s.scrollHeight, behavior: behavior || 'auto' });
                   requestAnimationFrame(() => {
-                    stickQueued = false;
-                    if (window.__oxstick !== false && !hasSelection() && !typingTarget()) {
-                      ignoreScroll = true;
+                    state.ignoreScroll = false;
+                    update(s, state);
+                  });
+                };
+                state.stick = () => {
+                  if (state.stickQueued) return;
+                  state.stickQueued = true;
+                  requestAnimationFrame(() => {
+                    state.stickQueued = false;
+                    if (state.sticky && !hasSelection(s) && !typingTarget(s)) {
+                      state.ignoreScroll = true;
                       s.scrollTop = s.scrollHeight;
-                      requestAnimationFrame(() => { ignoreScroll = false; });
+                      requestAnimationFrame(() => {
+                        if (!state.jumpScroll) state.ignoreScroll = false;
+                      });
                     }
-                    // Keep the LIVE reasoning panel pinned to its latest line as it
-                    // streams (Cursor-style), but only when already near the bottom
-                    // so a manual scroll-up to re-read isn't yanked back down.
                     const tb = s.querySelector('.thinking-box[open] .thinking-body');
-                    if (tb && window.__oxstick !== false && !hasSelection()) {
+                    if (tb && state.sticky && !hasSelection(s)) {
                       const dd = tb.scrollHeight - tb.scrollTop - tb.clientHeight;
                       if (dd < 60) tb.scrollTop = tb.scrollHeight;
                     }
-                    upd();
+                    followLiveOutputs(s);
+                    update(s, state);
                   });
                 };
-                s.addEventListener('scroll', () => {
-                  if (ignoreScroll) return;
-                  upd();
-                }, { passive: true });
-                // UPWARD intent unsticks IMMEDIATELY — direction, not distance.
-                // (The old `distance > 80` guard was unreachable mid-stream:
-                // per-frame snaps reset the distance before a gesture crossed it.)
-                s.addEventListener('wheel', (ev) => {
-                  if (ev.deltaY < 0) window.__oxstick = false;
-                }, { passive: true });
+                const onScroll = () => {
+                  if (state.jumpScroll) {
+                    if (bottomDistance(s) < 8) finishJump();
+                    return;
+                  }
+                  if (state.ignoreScroll) return;
+                  setSticky(s, state, bottomDistance(s) < 8);
+                  update(s, state);
+                };
+                const onWheel = (ev) => {
+                  if (ev.deltaY < 0) {
+                    cancelJump();
+                    setSticky(s, state, false);
+                  }
+                };
                 let touchY = 0;
-                s.addEventListener('touchstart', (ev) => {
+                const onTouchStart = (ev) => {
                   touchY = ev.touches[0] ? ev.touches[0].clientY : 0;
-                }, { passive: true });
-                s.addEventListener('touchmove', (ev) => {
+                };
+                const onTouchMove = (ev) => {
                   const y = ev.touches[0] ? ev.touches[0].clientY : 0;
-                  if (y > touchY + 4) window.__oxstick = false; // finger down = scroll up
+                  if (y > touchY + 4) {
+                    cancelJump();
+                    setSticky(s, state, false);
+                  }
                   touchY = y;
-                }, { passive: true });
-                s.addEventListener('keydown', (ev) => {
-                  if (['PageUp', 'ArrowUp', 'Home'].includes(ev.key)) window.__oxstick = false;
-                }, { passive: true });
-                // If a disclosure is toggled while the reader is already pinned
-                // to the tail, follow its 180ms grid-track tween. A detached
-                // reader is never re-captured.
-                s.addEventListener('click', (ev) => {
+                };
+                const onKeyDown = (ev) => {
+                  if (['PageUp', 'ArrowUp', 'Home'].includes(ev.key)) {
+                    cancelJump();
+                    setSticky(s, state, false);
+                  }
+                };
+                const onClick = (ev) => {
                   const summary = ev.target && ev.target.closest ? ev.target.closest('summary') : null;
                   const card = summary && summary.parentElement;
                   if (!card || !card.matches('.activity-card.has-out, .thinking-box, .thought-row')) return;
-                  if (window.__oxstick === false || bottomDistance() >= 8) return;
-                  const started = performance.now();
-                  const followTween = (now) => {
-                    if (window.__oxstick === false) return;
-                    ignoreScroll = true;
-                    s.scrollTop = s.scrollHeight;
-                    requestAnimationFrame(() => { ignoreScroll = false; });
-                    if (now - started < 240) requestAnimationFrame(followTween);
+                  if (!state.sticky || bottomDistance(s) >= 8) return;
+                  if (state.disclosureStop) state.disclosureStop();
+                  let finished = false;
+                  let fallback = null;
+                  const resize = window.ResizeObserver
+                    ? new ResizeObserver(() => state.stick())
+                    : null;
+                  const finish = () => {
+                    if (finished) return;
+                    finished = true;
+                    if (fallback !== null) clearTimeout(fallback);
+                    if (resize) resize.disconnect();
+                    card.removeEventListener('transitionend', finish);
+                    card.removeEventListener('animationend', finish);
+                    state.disclosureStop = null;
+                    state.stick();
                   };
-                  requestAnimationFrame(followTween);
-                });
-                inner = new MutationObserver(stick);
-                inner.observe(s, { childList: true, subtree: true, characterData: true });
-                // Fresh transcript mount (app start, welcome to chat): start at the bottom.
-                s.scrollTop = s.scrollHeight;
-                upd();
+                  state.disclosureStop = finish;
+                  if (resize) resize.observe(card);
+                  card.addEventListener('transitionend', finish, { once: true });
+                  card.addEventListener('animationend', finish, { once: true });
+                  const motionBudget = parseCssTime(
+                    getComputedStyle(card).getPropertyValue('--dur-slow')
+                  );
+                  if (motionBudget > 0) {
+                    fallback = setTimeout(finish, Math.ceil(motionBudget * 1.5));
+                  } else {
+                    requestAnimationFrame(() => requestAnimationFrame(finish));
+                  }
+                  state.stick();
+                };
+                s.addEventListener('scroll', onScroll, { passive: true });
+                s.addEventListener('wheel', onWheel, { passive: true });
+                s.addEventListener('touchstart', onTouchStart, { passive: true });
+                s.addEventListener('touchmove', onTouchMove, { passive: true });
+                s.addEventListener('keydown', onKeyDown);
+                s.addEventListener('click', onClick);
+                state.observer = new MutationObserver(state.stick);
+                state.observer.observe(s, { childList: true, subtree: true, characterData: true });
+                state.cleanup = () => {
+                  state.observer.disconnect();
+                  cancelJump();
+                  if (state.disclosureStop) state.disclosureStop();
+                  s.removeEventListener('scroll', onScroll);
+                  s.removeEventListener('wheel', onWheel);
+                  s.removeEventListener('touchstart', onTouchStart);
+                  s.removeEventListener('touchmove', onTouchMove);
+                  s.removeEventListener('keydown', onKeyDown);
+                  s.removeEventListener('click', onClick);
+                };
+                states.set(s, state);
+                setSticky(s, state, true);
+                scrollToEnd('auto');
+                return state;
               };
-              // Rebind the main transcript and follow live command windows in
-              // both the main chat and detached split panes.
-              new MutationObserver(() => {
-                rebind();
-                followLiveOutputs();
-              }).observe(document.body, { childList: true, subtree: true, characterData: true });
-              rebind();
-              followLiveOutputs();
+              const sync = () => {
+                document.querySelectorAll(transcriptSelector).forEach(bind);
+                for (const [s, state] of states) {
+                  if (!s.isConnected) {
+                    state.cleanup();
+                    states.delete(s);
+                  }
+                }
+              };
+              let syncQueued = false;
+              const scheduleSync = () => {
+                if (syncQueued) return;
+                syncQueued = true;
+                requestAnimationFrame(() => {
+                  syncQueued = false;
+                  sync();
+                });
+              };
+              const containsTranscript = (node) => node && node.nodeType === 1 && (
+                node.matches(transcriptSelector) || node.querySelector(transcriptSelector)
+              );
+              const shell = document.querySelector('.app') || document.body;
+              new MutationObserver((records) => {
+                const changed = records.some((record) => {
+                  const target = record.target;
+                  if (target.nodeType === 1 && target.closest(transcriptSelector)) return false;
+                  return Array.from(record.addedNodes).some(containsTranscript)
+                    || Array.from(record.removedNodes).some(containsTranscript);
+                });
+                if (changed) scheduleSync();
+              }).observe(shell, { childList: true, subtree: true });
+              window.__oxTranscript = {
+                main,
+                sync,
+                detach(target) {
+                  const s = target || main();
+                  const state = bind(s);
+                  if (s && state) {
+                    state.jumpScroll = false;
+                    setSticky(s, state, false);
+                    update(s, state);
+                  }
+                },
+                jump(target, behavior) {
+                  const s = target || main();
+                  const state = bind(s);
+                  if (s && state) {
+                    setSticky(s, state, true);
+                    state.jumpScroll = true;
+                    state.ignoreScroll = true;
+                    s.scrollTo({ top: s.scrollHeight, behavior: behavior || 'smooth' });
+                    const trackJump = () => {
+                      if (!state.jumpScroll) return;
+                      if (bottomDistance(s) < 8) finishJump();
+                      else requestAnimationFrame(trackJump);
+                    };
+                    requestAnimationFrame(trackJump);
+                  }
+                },
+                restore(target, top, detached) {
+                  const s = target || main();
+                  const state = bind(s);
+                  if (!s || !state) return;
+                  cancelJump();
+                  state.ignoreScroll = true;
+                  s.scrollTop = top;
+                  requestAnimationFrame(() => {
+                    state.ignoreScroll = false;
+                    update(s, state);
+                    setSticky(s, state, detached ? false : bottomDistance(s) < 8);
+                  });
+                },
+              };
+              sync();
             }
             while (true) { await new Promise(r => setTimeout(r, 3600000)); }
             "#,
@@ -6896,13 +7472,6 @@ fn app() -> Element {
                         think_secs.set(0);
                         think_open.set(None);
                         settling_thought.set(Some(thought_id));
-                        let mut settling = settling_thought;
-                        spawn(async move {
-                            tokio::time::sleep(std::time::Duration::from_millis(320)).await;
-                            if *settling.peek() == Some(thought_id) {
-                                settling.set(None);
-                            }
-                        });
                     }
                 }};
             }
@@ -6930,7 +7499,7 @@ fn app() -> Element {
                       flush_agent!();
                       flush_reasoning_live!();
                       match cmd {
-                        Some(EngineCmd::Submit { engine: eng, display }) => {
+                        Some(EngineCmd::Submit { engine: eng, display, permissions }) => {
                             followups.write().clear();
                             let aid = view_tab;
                             if !handles.contains_key(&aid) {
@@ -6952,7 +7521,13 @@ fn app() -> Element {
                                 elapsed_s.set(0);
                                 busy_tabs.write().insert(aid);
                                 tab_statuses.write().insert(aid, TabStatus::Running);
-                                let _ = h.submit(Op::UserTurn { text: eng }).await;
+                                let permissions = Some(permissions.fail_closed());
+                                let _ = h
+                                    .submit(Op::UserTurn {
+                                        text: eng,
+                                        permissions,
+                                    })
+                                    .await;
                             } else {
                                 // Engine failed to start — don't eat the message silently.
                                 messages.write().push(ChatMsg::new(Author::User, display));
@@ -6986,18 +7561,7 @@ fn app() -> Element {
                             // it makes a later launch (possibly in another folder) silently
                             // continue an old session instead of starting clean.
                             let ws = workspace_of(&conf);
-                            let mut persist = conf.clone();
-                            persist.resume_path = None;
-                            persist.resume = false;
-                            if let Ok(s) = toml::to_string(&persist) {
-                                let _ = write_atomic(&ws.join("oxide.toml"), &s);
-                                // Also persist globally so the packaged app remembers across launches.
-                                if let Some(home) = std::env::var_os("HOME") {
-                                    let gdir = std::path::PathBuf::from(home).join(".config/oxide");
-                                    let _ = std::fs::create_dir_all(&gdir);
-                                    let _ = write_atomic(&gdir.join("config.toml"), &s);
-                                }
-                            }
+                            persist_config_preferences(&conf);
                             // Only wipe the transcript when switching PROJECT — a
                             // model/effort/fast/access change must not erase the chat.
                             let same_ws = ws == cur_ws;
@@ -7052,6 +7616,7 @@ fn app() -> Element {
                             timeline.write().clear();
                             streaming.set(false);
                             let aid = view_tab;
+                            browser_sessions.write().remove(&aid);
                             busy_tabs.write().remove(&aid);
                             tab_statuses.write().remove(&aid);
                             // Stale events from the replaced engine are dropped by the
@@ -7162,6 +7727,7 @@ fn app() -> Element {
                             parked_appr.remove(&id);
                             parked_q.remove(&id);
                             bg_buffers.remove(&id);
+                            browser_sessions.write().remove(&id);
                             busy_tabs.write().remove(&id);
                             tab_statuses.write().remove(&id);
                         }
@@ -7197,6 +7763,11 @@ fn app() -> Element {
                                 let _ = h
                                     .submit(Op::SubagentControl { worker_id, action })
                                     .await;
+                            }
+                        }
+                        Some(EngineCmd::BrowserControl(action)) => {
+                            if let Some(h) = handles.get(&view_tab) {
+                                let _ = h.submit(Op::BrowserControl { action }).await;
                             }
                         }
                         Some(EngineCmd::SetHistory(msgs)) => {
@@ -7262,6 +7833,22 @@ fn app() -> Element {
                                 } else {
                                     tab_statuses.write().insert(ev_tid, TabStatus::Failed);
                                 }
+                            }
+                            Event::BrowserSessionState {
+                                state,
+                                url,
+                                detail,
+                                visible,
+                            } => {
+                                browser_sessions.write().insert(
+                                    ev_tid,
+                                    BrowserUiSession {
+                                        state: state.clone(),
+                                        url: url.clone(),
+                                        detail: detail.clone(),
+                                        visible: *visible,
+                                    },
+                                );
                             }
                             _ => {}
                         }
@@ -7774,7 +8361,6 @@ fn app() -> Element {
                             }
                             Event::UiSpec { spec, .. } => {
                                 finalize_ui_spec_preview(&mut messages.write(), ui_spec_message(*spec));
-                                scroll_chat_bottom_if_sticky();
                             }
                             Event::SubagentStarted { worker_id, profile, task, .. } => {
                                 // Chronological anchor IN the transcript — the detail card
@@ -7799,7 +8385,6 @@ fn app() -> Element {
                                     title: format!("Subagent · {profile}"),
                                     sub: task,
                                 });
-                                scroll_chat_bottom_if_sticky();
                             }
                             Event::SubagentStatus { worker_id, profile, status, detail, .. } => {
                                 {
@@ -7823,7 +8408,6 @@ fn app() -> Element {
                                     title: format!("Subagent {status} · {profile}"),
                                     sub: detail,
                                 });
-                                scroll_chat_bottom_if_sticky();
                             }
                             Event::SubagentFinished { worker_id, profile, task, summary, ok, session, .. } => {
                                 // Settle the transcript anchor row for this worker.
@@ -7867,7 +8451,6 @@ fn app() -> Element {
                                     title: format!("Subagent {} · {profile}", if ok { "done" } else { "stopped" }),
                                     sub: if summary.trim().is_empty() { task } else { summary },
                                 });
-                                scroll_chat_bottom_if_sticky();
                             }
                             Event::ApprovalRequested { request_id, call_id, tool, summary } => {
                                 mark_activity_waiting_for_approval(
@@ -7899,7 +8482,6 @@ fn app() -> Element {
                                 } else {
                                     upsert_tool_input_preview(&mut m, call_id, tool, accumulated);
                                 }
-                                scroll_chat_bottom_if_sticky();
                             }
                             Event::ToolCallBegin { call_id, tool, args, .. } => {
                                 timeline.write().push(TimelineItem { title: format!("Tool · {tool}"), sub: "running…".into() });
@@ -7981,7 +8563,6 @@ fn app() -> Element {
                                             command_activity_label(&command, background),
                                         );
                                     }
-                                    scroll_chat_bottom_if_sticky();
                                 }
                                 Event::CommandOutput { command_id, worker_id, stream, chunk, .. } => {
                                     if let Some(worker_id) = worker_id {
@@ -8025,11 +8606,9 @@ fn app() -> Element {
                                             append_activity_output(&mut row.text, &footer);
                                         }
                                     }
-                                    scroll_chat_bottom_if_sticky();
                                 }
                                 Event::Todos { items } => {
                                     todos.set(items);
-                                    scroll_chat_bottom_if_sticky();
                                 }
                             Event::PatchApplied { path, .. } => {
                                 timeline.write().push(TimelineItem { title: "Patched".into(), sub: path });
@@ -8086,6 +8665,12 @@ fn app() -> Element {
                             }
                             Event::BrowserSnapshotRequested { url, note, .. } => {
                                 timeline.write().push(TimelineItem { title: format!("Browser snapshot · {url}"), sub: note });
+                            }
+                            Event::BrowserSessionState { state, detail, .. } => {
+                                timeline.write().push(TimelineItem {
+                                    title: format!("Browser · {}", state.replace('_', " ")),
+                                    sub: detail,
+                                });
                             }
                             Event::DesignSnapshotRequested { url, note, .. } => {
                                 if !url.trim().is_empty() {
@@ -8275,9 +8860,9 @@ fn app() -> Element {
                                     // focused (you stepped away); no ding while you're watching.
                                     play_notification_sound(cfg, false);
                                 }
-                                if let Some(text) = next {
+                                if let Some(queued_prompt) = next {
                                     if let Some(h) = handles.get(&ev_tid) {
-                                        let display = queued_display_text(&text);
+                                        let display = queued_display_text(&queued_prompt.text);
                                         followups.write().clear();
                                         messages.write().push(ChatMsg::new(Author::User, display));
                                         messages.write().push(ChatMsg::new(Author::Agent, String::new()));
@@ -8289,7 +8874,13 @@ fn app() -> Element {
                                         elapsed_s.set(0);
                                         busy_tabs.write().insert(ev_tid);
                                         tab_statuses.write().insert(ev_tid, TabStatus::Running);
-                                        let _ = h.submit(Op::UserTurn { text }).await;
+                                        let permissions = Some(queued_prompt.permissions.fail_closed());
+                                        let _ = h
+                                            .submit(Op::UserTurn {
+                                                text: queued_prompt.text,
+                                                permissions,
+                                            })
+                                            .await;
                                     }
                                 }
                             }
@@ -8363,7 +8954,11 @@ fn app() -> Element {
             if (!window.__oxpick) {
               window.__oxpick = 1;
               window.addEventListener('message', function(e){
-                if (e.data && e.data.type === 'oxide-element') { try { dioxus.send(JSON.stringify(e.data)); } catch(_){} }
+                const frame = document.querySelector('.preview-frame');
+                if (!frame || e.source !== frame.contentWindow || !e.data) return;
+                if (e.data.type === 'oxide-element' || e.data.type === 'oxide-annotations-restored') {
+                  try { dioxus.send(JSON.stringify(e.data)); } catch(_){}
+                }
               });
             }
             while (true) { await new Promise(r => setTimeout(r, 3600000)); }
@@ -8378,32 +8973,94 @@ fn app() -> Element {
                 Ok(v) => v,
                 Err(_) => continue,
             };
+            if v.get("type").and_then(|value| value.as_str()) == Some("oxide-annotations-restored")
+            {
+                if let Some(restored) = v.get("restored").and_then(|value| value.as_array()) {
+                    let mut annotations = preview_annotations.write();
+                    for item in restored {
+                        let Some(selector) = item.get("selector").and_then(|value| value.as_str())
+                        else {
+                            continue;
+                        };
+                        let restored_url = item.get("url").and_then(|value| value.as_str());
+                        let Some(number) = item.get("annotation").and_then(|value| value.as_u64())
+                        else {
+                            continue;
+                        };
+                        if let Some(existing) = annotations.iter_mut().find(|value| {
+                            value.get("selector").and_then(|value| value.as_str()) == Some(selector)
+                                && restored_url.map_or(true, |url| {
+                                    value.get("url").and_then(|value| value.as_str()) == Some(url)
+                                })
+                        }) {
+                            existing["annotation"] = serde_json::json!(number);
+                        }
+                    }
+                }
+                let count = v.get("count").and_then(|value| value.as_u64()).unwrap_or(0);
+                let missing = v
+                    .get("missing")
+                    .and_then(|value| value.as_array())
+                    .map(Vec::len)
+                    .unwrap_or(0);
+                let skipped = v
+                    .get("skipped")
+                    .and_then(|value| value.as_array())
+                    .map(Vec::len)
+                    .unwrap_or(0);
+                annotation_status.set(if missing > 0 {
+                    format!("Restored {count}; {missing} target(s) changed or disappeared")
+                } else if skipped > 0 {
+                    format!("Restored {count} on this page; {skipped} kept for other pages")
+                } else {
+                    format!("Restored {count} annotation(s) after navigation")
+                });
+                continue;
+            }
+            if v.get("type").and_then(|value| value.as_str()) != Some("oxide-element") {
+                continue;
+            }
             if *design_mode.read() {
                 design_sel.set(Some(v));
                 design_edits.set(Vec::new());
                 design_note.set(String::new());
                 continue;
             }
-            let sel = v["selector"].as_str().unwrap_or("");
-            let src = v["source"].as_str().unwrap_or("");
-            let comp = v["component"].as_str().unwrap_or("");
-            let text = v["text"].as_str().unwrap_or("");
-            let html = v["html"].as_str().unwrap_or("");
-            let mut ctx = String::from("Selected UI element to change:\n");
-            ctx.push_str(&format!("- selector: {sel}\n"));
-            if !comp.is_empty() {
-                ctx.push_str(&format!("- component: <{comp}>\n"));
+            if v.get("annotation")
+                .and_then(|value| value.as_u64())
+                .is_some()
+            {
+                let selector = v
+                    .get("selector")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let url = v
+                    .get("url")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let (count, context) = {
+                    let mut annotations = preview_annotations.write();
+                    if let Some(existing) = annotations.iter_mut().find(|item| {
+                        item.get("selector").and_then(|value| value.as_str())
+                            == Some(selector.as_str())
+                            && item.get("url").and_then(|value| value.as_str())
+                                == Some(url.as_str())
+                    }) {
+                        *existing = v;
+                    } else {
+                        annotations.push(v);
+                    }
+                    (annotations.len(), preview_annotations_context(&annotations))
+                };
+                annotation_status.set(format!(
+                    "{count} annotation(s) ready — navigate freely, then send them with your prompt"
+                ));
+                picked_element.set(Some(context));
+            } else {
+                picked_element.set(Some(preview_selection_context(&v)));
             }
-            if !src.is_empty() {
-                ctx.push_str(&format!("- source: {src}\n"));
-            }
-            if !text.is_empty() {
-                ctx.push_str(&format!("- text: {text}\n"));
-            }
-            if !html.is_empty() {
-                ctx.push_str(&format!("- html: {html}\n"));
-            }
-            picked_element.set(Some(ctx));
         }
     });
     // Active TUI tab (embedded terminal) info.
@@ -8411,15 +9068,30 @@ fn app() -> Element {
         let t = tabs.read();
         match t.get(*active_tab.read()) {
             Some(tab) if tab.mode == "tui" => (true, tab.id),
-            _ => (false, 0),
+            Some(tab) => (false, tab.id),
+            None => (false, 0),
         }
     };
+    let browser_session = browser_sessions
+        .read()
+        .get(&active_tab_id)
+        .cloned()
+        .unwrap_or_default();
     let branch = git_branch(&workspace);
     let ws_changes = workspace.clone();
     let active_cfg = cfg.read().clone();
     let provider = active_cfg.provider.clone();
     let model = active_cfg.model.clone();
-    let bypass = matches!(active_cfg.approval_policy, ApprovalPolicy::Never);
+    let access = access_preset(&active_cfg);
+    let board_full_access = matches!(
+        (
+            active_cfg.effective_approval_policy(),
+            active_cfg.effective_sandbox(),
+        ),
+        (ApprovalPolicy::Never, SandboxPolicy::DangerFullAccess)
+    );
+    publish_runtime_permissions(&active_cfg);
+    let current_permission_epoch = runtime_permission_epoch();
     let model_name = selected_model(&provider, &model)
         .map(|p| p.label.to_string())
         .unwrap_or_else(|| {
@@ -8642,7 +9314,12 @@ fn app() -> Element {
                                     }
                                 };
                                 let initial = messages.read().clone();
-                                let dom = VirtualDom::new_with_props(PipWindow, PipWindowProps { workspace: ws.clone(), mode, provider, model, bin, theme, initial });
+                                let runtime = cfg.read();
+                                let permissions = RuntimePermissions {
+                                    approval_policy: runtime.effective_approval_policy(),
+                                    sandbox: runtime.effective_sandbox(),
+                                };
+                                let dom = VirtualDom::new_with_props(PipWindow, PipWindowProps { workspace: ws.clone(), mode, provider, model, bin, theme, initial, permissions, permission_epoch: runtime_permission_epoch() });
                                 use dioxus::desktop::tao::dpi::LogicalSize;
                                 let w = WindowBuilder::new()
                                     .with_title("Oxide — chat")
@@ -9745,6 +10422,9 @@ fn app() -> Element {
                                 bin: t.bin.clone(),
                                 ws: workspace.display().to_string(),
                                 resume: t.resume.clone(),
+                                approval_policy: cfg.read().effective_approval_policy(),
+                                sandbox: cfg.read().effective_sandbox(),
+                                permission_epoch: current_permission_epoch,
                             }
                         }
                     }
@@ -9762,6 +10442,11 @@ fn app() -> Element {
                             rects: split_rects,
                             def_provider: cfg.read().provider.clone(),
                             def_model: cfg.read().model.clone(),
+                            permissions: RuntimePermissions {
+                                approval_policy: cfg.read().effective_approval_policy(),
+                                sandbox: cfg.read().effective_sandbox(),
+                            },
+                            permission_epoch: current_permission_epoch,
                         }
                     } else if sidebar_tab.read().as_str() == "brain" {
                         BrainView {
@@ -9803,7 +10488,7 @@ fn app() -> Element {
                                             }
                                         }
                                     }
-                                    button { class: "board-btn", title: "Run all To Do tasks", onclick: move |_| { let _ = workspace_of(&cfg.read()); run_board(board, cfg, workspace_of(&cfg.read())); }, Icon { name: "play" } "Run To-Do" }
+                                    button { class: "board-btn", disabled: !board_full_access, title: if board_full_access { "Run all To Do tasks" } else { "Board tasks require Full access" }, onclick: move |_| { run_board(board, cfg, workspace_of(&cfg.read())); }, Icon { name: "play" } "Run To-Do" }
                                     button { class: "board-btn ghost", onclick: move |_| {
                                             let root = workspace_of(&cfg.read());
                                             sync_board_issues(board, root, board_sync_status, board_syncing);
@@ -9931,7 +10616,7 @@ fn app() -> Element {
                         div { class: "hero",
                             h1 { class: "hero-title", "What should we build in {project}?" }
                             Composer { streaming, engine, cfg, model_label: model_label.clone(),
-                                       bypass, project: project.clone(), branch: branch.clone(),
+                                       access, project: project.clone(), branch: branch.clone(),
                                        draft_key: format!("{}:{}", workspace.display(), tabs.read().get(*active_tab.read()).map(|tab| tab.id).unwrap_or(0)),
                                        context_used: ctx_used, context_limit: ctx_limit,
                                        workspace: workspace.clone(), plan_mode, pursue_goal, goal_text, queue, picked_element,
@@ -9959,14 +10644,14 @@ fn app() -> Element {
                                     button { class: "suggestion",
                                         onclick: {
                                             let p = s.to_string();
-                                            move |_| { engine.send(EngineCmd::Submit { engine: p.clone(), display: p.clone() }); }
+                                            move |_| { engine.send(EngineCmd::submit(p.clone(), p.clone())); }
                                         },
                                         Icon { name: "spark" } span { "{s}" }
                                     }
                                 }
                             }
                             div { class: "hero-pills",
-                                button { class: "hero-pill", onclick: move |_| { let mut pm = plan_mode; let v = *pm.read(); pm.set(!v); },
+                                button { class: "hero-pill", onclick: move |_| { let v = *plan_mode.read(); set_plan_mode(cfg, plan_mode, !v); },
                                     if *plan_mode.read() { "Plan mode on" } else { "Plan mode" }
                                 }
                                 button { class: "hero-pill",
@@ -9976,10 +10661,13 @@ fn app() -> Element {
                             }
                         }
                     } else {
-                        div { class: if *streaming.read() { "scroll" } else { "scroll smooth" },
+                        div {
+                            id: "main-transcript",
+                            "data-oxide-transcript": "main",
+                            class: if *streaming.read() { "scroll" } else { "scroll smooth" },
                             div { class: "jump-anchor",
-                                button { class: "jump-bottom", title: "Scroll to bottom",
-                                    onclick: move |_| { spawn(async move { let _ = dioxus::document::eval("window.__oxstick = true; const s=document.querySelector('.scroll'); if(s) s.scrollTo({top:s.scrollHeight, behavior:'smooth'});").await; }); },
+                                button { class: "jump-bottom", title: "Jump to latest", aria_label: "Jump to latest",
+                                    onclick: move |_| { spawn(async move { let _ = dioxus::document::eval("const c=window.__oxTranscript;c&&c.jump(c.main(),'smooth');").await; }); },
                                     Icon { name: "arrow-down" }
                                 }
                             }
@@ -10032,11 +10720,11 @@ fn app() -> Element {
                                             button {
                                                 class: "transcript-load-earlier",
                                                 onclick: move |_| {
-                                                    spawn(async move {
-                                                        let _ = dioxus::document::eval(
-                                                            "const s=document.querySelector('.scroll'); if(s){window.__oxprependH=s.scrollHeight;window.__oxprependY=s.scrollTop;window.__oxstick=false;}",
-                                                        )
-                                                        .await;
+                                                        spawn(async move {
+                                                            let _ = dioxus::document::eval(
+                                                                "const c=window.__oxTranscript;const s=c?c.main():document.getElementById('main-transcript');if(s){window.__oxprependH=s.scrollHeight;window.__oxprependY=s.scrollTop;if(c)c.detach(s);else window.__oxstick=false;}",
+                                                            )
+                                                            .await;
                                                         let current = transcript_turn_limits
                                                             .read()
                                                             .get(&tab_id)
@@ -10045,11 +10733,11 @@ fn app() -> Element {
                                                         transcript_turn_limits.write().insert(
                                                             tab_id,
                                                             current.saturating_add(TRANSCRIPT_TURN_BATCH),
-                                                        );
-                                                        let _ = dioxus::document::eval(
-                                                            "for(const d of [0,40,120])setTimeout(()=>requestAnimationFrame(()=>{const s=document.querySelector('.scroll');if(!s)return;const h=window.__oxprependH??s.scrollHeight;const y=window.__oxprependY??0;s.scrollTop=y+(s.scrollHeight-h);}),d);",
-                                                        )
-                                                        .await;
+                                                            );
+                                                            let _ = dioxus::document::eval(
+                                                                "for(const d of [0,40,120])setTimeout(()=>requestAnimationFrame(()=>{const c=window.__oxTranscript;const s=c?c.main():document.getElementById('main-transcript');if(!s)return;const h=window.__oxprependH??s.scrollHeight;const y=window.__oxprependY??0;const top=y+(s.scrollHeight-h);if(c)c.restore(s,top,true);else s.scrollTop=top;}),d);",
+                                                            )
+                                                            .await;
                                                     });
                                                 },
                                                 "{earlier_label}"
@@ -10064,11 +10752,19 @@ fn app() -> Element {
                                                 {
                                                     let idxs = group.indices;
                                                     let group_key = group.key;
-                                                    let rows: Vec<(String, bool, bool)> = idxs.iter().map(|&i| {
+                                                    let rows: Vec<ActivityRenderRow> = idxs.iter().map(|&i| {
                                                         let m = &messages.read()[i];
-                                                        if let Author::Activity { running, ok, .. } = m.author { (m.text.clone(), running, ok) } else { (m.text.clone(), false, true) }
+                                                        if let Author::Activity { running, ok, .. } = m.author {
+                                                            ActivityRenderRow { id: m.id, text: m.text.clone(), running, ok, count: 1 }
+                                                        } else {
+                                                            ActivityRenderRow { id: m.id, text: m.text.clone(), running: false, ok: true, count: 1 }
+                                                        }
                                                     }).collect();
-                                                    let (icon, label) = activity_group_display(&rows);
+                                                    let display_rows: Vec<(String, bool, bool)> = rows
+                                                        .iter()
+                                                        .map(|row| (row.text.clone(), row.running, row.ok))
+                                                        .collect();
+                                                    let (icon, label) = activity_group_display(&display_rows);
                                                     // Always default COLLAPSED, even while live or in detailed mode —
                                                     // an open group with dozens of rows competes with Thought/Reasoning
                                                     // and can create many simultaneous animation timelines. Detailed
@@ -10082,13 +10778,13 @@ fn app() -> Element {
                                                     const ACT_ROW_CAP: usize = 12;
                                                     // Compact density: settled-ok rows collapse into the header;
                                                     // running and failed rows always stay visible.
-                                                    let rows: Vec<(String, bool, bool)> = if tool_detail == "compact" {
-                                                        rows.into_iter().filter(|(_, r, o)| *r || !*o).collect()
+                                                    let rows: Vec<ActivityRenderRow> = if tool_detail == "compact" {
+                                                        rows.into_iter().filter(|row| row.running || !row.ok).collect()
                                                     } else {
                                                         rows
                                                     };
                                                     let hidden = rows.len().saturating_sub(ACT_ROW_CAP);
-                                                    let shown: Vec<(String, bool, bool)> = rows.into_iter().skip(hidden).collect();
+                                                    let shown: Vec<ActivityRenderRow> = rows.into_iter().skip(hidden).collect();
                                                     rsx! {
                                                         details { key: "g-{group_key}", class: "act-group", open: is_open,
                                                             summary { class: "act-group-head",
@@ -10102,8 +10798,13 @@ fn app() -> Element {
                                                                 "{label}"
                                                             }
                                                             if hidden > 0 { div { class: "act-more", "… {hidden} earlier" } }
-                                                            for (t, r, o, count) in coalesce_activity_rows(shown) {
+                                                            for row in coalesce_activity_rows(shown) {
                                                                 {
+                                                                    let row_key = row.id;
+                                                                    let t = row.text;
+                                                                    let r = row.running;
+                                                                    let o = row.ok;
+                                                                    let count = row.count;
                                                                     let view = activity_view(&t);
                                                                     if matches!(view.kind, ActivityKind::FileChange) {
                                                                         // Join the file's cumulative +/− from turn_edits by
@@ -10122,10 +10823,10 @@ fn app() -> Element {
                                                                             })
                                                                             .fold((0u32, 0u32), |(a, d), e| (a + e.1, d + e.2));
                                                                         let secs = if r { tool_start.read().as_ref().map(|ts| ts.elapsed().as_secs()).unwrap_or(0) } else { 0 };
-                                                                        rsx! { EditActivityRow { text: t, running: r, ok: o, count, adds, dels, secs } }
+                                                                        rsx! { EditActivityRow { key: "a-{row_key}", text: t, running: r, ok: o, count, adds, dels, secs } }
                                                                     } else {
                                                                         let secs = if r { tool_start.read().as_ref().map(|ts| ts.elapsed().as_secs()).unwrap_or(0) } else { 0 };
-                                                                        rsx! { ActivityRow { text: t, running: r, ok: o, secs, auto_open: tool_detail == "detailed" } }
+                                                                        rsx! { ActivityRow { key: "a-{row_key}", text: t, running: r, ok: o, secs, auto_open: tool_detail == "detailed" } }
                                                                     }
                                                                 }
                                                             }
@@ -10250,6 +10951,11 @@ fn app() -> Element {
                                                                             secs,
                                                                             body,
                                                                             settling: *settling_thought.read() == Some(m.id),
+                                                                            on_settled: move |_| {
+                                                                                if *settling_thought.peek() == Some(m.id) {
+                                                                                    settling_thought.set(None);
+                                                                                }
+                                                                            },
                                                                         }
                                                                     }
                                                                 }
@@ -10707,7 +11413,7 @@ fn app() -> Element {
                                         button { class: "suggestion followup",
                                             onclick: {
                                                 let p = f.clone();
-                                                move |_| { engine.send(EngineCmd::Submit { engine: p.clone(), display: p.clone() }); }
+                                                move |_| { engine.send(EngineCmd::submit(p.clone(), p.clone())); }
                                             },
                                             Icon { name: "spark" } span { "{f}" }
                                         }
@@ -10715,7 +11421,7 @@ fn app() -> Element {
                                     button { class: "followups-x", title: "Dismiss", onclick: move |_| followups.write().clear(), Icon { name: "x" } }
                                 }
                             }
-                            Composer { streaming, engine, cfg, model_label, bypass,
+                            Composer { streaming, engine, cfg, model_label, access,
                                        followup: !messages.read().is_empty(),
                                        project: project.clone(), branch: branch.clone(),
                                        draft_key: format!("{}:{}", workspace.display(), tabs.read().get(*active_tab.read()).map(|tab| tab.id).unwrap_or(0)),
@@ -10762,7 +11468,9 @@ fn app() -> Element {
                                 button { class: "env-x", title: "Close", onclick: move |_| show_env.set(false), Icon { name: "x" } }
                             }
                             div { class: "env-body",
-                            if env_tab.read().as_str() == "changes" {
+                            div {
+                                key: "env-changes",
+                                class: if env_tab.read().as_str() == "changes" { "env-pane env-pane-on" } else { "env-pane env-pane-off" },
                                 {
                                     let files = changed_files.read().clone();
                                     let n = files.len();
@@ -10844,7 +11552,9 @@ fn app() -> Element {
                                     }
                                 }
                             }
-                            if env_tab.read().as_str() == "preview" {
+                            div {
+                                key: "env-preview",
+                                class: if env_tab.read().as_str() == "preview" { "env-pane env-pane-on" } else { "env-pane env-pane-off" },
                                 div { class: "preview-panel",
                                     div { class: "preview-bar",
                                         input { class: "preview-addr", placeholder: "http://localhost:3000", value: "{preview_url}",
@@ -10858,11 +11568,33 @@ fn app() -> Element {
                                             Icon { name: "refresh" } "Scan"
                                         }
                                         button { class: "preview-btn pick", title: "Select an element to send to the composer", onclick: move |_| {
+                                            annotation_mode.set(false);
+                                            design_mode.set(false);
                                             spawn(async move { let _ = document::eval("document.querySelector('.preview-frame')?.contentWindow?.postMessage('oxide-pick-on','*')").await; });
                                         }, "Pick" }
+                                        button {
+                                            class: if *annotation_mode.read() { "preview-btn on" } else { "preview-btn" },
+                                            title: "Pin multiple numbered elements as persistent prompt context",
+                                            onclick: move |_| {
+                                                let enabled = !*annotation_mode.read();
+                                                annotation_mode.set(enabled);
+                                                design_mode.set(false);
+                                                if enabled {
+                                                    design_sel.set(None);
+                                                    design_edits.set(Vec::new());
+                                                    design_note.set(String::new());
+                                                    annotation_status.set("Click elements to add numbered annotations".to_string());
+                                                }
+                                                let message = if enabled { "'oxide-annotate-on'" } else { "'oxide-annotate-off'" };
+                                                let js = format!("document.querySelector('.preview-frame')?.contentWindow?.postMessage({message},'*')");
+                                                spawn(async move { let _ = document::eval(&js).await; });
+                                            },
+                                            if *annotation_mode.read() { "Done" } else { "Annotate" }
+                                        }
                                         button { class: if *design_mode.read() { "preview-btn pick on" } else { "preview-btn" }, title: "Design Mode — click an element, edit it live, Apply writes the code", onclick: move |_| {
                                             let v = *design_mode.read();
                                             design_mode.set(!v);
+                                            annotation_mode.set(false);
                                             if v { design_sel.set(None); design_edits.set(Vec::new()); design_note.set(String::new()); }
                                             let msg = if v { "'oxide-design-off'" } else { "'oxide-design-on'" };
                                             let js = format!("document.querySelector('.preview-frame')?.contentWindow?.postMessage({msg},'*')");
@@ -10873,6 +11605,69 @@ fn app() -> Element {
                                             Icon { name: "external-link" }
                                         }
                                         button { class: "term-x", onclick: move |_| show_env.set(false), Icon { name: "x" } }
+                                    }
+                                    if !browser_session.state.is_empty() {
+                                        {
+                                            let state = browser_session.state.clone();
+                                            let state_label = match state.as_str() {
+                                                "agent_controlled" => "Agent controlled",
+                                                "human_controlled" => "Your control",
+                                                "closed" => "Browser closed",
+                                                _ => "Browser session",
+                                            };
+                                            let state_class = format!("preview-session-state {state}");
+                                            let detail = if browser_session.url.is_empty() {
+                                                browser_session.detail.clone()
+                                            } else if browser_session.detail.is_empty() {
+                                                browser_session.url.clone()
+                                            } else {
+                                                format!("{} · {}", browser_session.url, browser_session.detail)
+                                            };
+                                            let can_take_over = browser_session.is_open()
+                                                && state == "agent_controlled"
+                                                && browser_session.visible;
+                                            let takeover_title = if browser_session.visible {
+                                                "Pause browser automation and take control"
+                                            } else {
+                                                "This session is headless. Disable headless browser automation in Settings before the next session."
+                                            };
+                                            rsx! {
+                                                div { class: "preview-session", role: "status", aria_live: "polite",
+                                                    span { class: "{state_class}", "{state_label}" }
+                                                    span { class: "preview-session-detail", title: "{detail}",
+                                                        if browser_session.is_open() && !browser_session.visible { "Headless · " }
+                                                        "{detail}"
+                                                    }
+                                                    div { class: "preview-session-actions",
+                                                        if state == "agent_controlled" {
+                                                            button {
+                                                                class: "preview-btn",
+                                                                disabled: !can_take_over,
+                                                                title: "{takeover_title}",
+                                                                onclick: move |_| engine.send(EngineCmd::BrowserControl(BrowserControlAction::TakeOver)),
+                                                                "Take over"
+                                                            }
+                                                        }
+                                                        if state == "human_controlled" {
+                                                            button {
+                                                                class: "preview-btn on",
+                                                                title: "Return this browser session to agent automation",
+                                                                onclick: move |_| engine.send(EngineCmd::BrowserControl(BrowserControlAction::Resume)),
+                                                                "Resume agent"
+                                                            }
+                                                        }
+                                                        if browser_session.is_open() {
+                                                            button {
+                                                                class: "preview-btn",
+                                                                title: "Close only this browser session; keep the agent turn running",
+                                                                onclick: move |_| engine.send(EngineCmd::BrowserControl(BrowserControlAction::Cancel)),
+                                                                "Cancel browser"
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
                                     div { class: "preview-ports",
                                         if preview_ports.read().is_empty() {
@@ -10888,6 +11683,54 @@ fn app() -> Element {
                                                 });
                                             },
                                                 span { class: "port-dot" } "localhost:{port}" span { class: "port-cmd", "{cmd}" }
+                                            }
+                                        }
+                                    }
+                                    if *annotation_mode.read()
+                                        || !preview_annotations.read().is_empty()
+                                        || !annotation_status.read().is_empty()
+                                    {
+                                        {
+                                            let annotation_count = preview_annotations.read().len();
+                                            let annotation_message = annotation_status.read().clone();
+                                            let annotations_attached = picked_element
+                                                .read()
+                                                .as_deref()
+                                                .map(|context| context.starts_with("Annotated UI elements ("))
+                                                .unwrap_or(false);
+                                            rsx! {
+                                                div { class: "annotation-bar", role: "status", aria_live: "polite",
+                                                    span { class: "annotation-count", "{annotation_count} pinned" }
+                                                    span { class: "annotation-status", "{annotation_message}" }
+                                                    if annotation_count > 0 {
+                                                        button {
+                                                            class: "preview-btn annotation-clear",
+                                                            disabled: annotations_attached,
+                                                            title: "Attach every numbered annotation to the next prompt",
+                                                            onclick: move |_| {
+                                                                picked_element.set(Some(preview_annotations_context(&preview_annotations.read())));
+                                                            },
+                                                            if annotations_attached { "Attached" } else { "Add to prompt" }
+                                                        }
+                                                        button {
+                                                            class: "preview-btn",
+                                                            title: "Remove all numbered annotations",
+                                                            onclick: move |_| {
+                                                                preview_annotations.write().clear();
+                                                                picked_element.set(None);
+                                                                annotation_status.set(if *annotation_mode.read() {
+                                                                    "Click elements to add numbered annotations".to_string()
+                                                                } else {
+                                                                    String::new()
+                                                                });
+                                                                spawn(async move {
+                                                                    let _ = document::eval("document.querySelector('.preview-frame')?.contentWindow?.postMessage('oxide-annotations-clear','*')").await;
+                                                                });
+                                                            },
+                                                            "Clear"
+                                                        }
+                                                    }
+                                                }
                                             }
                                         }
                                     }
@@ -10974,13 +11817,13 @@ fn app() -> Element {
                                                                     "Review this selected UI element before code changes. Use Design Workbench standards: token fit, contrast/accessibility, layout overflow, motion discipline, and source-code implementation risk. Do not edit files unless you find a concrete fix is needed.\n\n{}",
                                                                     build_design_apply_prompt(&selection_review, &edits, &note)
                                                                 );
-                                                                engine.send(EngineCmd::Submit { engine: prompt, display: format!("Review design edits · {selector_review}") });
+                                                                engine.send(EngineCmd::submit(prompt, format!("Review design edits · {selector_review}")));
                                                             }, "Review" }
                                                             button { class: "git-act", onclick: move |_| {
                                                                 let edits = design_edit_values(&design_edits.read());
                                                                 if edits.is_empty() { return; }
                                                                 let prompt = build_design_apply_prompt(&selection_apply, &edits, &design_note.read());
-                                                                engine.send(EngineCmd::Submit { engine: prompt, display: format!("Apply design edits · {selector_apply}") });
+                                                                engine.send(EngineCmd::submit(prompt, format!("Apply design edits · {selector_apply}")));
                                                                 design_edits.set(Vec::new());
                                                                 design_note.set(String::new());
                                                                 spawn(async move { let _ = document::eval("document.querySelector('.preview-frame')?.contentWindow?.postMessage('oxide-design-reset','*')").await; });
@@ -11001,11 +11844,47 @@ fn app() -> Element {
                                     if preview_url.read().is_empty() {
                                         div { class: "preview-empty", "Pick a detected server above, or type a URL. Build + run + see it without leaving Oxide." }
                                     } else {
-                                        iframe { class: "preview-frame", src: "{preview_url}" }
+                                        iframe {
+                                            class: "preview-frame",
+                                            title: "Oxide local preview",
+                                            src: "{preview_url}",
+                                            onload: move |_| {
+                                                let annotations = preview_annotations
+                                                    .read()
+                                                    .iter()
+                                                    .filter_map(|value| {
+                                                        let selector = value
+                                                            .get("selector")
+                                                            .and_then(|item| item.as_str())
+                                                            .map(str::to_string)?;
+                                                        let annotation = value
+                                                            .get("annotation")
+                                                            .and_then(|item| item.as_u64())?;
+                                                        let url = value
+                                                            .get("url")
+                                                            .and_then(|item| item.as_str())
+                                                            .unwrap_or("");
+                                                        Some(serde_json::json!({
+                                                            "selector": selector,
+                                                            "annotation": annotation,
+                                                            "url": url,
+                                                        }))
+                                                    })
+                                                    .collect::<Vec<_>>();
+                                                let annotations = serde_json::to_string(&annotations).unwrap_or_else(|_| "[]".to_string());
+                                                let annotate = *annotation_mode.read();
+                                                let js = format!(
+                                                    "const frame=document.querySelector('.preview-frame');if(frame){{if({annotate})frame.contentWindow.postMessage('oxide-annotate-on','*');if({annotations}.length)frame.contentWindow.postMessage({{type:'oxide-annotations-restore',annotations:{annotations}}},'*');}}"
+                                                );
+                                                spawn(async move { let _ = document::eval(&js).await; });
+                                            }
+                                        }
                                     }
                                 }
                             }
-                    if env_tab.read().as_str() == "files" {
+                    div {
+                        key: "env-files",
+                        class: if env_tab.read().as_str() == "files" { "env-pane env-pane-on" } else { "env-pane env-pane-off" },
                         div { class: "panel-resizer", title: "Drag to resize inspector",
                             onmousedown: move |e: dioxus::prelude::MouseEvent| {
                                 e.prevent_default();
@@ -11191,12 +12070,9 @@ fn app() -> Element {
                                                                         "Act as Bugbot. Review the current working changes for bugs, security issues, logic errors, and regressions. For each finding give: file:line, severity, why it is wrong, and the concrete fix. If the diff is clean, say so plainly.\n\n```diff\n{diff}\n```"
                                                                     );
                                                                     if *streaming.read() {
-                                                                        queue.write().push(prompt);
+                                                                        queue.write().push(QueuedPrompt::capture(prompt));
                                                                     } else {
-                                                                        engine.send(EngineCmd::Submit {
-                                                                            engine: prompt,
-                                                                            display: "/review (Bugbot)".into(),
-                                                                        });
+                                                                        engine.send(EngineCmd::submit(prompt, "/review (Bugbot)".into()));
                                                                     }
                                                                 });
                                                             },
@@ -11207,12 +12083,9 @@ fn app() -> Element {
                                                             button { class: "agents-work-card", onclick: move |_| {
                                                                 let prompt = "Assess the current workspace and conversation, then propose the single most valuable next piece of work. Inspect git status, unfinished TODOs, recent verification/audit evidence, and saved automations. If a safe, scoped action is clearly ready, implement it and verify it; otherwise give a concise prioritized recommendation.".to_string();
                                                                 if *streaming.read() {
-                                                                    queue.write().push(prompt);
+                                                                    queue.write().push(QueuedPrompt::capture(prompt));
                                                                 } else {
-                                                                    engine.send(EngineCmd::Submit {
-                                                                        engine: prompt,
-                                                                        display: "Next Work".to_string(),
-                                                                    });
+                                                                    engine.send(EngineCmd::submit(prompt, "Next Work".to_string()));
                                                                 }
                                                             },
                                                                 Icon { name: "arrow-right" }
@@ -11340,12 +12213,9 @@ fn app() -> Element {
                                                             "Apply the inline review feedback below. Inspect each referenced file and hunk, make the smallest correct changes, then run the relevant verification.\n\n{notes}"
                                                         );
                                                         if *streaming.read() {
-                                                            queue.write().push(prompt);
+                                                            queue.write().push(QueuedPrompt::capture(prompt));
                                                         } else {
-                                                            engine.send(EngineCmd::Submit {
-                                                                engine: prompt,
-                                                                display: "Fix inline review feedback".to_string(),
-                                                            });
+                                                            engine.send(EngineCmd::submit(prompt, "Fix inline review feedback".to_string()));
                                                         }
                                                     }, "Fix feedback" }
                                                 }
@@ -11801,7 +12671,9 @@ fn app() -> Element {
                                 // when another env tab is active.
                                 {
                                     rsx! {
-                                    div { class: if env_tab.read().as_str() == "term" { "env-terms" } else { "env-terms env-hidden" },
+                                    div {
+                                        key: "env-term",
+                                        class: if env_tab.read().as_str() == "term" { "env-pane env-pane-on env-terms" } else { "env-pane env-pane-off env-terms" },
                                         div { class: "term-tabs",
                                             for ti in 0..terms.read().len() {
                                                 {
@@ -12723,7 +13595,7 @@ fn switch_tab(
     // brand-new tabs (no saved position) land at the bottom as before.
     spawn(async move {
         let js = format!(
-            "const s=document.querySelector('.scroll'); window.__oxscrollpos=window.__oxscrollpos||{{}}; if(s) window.__oxscrollpos[{cur_id}]=s.scrollTop;              for (const delay of [40, 140]) setTimeout(()=>requestAnimationFrame(()=>{{ const s2=document.querySelector('.scroll'); if(!s2) return;              const p=window.__oxscrollpos[{new_id}];              if (p===undefined) {{ s2.scrollTo({{top:s2.scrollHeight, behavior:'auto'}}); window.__oxstick=true; }}              else {{ s2.scrollTo({{top:p, behavior:'auto'}}); const d=s2.scrollHeight-s2.scrollTop-s2.clientHeight; window.__oxstick = d<8; }} }}),delay);"
+            "const c=window.__oxTranscript;const s=c?c.main():document.getElementById('main-transcript');window.__oxscrollpos=window.__oxscrollpos||{{}};if(s)window.__oxscrollpos[{cur_id}]=s.scrollTop;for(const delay of [40,140])setTimeout(()=>requestAnimationFrame(()=>{{const c2=window.__oxTranscript;const s2=c2?c2.main():document.getElementById('main-transcript');if(!s2)return;const p=window.__oxscrollpos[{new_id}];if(p===undefined){{if(c2)c2.jump(s2,'auto');else{{s2.scrollTo({{top:s2.scrollHeight,behavior:'auto'}});window.__oxstick=true;}}}}else if(c2)c2.restore(s2,p);else{{s2.scrollTo({{top:p,behavior:'auto'}});const d=s2.scrollHeight-s2.scrollTop-s2.clientHeight;window.__oxstick=d<8;}}}}),delay);"
         );
         let _ = dioxus::document::eval(&js).await;
     });
@@ -13749,7 +14621,7 @@ fn SettingsModal(
     mut hermes_status: Signal<String>,
     mut hermes_confirm_delete: Signal<Option<String>>,
     streaming: Signal<bool>,
-    mut queue: Signal<Vec<String>>,
+    mut queue: Signal<Vec<QueuedPrompt>>,
     on_close: EventHandler<()>,
 ) -> Element {
     let base = cfg.read().clone();
@@ -13761,7 +14633,7 @@ fn SettingsModal(
     let mut model = use_signal(|| base.model.clone());
     let mut effort = use_signal(|| base.reasoning_effort.clone());
     let mut fast = use_signal(|| base.fast_mode);
-    let mut bypass = use_signal(|| matches!(base.approval_policy, ApprovalPolicy::Never));
+    let mut access = use_signal(|| access_preset(&base));
     let mut ws = use_signal(|| workspace_of(&base));
     let mut orchestrate = use_signal(|| base.orchestrate);
     let mut front = use_signal(|| base.front_provider.clone());
@@ -13796,9 +14668,10 @@ fn SettingsModal(
     let mut hook_status = use_signal(|| "Hooks ready".to_string());
     let dcg_bin = use_hook(oxide_core::hooks::dcg_binary);
 
-    // Oxide is a GUI wrapper around the user's logged-in agent CLIs + the ChatGPT
-    // subscription — no raw API-key providers (openai/anthropic) in the picker.
-    let providers = ["chatgpt", "codex", "claude", "echo", "mock"];
+    // Provider order and models come from oxide-providers. The GUI policy keeps
+    // authenticated production backends first, with explicit local test
+    // fallbacks available only from Settings.
+    let providers = gui_providers(true);
 
     let save = move |_| {
         let mut c = cfg.read().clone();
@@ -13819,13 +14692,11 @@ fn SettingsModal(
         c.native_notifications = *native_notifications.read();
         c.tool_detail = tool_detail_sel.read().clone();
         c.notification_volume = *notification_volume.read();
-        c.approval_policy = if *bypass.read() {
-            ApprovalPolicy::Never
-        } else {
-            ApprovalPolicy::OnRequest
-        };
-        if !*bypass.read() {
-            c.sandbox = SandboxPolicy::WorkspaceWrite;
+        let previous_permissions = (c.effective_approval_policy(), c.effective_sandbox());
+        apply_access_preset(&mut c, *access.read());
+        let next_permissions = (c.effective_approval_policy(), c.effective_sandbox());
+        if previous_permissions != next_permissions {
+            publish_runtime_permissions(&c);
         }
         let chosen_ws = ws.read().clone();
         c.workspace = Some(chosen_ws.clone());
@@ -13872,10 +14743,20 @@ fn SettingsModal(
                             }, "Connect / Re-login" }
                         }
                         button { class: "ed-save", style: "margin-top:8px", onclick: move |_| {
-                            provider.set("chatgpt".to_string());
-                            model.set("gpt-5.5".to_string());
-                            fast.set(false);
-                        }, "Use ChatGPT subscription" }
+                            if provider_is_selectable("chatgpt") {
+                                provider.set("chatgpt".to_string());
+                                if let Some(preset) = default_model_for("chatgpt") {
+                                    let current_effort = effort.read().clone();
+                                    model.set(preset.model.to_string());
+                                    fast.set(preset.fast);
+                                    effort.set(clamp_effort(
+                                        "chatgpt",
+                                        preset.model,
+                                        &current_effort,
+                                    ));
+                                }
+                            }
+                        }, disabled: !provider_is_selectable("chatgpt"), "Use ChatGPT subscription" }
                     }
                     label { class: "field",
                         span { class: "field-label", "Harness (coding behavior)" }
@@ -13901,15 +14782,34 @@ fn SettingsModal(
                             value: "{provider}",
                             onchange: move |e| {
                                 let next = e.value();
+                                if !provider_is_selectable(&next) {
+                                    return;
+                                }
                                 provider.set(next.clone());
-                                if let Some(preset) = MODEL_PRESETS.iter().find(|p| p.provider == next) {
+                                if let Some(preset) = default_model_for(&next) {
+                                    let current_effort = effort.read().clone();
                                     model.set(preset.model.to_string());
                                     fast.set(preset.fast);
-                                    effort.set(if preset.fast { "low".to_string() } else { "medium".to_string() });
+                                    effort.set(if preset.fast {
+                                        "low".to_string()
+                                    } else {
+                                        clamp_effort(&next, preset.model, &current_effort)
+                                    });
                                 }
                             },
-                            for p in providers.iter() {
-                                option { value: "{p}", selected: provider.read().as_str() == *p, "{p}" }
+                            for choice in providers.iter() {
+                                option {
+                                    value: "{choice.id}",
+                                    selected: provider.read().as_str() == choice.id,
+                                    disabled: choice.diagnostic.status == oxide_providers::DiagnosticStatus::Missing,
+                                    "{choice.label} · {provider_readiness_label(choice.diagnostic.status)}"
+                                }
+                            }
+                        }
+                        if let Some(choice) = providers.iter().find(|choice| choice.id == provider.read().as_str()) {
+                            span {
+                                class: "field-hint",
+                                "{provider_readiness_label(choice.diagnostic.status)} · {choice.diagnostic.summary}. {choice.diagnostic.detail}"
                             }
                         }
                     }
@@ -13918,20 +14818,30 @@ fn SettingsModal(
                         select {
                             class: "field-input",
                             value: "{model}",
+                            disabled: !provider_is_selectable(provider.read().as_str()),
                             onchange: move |e| {
                                 let next = e.value();
-                                let is_fast = MODEL_PRESETS
-                                    .iter()
-                                    .find(|p| p.provider == provider.read().as_str() && p.model == next)
+                                let selected_provider = provider.read().clone();
+                                let is_fast = selected_model(&selected_provider, &next)
                                     .map(|p| p.fast)
                                     .unwrap_or(false);
+                                let next_effort = clamp_effort(
+                                    &selected_provider,
+                                    &next,
+                                    effort.read().as_str(),
+                                );
                                 model.set(next);
                                 fast.set(is_fast);
                                 if is_fast {
                                     effort.set("low".to_string());
+                                } else {
+                                    effort.set(next_effort);
                                 }
                             },
-                            for preset in MODEL_PRESETS.iter().filter(|p| p.provider == provider.read().as_str()) {
+                            for preset in settings_provider_models(
+                                provider.read().as_str(),
+                                model.read().as_str(),
+                            ) {
                                 option {
                                     value: "{preset.model}",
                                     selected: model.read().as_str() == preset.model,
@@ -13971,8 +14881,12 @@ fn SettingsModal(
                                 if enabled {
                                     if let Some(preset) = fast_model_for(provider.read().as_str()) {
                                         model.set(preset.model.to_string());
+                                        effort.set(clamp_effort(
+                                            provider.read().as_str(),
+                                            preset.model,
+                                            "low",
+                                        ));
                                     }
-                                    effort.set("low".to_string());
                                 }
                             }
                         }
@@ -13984,9 +14898,19 @@ fn SettingsModal(
                         span { class: "field-label", "Permissions" }
                         select {
                             class: "field-input",
-                            onchange: move |e| bypass.set(e.value() == "full"),
-                            option { value: "full", selected: *bypass.read(), "Full access (bypass)" }
-                            option { value: "ask", selected: !*bypass.read(), "Ask first" }
+                            onchange: move |e| access.set(match e.value().as_str() {
+                                "full" => AccessPreset::FullAccess,
+                                "auto" => AccessPreset::Auto,
+                                _ => AccessPreset::ApprovalRequired,
+                            }),
+                            option { value: "approval", selected: matches!(*access.read(), AccessPreset::ApprovalRequired), "Approval required" }
+                            option { value: "auto", selected: matches!(*access.read(), AccessPreset::Auto), "Auto (workspace sandbox)" }
+                            option { value: "full", selected: matches!(*access.read(), AccessPreset::FullAccess), "Full access (unrestricted)" }
+                        }
+                        if matches!(provider.read().as_str(), "codex" | "claude" | "claude_interactive")
+                            && matches!(*access.read(), AccessPreset::ApprovalRequired)
+                        {
+                            span { class: "field-hint", "Headless CLI runs read-only in this mode; interactive approval bridging is not available yet." }
                         }
                     }
                     div { class: "field",
@@ -14024,13 +14948,27 @@ fn SettingsModal(
                                 div { class: "orch-col",
                                     span { class: "field-label", "Front (plan)" }
                                     select { class: "field-input", value: "{front}", onchange: move |e| front.set(e.value()),
-                                        for p in providers.iter() { option { value: "{p}", selected: front.read().as_str() == *p, "{p}" } }
+                                        for choice in providers.iter() {
+                                            option {
+                                                value: "{choice.id}",
+                                                selected: front.read().as_str() == choice.id,
+                                                disabled: choice.diagnostic.status == oxide_providers::DiagnosticStatus::Missing,
+                                                "{choice.label} · {provider_readiness_label(choice.diagnostic.status)}"
+                                            }
+                                        }
                                     }
                                 }
                                 div { class: "orch-col",
                                     span { class: "field-label", "Backend (do)" }
                                     select { class: "field-input", value: "{backend}", onchange: move |e| backend.set(e.value()),
-                                        for p in providers.iter() { option { value: "{p}", selected: backend.read().as_str() == *p, "{p}" } }
+                                        for choice in providers.iter() {
+                                            option {
+                                                value: "{choice.id}",
+                                                selected: backend.read().as_str() == choice.id,
+                                                disabled: choice.diagnostic.status == oxide_providers::DiagnosticStatus::Missing,
+                                                "{choice.label} · {provider_readiness_label(choice.diagnostic.status)}"
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -14665,7 +15603,13 @@ fn SettingsModal(
                 }
                 div { class: "modal-foot",
                     button { class: "ed-close", onclick: move |_| on_close.call(()), "Cancel" }
-                    button { class: "ed-save", onclick: save, "Save" }
+                    button {
+                        class: "ed-save",
+                        disabled: !provider_is_selectable(provider.read().as_str()),
+                        title: if provider_is_selectable(provider.read().as_str()) { "Save settings" } else { "Install or connect the selected provider before saving" },
+                        onclick: save,
+                        "Save"
+                    }
                 }
             }
         }
@@ -14673,13 +15617,13 @@ fn SettingsModal(
 }
 
 #[component]
-fn QueuedPromptBar(mut queue: Signal<Vec<String>>, engine: Coroutine<EngineCmd>) -> Element {
+fn QueuedPromptBar(mut queue: Signal<Vec<QueuedPrompt>>, engine: Coroutine<EngineCmd>) -> Element {
     let items = queue.read().clone();
     let Some(first) = items.first() else {
         return rsx! {};
     };
     let total = items.len();
-    let first_preview = queue_preview(first);
+    let first_preview = queue_preview(&first.text);
 
     rsx! {
         div { class: "queue-bar",
@@ -14722,7 +15666,7 @@ fn QueuedPromptBar(mut queue: Signal<Vec<String>>, engine: Coroutine<EngineCmd>)
                         for (offset, prompt) in items.iter().skip(1).cloned().enumerate() {
                             {
                                 let index = offset + 1;
-                                let preview = queue_preview(&prompt);
+                                let preview = queue_preview(&prompt.text);
                                 rsx! {
                                     div { class: "queue-row",
                                         button {
@@ -14786,7 +15730,7 @@ fn Composer(
     cfg: Signal<Config>,
     #[props(default)] followup: bool,
     model_label: String,
-    bypass: bool,
+    access: AccessPreset,
     project: String,
     branch: String,
     draft_key: String,
@@ -14796,7 +15740,7 @@ fn Composer(
     plan_mode: Signal<bool>,
     pursue_goal: Signal<bool>,
     goal_text: Signal<String>,
-    queue: Signal<Vec<String>>,
+    queue: Signal<Vec<QueuedPrompt>>,
     mut picked_element: Signal<Option<String>>,
     on_mcp: EventHandler<()>,
     on_model: EventHandler<()>,
@@ -14810,8 +15754,21 @@ fn Composer(
     let mut show_proj = use_signal(|| false);
     let mut show_branch = use_signal(|| false);
     let recent = cfg.read().recent_workspaces.clone();
-    let access_label = if bypass { "Full access" } else { "Ask first" };
-    let mut plan_mode = plan_mode;
+    let headless_cli = matches!(
+        cfg.read().provider.as_str(),
+        "codex" | "claude" | "claude_interactive"
+    );
+    let access_label = if *plan_mode.read() {
+        "Read only · new turns"
+    } else {
+        match access {
+            AccessPreset::ApprovalRequired if headless_cli => "Read only (CLI)",
+            AccessPreset::ApprovalRequired => "Approval required",
+            AccessPreset::Auto => "Auto",
+            AccessPreset::FullAccess => "Full access",
+        }
+    };
+    let plan_mode = plan_mode;
     let mut pursue_goal = pursue_goal;
     let mut show_plus = use_signal(|| false);
     let mut show_access = use_signal(|| false);
@@ -14999,7 +15956,7 @@ fn Composer(
     } else {
         "context usage — send a message to populate".to_string()
     };
-    let access_cls = if bypass {
+    let access_cls = if matches!(access, AccessPreset::FullAccess) && !*plan_mode.read() {
         "pill access danger"
     } else {
         "pill access"
@@ -15014,7 +15971,8 @@ fn Composer(
     let fast_enabled = cfg.read().fast_mode;
     let pill_logo = provider_logo(&cur_provider);
     let query = model_query.read().trim().to_ascii_lowercase();
-    let model_count = MODEL_PRESETS
+    let model_presets = production_model_presets();
+    let model_count = model_presets
         .iter()
         .filter(|preset| model_matches(preset, &query))
         .count();
@@ -15201,7 +16159,20 @@ fn Composer(
             }
             if let Some(p) = picked_element.read().clone() {
                 {
-                    let label = p.lines().find_map(|l| l.strip_prefix("- selector: ")).unwrap_or("element").to_string();
+                    let label = p
+                        .lines()
+                        .next()
+                        .and_then(|line| {
+                            line.strip_prefix("Annotated UI elements (")
+                                .and_then(|rest| rest.strip_suffix("):") )
+                                .map(|count| format!("{count} annotations"))
+                        })
+                        .or_else(|| {
+                            p.lines()
+                                .find_map(|line| line.strip_prefix("- selector: "))
+                                .map(str::to_string)
+                        })
+                        .unwrap_or_else(|| "element".to_string());
                     rsx! {
                         div { class: "elem-chip", title: "{p}",
                             span { class: "elem-pin", Icon { name: "pin" } }
@@ -15390,11 +16361,11 @@ fn Composer(
                         }
                         e.prevent_default();
                         let ws = ws_kd2.clone();
-                        spawn(async move { submit_ce(streaming, engine, plan_mode, pursue_goal, goal_text, queue, attachments, text_attachments, picked_element, on_mcp, on_model, on_status, on_goal, on_new, false, ws).await; });
+                        spawn(async move { submit_ce(streaming, engine, cfg, plan_mode, pursue_goal, goal_text, queue, attachments, text_attachments, picked_element, on_mcp, on_model, on_status, on_goal, on_new, false, ws).await; });
                     } else if e.key() == Key::Tab && e.modifiers().shift() {
                         e.prevent_default();
                         let v = *plan_mode.read();
-                        plan_mode.set(!v);
+                        set_plan_mode(cfg, plan_mode, !v);
                     }
                 },
             }
@@ -15442,8 +16413,8 @@ fn Composer(
                                     span { class: "plus-name", "Add files & folders" }
                                 }
                                 div { class: "plus-divider" }
-                                button { class: "plus-item",
-                                    onclick: move |_| { let v = *plan_mode.read(); plan_mode.set(!v); },
+                                button { class: "plus-item", title: "Applies to newly submitted turns; a turn already running keeps the access it started with",
+                                    onclick: move |_| { let v = *plan_mode.read(); set_plan_mode(cfg, plan_mode, !v); },
                                     Icon { name: "list" }
                                     span { class: "plus-name", "Plan mode" }
                                     span { class: "plus-hint", "⇧⇥" }
@@ -15470,7 +16441,7 @@ fn Composer(
                         }
                     }
                     if *plan_mode.read() {
-                        span { class: "pill plan", Icon { name: "list" } "Plan" }
+                        span { class: "pill plan", title: "Read-only for newly submitted turns", Icon { name: "list" } "Plan" }
                     }
                     if *pursue_goal.read() {
                         span {
@@ -15487,24 +16458,24 @@ fn Composer(
                         if *show_access.read() {
                             div { class: "menu-backdrop", onclick: move |_| show_access.set(false) }
                             {
-                                let ap = cfg.read().approval_policy;
+                                let selected_access = access_preset(&cfg.read());
                                 rsx! {
                                     div { class: "access-menu",
                                         div { class: "menu-label", "How should actions be approved?" }
                                         button { class: "menu-item", onclick: move |_| set_access_mode(cfg, engine, show_access, ApprovalPolicy::Always, SandboxPolicy::WorkspaceWrite),
                                             Icon { name: "shield" }
-                                            span { class: "menu-copy", span { class: "menu-name", "Ask for approval" } span { class: "menu-meta", "Always ask before edits and network" } }
-                                            if matches!(ap, ApprovalPolicy::Always) { span { class: "menu-check", Icon { name: "check" } } }
+                                            span { class: "menu-copy", span { class: "menu-name", "Ask for approval" } span { class: "menu-meta", if headless_cli { "Headless CLI stays read-only until its approval bridge is available" } else { "Always ask before edits and network" } } }
+                                            if matches!(selected_access, AccessPreset::ApprovalRequired) { span { class: "menu-check", Icon { name: "check" } } }
                                         }
                                         button { class: "menu-item", onclick: move |_| set_access_mode(cfg, engine, show_access, ApprovalPolicy::OnRequest, SandboxPolicy::WorkspaceWrite),
                                             Icon { name: "terminal" }
                                             span { class: "menu-copy", span { class: "menu-name", "Approve for me" } span { class: "menu-meta", "Auto-run safe; ask for risky actions" } }
-                                            if matches!(ap, ApprovalPolicy::OnRequest) { span { class: "menu-check", Icon { name: "check" } } }
+                                            if matches!(selected_access, AccessPreset::Auto) { span { class: "menu-check", Icon { name: "check" } } }
                                         }
                                         button { class: "menu-item", onclick: move |_| set_access_mode(cfg, engine, show_access, ApprovalPolicy::Never, SandboxPolicy::DangerFullAccess),
                                             Icon { name: "zap" }
                                             span { class: "menu-copy", span { class: "menu-name", "Full access" } span { class: "menu-meta", "Unrestricted files + network (yolo)" } }
-                                            if matches!(ap, ApprovalPolicy::Never) { span { class: "menu-check", Icon { name: "check" } } }
+                                            if matches!(selected_access, AccessPreset::FullAccess) { span { class: "menu-check", Icon { name: "check" } } }
                                         }
                                         div { class: "plus-divider" }
                                         button { class: "menu-item", onclick: move |_| { show_access.set(false); on_settings.call(()); },
@@ -15526,6 +16497,11 @@ fn Composer(
                             if c.fast_mode {
                                 if let Some(preset) = fast_model_for(&c.provider) {
                                     c.model = preset.model.to_string();
+                                    c.reasoning_effort = clamp_effort(
+                                        &c.provider,
+                                        &c.model,
+                                        &c.reasoning_effort,
+                                    );
                                 }
                             }
                             cfg.set(c.clone());
@@ -15567,34 +16543,56 @@ fn Composer(
                                     div { class: "menu-empty", "No matching model" }
                                 }
                                 {
-                                    let visible: Vec<&'static ModelPreset> = MODEL_PRESETS.iter().filter(|preset| model_matches(preset, &query)).collect();
+                                    let visible: Vec<ModelPreset> = model_presets.iter().copied().filter(|preset| model_matches(preset, &query)).collect();
                                     rsx! {
-                                        for (gi, preset) in visible.iter().cloned().enumerate() {
+                                        for (gi, preset) in visible.iter().copied().enumerate() {
                                             {
                                         // Section header when the provider group changes (synara-style).
                                         let header = if gi == 0 || visible[gi - 1].provider_label != preset.provider_label {
                                             Some(preset.provider_label)
                                         } else { None };
+                                        let diagnostic = oxide_providers::diagnose_provider(preset.provider);
+                                        let selectable = diagnostic
+                                            .as_ref()
+                                            .map(|diagnostic| diagnostic.status != oxide_providers::DiagnosticStatus::Missing)
+                                            .unwrap_or(false);
+                                        let readiness = diagnostic
+                                            .as_ref()
+                                            .map(|diagnostic| provider_readiness_label(diagnostic.status))
+                                            .unwrap_or("Missing");
+                                        let readiness_title = diagnostic
+                                            .as_ref()
+                                            .map(|diagnostic| format!("{}: {}", diagnostic.summary, diagnostic.detail))
+                                            .unwrap_or_else(|| "Provider is not present in the runtime catalog".to_string());
                                         let selected = preset.provider == cur_provider && preset.model == cur_model;
                                         let logo = provider_logo(preset.provider);
                                         let prov = preset.provider.to_string();
                                         let model = preset.model.to_string();
-                                        let is_fast = preset.fast;
                                         rsx! {
                                             if let Some(h) = header {
-                                                div { class: "menu-label model-group",
+                                                div { class: "menu-label model-group", title: "{readiness_title}",
                                                     if let Some(svg) = provider_logo(preset.provider) { span { class: "prov-logo sm", dangerous_inner_html: svg } }
                                                     "{h}"
+                                                    span { class: if selectable { "menu-badge" } else { "menu-badge fast" }, "{readiness}" }
                                                 }
                                             }
                                             button {
                                                 class: if selected { "menu-item sel" } else { "menu-item" },
+                                                disabled: !selectable,
+                                                title: "{readiness_title}",
                                                 onclick: move |_| {
                                                     // Keep the user's chosen effort + fast toggle on model switch.
-                                                    let _ = is_fast;
+                                                    if !provider_is_selectable(&prov) {
+                                                        return;
+                                                    }
                                                     let mut c = cfg.read().clone();
                                                     c.provider = prov.clone();
                                                     c.model = model.clone();
+                                                    c.reasoning_effort = clamp_effort(
+                                                        &c.provider,
+                                                        &c.model,
+                                                        &c.reasoning_effort,
+                                                    );
                                                     cfg.set(c.clone());
                                                     engine.send(EngineCmd::Reconfigure(c));
                                                     show_models.set(false);
@@ -15662,10 +16660,10 @@ fn Composer(
                         }
                     }
                     if *streaming.read() {
-                        button { class: "send steer", title: "Steer (inject into the running turn)", onclick: move |_| { let ws = ws_steer.clone(); spawn(async move { submit_ce(streaming, engine, plan_mode, pursue_goal, goal_text, queue, attachments, text_attachments, picked_element, on_mcp, on_model, on_status, on_goal, on_new, true, ws).await; }); }, Icon { name: "corner-up-right" } }
+                        button { class: "send steer", title: "Steer (inject into the running turn)", onclick: move |_| { let ws = ws_steer.clone(); spawn(async move { submit_ce(streaming, engine, cfg, plan_mode, pursue_goal, goal_text, queue, attachments, text_attachments, picked_element, on_mcp, on_model, on_status, on_goal, on_new, true, ws).await; }); }, Icon { name: "corner-up-right" } }
                         button { class: "send stop", title: "Stop", onclick: move |_| { engine.send(EngineCmd::Interrupt); }, Icon { name: "stop" } }
                     } else {
-                        button { class: "send", onclick: move |_| { let ws = ws_btn.clone(); spawn(async move { submit_ce(streaming, engine, plan_mode, pursue_goal, goal_text, queue, attachments, text_attachments, picked_element, on_mcp, on_model, on_status, on_goal, on_new, false, ws).await; }); }, Icon { name: "arrow-up" } }
+                        button { class: "send", onclick: move |_| { let ws = ws_btn.clone(); spawn(async move { submit_ce(streaming, engine, cfg, plan_mode, pursue_goal, goal_text, queue, attachments, text_attachments, picked_element, on_mcp, on_model, on_status, on_goal, on_new, false, ws).await; }); }, Icon { name: "arrow-up" } }
                     }
                 }
             }
@@ -15896,7 +16894,11 @@ fn BrainView(
                             span { "Knowledge map" }
                             span { "Click a workspace node to inspect what it learned" }
                         }
-                        svg { class: "brain-map", view_box: "0 0 900 520", role: "img",
+                        svg {
+                            class: "brain-map",
+                            view_box: "0 0 900 520",
+                            role: "group",
+                            "aria-label": "Interactive workspace knowledge map",
                             for (index, x, y, _, memories, _, _, _, _,) in graph_nodes.iter() {
                                 {
                                     let edge_width = 1.0 + (*memories).min(8) as f64 * 0.12;
@@ -15916,7 +16918,12 @@ fn BrainView(
                             text { class: "brain-core-label", x: "450", y: "278", "Memory" }
                             for (index, x, y, label, memories, facts, skills, current, path) in graph_nodes.iter().cloned() {
                                 {
-                                    let node_class = if index == selected_idx { "brain-node active" } else { "brain-node" };
+                                    let is_selected = index == selected_idx;
+                                    let node_class = if is_selected { "brain-node active" } else { "brain-node" };
+                                    let node_label = format!(
+                                        "{label}, {memories} memories, {facts} facts, {skills} skills{}",
+                                        if current { ", current workspace" } else { "" }
+                                    );
                                     let node_x = format!("{:.1}", x - 88.0);
                                     let node_y = format!("{:.1}", y - 36.0);
                                     let current_x = format!("{:.1}", x + 72.0);
@@ -15930,10 +16937,13 @@ fn BrainView(
                                             class: "{node_class}",
                                             role: "button",
                                             tabindex: "0",
+                                            "aria-label": "{node_label}",
+                                            "aria-pressed": "{is_selected}",
                                             onclick: move |_| selected.set(index),
                                             onkeydown: move |event| {
                                                 let key = event.key();
                                                 if key == Key::Enter || key == Key::Character(" ".to_string()) {
+                                                    event.prevent_default();
                                                     selected.set(index);
                                                 }
                                             },
@@ -15955,7 +16965,10 @@ fn BrainView(
                             }
                         }
                     }
-                    aside { class: "brain-inspector",
+                    aside {
+                        class: "brain-inspector",
+                        aria_label: "Selected workspace memory",
+                        aria_live: "polite",
                         if let Some(project) = selected_project {
                             div { class: "brain-project-head",
                                 span { class: "brain-project-icon", Icon { name: "folder" } }
@@ -16114,7 +17127,12 @@ fn StatusPill(
 }
 
 #[component]
-fn ThoughtRow(secs: u64, body: String, #[props(default)] settling: bool) -> Element {
+fn ThoughtRow(
+    secs: u64,
+    body: String,
+    #[props(default)] settling: bool,
+    on_settled: EventHandler<()>,
+) -> Element {
     let duration = format_thought_duration(secs);
     let class = if settling {
         "thought-row settling"
@@ -16127,7 +17145,28 @@ fn ThoughtRow(secs: u64, body: String, #[props(default)] settling: bool) -> Elem
                 span { class: "thought-label-stack",
                     if settling {
                         span { class: "thought-label-live", "Reasoning" }
-                        span { class: "thought-label-settled", "Thought for {duration}" }
+                        span {
+                            class: "thought-label-settled",
+                            onmounted: move |_| {
+                                spawn(async move {
+                                    let reduced = document::eval(
+                                        "window.matchMedia('(prefers-reduced-motion: reduce)').matches",
+                                    )
+                                    .join::<bool>()
+                                    .await
+                                    .unwrap_or(false);
+                                    if reduced {
+                                        on_settled.call(());
+                                    }
+                                });
+                            },
+                            onanimationend: move |event| {
+                                if event.animation_name() == "oxide-thought-settled-in" {
+                                    on_settled.call(());
+                                }
+                            },
+                            "Thought for {duration}"
+                        }
                     } else {
                         span { class: "thought-label", "Thought for {duration}" }
                     }
@@ -16329,7 +17368,78 @@ fn scan_mouse_mode(bytes: &[u8]) -> Option<bool> {
 /// "running" | "review" (turn selesai, siap direview) | "attention" (butuh izin).
 static TUI_AGENT_STATES: GlobalSignal<HashMap<u64, &'static str>> = Signal::global(HashMap::new);
 static TERMINAL_TAILS: GlobalSignal<HashMap<u64, Vec<u8>>> = Signal::global(HashMap::new);
+static RUNTIME_PERMISSION_EPOCH: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[derive(Clone, Copy)]
+struct PublishedRuntimePermissions {
+    permissions: RuntimePermissions,
+    epoch: u64,
+}
+
+static RUNTIME_PERMISSIONS: OnceLock<std::sync::RwLock<PublishedRuntimePermissions>> =
+    OnceLock::new();
 const TERMINAL_TAIL_BYTES: usize = 64 * 1024;
+
+fn runtime_permission_epoch() -> u64 {
+    RUNTIME_PERMISSION_EPOCH.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+fn runtime_permission_snapshot() -> (RuntimePermissions, u64) {
+    if let Some(state) = RUNTIME_PERMISSIONS.get() {
+        let state = state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        return (state.permissions, state.epoch);
+    }
+    (
+        RuntimePermissions {
+            approval_policy: ApprovalPolicy::Never,
+            sandbox: SandboxPolicy::ReadOnly,
+        },
+        runtime_permission_epoch(),
+    )
+}
+
+fn publish_runtime_permissions(config: &Config) {
+    let next = RuntimePermissions {
+        approval_policy: config.effective_approval_policy(),
+        sandbox: config.effective_sandbox(),
+    };
+    let state = RUNTIME_PERMISSIONS.get_or_init(|| {
+        std::sync::RwLock::new(PublishedRuntimePermissions {
+            permissions: next,
+            epoch: runtime_permission_epoch(),
+        })
+    });
+    let mut current = state
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if current.permissions != next {
+        // Revoke stale captures before exposing the replacement pair. The
+        // write lock keeps `{permissions, epoch}` atomic for new captures,
+        // while the mirrored atomic lets terminals and queued work fail closed
+        // as soon as an access transition begins.
+        let epoch = RUNTIME_PERMISSION_EPOCH
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            .wrapping_add(1);
+        current.permissions = next;
+        current.epoch = epoch;
+    }
+}
+
+fn fail_closed_stale_permissions(
+    permissions: RuntimePermissions,
+    expected_epoch: u64,
+) -> RuntimePermissions {
+    if runtime_permission_epoch() == expected_epoch {
+        permissions
+    } else {
+        RuntimePermissions {
+            approval_policy: ApprovalPolicy::Never,
+            sandbox: SandboxPolicy::ReadOnly,
+        }
+    }
+}
 
 struct TerminalChildGuard {
     child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
@@ -16549,6 +17659,9 @@ fn TerminalView(
     ws: String,
     resume: Option<String>,
     #[props(default)] command: Vec<String>,
+    #[props(default)] approval_policy: ApprovalPolicy,
+    #[props(default)] sandbox: SandboxPolicy,
+    #[props(default)] permission_epoch: u64,
 ) -> Element {
     let host = format!("term-{id}");
     let host_js = host.clone();
@@ -16663,14 +17776,20 @@ fn TerminalView(
             if command.is_empty() {
                 match bin.as_str() {
                     "codex" => {
-                        cmd.arg("--dangerously-bypass-approvals-and-sandbox");
+                        for arg in oxide_providers::codex_permission_args(approval_policy, sandbox)
+                        {
+                            cmd.arg(arg);
+                        }
                         if let Some(sid) = &resume {
                             cmd.arg("resume");
                             cmd.arg(sid);
                         }
                     }
                     "claude" => {
-                        cmd.arg("--dangerously-skip-permissions");
+                        for arg in oxide_providers::claude_permission_args(approval_policy, sandbox)
+                        {
+                            cmd.arg(arg);
+                        }
                         // Hook OSC 633 (Synara): status Start/Stop/PermissionRequest
                         // dari CLI mengalir lewat stream PTY → dot status di tab.
                         if let Some(settings) = ensure_agent_hook_assets() {
@@ -16772,6 +17891,16 @@ fn TerminalView(
             let mut agent_rx_open = true;
             loop {
                 tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(250)),
+                        if matches!(bin.as_str(), "codex" | "claude") => {
+                        if runtime_permission_epoch() != permission_epoch {
+                            future_error.set(
+                                "Terminal stopped because the access mode changed. Reopen it to continue with the new permissions."
+                                    .to_string(),
+                            );
+                            break;
+                        }
+                    },
                     bytes = rx.recv() => match bytes {
                         Some(bytes) => {
                             append_terminal_tail(id, &bytes);
@@ -16867,7 +17996,10 @@ fn TerminalView(
 
 /// Commands into a ChatPane's own engine.
 enum PaneCmd {
-    Submit(String),
+    Submit {
+        text: String,
+        permissions: RuntimePermissions,
+    },
     Interrupt,
 }
 
@@ -17362,10 +18494,10 @@ fn UiNodeView(node: UiNode) -> Element {
                                 let text = format!(
                                     "UI action clicked: {action_name}\nPayload: {payload}{form_note}"
                                 );
-                                engine.send(EngineCmd::Submit {
-                                    engine: text.clone(),
-                                    display: format!("\u{25b8} {action_name}"),
-                                });
+                                engine.send(EngineCmd::submit(
+                                    text.clone(),
+                                    format!("\u{25b8} {action_name}"),
+                                ));
                             });
                         },
                         "{label}"
@@ -17565,6 +18697,8 @@ fn SplitView(
     rects: Signal<std::collections::HashMap<u64, (f64, f64, f64, f64)>>,
     def_provider: String,
     def_model: String,
+    permissions: RuntimePermissions,
+    permission_epoch: u64,
 ) -> Element {
     match node {
         Tile::Leaf(pid) => {
@@ -17590,6 +18724,8 @@ fn SplitView(
                     mode: mode.clone(),
                     target: target.clone(),
                     model: model.clone(),
+                    permissions,
+                    permission_epoch,
                     closable,
                     on_split: move |vertical: bool| {
                         let base = *next_id.read();
@@ -17651,13 +18787,13 @@ fn SplitView(
                     },
                     onmouseup: move |_| drag.set(None),
                     div { class: "split-cell", style: "flex: {ratio}",
-                        SplitView { node: na, workspace: workspace.clone(), panes, layout, next_id, drag, rects, def_provider: def_provider.clone(), def_model: def_model.clone() }
+                        SplitView { node: na, workspace: workspace.clone(), panes, layout, next_id, drag, rects, def_provider: def_provider.clone(), def_model: def_model.clone(), permissions, permission_epoch }
                     }
                     div { class: if vertical { "split-divider vert" } else { "split-divider horz" },
                         onmousedown: move |_| drag.set(Some(id)),
                     }
                     div { class: "split-cell", style: "flex: {1.0 - ratio}",
-                        SplitView { node: nb, workspace: workspace.clone(), panes, layout, next_id, drag, rects, def_provider: def_provider.clone(), def_model: def_model.clone() }
+                        SplitView { node: nb, workspace: workspace.clone(), panes, layout, next_id, drag, rects, def_provider: def_provider.clone(), def_model: def_model.clone(), permissions, permission_epoch }
                     }
                 }
             }
@@ -17673,6 +18809,8 @@ fn SplitLeaf(
     mode: String,
     target: String,
     model: String,
+    permissions: RuntimePermissions,
+    permission_epoch: u64,
     closable: bool,
     on_split: EventHandler<bool>,
     on_close: EventHandler<()>,
@@ -17721,9 +18859,18 @@ fn SplitLeaf(
                 }
             }
             if is_tui {
-                TerminalView { id: pane_id, bin: target.clone(), ws: workspace.display().to_string(), resume: None }
+                TerminalView {
+                    key: "split-term-{pane_id}",
+                    id: pane_id,
+                    bin: target.clone(),
+                    ws: workspace.display().to_string(),
+                    resume: None,
+                    approval_policy: permissions.approval_policy,
+                    sandbox: permissions.sandbox,
+                    permission_epoch,
+                }
             } else {
-                ChatPane { pane_id, workspace: workspace.clone(), provider: target.clone(), model: model.clone(), isolate: pane_id != 0 }
+                ChatPane { pane_id, workspace: workspace.clone(), provider: target.clone(), model: model.clone(), isolate: pane_id != 0, permissions, permission_epoch }
             }
         }
     }
@@ -17796,15 +18943,25 @@ fn PipWindow(
     bin: String,
     theme: String,
     initial: Vec<ChatMsg>,
+    permissions: RuntimePermissions,
+    permission_epoch: u64,
 ) -> Element {
     rsx! {
         style { {CSS} }
         style { {WTERM_CSS} }
         div { class: "app pip-win", "data-theme": "{theme}",
             if mode == "tui" {
-                TerminalView { id: 990_001, bin: bin.clone(), ws: workspace.display().to_string(), resume: None }
+                TerminalView {
+                    id: 990_001,
+                    bin: bin.clone(),
+                    ws: workspace.display().to_string(),
+                    resume: None,
+                    approval_policy: permissions.approval_policy,
+                    sandbox: permissions.sandbox,
+                    permission_epoch,
+                }
             } else {
-                ChatPane { pane_id: 990_001, workspace, provider, model, initial }
+                ChatPane { pane_id: 990_001, workspace, provider, model, initial, permissions, permission_epoch }
             }
         }
     }
@@ -17820,6 +18977,8 @@ fn ChatPane(
     model: String,
     #[props(default)] initial: Vec<ChatMsg>,
     #[props(default)] isolate: bool,
+    permissions: RuntimePermissions,
+    permission_epoch: u64,
 ) -> Element {
     let mut messages = use_signal(move || coalesce_transcript_thoughts(initial.clone()));
     let mut input = use_signal(String::new);
@@ -17833,8 +18992,9 @@ fn ChatPane(
     let p0 = provider.clone();
     let m0 = model.clone();
     let w0 = workspace.clone();
+    let permissions0 = permissions;
     let pane = use_coroutine(move |mut rx: UnboundedReceiver<PaneCmd>| {
-        let (p, m, w) = (p0.clone(), m0.clone(), w0.clone());
+        let (p, m, w, runtime) = (p0.clone(), m0.clone(), w0.clone(), permissions0);
         async move {
             // Unbounded: same rationale as the primary engine coroutine — a bounded
             // forwarder would back-propagate into core and stall the pane's turn.
@@ -17842,7 +19002,7 @@ fn ChatPane(
             let mut cfg = Config::load().unwrap_or_default();
             // Isolate non-primary panes in their own git worktree so parallel
             // agents never clobber each other's working tree.
-            let ws_eff = if isolate {
+            let ws_eff = if isolate && !matches!(runtime.sandbox, SandboxPolicy::ReadOnly) {
                 pane_worktree(&w, pane_id)
                     .await
                     .unwrap_or_else(|| w.clone())
@@ -17852,10 +19012,13 @@ fn ChatPane(
             cfg.workspace = Some(ws_eff);
             cfg.provider = p;
             cfg.model = m;
-            // Detached panes have no MCP approval UI. Keep their native coding
-            // workflow autonomous, but never expose external MCP tools ungated.
+            // Detached panes have no provider-native approval bridge. Preserve
+            // the parent permission cap and fail closed instead of silently
+            // promoting the pane to Full access.
             cfg.mcp_servers.clear();
-            cfg.approval_policy = oxide_protocol::ApprovalPolicy::Never;
+            cfg.approval_policy = runtime.approval_policy;
+            cfg.sandbox = runtime.sandbox;
+            cfg.plan_mode = false;
             cfg.persist = true;
             cfg.resume = false;
             cfg.orchestrate = false;
@@ -17925,13 +19088,6 @@ fn ChatPane(
                         thinking.set(String::new());
                         pane_think_started = None;
                         settling_thought.set(Some(thought_id));
-                        let mut settling = settling_thought;
-                        spawn(async move {
-                            tokio::time::sleep(std::time::Duration::from_millis(320)).await;
-                            if *settling.peek() == Some(thought_id) {
-                                settling.set(None);
-                            }
-                        });
                     }
                 }};
             }
@@ -17940,11 +19096,16 @@ fn ChatPane(
                         cmd = rx.next() => {
                             settle_pane_thinking!();
                             match cmd {
-                            Some(PaneCmd::Submit(t)) => {
+                            Some(PaneCmd::Submit { text: t, permissions }) => {
                                 messages.write().push(ChatMsg::new(Author::User, t.clone()));
                                 messages.write().push(ChatMsg::new(Author::Agent, String::new()));
                                 streaming.set(true);
-                                let _ = handle.submit(Op::UserTurn { text: t }).await;
+                                let _ = handle
+                                    .submit(Op::UserTurn {
+                                        text: t,
+                                        permissions: Some(permissions),
+                                    })
+                                    .await;
                             }
                             Some(PaneCmd::Interrupt) => { let _ = handle.submit(Op::Interrupt).await; streaming.set(false); }
                             None => break,
@@ -18044,6 +19205,18 @@ fn ChatPane(
                                 messages.write().push(ChatMsg::new(Author::Note, format!("Question: {question}")));
                                 pane_question.set(Some((question, options)));
                             }
+                            Some(Event::ApprovalRequested { request_id, tool, .. }) => {
+                                let _ = handle
+                                    .submit(Op::ApprovalResponse {
+                                        request_id,
+                                        decision: ApprovalDecision::Reject,
+                                    })
+                                    .await;
+                                messages.write().push(ChatMsg::new(
+                                    Author::Note,
+                                    format!("Blocked: {tool} requires approval in the main chat"),
+                                ));
+                            }
                             Some(Event::AuditLog { .. })
                             | Some(Event::SubagentStarted { .. })
                             | Some(Event::SubagentStatus { .. })
@@ -18084,10 +19257,32 @@ fn ChatPane(
             .any(|msg| matches!(msg.author, Author::Activity { running: true, .. }));
         (last_agent, active_thought, answer_visible, running_activity)
     };
+    let pane_transcript_id = format!("pane-transcript-{pane_id}");
+    let pane_jump_js = format!(
+        "const s=document.getElementById('{}');const c=window.__oxTranscript;if(c)c.jump(s,'smooth');else if(s)s.scrollTo({{top:s.scrollHeight,behavior:'smooth'}});",
+        pane_transcript_id
+    );
 
     rsx! {
         div { class: "pane-body",
-            div { class: "pane-scroll",
+            div {
+                id: "{pane_transcript_id}",
+                "data-oxide-transcript": "pane",
+                class: "pane-scroll",
+                div { class: "jump-anchor",
+                    button {
+                        class: "jump-bottom",
+                        title: "Jump to latest",
+                        aria_label: "Jump to latest",
+                        onclick: move |_| {
+                            let js = pane_jump_js.clone();
+                            spawn(async move {
+                                let _ = dioxus::document::eval(&js).await;
+                            });
+                        },
+                        Icon { name: "arrow-down" }
+                    }
+                }
                 for msg in messages.read().iter() {
                     {
                         match &msg.author {
@@ -18114,13 +19309,19 @@ fn ChatPane(
                                 let _ = parts.next();
                                 let secs = parts.next().unwrap_or("1").parse().unwrap_or(1);
                                 let body = parts.next().unwrap_or("").to_string();
+                                let thought_id = msg.id;
                                 rsx! {
-                                    if active_thought_id != Some(msg.id) {
+                                    if active_thought_id != Some(thought_id) {
                                         ThoughtRow {
-                                            key: "m-{msg.id}",
+                                            key: "m-{thought_id}",
                                             secs,
                                             body,
-                                            settling: *settling_thought.read() == Some(msg.id),
+                                            settling: *settling_thought.read() == Some(thought_id),
+                                            on_settled: move |_| {
+                                                if *settling_thought.peek() == Some(thought_id) {
+                                                    settling_thought.set(None);
+                                                }
+                                            },
                                         }
                                     }
                                 }
@@ -18160,7 +19361,10 @@ fn ChatPane(
                                 let o = opt.clone();
                                 rsx! {
                                     button { class: "question-opt", onclick: move |_| {
-                                        pane.send(PaneCmd::Submit(o.clone()));
+                                        pane.send(PaneCmd::Submit {
+                                            text: o.clone(),
+                                            permissions: fail_closed_stale_permissions(permissions, permission_epoch),
+                                        });
                                         pane_question.set(None);
                                     }, "{opt}" }
                                 }
@@ -18175,7 +19379,7 @@ fn ChatPane(
                     onkeydown: move |e| if e.key() == Key::Enter && !e.modifiers().shift() {
                         e.prevent_default();
                         let t = input.read().trim().to_string();
-                        if !t.is_empty() { input.set(String::new()); pane_question.set(None); pane.send(PaneCmd::Submit(t)); }
+                        if !t.is_empty() { input.set(String::new()); pane_question.set(None); pane.send(PaneCmd::Submit { text: t, permissions: fail_closed_stale_permissions(permissions, permission_epoch) }); }
                     }
                 }
                 if *streaming.read() {
@@ -18183,7 +19387,7 @@ fn ChatPane(
                 } else {
                     button { class: "send", onclick: move |_| {
                         let t = input.read().trim().to_string();
-                        if !t.is_empty() { input.set(String::new()); pane_question.set(None); pane.send(PaneCmd::Submit(t)); }
+                        if !t.is_empty() { input.set(String::new()); pane_question.set(None); pane.send(PaneCmd::Submit { text: t, permissions: fail_closed_stale_permissions(permissions, permission_epoch) }); }
                     }, Icon { name: "arrow-up" } }
                 }
             }

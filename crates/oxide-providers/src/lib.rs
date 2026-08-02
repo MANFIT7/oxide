@@ -17,12 +17,13 @@ pub use catalog::{
     ProviderKind, ProviderModel, ProviderStability,
 };
 pub use cli::{
-    claude_persistent_close, claude_persistent_interrupt, ClaudeCliProvider,
-    ClaudeInteractiveProvider, ClaudePersistentProvider, CodexCliProvider,
+    claude_permission_args, claude_persistent_close, claude_persistent_interrupt,
+    codex_permission_args, ClaudeCliProvider, ClaudeInteractiveProvider, ClaudePersistentProvider,
+    CodexCliProvider,
 };
 
 use async_trait::async_trait;
-use oxide_protocol::ToolSpec;
+use oxide_protocol::{ApprovalPolicy, SandboxPolicy, ToolSpec};
 use tokio::sync::mpsc;
 
 /// A tool call the assistant made, carried structurally so providers can emit a
@@ -117,6 +118,11 @@ pub struct TurnRequest {
     /// Custom subagents for an external agent CLI (claude `--agents <json>`).
     /// None = no override.
     pub claude_agents: Option<serde_json::Value>,
+    /// Effective runtime policy for this turn. CLI providers must translate
+    /// this contract to their native permission flags instead of inheriting
+    /// user-level defaults or unconditionally bypassing safety controls.
+    pub approval_policy: ApprovalPolicy,
+    pub sandbox: SandboxPolicy,
 }
 
 /// Normalized streaming output. Each provider maps its SSE events to these.

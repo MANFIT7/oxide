@@ -5812,6 +5812,7 @@ dependencies = [
  "oxide-core",
  "oxide-harness",
  "oxide-protocol",
+ "oxide-providers",
  "portable-pty 0.8.1",
  "pulldown-cmark",
  "reqwest",

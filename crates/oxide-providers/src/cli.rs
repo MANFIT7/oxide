@@ -2,15 +2,17 @@
 //!
 //! Instead of calling a model API with our own key, these drive the user's
 //! already-authenticated local CLIs — `codex` and `claude` (Claude Code) — in
-//! headless JSONL-streaming mode with permissions bypassed. No API key needed:
-//! the CLI uses its own login. The CLI does its own tools, sandboxing and
-//! context compaction; Oxide just streams its output into the same event model.
+//! headless JSONL-streaming mode. No API key needed: the CLI uses its own
+//! login. The CLI does its own tools, sandboxing and context compaction; Oxide
+//! translates the active runtime policy to provider-native permission flags
+//! and streams output into the same event model.
 //!
-//! - codex:  `codex exec --json --dangerously-bypass-approvals-and-sandbox`
-//! - claude: `claude -p --output-format stream-json --verbose --dangerously-skip-permissions`
+//! Dangerous bypass flags are emitted only for the explicit Full access pair
+//! (`Never` + `DangerFullAccess`).
 
 use crate::{Provider, Role, StreamItem, TurnRequest};
 use async_trait::async_trait;
+use oxide_protocol::{ApprovalPolicy, SandboxPolicy};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -20,6 +22,62 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
+
+/// Provider-native Codex flags for one effective runtime policy.
+///
+/// These are global Codex flags and must be placed before `exec`, including
+/// when the request resumes an existing native thread.
+pub fn codex_permission_args(approval: ApprovalPolicy, sandbox: SandboxPolicy) -> Vec<String> {
+    if matches!(approval, ApprovalPolicy::Never)
+        && matches!(sandbox, SandboxPolicy::DangerFullAccess)
+    {
+        return vec!["--dangerously-bypass-approvals-and-sandbox".to_string()];
+    }
+
+    let approval = match approval {
+        ApprovalPolicy::Always => "untrusted",
+        ApprovalPolicy::OnRequest => "on-request",
+        ApprovalPolicy::Never => "never",
+    };
+    // Raw `codex exec` has no Oxide approval-response bridge yet. Supervised
+    // mode must therefore fail closed: reads are allowed, writes wait until a
+    // future app-server bridge can relay the user's approval.
+    let sandbox = if matches!(approval, "untrusted") {
+        SandboxPolicy::ReadOnly
+    } else {
+        sandbox
+    };
+    let sandbox = match sandbox {
+        SandboxPolicy::ReadOnly => "read-only",
+        SandboxPolicy::WorkspaceWrite => "workspace-write",
+        SandboxPolicy::DangerFullAccess => "danger-full-access",
+    };
+    vec![
+        "--ask-for-approval".to_string(),
+        approval.to_string(),
+        "--sandbox".to_string(),
+        sandbox.to_string(),
+    ]
+}
+
+/// Provider-native Claude Code flags for one effective runtime policy.
+pub fn claude_permission_args(approval: ApprovalPolicy, sandbox: SandboxPolicy) -> Vec<String> {
+    if matches!(approval, ApprovalPolicy::Never)
+        && matches!(sandbox, SandboxPolicy::DangerFullAccess)
+    {
+        return vec!["--dangerously-skip-permissions".to_string()];
+    }
+
+    let mode = if matches!(sandbox, SandboxPolicy::ReadOnly) {
+        "plan"
+    } else {
+        match approval {
+            ApprovalPolicy::Always => "manual",
+            ApprovalPolicy::OnRequest | ApprovalPolicy::Never => "auto",
+        }
+    };
+    vec!["--permission-mode".to_string(), mode.to_string()]
+}
 
 /// Kills a CLI driver's whole process group on drop (unless disarmed) so that
 /// when the engine aborts the stream task on interrupt, anything the CLI
@@ -523,14 +581,14 @@ impl Provider for CodexCliProvider {
         let skey = session_key(&self.bin, &req.conversation_id, &req.cwd);
         // Prefer the persisted link (survives app restarts) over the in-memory map.
         let resume = req.cli_resume.clone().or_else(|| session_get(&skey));
-        let mut args = vec!["exec".to_string()];
+        let mut args = codex_permission_args(req.approval_policy, req.sandbox);
+        args.push("exec".to_string());
         if let Some(id) = &resume {
             // Continue the same codex thread — context carries across turns.
             args.push("resume".to_string());
             args.push(id.clone());
         }
         args.push("--json".to_string());
-        args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
         args.push("--skip-git-repo-check".to_string());
         if !req.cwd.is_empty() {
             args.push("-C".to_string());
@@ -836,8 +894,8 @@ impl Provider for ClaudeCliProvider {
             "--verbose".to_string(),
             // Token-level deltas: real streaming AND keeps the idle timer fed.
             "--include-partial-messages".to_string(),
-            "--dangerously-skip-permissions".to_string(),
         ];
+        args.extend(claude_permission_args(req.approval_policy, req.sandbox));
         if let Some(id) = &resume {
             // Continue the same Claude Code session — context carries across turns.
             args.push("--resume".to_string());
@@ -1282,6 +1340,10 @@ type PersistentReader = tokio::io::Lines<BufReader<tokio::process::ChildStdout>>
 struct PersistentChild {
     /// Held only so the child is killed when the entry is dropped (kill_on_drop).
     _child: tokio::process::Child,
+    /// The persistent CLI is its own process-group leader. Keep the group id so
+    /// an access downgrade kills tool/background descendants, not only Claude.
+    #[cfg(unix)]
+    pgid: Option<i32>,
     stdin_tx: mpsc::UnboundedSender<String>,
     reader: PersistentReader,
     /// Set by `claude_persistent_interrupt`; the read loop consumes it on the
@@ -1290,6 +1352,10 @@ struct PersistentChild {
     /// The model this child was spawned with; a per-turn mismatch triggers a live
     /// `set_model` control message instead of a respawn.
     model: String,
+    /// Permission contract used to spawn this process. A changed runtime mode
+    /// must respawn the child; Claude applies this flag at process startup.
+    approval_policy: ApprovalPolicy,
+    sandbox: SandboxPolicy,
     /// When the child last finished a turn — the idle reaper kills children
     /// unused past a threshold (Synara: 30-minute reap, guard on active turn).
     last_used: std::time::Instant,
@@ -1300,6 +1366,28 @@ struct PersistentChild {
     /// processed at the start of the next turn so nothing is lost — and the OS
     /// pipe can never fill and block the child while nobody is reading.
     pending_lines: Vec<String>,
+}
+
+impl PersistentChild {
+    fn kill_tree(&mut self) {
+        #[cfg(unix)]
+        if let Some(pgid) = self.pgid.take() {
+            if pgid > 1 {
+                // SAFETY: `spawn_persistent` puts the child in a dedicated
+                // process group whose id is the child's pid.
+                unsafe {
+                    libc::killpg(pgid, libc::SIGKILL);
+                }
+            }
+        }
+        let _ = self._child.start_kill();
+    }
+}
+
+impl Drop for PersistentChild {
+    fn drop(&mut self) {
+        self.kill_tree();
+    }
 }
 
 /// Cap for idle-drained lines kept for the next turn (oldest dropped first).
@@ -1487,12 +1575,27 @@ pub fn claude_persistent_close(conversation_id: &str, cwd: &str) {
 }
 
 fn remove_persistent(key: &str) {
-    if let Ok(mut m) = persistent_map().lock() {
-        m.remove(key);
-    }
+    let _ = take_persistent(key);
+}
+
+fn take_persistent(key: &str) -> Option<Arc<tokio::sync::Mutex<PersistentChild>>> {
+    let entry = persistent_map()
+        .lock()
+        .ok()
+        .and_then(|mut map| map.remove(key));
     if let Ok(mut m) = steer_map().lock() {
         m.remove(key);
     }
+    entry
+}
+
+async fn stop_persistent(key: &str) {
+    let Some(entry) = take_persistent(key) else {
+        return;
+    };
+    let mut child = entry.lock().await;
+    child.kill_tree();
+    let _ = child._child.wait().await;
 }
 
 /// Idle reaper (Synara's ProviderSessionReaper): sweep every 5 minutes, kill
@@ -1533,6 +1636,8 @@ fn spawn_persistent(
     cwd: &str,
     key: &str,
     model: &str,
+    approval_policy: ApprovalPolicy,
+    sandbox: SandboxPolicy,
 ) -> anyhow::Result<Arc<tokio::sync::Mutex<PersistentChild>>> {
     let mut cmd = tokio::process::Command::new(bin);
     cmd.args(args)
@@ -1548,6 +1653,8 @@ fn spawn_persistent(
     let mut child = cmd
         .spawn()
         .map_err(|e| anyhow::anyhow!("failed to spawn '{bin}': {e}"))?;
+    #[cfg(unix)]
+    let pgid = child.id().map(|pid| pid as i32);
     let mut stdin = child
         .stdin
         .take()
@@ -1579,10 +1686,14 @@ fn spawn_persistent(
     let turn_active = Arc::new(AtomicBool::new(false));
     let entry = Arc::new(tokio::sync::Mutex::new(PersistentChild {
         _child: child,
+        #[cfg(unix)]
+        pgid,
         stdin_tx: tx.clone(),
         reader: BufReader::new(stdout).lines(),
         interrupt: interrupt.clone(),
         model: model.to_string(),
+        approval_policy,
+        sandbox,
         last_used: std::time::Instant::now(),
         turn_active: turn_active.clone(),
         pending_lines: Vec::new(),
@@ -1652,6 +1763,20 @@ impl Provider for ClaudePersistentProvider {
             .lock()
             .ok()
             .and_then(|m| m.get(&skey).cloned());
+        let existing = if let Some(entry) = existing {
+            let same_permissions = {
+                let guard = entry.lock().await;
+                guard.approval_policy == req.approval_policy && guard.sandbox == req.sandbox
+            };
+            if same_permissions {
+                Some(entry)
+            } else {
+                stop_persistent(&skey).await;
+                None
+            }
+        } else {
+            None
+        };
         let mut entry = match existing {
             Some(e) => e,
             None => {
@@ -1663,8 +1788,8 @@ impl Provider for ClaudePersistentProvider {
                     "stream-json".to_string(),
                     "--verbose".to_string(),
                     "--include-partial-messages".to_string(),
-                    "--dangerously-skip-permissions".to_string(),
                 ];
+                args.extend(claude_permission_args(req.approval_policy, req.sandbox));
                 // Resume a persisted session (context survives an app restart —
                 // the process map is per-run) or pin a deterministic session id.
                 if let Some(id) = req.cli_resume.clone().or_else(|| session_get(&skey)) {
@@ -1676,7 +1801,15 @@ impl Provider for ClaudePersistentProvider {
                 }
                 args.extend(claude_tuning_args(&req));
                 let model = claude_model_arg(&req.model).unwrap_or("").to_string();
-                spawn_persistent(&self.bin, &args, &req.cwd, &skey, &model)?
+                spawn_persistent(
+                    &self.bin,
+                    &args,
+                    &req.cwd,
+                    &skey,
+                    &model,
+                    req.approval_policy,
+                    req.sandbox,
+                )?
             }
         };
 
@@ -1737,7 +1870,7 @@ impl Provider for ClaudePersistentProvider {
                             resume_retry_done = true;
                             guard.turn_active.store(false, Ordering::SeqCst);
                             drop(guard);
-                            remove_persistent(&skey);
+                            stop_persistent(&skey).await;
                             session_set(&skey, "");
                             let mut args = vec![
                                 "--print".to_string(),
@@ -1747,14 +1880,21 @@ impl Provider for ClaudePersistentProvider {
                                 "stream-json".to_string(),
                                 "--verbose".to_string(),
                                 "--include-partial-messages".to_string(),
-                                "--dangerously-skip-permissions".to_string(),
                                 "--session-id".to_string(),
                                 stable_session_uuid(&req.conversation_id),
                             ];
+                            args.extend(claude_permission_args(req.approval_policy, req.sandbox));
                             args.extend(claude_tuning_args(&req));
                             let model = claude_model_arg(&req.model).unwrap_or("").to_string();
-                            let fresh =
-                                spawn_persistent(&self.bin, &args, &req.cwd, &skey, &model)?;
+                            let fresh = spawn_persistent(
+                                &self.bin,
+                                &args,
+                                &req.cwd,
+                                &skey,
+                                &model,
+                                req.approval_policy,
+                                req.sandbox,
+                            )?;
                             entry = fresh;
                             guard = entry.lock().await;
                             if guard.stdin_tx.send(claude_user_line(&prompt)).is_err() {
@@ -1951,6 +2091,89 @@ mod cli_driver_tests {
     use super::*;
     use crate::Message;
 
+    #[test]
+    fn codex_permission_args_preserve_runtime_modes() {
+        assert_eq!(
+            codex_permission_args(ApprovalPolicy::Always, SandboxPolicy::WorkspaceWrite),
+            ["--ask-for-approval", "untrusted", "--sandbox", "read-only"].map(str::to_string)
+        );
+        assert_eq!(
+            codex_permission_args(ApprovalPolicy::OnRequest, SandboxPolicy::WorkspaceWrite),
+            [
+                "--ask-for-approval",
+                "on-request",
+                "--sandbox",
+                "workspace-write"
+            ]
+            .map(str::to_string)
+        );
+        assert_eq!(
+            codex_permission_args(ApprovalPolicy::Never, SandboxPolicy::ReadOnly),
+            ["--ask-for-approval", "never", "--sandbox", "read-only"].map(str::to_string)
+        );
+        assert_eq!(
+            codex_permission_args(ApprovalPolicy::Never, SandboxPolicy::DangerFullAccess),
+            ["--dangerously-bypass-approvals-and-sandbox"].map(str::to_string)
+        );
+    }
+
+    #[test]
+    fn claude_permission_args_preserve_runtime_modes() {
+        assert_eq!(
+            claude_permission_args(ApprovalPolicy::Always, SandboxPolicy::WorkspaceWrite),
+            ["--permission-mode", "manual"].map(str::to_string)
+        );
+        assert_eq!(
+            claude_permission_args(ApprovalPolicy::OnRequest, SandboxPolicy::WorkspaceWrite),
+            ["--permission-mode", "auto"].map(str::to_string)
+        );
+        assert_eq!(
+            claude_permission_args(ApprovalPolicy::Never, SandboxPolicy::ReadOnly),
+            ["--permission-mode", "plan"].map(str::to_string)
+        );
+        assert_eq!(
+            claude_permission_args(ApprovalPolicy::Never, SandboxPolicy::DangerFullAccess),
+            ["--dangerously-skip-permissions"].map(str::to_string)
+        );
+    }
+
+    #[test]
+    fn dangerous_bypass_requires_full_access_on_both_axes() {
+        let approvals = [
+            ApprovalPolicy::Always,
+            ApprovalPolicy::OnRequest,
+            ApprovalPolicy::Never,
+        ];
+        let sandboxes = [
+            SandboxPolicy::ReadOnly,
+            SandboxPolicy::WorkspaceWrite,
+            SandboxPolicy::DangerFullAccess,
+        ];
+
+        for approval in approvals {
+            for sandbox in sandboxes {
+                let should_bypass = matches!(approval, ApprovalPolicy::Never)
+                    && matches!(sandbox, SandboxPolicy::DangerFullAccess);
+                let codex = codex_permission_args(approval, sandbox);
+                let claude = claude_permission_args(approval, sandbox);
+                assert_eq!(
+                    codex
+                        .iter()
+                        .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox"),
+                    should_bypass,
+                    "unexpected Codex bypass for {approval:?} + {sandbox:?}"
+                );
+                assert_eq!(
+                    claude
+                        .iter()
+                        .any(|arg| arg == "--dangerously-skip-permissions"),
+                    should_bypass,
+                    "unexpected Claude bypass for {approval:?} + {sandbox:?}"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn run_jsonl_writes_prompt_to_child_stdin() {
         let args = vec![
@@ -2080,6 +2303,8 @@ mod cli_driver_tests {
             cli_resume: None,
             system_append: None,
             claude_agents: None,
+            approval_policy: ApprovalPolicy::Never,
+            sandbox: SandboxPolicy::ReadOnly,
         };
 
         let (prompt, images) = extract_cli_images(&req);
@@ -2102,6 +2327,8 @@ mod cli_driver_tests {
             cli_resume: None,
             system_append: Some("Review before editing.".to_string()),
             claude_agents: None,
+            approval_policy: ApprovalPolicy::Never,
+            sandbox: SandboxPolicy::ReadOnly,
         };
 
         let prompt = prepend_cli_system(last_user_prompt(&req), &req);
@@ -2270,6 +2497,8 @@ mod cli_driver_tests {
                 cli_resume: None,
                 system_append: None,
                 claude_agents: None,
+                approval_policy: ApprovalPolicy::Never,
+                sandbox: SandboxPolicy::ReadOnly,
             };
             provider.stream(req, tx).await.unwrap();
             let (text, done) = reader.await.unwrap();
@@ -2319,6 +2548,8 @@ mod cli_driver_tests {
             cli_resume: None,
             system_append: None,
             claude_agents: None,
+            approval_policy: ApprovalPolicy::Never,
+            sandbox: SandboxPolicy::ReadOnly,
         };
         provider.stream(req, tx).await.unwrap();
         reader.await.unwrap()
@@ -2380,6 +2611,8 @@ mod cli_driver_tests {
                 cli_resume: None,
                 system_append: None,
                 claude_agents: None,
+                approval_policy: ApprovalPolicy::Never,
+                sandbox: SandboxPolicy::ReadOnly,
             };
             provider.stream(req, tx).await.unwrap();
         });
@@ -2512,6 +2745,8 @@ mod cli_driver_tests {
                 cli_resume: None,
                 system_append: None,
                 claude_agents: None,
+                approval_policy: ApprovalPolicy::Never,
+                sandbox: SandboxPolicy::ReadOnly,
             };
             provider.stream(req, tx).await.unwrap();
         });

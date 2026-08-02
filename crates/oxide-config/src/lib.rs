@@ -25,6 +25,11 @@ pub struct Config {
     pub provider: String,
     pub approval_policy: ApprovalPolicy,
     pub sandbox: SandboxPolicy,
+    /// Enforce a read-only planning turn across native tools and CLI providers.
+    /// Kept separate from the preferred access preset so leaving plan mode
+    /// restores the user's previous approval/sandbox choice exactly.
+    #[serde(default)]
+    pub plan_mode: bool,
     /// Directory scanned for external harness manifests.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub harness_dir: Option<PathBuf>,
@@ -320,6 +325,7 @@ impl Default for Config {
             provider: "echo".to_string(),
             approval_policy: ApprovalPolicy::default(),
             sandbox: SandboxPolicy::default(),
+            plan_mode: false,
             harness_dir: None,
             workspace: None,
             max_context_tokens: 100_000,
@@ -418,6 +424,34 @@ impl Config {
                 .unwrap_or_default();
         }
         self.model.clone()
+    }
+
+    /// Runtime approval policy after applying product modes such as Plan.
+    pub fn effective_approval_policy(&self) -> ApprovalPolicy {
+        self.effective_permissions().0
+    }
+
+    /// Runtime sandbox after applying product modes such as Plan.
+    pub fn effective_sandbox(&self) -> SandboxPolicy {
+        self.effective_permissions().1
+    }
+
+    /// Normalize persisted/legacy permission pairs to the product's supported
+    /// contracts. Unknown combinations must fail closed: older UI versions
+    /// could persist `Never + WorkspaceWrite`, which otherwise auto-writes
+    /// while the current UI labels it as approval-required.
+    pub fn effective_permissions(&self) -> (ApprovalPolicy, SandboxPolicy) {
+        if self.plan_mode {
+            return (ApprovalPolicy::Never, SandboxPolicy::ReadOnly);
+        }
+
+        match (self.approval_policy, self.sandbox) {
+            pair @ (ApprovalPolicy::Always, SandboxPolicy::WorkspaceWrite)
+            | pair @ (ApprovalPolicy::OnRequest, SandboxPolicy::WorkspaceWrite)
+            | pair @ (ApprovalPolicy::Never, SandboxPolicy::DangerFullAccess)
+            | pair @ (ApprovalPolicy::Never, SandboxPolicy::ReadOnly) => pair,
+            _ => (ApprovalPolicy::Always, SandboxPolicy::ReadOnly),
+        }
     }
 }
 
@@ -544,6 +578,35 @@ env = { GITHUB_TOKEN = "legacy-secret" }
 
         cfg.provider = "mistral".to_string();
         assert_eq!(cfg.effective_model(), "mistral-small-4");
+    }
+
+    #[test]
+    fn plan_mode_is_a_read_only_overlay_that_preserves_baseline_access() {
+        let mut cfg = Config {
+            approval_policy: ApprovalPolicy::Never,
+            sandbox: SandboxPolicy::DangerFullAccess,
+            plan_mode: true,
+            ..Config::default()
+        };
+
+        assert_eq!(cfg.effective_approval_policy(), ApprovalPolicy::Never);
+        assert_eq!(cfg.effective_sandbox(), SandboxPolicy::ReadOnly);
+
+        cfg.plan_mode = false;
+        assert_eq!(cfg.effective_approval_policy(), ApprovalPolicy::Never);
+        assert_eq!(cfg.effective_sandbox(), SandboxPolicy::DangerFullAccess);
+    }
+
+    #[test]
+    fn unsupported_legacy_permission_pairs_fail_closed() {
+        let cfg = Config {
+            approval_policy: ApprovalPolicy::Never,
+            sandbox: SandboxPolicy::WorkspaceWrite,
+            ..Config::default()
+        };
+
+        assert_eq!(cfg.effective_approval_policy(), ApprovalPolicy::Always);
+        assert_eq!(cfg.effective_sandbox(), SandboxPolicy::ReadOnly);
     }
 
     #[test]

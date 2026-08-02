@@ -221,19 +221,58 @@ async fn handle(mut sock: tokio::net::TcpStream, client: reqwest::Client) -> std
 /// Element-picker injected into previewed pages. Toggled by `postMessage`
 /// from the parent (`oxide-pick-on`/`oxide-pick-off`); on click it posts the
 /// selected element's selector, outerHTML, React component + source file:line.
+/// Annotation mode keeps numbered element outlines mounted while the user
+/// continues browsing so visual review context survives subsequent picks.
 const PICKER_JS: &str = r#"
 (function(){
   if (window.__oxidePick) return; window.__oxidePick = true;
-  var on=false, hl=null, last=null;
+  var on=false, hl=null, last=null, annotate=false, annotations=[], annotationSeq=0;
   function overlay(){ if(hl) return hl; hl=document.createElement('div');
     hl.style.cssText='position:fixed;z-index:2147483647;pointer-events:none;border:2px solid #6073cc;background:rgba(96,115,204,.15);border-radius:3px;display:none';
     (document.body||document.documentElement).appendChild(hl); return hl; }
   function rectTo(el){ var r=el.getBoundingClientRect(); var o=overlay();
     o.style.display='block'; o.style.left=r.left+'px'; o.style.top=r.top+'px'; o.style.width=r.width+'px'; o.style.height=r.height+'px'; }
-  function selector(el){ var p=[]; while(el&&el.nodeType===1&&p.length<5){ if(el.id){ p.unshift('#'+el.id); break; } var s=el.tagName.toLowerCase(); if(el.className&&typeof el.className==='string'){ var c=el.className.trim().split(/\s+/).slice(0,2).join('.'); if(c) s+='.'+c; } var par=el.parentNode; if(par){ var sib=[].slice.call(par.children).filter(function(x){return x.tagName===el.tagName;}); if(sib.length>1) s+=':nth-of-type('+(sib.indexOf(el)+1)+')'; } p.unshift(s); el=el.parentNode; } return p.join(' > '); }
+  function selector(el){ var p=[]; while(el&&el.nodeType===1&&p.length<5){ if(el.id){ p.unshift('#'+CSS.escape(el.id)); break; } var s=el.tagName.toLowerCase(); if(el.className&&typeof el.className==='string'){ var c=el.className.trim().split(/\s+/).slice(0,2).map(function(value){return '.'+CSS.escape(value);}).join(''); if(c) s+=c; } var par=el.parentNode; if(par){ var sib=[].slice.call(par.children).filter(function(x){return x.tagName===el.tagName;}); if(sib.length>1) s+=':nth-of-type('+(sib.indexOf(el)+1)+')'; } p.unshift(s); el=el.parentNode; } return p.join(' > '); }
   function fiber(el){ for(var k in el){ if(k.indexOf('__reactFiber$')===0||k.indexOf('__reactInternalInstance$')===0) return el[k]; } return null; }
   function reactSource(el){ var f=fiber(el), g=0; while(f&&g++<40){ if(f._debugSource){ return f._debugSource.fileName+':'+f._debugSource.lineNumber; } f=f.return; } return null; }
   function reactName(el){ var f=fiber(el), g=0; while(f&&g++<40){ var t=f.type; if(t&&(t.displayName||t.name)) return t.displayName||t.name; f=f.return; } return null; }
+  function positionAnnotation(item){
+    if(!item.el||!item.el.isConnected){ item.box.style.display='none'; return; }
+    var r=item.el.getBoundingClientRect(); item.box.style.display='block';
+    item.box.style.left=r.left+'px'; item.box.style.top=r.top+'px';
+    item.box.style.width=Math.max(0,r.width)+'px'; item.box.style.height=Math.max(0,r.height)+'px';
+  }
+  function addAnnotation(el, preferredNumber){
+    var existing=annotations.find(function(item){ return item.el===el; });
+    if(existing){ positionAnnotation(existing); return existing.number; }
+    var requested=Number(preferredNumber);
+    var number=Number.isInteger(requested)&&requested>0&&!annotations.some(function(item){return item.number===requested;})?requested:annotationSeq+1;
+    annotationSeq=Math.max(annotationSeq,number);
+    var box=document.createElement('div'), badge=document.createElement('span');
+    box.setAttribute('data-oxide-annotation',String(number));
+    box.style.cssText='position:fixed;z-index:2147483646;pointer-events:none;border:2px solid #6073cc;background:rgba(96,115,204,.08);border-radius:4px;box-sizing:border-box';
+    badge.textContent=String(number);
+    badge.style.cssText='position:absolute;left:-2px;top:-22px;min-width:20px;height:20px;padding:0 5px;box-sizing:border-box;border-radius:6px 6px 6px 0;background:#6073cc;color:#fff;font:600 11px/20px -apple-system,BlinkMacSystemFont,sans-serif;text-align:center;box-shadow:0 2px 8px rgba(0,0,0,.24)';
+    box.appendChild(badge); (document.body||document.documentElement).appendChild(box);
+    var item={el:el,box:box,number:number}; annotations.push(item); positionAnnotation(item); return number;
+  }
+  function renderAnnotations(){ annotations.forEach(positionAnnotation); }
+  function clearAnnotations(){ annotations.forEach(function(item){ item.box.remove(); }); annotations=[]; annotationSeq=0; }
+  function pageKey(value){ try { var url=new URL(value,location.href); return url.origin+url.pathname; } catch(_){ return value||''; } }
+  function restoreAnnotations(values){
+    clearAnnotations(); var missing=[], restored=[], skipped=[];
+    (values||[]).forEach(function(value){
+      var entry=typeof value==='string'?{selector:value}:value||{};
+      var selected=entry.selector;
+      var requested=Number(entry.annotation);
+      if(Number.isInteger(requested)&&requested>0) annotationSeq=Math.max(annotationSeq,requested);
+      if(entry.url&&pageKey(entry.url)!==pageKey(location.href)){ skipped.push(entry); return; }
+      if(typeof selected!=='string'||!selected){ missing.push(entry); return; }
+      try { var el=document.querySelector(selected); if(el){ var number=addAnnotation(el,requested); restored.push({selector:selected,annotation:number,url:entry.url||location.href}); } else { missing.push(entry); } }
+      catch(_){ missing.push(entry); }
+    });
+    window.parent.postMessage({type:'oxide-annotations-restored',count:annotations.length,restored:restored,missing:missing,skipped:skipped},'*');
+  }
   function onMove(e){ if(!on) return; var el=document.elementFromPoint(e.clientX,e.clientY); if(el&&el!==hl){ last=el; rectTo(el); } }
   var design=false, selEl=null, originalStyle=null, originalText=null;
   function onClick(e){ if(!on) return; e.preventDefault(); e.stopPropagation();
@@ -242,7 +281,8 @@ const PICKER_JS: &str = r#"
     originalText=el.textContent;
     var cs=getComputedStyle(el);
     var r=el.getBoundingClientRect();
-    var info={ type:'oxide-element', tag:el.tagName.toLowerCase(), selector:selector(el),
+    var annotation=annotate?addAnnotation(el):null;
+    var info={ type:'oxide-element', tag:el.tagName.toLowerCase(), selector:selector(el), annotation:annotation,
       url:location.href, title:document.title||'', viewport:{width:window.innerWidth,height:window.innerHeight},
       rect:{x:Math.round(r.x),y:Math.round(r.y),width:Math.round(r.width),height:Math.round(r.height)},
       text:(el.innerText||'').replace(/\s+/g,' ').trim().slice(0,120),
@@ -252,14 +292,17 @@ const PICKER_JS: &str = r#"
                fontWeight:cs.fontWeight, padding:cs.padding, margin:cs.margin,
                borderRadius:cs.borderRadius } };
     window.parent.postMessage(info,'*');
-    if(design){ rectTo(el); } else { setOn(false); }
+    if(design||annotate){ rectTo(el); } else { setOn(false); }
   }
-  function setOn(v){ on=v; if(!v&&!design) overlay().style.display='none'; document.documentElement.style.cursor=v?'crosshair':''; }
+  function setOn(v){ on=v; if(!v&&!design&&!annotate) overlay().style.display='none'; document.documentElement.style.cursor=v?'crosshair':''; }
   window.addEventListener('message',function(e){
     var d=e.data;
-    if(d==='oxide-pick-on'){ design=false; setOn(true); }
-    else if(d==='oxide-design-on'){ design=true; setOn(true); }
-    else if(d==='oxide-pick-off'||d==='oxide-design-off'){ design=false; setOn(false); overlay().style.display='none'; }
+    if(d==='oxide-pick-on'){ design=false; annotate=false; setOn(true); }
+    else if(d==='oxide-design-on'){ design=true; annotate=false; setOn(true); }
+    else if(d==='oxide-annotate-on'){ design=false; annotate=true; setOn(true); }
+    else if(d==='oxide-pick-off'||d==='oxide-design-off'||d==='oxide-annotate-off'){ design=false; annotate=false; setOn(false); overlay().style.display='none'; }
+    else if(d==='oxide-annotations-clear'){ clearAnnotations(); }
+    else if(d && d.type==='oxide-annotations-restore'){ restoreAnnotations(d.annotations||d.selectors); }
     else if(d && d.type==='oxide-style-set' && selEl){ selEl.style.setProperty(d.prop, d.value); rectTo(selEl); }
     else if(d && d.type==='oxide-text-set' && selEl){ selEl.textContent = d.text; rectTo(selEl); }
     else if(d==='oxide-design-reset' && selEl){
@@ -270,5 +313,34 @@ const PICKER_JS: &str = r#"
   });
   document.addEventListener('mousemove',onMove,true);
   document.addEventListener('click',onClick,true);
+  window.addEventListener('scroll',renderAnnotations,true);
+  window.addEventListener('resize',renderAnnotations);
 })();
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::PICKER_JS;
+
+    #[test]
+    fn picker_supports_persistent_numbered_annotations() {
+        for token in [
+            "oxide-annotate-on",
+            "oxide-annotate-off",
+            "oxide-annotations-clear",
+            "oxide-annotations-restore",
+            "oxide-annotations-restored",
+            "data-oxide-annotation",
+            "renderAnnotations",
+            "CSS.escape",
+            "pageKey(entry.url)",
+            "addAnnotation(el,requested)",
+            "skipped:skipped",
+        ] {
+            assert!(
+                PICKER_JS.contains(token),
+                "missing annotation contract: {token}"
+            );
+        }
+    }
+}
