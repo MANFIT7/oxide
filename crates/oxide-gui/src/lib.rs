@@ -8,6 +8,8 @@
 
 mod board;
 mod hermes;
+#[cfg(target_os = "macos")]
+mod macos_notifications;
 mod preview_proxy;
 mod update;
 
@@ -5394,22 +5396,12 @@ fn show_native_notification(cfg: Signal<Config>, title: &str, body: &str) {
     std::thread::spawn(move || {
         #[cfg(target_os = "macos")]
         {
-            let helper = std::env::current_exe().ok().and_then(|exe| {
-                let contents = exe.parent()?.parent()?;
-                let helper = contents.join("Helpers/Oxide Notifications.app");
-                helper.exists().then_some(helper)
-            });
-            if let Some(helper) = helper {
-                let launched = std::process::Command::new("open")
-                    .arg("-g")
-                    .arg("-n")
-                    .arg(helper)
-                    .arg("--args")
-                    .args([&title, &body])
-                    .status()
-                    .is_ok_and(|status| status.success());
-                if launched {
-                    return;
+            match macos_notifications::show(&title, &body) {
+                Ok(()) => return,
+                Err(error) => {
+                    eprintln!(
+                        "oxide: native notification helper failed: {error}; using osascript fallback"
+                    );
                 }
             }
             let _ = std::process::Command::new("osascript")

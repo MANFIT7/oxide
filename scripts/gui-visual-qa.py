@@ -32,6 +32,8 @@ CHECKLIST = ROOT / "docs/gui-visual-qa-checklist.md"
 NATIVE_SMOKE = ROOT / "scripts/gui-native-visual-smoke.py"
 NATIVE_RECORD = ROOT / "scripts/gui-native-visual-record.py"
 UPDATE = ROOT / "crates/oxide-gui/src/update.rs"
+MACOS_NOTIFICATIONS = ROOT / "crates/oxide-gui/src/macos_notifications.rs"
+MAKE_DMG = ROOT / "scripts/make-dmg.sh"
 HOOKS = ROOT / "crates/oxide-core/src/hooks.rs"
 AUTOMATION = ROOT / "crates/oxide-core/src/automation.rs"
 OUT_DIR = ROOT / "target/gui-visual-qa"
@@ -551,6 +553,8 @@ def main() -> int:
     native_smoke = read(NATIVE_SMOKE)
     native_record = read(NATIVE_RECORD)
     update = read(UPDATE)
+    macos_notifications = read(MACOS_NOTIFICATIONS)
+    make_dmg = read(MAKE_DMG)
     hooks = read(HOOKS)
     automation = read(AUTOMATION)
 
@@ -1503,6 +1507,31 @@ def main() -> int:
         )
         and contains_all(update, ["release is missing a SHA-256 checksum", "oxide-term checksum mismatch"]),
         "updates poll without reload, notify once, restore drafts, and require signed checksums",
+    )
+    require(
+        "native notification icon survives OTA and fresh installs",
+        contains_all(
+            macos_notifications,
+            [
+                'const HELPER_IDENTIFIER: &str = "com.oxide.desktop.notifications";',
+                'join("Library/Application Support/Oxide/Helpers")',
+                'contents.join("Resources/oxide.icns")',
+                '"Delete :CFBundleIconName"',
+                "codesign_identifier(helper)",
+            ],
+        )
+        and contains_all(
+            make_dmg,
+            [
+                'ICON_SOURCE="crates/oxide-gui/assets/logo.png"',
+                'Delete :CFBundleIconName',
+                'Set :CFBundleIconFile oxide.icns',
+                'HELPER_SIGN_ID=',
+                'notification helper icon differs from the Oxide app icon',
+            ],
+        )
+        and "codesign --force --deep --sign" not in make_dmg,
+        "OTA installs migrate a signed helper while fresh bundles retain the canonical Oxide icon and identity",
     )
     require(
         "hook and thread automation contracts",

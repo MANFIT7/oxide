@@ -9,6 +9,8 @@ DIST="dist"
 BIN="target/release/oxide"
 SIGN_NAME="${OXIDE_SIGN_IDENTITY:-Oxide Dev}"
 REQUIRE_SIGNING="${OXIDE_REQUIRE_SIGNING:-0}"
+ICON_SOURCE="crates/oxide-gui/assets/logo.png"
+VERSION="$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/' || echo 0.0.1)"
 
 echo "▶ building release binaries (oxide + oxide-term)…"
 cargo build --release -p oxide-cli -p oxide-term
@@ -43,12 +45,12 @@ cp target/release/oxide-term "$APPDIR/Contents/MacOS/oxide-term"
 chmod +x "$APPDIR/Contents/MacOS/oxide-term"
 echo "  ✓ bundled oxide-term"
 
-# icon: logo.png -> oxide.icns
+# icon: canonical GUI logo.png -> oxide.icns
 echo "▶ building icon…"
 ICONSET="$DIST/oxide.iconset"
 mkdir -p "$ICONSET"
 for s in 16 32 64 128 256 512 1024; do
-  sips -z $s $s logo.png --out "$ICONSET/icon_${s}x${s}.png" >/dev/null
+  sips -z "$s" "$s" "$ICON_SOURCE" --out "$ICONSET/icon_${s}x${s}.png" >/dev/null
 done
 # retina (@2x) variants
 cp "$ICONSET/icon_32x32.png"   "$ICONSET/icon_16x16@2x.png"
@@ -71,18 +73,22 @@ on run argv
   display notification (item 2 of argv) with title (item 1 of argv)
 end run
 APPLESCRIPT
-cp "$APPDIR/Contents/Resources/oxide.icns" "$NOTIFY_APP/Contents/Resources/applet.icns"
+cp "$APPDIR/Contents/Resources/oxide.icns" "$NOTIFY_APP/Contents/Resources/oxide.icns"
 NOTIFY_PLIST="$NOTIFY_APP/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Delete :CFBundleIconName" "$NOTIFY_PLIST" 2>/dev/null || true
+/usr/libexec/PlistBuddy -c "Set :CFBundleIconFile oxide.icns" "$NOTIFY_PLIST"
 /usr/libexec/PlistBuddy -c "Add :CFBundleIdentifier string com.oxide.desktop.notifications" "$NOTIFY_PLIST" 2>/dev/null \
   || /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier com.oxide.desktop.notifications" "$NOTIFY_PLIST"
 /usr/libexec/PlistBuddy -c "Set :CFBundleName Oxide" "$NOTIFY_PLIST"
 /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string Oxide" "$NOTIFY_PLIST" 2>/dev/null \
   || /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName Oxide" "$NOTIFY_PLIST"
+/usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $VERSION" "$NOTIFY_PLIST" 2>/dev/null \
+  || /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION" "$NOTIFY_PLIST"
+/usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $VERSION" "$NOTIFY_PLIST" 2>/dev/null \
+  || /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$NOTIFY_PLIST"
 /usr/libexec/PlistBuddy -c "Add :LSUIElement bool true" "$NOTIFY_PLIST" 2>/dev/null \
   || /usr/libexec/PlistBuddy -c "Set :LSUIElement true" "$NOTIFY_PLIST"
 touch "$NOTIFY_APP"
-
-VERSION="$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/' || echo 0.0.1)"
 
 cat > "$APPDIR/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -110,11 +116,13 @@ if [ -n "${SIGN_ID:-}" ]; then
   echo "▶ signing with $SIGN_NAME (stable identity)…"
   codesign --force --sign "$SIGN_ID" --identifier com.oxide.desktop.notifications "$NOTIFY_APP"
   codesign --force --sign "$SIGN_ID" --identifier com.oxide.desktop "$APPDIR/Contents/MacOS/oxide-bin"
+  codesign --force --sign "$SIGN_ID" --identifier com.oxide.desktop "$APPDIR/Contents/MacOS/oxide-term"
   codesign --force --sign "$SIGN_ID" --identifier com.oxide.desktop "$APPDIR/Contents/MacOS/$APP"
-  codesign --force --deep --sign "$SIGN_ID" --identifier com.oxide.desktop "$APPDIR"
+  codesign --force --sign "$SIGN_ID" --identifier com.oxide.desktop "$APPDIR"
   # Sign the raw release binary too so the OTA-swapped binary keeps the SAME
   # identity (otherwise the first OTA update reverts to ad-hoc and TCC re-asks).
   codesign --force --sign "$SIGN_ID" --identifier com.oxide.desktop "$BIN" 2>/dev/null || true
+  codesign --force --sign "$SIGN_ID" --identifier com.oxide.desktop target/release/oxide-term 2>/dev/null || true
   codesign --verify --deep --verbose=2 "$APPDIR"
 elif [ "$REQUIRE_SIGNING" = "1" ]; then
   echo "✗ required signing identity '$SIGN_NAME' was not found" >&2
@@ -123,8 +131,34 @@ elif [ "$REQUIRE_SIGNING" = "1" ]; then
 else
   echo "⚠ no '$SIGN_NAME' identity in keychain — app will be ad-hoc signed and macOS may re-ask volume permissions after updates." >&2
   codesign --force --sign - --identifier com.oxide.desktop.notifications "$NOTIFY_APP" 2>/dev/null || true
-  codesign --force --deep --sign - "$APPDIR" 2>/dev/null || true
+  codesign --force --sign - --identifier com.oxide.desktop "$APPDIR/Contents/MacOS/oxide-bin" 2>/dev/null || true
+  codesign --force --sign - --identifier com.oxide.desktop "$APPDIR/Contents/MacOS/oxide-term" 2>/dev/null || true
+  codesign --force --sign - --identifier com.oxide.desktop "$APPDIR/Contents/MacOS/$APP" 2>/dev/null || true
+  codesign --force --sign - --identifier com.oxide.desktop "$APPDIR" 2>/dev/null || true
 fi
+
+echo "▶ verifying notification helper identity and icon…"
+HELPER_PLIST_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$NOTIFY_PLIST")"
+HELPER_ICON_FILE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconFile' "$NOTIFY_PLIST")"
+HELPER_SIGN_ID="$(codesign -d --verbose=4 "$NOTIFY_APP" 2>&1 | sed -n 's/^Identifier=//p' | head -n 1)"
+if [ "$HELPER_PLIST_ID" != "com.oxide.desktop.notifications" ] || [ "$HELPER_SIGN_ID" != "$HELPER_PLIST_ID" ]; then
+  echo "✗ notification helper identity mismatch: plist=$HELPER_PLIST_ID signature=$HELPER_SIGN_ID" >&2
+  exit 1
+fi
+if [ "$HELPER_ICON_FILE" != "oxide.icns" ] || [ ! -f "$NOTIFY_APP/Contents/Resources/oxide.icns" ]; then
+  echo "✗ notification helper does not reference oxide.icns" >&2
+  exit 1
+fi
+if /usr/libexec/PlistBuddy -c "Print :CFBundleIconName" "$NOTIFY_PLIST" >/dev/null 2>&1; then
+  echo "✗ notification helper must not use the generated applet icon catalog" >&2
+  exit 1
+fi
+cmp -s "$APPDIR/Contents/Resources/oxide.icns" "$NOTIFY_APP/Contents/Resources/oxide.icns" || {
+  echo "✗ notification helper icon differs from the Oxide app icon" >&2
+  exit 1
+}
+codesign --verify --strict --verbose=2 "$NOTIFY_APP"
+codesign --verify --deep --strict --verbose=2 "$APPDIR"
 
 echo "▶ building $APP.dmg…"
 STAGE="$DIST/stage"
