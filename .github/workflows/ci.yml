@@ -39,4 +39,5 @@ jobs:
         run: cargo check --workspace --all-targets
 
       - name: Run tests
+        timeout-minutes: 20
         run: cargo test --workspace

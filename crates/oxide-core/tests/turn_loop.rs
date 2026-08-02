@@ -105,6 +105,7 @@ async fn mock_provider_tool_call_writes_file_in_sandbox() {
     let config = Config {
         provider: "mock".into(),
         approval_policy: oxide_protocol::ApprovalPolicy::Never,
+        sandbox: oxide_protocol::SandboxPolicy::DangerFullAccess,
         workspace: Some(tmp.clone()),
         ..Default::default()
     };
@@ -230,6 +231,7 @@ async fn mock_provider_renders_ui_spec_artifact() {
     let config = Config {
         provider: "mock".into(),
         approval_policy: oxide_protocol::ApprovalPolicy::Never,
+        sandbox: oxide_protocol::SandboxPolicy::DangerFullAccess,
         persist: false,
         workspace: Some(tmp.clone()),
         ..Default::default()
@@ -249,19 +251,23 @@ async fn mock_provider_renders_ui_spec_artifact() {
     let mut began = false;
     let mut rendered = false;
     let mut ended_ok = false;
-    while let Some(ev) = events.recv().await {
-        match ev {
-            Event::ToolCallBegin { tool, .. } => began |= tool == "render_ui_spec",
-            Event::UiSpec { spec, .. } => {
-                assert_eq!(spec.title.as_deref(), Some("Mock UI"));
-                spec.validate().expect("mock UI spec should validate");
-                rendered = true;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while let Some(ev) = events.recv().await {
+            match ev {
+                Event::ToolCallBegin { tool, .. } => began |= tool == "render_ui_spec",
+                Event::UiSpec { spec, .. } => {
+                    assert_eq!(spec.title.as_deref(), Some("Mock UI"));
+                    spec.validate().expect("mock UI spec should validate");
+                    rendered = true;
+                }
+                Event::ToolCallEnd { ok, .. } => ended_ok |= ok,
+                Event::TurnFinished { .. } => break,
+                _ => {}
             }
-            Event::ToolCallEnd { ok, .. } => ended_ok |= ok,
-            Event::TurnFinished { .. } => break,
-            _ => {}
         }
-    }
+    })
+    .await
+    .expect("render_ui_spec turn should finish within 5 seconds");
 
     assert!(began, "render_ui_spec tool call should begin");
     assert!(rendered, "engine should emit a UiSpec event");
@@ -283,6 +289,7 @@ async fn orchestrated_subagents_run_backend_tool_calls() {
         front_provider: "mock_plan".into(),
         backend_provider: "mock".into(),
         approval_policy: oxide_protocol::ApprovalPolicy::Never,
+        sandbox: oxide_protocol::SandboxPolicy::DangerFullAccess,
         persist: false,
         workspace: Some(tmp.clone()),
         ..Default::default()
@@ -351,6 +358,7 @@ async fn checkpoint_then_rewind_undoes_write() {
     let config = Config {
         provider: "mock".into(),
         approval_policy: oxide_protocol::ApprovalPolicy::Never,
+        sandbox: oxide_protocol::SandboxPolicy::DangerFullAccess,
         persist: false,
         workspace: Some(tmp.clone()),
         ..Default::default()
