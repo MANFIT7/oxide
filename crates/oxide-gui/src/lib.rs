@@ -899,14 +899,17 @@ fn spawn_bg_tailer(
     });
 }
 
-/// Upgrade the newest streamed "Preparing {verb} · {args}" preview row into the
+/// Upgrade the newest streamed preview for a tool into the
 /// tool's settled activity row (in place, key preserved). Non-command tools
 /// (Edit/Read/Grep…) have no CommandStarted to retire their preview — without
 /// this the preview spins beside the real row for the whole turn.
 fn upgrade_preparing_row(rows: &mut [ChatMsg], verb: &str, row: &str) -> bool {
-    let prefix = format!("spark\tPreparing\t{verb}");
     match rows.iter().rposition(|m| {
-        matches!(&m.author, Author::Activity { key: Some(_), .. }) && m.text.starts_with(&prefix)
+        if !matches!(&m.author, Author::Activity { key: Some(_), .. }) {
+            return false;
+        }
+        let view = activity_view(&m.text);
+        view.verb == "Preparing" && view.source_tool.eq_ignore_ascii_case(verb)
     }) {
         Some(idx) => {
             rows[idx].text = row.to_string();
@@ -1008,7 +1011,7 @@ fn done_note_display_parts(text: &str) -> (String, Vec<String>) {
     (label, parts)
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ActivityKind {
     Command,
     FileRead,
@@ -1038,6 +1041,7 @@ struct ActivityView {
     icon: String,
     verb: String,
     detail: String,
+    source_tool: String,
     output: String,
     kind: ActivityKind,
 }
@@ -1172,13 +1176,22 @@ fn activity_view(text: &str) -> ActivityView {
     let mut parts = text.splitn(4, '\t');
     let icon = parts.next().unwrap_or("spark").to_string();
     let verb = parts.next().unwrap_or("").to_string();
-    let detail = parts.next().unwrap_or("").to_string();
+    let raw_detail = parts.next().unwrap_or("");
+    let (source_tool, detail) = if verb == "Preparing" {
+        raw_detail
+            .split_once('\u{1f}')
+            .map(|(tool, detail)| (tool.to_string(), detail.to_string()))
+            .unwrap_or_else(|| (String::new(), raw_detail.to_string()))
+    } else {
+        (String::new(), raw_detail.to_string())
+    };
     let output = parts.next().unwrap_or("").to_string();
     let kind = activity_kind(&icon, &verb, &detail);
     ActivityView {
         icon,
         verb,
         detail,
+        source_tool,
         output,
         kind,
     }
@@ -1654,19 +1667,135 @@ fn build_design_apply_prompt(
     spec
 }
 
-fn tool_input_preview_label(tool: &str, accumulated: &str) -> String {
-    let short = accumulated
-        .trim()
-        .replace(['\n', '\r', '\t'], " ")
-        .chars()
-        .take(140)
-        .collect::<String>();
-    let detail = if short.is_empty() {
-        tool.to_string()
+fn tool_preview_icon(tool: &str) -> &'static str {
+    let tool = tool.to_ascii_lowercase();
+    if tool.contains("bash") || tool.contains("shell") || tool.contains("exec") {
+        "terminal"
+    } else if tool.contains("edit") || tool.contains("write") || tool.contains("patch") {
+        "edit"
+    } else if tool.contains("read") || tool.contains("file") {
+        "eye"
+    } else if tool.contains("search") || tool.contains("grep") || tool.contains("find") {
+        "search"
+    } else if tool.contains("browser") || tool.contains("web") || tool.contains("fetch") {
+        "globe"
     } else {
-        format!("{tool} · {short}")
-    };
-    format!("spark\tPreparing\t{detail}")
+        "spark"
+    }
+}
+
+fn tool_preview_name(tool: &str) -> String {
+    let label = tool.trim().replace(['_', '-'], " ");
+    if label.is_empty() {
+        "tool input".to_string()
+    } else {
+        label.to_ascii_lowercase()
+    }
+}
+
+fn normalize_inline_preview(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn truncate_inline_preview(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let mut preview = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        preview.push('…');
+    }
+    preview
+}
+
+/// Extract a string field from complete or still-streaming JSON. Tool argument
+/// deltas are often incomplete, so falling back to the partial quoted value
+/// keeps the activity row useful without rendering the raw JSON envelope.
+fn streamed_json_string_field(input: &str, key: &str) -> Option<String> {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(input) {
+        if let Some(value) = value.get(key).and_then(serde_json::Value::as_str) {
+            return Some(value.to_string());
+        }
+    }
+
+    let marker = format!("\"{key}\"");
+    let after_key = input.split_once(&marker)?.1;
+    let after_colon = after_key.split_once(':')?.1.trim_start();
+    let mut chars = after_colon.chars();
+    if chars.next()? != '"' {
+        return None;
+    }
+
+    let mut output = String::new();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => break,
+            '\\' => match chars.next() {
+                Some('n') => output.push('\n'),
+                Some('r') => output.push('\r'),
+                Some('t') => output.push('\t'),
+                Some('"') => output.push('"'),
+                Some('\\') => output.push('\\'),
+                Some('/') => output.push('/'),
+                Some('u') => {
+                    let digits = chars.by_ref().take(4).collect::<String>();
+                    if digits.len() == 4 {
+                        if let Ok(code) = u32::from_str_radix(&digits, 16) {
+                            if let Some(decoded) = char::from_u32(code) {
+                                output.push(decoded);
+                            }
+                        }
+                    }
+                }
+                Some(other) => output.push(other),
+                None => break,
+            },
+            other => output.push(other),
+        }
+    }
+    (!output.is_empty()).then_some(output)
+}
+
+fn tool_input_preview_detail(tool: &str, accumulated: &str) -> String {
+    let lower = tool.to_ascii_lowercase();
+    let keys: &[&str] =
+        if lower.contains("bash") || lower.contains("shell") || lower.contains("exec") {
+            &["command", "cmd"]
+        } else if lower.contains("edit")
+            || lower.contains("write")
+            || lower.contains("patch")
+            || lower.contains("read")
+            || lower.contains("file")
+        {
+            &["file_path", "path"]
+        } else if lower.contains("search") || lower.contains("grep") || lower.contains("find") {
+            &["query", "pattern"]
+        } else if lower.contains("browser") || lower.contains("web") || lower.contains("fetch") {
+            &["url", "query"]
+        } else {
+            &[
+                "command",
+                "cmd",
+                "file_path",
+                "path",
+                "query",
+                "url",
+                "question",
+                "prompt",
+                "name",
+            ]
+        };
+    let preview = keys
+        .iter()
+        .find_map(|key| streamed_json_string_field(accumulated, key))
+        .map(|value| normalize_inline_preview(&value))
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| tool_preview_name(tool));
+    truncate_inline_preview(&preview, 180)
+}
+
+fn tool_input_preview_label(tool: &str, accumulated: &str) -> String {
+    let icon = tool_preview_icon(tool);
+    let detail = tool_input_preview_detail(tool, accumulated);
+    format!("{icon}\tPreparing\t{tool}\u{1f}{detail}")
 }
 
 fn upsert_tool_input_preview(
@@ -1683,7 +1812,7 @@ fn upsert_tool_input_preview(
         // Never downgrade: once the row was upgraded to a real command/tool
         // label (CommandStarted shares the tool_use id), a late arg delta must
         // not flip it back to "Preparing…".
-        if !messages[idx].text.starts_with("spark\tPreparing\t") {
+        if activity_view(&messages[idx].text).verb != "Preparing" {
             return;
         }
         messages[idx].text = text;
@@ -4259,14 +4388,15 @@ mod tests {
 
     #[test]
     fn supabase_urls_support_direct_account_oauth_and_project_scoping() {
-        let account = reqwest::Url::parse(&supabase_provider_url("", true)).unwrap();
+        let account = reqwest::Url::parse(&supabase_provider_url("", false)).unwrap();
         let account_query = account
             .query_pairs()
             .collect::<std::collections::BTreeMap<_, _>>();
         assert!(!account_query.contains_key("project_ref"));
+        assert!(!account_query.contains_key("read_only"));
         assert_eq!(
             account_query.get("features").map(|value| value.as_ref()),
-            Some("account,database,docs")
+            Some("account,branching,database,debugging,development,docs,functions")
         );
 
         let project = reqwest::Url::parse(&supabase_provider_url("project-1", true)).unwrap();
@@ -4279,7 +4409,11 @@ mod tests {
         );
         assert_eq!(
             project_query.get("features").map(|value| value.as_ref()),
-            Some("database,docs")
+            Some("branching,database,debugging,development,docs,functions")
+        );
+        assert_eq!(
+            project_query.get("read_only").map(|value| value.as_ref()),
+            Some("true")
         );
     }
 
@@ -4429,6 +4563,17 @@ mod tests {
         let code = live_markdown_parts("```rust\nfn main() {");
         assert!(code.tail.is_none());
         assert!(code.stable_html.contains("<pre><code"));
+    }
+
+    #[test]
+    fn live_reasoning_keeps_completed_paragraphs_stable() {
+        let parts = live_reasoning_parts("**Inspecting**\nStreaming details");
+        assert!(parts.stable_html.contains("<strong>Inspecting</strong>"));
+        assert_eq!(parts.tail.as_deref(), Some("Streaming details"));
+
+        let adjacent = live_reasoning_parts("**First****Second**\nContinuing");
+        assert!(adjacent.stable_html.contains("<strong>First</strong>"));
+        assert!(adjacent.stable_html.contains("<strong>Second</strong>"));
     }
 
     #[test]
@@ -4853,6 +4998,35 @@ mod tests {
         assert!(!msgs
             .iter()
             .any(|m| matches!(m.author, Author::Activity { running: true, .. })));
+    }
+
+    #[test]
+    fn preparing_preview_shows_semantic_input_instead_of_raw_json() {
+        let label = tool_input_preview_label(
+            "shell",
+            r#"{"command":"bun --eval 'import { createClient } from \"@supabase/supabase-js\"'"}"#,
+        );
+        let view = activity_view(&label);
+
+        assert_eq!(view.kind, ActivityKind::Command);
+        assert_eq!(view.verb, "Preparing");
+        assert_eq!(
+            view.detail,
+            "bun --eval 'import { createClient } from \"@supabase/supabase-js\"'"
+        );
+        assert!(!view.detail.contains("{\"command\""));
+    }
+
+    #[test]
+    fn preparing_preview_handles_partial_streamed_json() {
+        let label = tool_input_preview_label(
+            "exec_command",
+            r#"{"cmd":"cargo test -p oxide-gui streamed"#,
+        );
+        let view = activity_view(&label);
+
+        assert_eq!(view.kind, ActivityKind::Command);
+        assert_eq!(view.detail, "cargo test -p oxide-gui streamed");
     }
 
     #[test]
@@ -6455,14 +6629,17 @@ fn app() -> Element {
         if matches!(visual_fixture, Some(VisualFixtureMode::Mcp)) {
             fixture.mcp_servers = vec![oxide_config::McpServerConfig {
                 name: "supabase-workspace".to_string(),
-                url: "https://mcp.supabase.com/mcp?project_ref=oxide-demo&read_only=true&features=database%2Cdocs".to_string(),
+                url: "https://mcp.supabase.com/mcp?project_ref=oxide-demo&features=branching%2Cdatabase%2Cdebugging%2Cdevelopment%2Cdocs%2Cfunctions".to_string(),
                 provider: "supabase".to_string(),
                 auth_mode: oxide_config::McpAuthMode::OAuth,
                 auth_profile_id: "supabase-oxide-demo".to_string(),
                 provider_options: std::collections::BTreeMap::from([
                     ("project_ref".to_string(), "oxide-demo".to_string()),
-                    ("read_only".to_string(), "true".to_string()),
-                    ("features".to_string(), "database,docs".to_string()),
+                    ("read_only".to_string(), "false".to_string()),
+                    (
+                        "features".to_string(),
+                        "branching,database,debugging,development,docs,functions".to_string(),
+                    ),
                 ]),
                 ..oxide_config::McpServerConfig::default()
             }];
@@ -6558,7 +6735,7 @@ fn app() -> Element {
                         "search_docs".to_string(),
                         "get_advisors".to_string(),
                     ],
-                    detail: "OAuth session ready · read-only".to_string(),
+                    detail: "OAuth session ready · full access".to_string(),
                 },
             );
         }
@@ -7942,7 +8119,10 @@ fn app() -> Element {
                         let chunk = std::mem::take(&mut reasoning_buf);
                         thinking.write().push_str(&chunk);
                         if let Some(started) = *think_started.peek() {
-                            think_secs.set(started.elapsed().as_secs());
+                            let elapsed = started.elapsed().as_secs();
+                            if *think_secs.peek() != elapsed {
+                                think_secs.set(elapsed);
+                            }
                         }
                         last_paint = std::time::Instant::now();
                     }
@@ -8877,7 +9057,7 @@ fn app() -> Element {
                                 if status.peek().as_str() != "Thinking…" {
                                     status.set("Thinking…".to_string());
                                 }
-                                if last_paint.elapsed() >= std::time::Duration::from_millis(33)
+                                if last_paint.elapsed() >= std::time::Duration::from_millis(50)
                                     || agent_buf.len() + reasoning_buf.len() > 800
                                 {
                                     flush_reasoning_live!();
@@ -11955,7 +12135,7 @@ fn app() -> Element {
                                                                     // under a fragment root → positional diffing → reversal).
                                                                     div { key: "m-{m.id}", class: "rowwrap",
                                                                     if is_live && !thinking.read().is_empty() {
-                                                                        details { class: "thinking-box", open: think_open.read().unwrap_or(true),
+                                                                        details { class: "thinking-box live-thinking", open: think_open.read().unwrap_or(true),
                                                                             summary {
                                                                                 class: "thinking-sum live",
                                                                                 onclick: move |e: dioxus::prelude::MouseEvent| {
@@ -11974,7 +12154,7 @@ fn app() -> Element {
                                                                                     }
                                                                                 }
                                                                             }
-                                                                            div { class: "thinking-body", dangerous_inner_html: reasoning_html(&thinking.read(), false) }
+                                                                            div { class: "thinking-body", LiveReasoning { text: thinking.read().clone() } }
                                                                         }
                                                                     }
                                                                     div { id: "msg-{i}", class: "pinwrap",
@@ -14369,9 +14549,9 @@ fn supabase_project_ref(server: &oxide_config::McpServerConfig) -> String {
 
 fn supabase_feature_names(project_ref: &str) -> &'static str {
     if project_ref.trim().is_empty() {
-        "account,database,docs"
+        "account,branching,database,debugging,development,docs,functions"
     } else {
-        "database,docs"
+        "branching,database,debugging,development,docs,functions"
     }
 }
 
@@ -14382,9 +14562,10 @@ fn supabase_provider_url(project_ref: &str, read_only: bool) -> String {
     if !project_ref.trim().is_empty() {
         query.append_pair("project_ref", project_ref.trim());
     }
-    query
-        .append_pair("read_only", if read_only { "true" } else { "false" })
-        .append_pair("features", supabase_feature_names(project_ref));
+    if read_only {
+        query.append_pair("read_only", "true");
+    }
+    query.append_pair("features", supabase_feature_names(project_ref));
     drop(query);
     endpoint.into()
 }
@@ -14514,7 +14695,7 @@ fn McpModal(
     let mut supabase_editing = use_signal(|| None::<oxide_config::McpServerConfig>);
     let mut supabase_name = use_signal(|| "supabase".to_string());
     let mut supabase_project = use_signal(String::new);
-    let mut supabase_read_only = use_signal(|| true);
+    let mut supabase_read_only = use_signal(|| false);
     let mut supabase_write_confirmed = use_signal(|| false);
     let mut supabase_message = use_signal(String::new);
 
@@ -14662,7 +14843,13 @@ fn McpModal(
                                             div { class: "mcp-card-meta",
                                                 span { "{transport}" }
                                                 if is_oauth { span { "OAuth" } }
-                                                if server.provider_options.get("read_only").map(String::as_str) == Some("true") { span { class: "safe", "Read-only" } }
+                                                if server.provider.eq_ignore_ascii_case("supabase") {
+                                                    if server.provider_options.get("read_only").map(String::as_str) == Some("true") {
+                                                        span { class: "safe", "Read-only" }
+                                                    } else {
+                                                        span { class: "warn", "Full access" }
+                                                    }
+                                                }
                                                 if server.required { span { class: "warn", "Required" } }
                                                 if current_status.as_ref().map(|value| value.tool_count > 0).unwrap_or(false) {
                                                     span { "{current_status.as_ref().map(|value| value.tool_count).unwrap_or(0)} tools" }
@@ -14835,13 +15022,34 @@ fn McpModal(
                                         span { class: "mcp-catalog-state", "Available" }
                                     }
                                     h4 { "Supabase" }
-                                    p { "Authorize in your browser, choose a Supabase organization, then use its projects." }
+                                    p { "Authorize in your browser, choose an organization, then select the access level Oxide can use." }
                                     ul {
-                                        li { Icon { name: "check" } "Read-only across the chosen organization" }
+                                        li { Icon { name: "check" } "Full database and project tools" }
+                                        li { Icon { name: "check" } "Read-only mode remains available" }
                                         li { Icon { name: "check" } "Tokens stored in system keychain" }
-                                        li { Icon { name: "check" } "Project selection through account tools" }
                                     }
                                     button { class: "mcp-btn primary wide", onclick: move |_| {
+                                        let mut list = cfg.read().mcp_servers.clone();
+                                        let connection_name = next_supabase_connection_name(&list);
+                                        list.push(configured_supabase_server(
+                                            None,
+                                            connection_name.clone(),
+                                            String::new(),
+                                            false,
+                                        ));
+                                        list.sort_by(|left, right| left.name.cmp(&right.name));
+                                        apply_mcp_servers_with_followup(
+                                            cfg,
+                                            engine,
+                                            list,
+                                            connection_name,
+                                            McpControlAction::Authorize,
+                                        );
+                                        supabase_open.set(false);
+                                        manual_open.set(false);
+                                        active_section.set("installed".to_string());
+                                    }, "Connect full access" }
+                                    button { class: "mcp-btn wide", onclick: move |_| {
                                         let mut list = cfg.read().mcp_servers.clone();
                                         let connection_name = next_supabase_connection_name(&list);
                                         list.push(configured_supabase_server(
@@ -14861,14 +15069,14 @@ fn McpModal(
                                         supabase_open.set(false);
                                         manual_open.set(false);
                                         active_section.set("installed".to_string());
-                                    }, "Connect with OAuth" }
+                                    }, "Connect read-only" }
                                     button { class: "mcp-btn subtle wide", onclick: move |_| {
                                         supabase_open.set(true);
                                         manual_open.set(false);
                                         supabase_editing.set(None);
                                         supabase_name.set(next_supabase_connection_name(&cfg.read().mcp_servers));
                                         supabase_project.set(String::new());
-                                        supabase_read_only.set(true);
+                                        supabase_read_only.set(false);
                                         supabase_write_confirmed.set(false);
                                         supabase_message.set(String::new());
                                     }, "Configure project scope" }
@@ -14917,27 +15125,40 @@ fn McpModal(
                                         label { class: "mcp-field",
                                             span { "Project reference (optional)" }
                                             input { value: "{supabase_project}", placeholder: "abcdefghijklmnopqrst", spellcheck: "false", oninput: move |event| supabase_project.set(event.value()) }
-                                            small { "Leave blank for read-only access to all projects in the organization selected during OAuth." }
+                                            small { "Leave blank to use every project available to the selected organization. Access mode is set below." }
                                         }
                                     }
                                     div { class: "mcp-permission-box",
                                         div { class: "mcp-permission-head",
                                             div {
                                                 strong { "Database access" }
-                                                p { if *supabase_read_only.read() { "Queries are restricted to read-only operations." } else { "Write operations may be available to the agent." } }
+                                                p { if *supabase_read_only.read() { "Inspect data, logs, and schema without database writes." } else { "Run SQL, migrations, and other write-capable project tools." } }
                                             }
-                                            label { class: "mcp-switch labeled",
-                                                span { "Read-only" }
-                                                input { r#type: "checkbox", checked: *supabase_read_only.read(), onchange: move |event| {
-                                                    supabase_read_only.set(event.checked());
-                                                    if event.checked() { supabase_write_confirmed.set(false); }
-                                                } }
-                                                span { class: "mcp-switch-track" }
+                                        }
+                                        div { class: "mcp-access-choice", role: "group", aria_label: "Supabase database access mode",
+                                            button {
+                                                class: if !*supabase_read_only.read() { "mcp-access-option active" } else { "mcp-access-option" },
+                                                aria_pressed: (!*supabase_read_only.read()).to_string(),
+                                                onclick: move |_| supabase_read_only.set(false),
+                                                strong { "Full access" }
+                                                small { "Read and write" }
+                                            }
+                                            button {
+                                                class: if *supabase_read_only.read() { "mcp-access-option active" } else { "mcp-access-option" },
+                                                aria_pressed: (*supabase_read_only.read()).to_string(),
+                                                onclick: move |_| {
+                                                    supabase_read_only.set(true);
+                                                    supabase_write_confirmed.set(false);
+                                                },
+                                                strong { "Read-only" }
+                                                small { "No database writes" }
                                             }
                                         }
                                         div { class: "mcp-feature-row",
                                             span { "Enabled features" }
                                             span { class: "mcp-feature-chip", "database" }
+                                            span { class: "mcp-feature-chip", "development" }
+                                            span { class: "mcp-feature-chip", "functions" }
                                             span { class: "mcp-feature-chip", "docs" }
                                         }
                                         if !*supabase_read_only.read() {
@@ -15862,6 +16083,10 @@ fn normalize_reasoning_markdown(src: &str) -> String {
 
 fn reasoning_html(src: &str, live: bool) -> String {
     md_to_html(&normalize_reasoning_markdown(src), live)
+}
+
+fn live_reasoning_parts(src: &str) -> LiveMarkdownParts {
+    live_markdown_parts(&normalize_reasoning_markdown(src))
 }
 
 /// Render agent markdown to safe HTML: raw HTML in the source is escaped
@@ -18860,6 +19085,19 @@ fn ThoughtRow(
 }
 
 #[component]
+fn LiveReasoning(text: String) -> Element {
+    let LiveMarkdownParts { stable_html, tail } = live_reasoning_parts(&text);
+    rsx! {
+        if !stable_html.is_empty() {
+            div { class: "reasoning-stable", dangerous_inner_html: "{stable_html}" }
+        }
+        if let Some(tail) = tail.filter(|tail| !tail.is_empty()) {
+            div { class: "reasoning-tail", "{tail}" }
+        }
+    }
+}
+
+#[component]
 fn LiveMarkdown(text: String) -> Element {
     let LiveMarkdownParts { stable_html, tail } = live_markdown_parts(&text);
     let tail = tail.filter(|tail| !tail.is_empty());
@@ -20293,7 +20531,7 @@ fn ActivityRow(
                     ActivityStatus { running, ok, waiting }
                     if running && !waiting && secs >= 2 { span { class: "activity-secs", "{duration}" } }
                     span { class: "activity-verb", "{view.verb}" }
-                    if !view.detail.is_empty() { span { class: "activity-text", "{view.detail}" } }
+                    if !view.detail.is_empty() { span { class: "activity-text", title: "{view.detail}", "{view.detail}" } }
                     if has_output {
                         span { class: "activity-out-n", "{lines} lines" }
                         span { class: "activity-caret", aria_hidden: "true", Icon { name: "chevron" } }
@@ -20352,7 +20590,7 @@ fn EditActivityRow(
                 ActivityStatus { running, ok, waiting }
                 if running && !waiting && secs >= 2 { span { class: "activity-secs", "{duration}" } }
                 span { class: "activity-verb", "{view.verb}" }
-                if !view.detail.is_empty() { span { class: "activity-text", "{view.detail}" } }
+                if !view.detail.is_empty() { span { class: "activity-text", title: "{view.detail}", "{view.detail}" } }
                 if count > 1 { span { class: "activity-count", "×{count}" } }
                 if adds + dels > 0 {
                     span { class: "activity-editcounts",
@@ -20837,7 +21075,7 @@ fn ChatPane(
                                     }
                                 }
                                 reasoning_buf.push_str(&text);
-                                if last_paint.elapsed() >= std::time::Duration::from_millis(33)
+                                if last_paint.elapsed() >= std::time::Duration::from_millis(50)
                                     || agent_buf.len() + reasoning_buf.len() > 800
                                 {
                                     flush_pane_streams!();
@@ -21018,11 +21256,11 @@ fn ChatPane(
                     }
                 }
                 if !thinking.read().is_empty() {
-                    details { class: "thinking-box", open: *streaming.read(),
+                    details { class: "thinking-box live-thinking", open: *streaming.read(),
                         summary { class: "thinking-sum live",
                             span { class: "thinking-glow", "Reasoning" }
                         }
-                        div { class: "thinking-body", dangerous_inner_html: reasoning_html(&thinking.read(), false) }
+                        div { class: "thinking-body", LiveReasoning { text: thinking.read().clone() } }
                     }
                 }
                 if is_streaming

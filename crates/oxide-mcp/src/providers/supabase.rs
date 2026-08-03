@@ -93,7 +93,7 @@ impl SupabasePresetBuilder {
     pub fn for_account() -> Self {
         Self {
             project_ref: String::new(),
-            read_only: true,
+            read_only: false,
             features: BTreeSet::from([
                 SupabaseFeature::Account,
                 SupabaseFeature::Docs,
@@ -107,7 +107,7 @@ impl SupabasePresetBuilder {
         validate_project_ref(&project_ref)?;
         Ok(Self {
             project_ref,
-            read_only: true,
+            read_only: false,
             features: BTreeSet::from([
                 SupabaseFeature::Docs,
                 SupabaseFeature::Database,
@@ -158,9 +158,10 @@ impl SupabasePresetBuilder {
         if !self.project_ref.is_empty() {
             query.append_pair("project_ref", &self.project_ref);
         }
-        query
-            .append_pair("read_only", if self.read_only { "true" } else { "false" })
-            .append_pair("features", &feature_names);
+        if self.read_only {
+            query.append_pair("read_only", "true");
+        }
+        query.append_pair("features", &feature_names);
         drop(query);
         SupabaseMcpPreset {
             project_ref: self.project_ref,
@@ -202,7 +203,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn preset_is_project_scoped_and_read_only_by_default() {
+    fn preset_is_project_scoped_and_full_access_by_default() {
         let preset = SupabasePresetBuilder::new("abc123").unwrap().build();
         let url = reqwest::Url::parse(preset.endpoint()).unwrap();
         let query = url
@@ -213,10 +214,8 @@ mod tests {
             query.get("project_ref").map(|value| value.as_ref()),
             Some("abc123")
         );
-        assert_eq!(
-            query.get("read_only").map(|value| value.as_ref()),
-            Some("true")
-        );
+        assert!(!query.contains_key("read_only"));
+        assert!(!preset.read_only());
         assert_eq!(preset.credential_profile_id(), "supabase:abc123");
     }
 
@@ -229,10 +228,8 @@ mod tests {
             .collect::<std::collections::BTreeMap<_, _>>();
 
         assert!(!query.contains_key("project_ref"));
-        assert_eq!(
-            query.get("read_only").map(|value| value.as_ref()),
-            Some("true")
-        );
+        assert!(!query.contains_key("read_only"));
+        assert!(!preset.read_only());
         assert!(preset.features().contains(&SupabaseFeature::Account));
         assert_eq!(preset.credential_profile_id(), "supabase:account");
     }
@@ -266,5 +263,23 @@ mod tests {
 
         assert_eq!(preset.features().len(), 2);
         assert!(preset.endpoint().contains("features=docs%2Cdatabase"));
+    }
+
+    #[test]
+    fn read_only_mode_adds_the_explicit_supabase_flag() {
+        let preset = SupabasePresetBuilder::new("abc123")
+            .unwrap()
+            .read_only(true)
+            .build();
+        let url = reqwest::Url::parse(preset.endpoint()).unwrap();
+        let query = url
+            .query_pairs()
+            .collect::<std::collections::BTreeMap<_, _>>();
+
+        assert_eq!(
+            query.get("read_only").map(|value| value.as_ref()),
+            Some("true")
+        );
+        assert!(preset.read_only());
     }
 }

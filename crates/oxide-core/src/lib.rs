@@ -810,16 +810,20 @@ fn validate_native_mcp_provider(server: &McpServerConfig) -> anyhow::Result<()> 
     } else {
         query.get("project_ref").map(String::as_str) == Some(preset.project_ref())
     };
-    let expected_query_count = if preset.project_ref().is_empty() {
-        2
+    let legacy_full_access_flag =
+        !preset.read_only() && query.get("read_only").map(String::as_str) == Some("false");
+    let expected_query_count = usize::from(!preset.project_ref().is_empty())
+        + usize::from(preset.read_only() || legacy_full_access_flag)
+        + 1;
+    let read_only_matches = if preset.read_only() {
+        query.get("read_only").map(String::as_str) == Some("true")
     } else {
-        3
+        !query.contains_key("read_only") || legacy_full_access_flag
     };
     if pairs.len() != expected_query_count
         || query.len() != expected_query_count
         || !project_scope_matches
-        || query.get("read_only").map(String::as_str)
-            != Some(if preset.read_only() { "true" } else { "false" })
+        || !read_only_matches
     {
         anyhow::bail!("the Supabase provider URL must match its scoped provider options");
     }
@@ -9409,21 +9413,28 @@ mod map_test {
     fn supabase_provider_accepts_official_account_oauth_endpoint() {
         let server = McpServerConfig {
             name: "supabase".to_string(),
-            url: "https://mcp.supabase.com/mcp?read_only=true&features=account%2Cdatabase%2Cdocs"
-                .to_string(),
+            url: "https://mcp.supabase.com/mcp?features=account%2Cdatabase%2Cdocs".to_string(),
             provider: "supabase".to_string(),
             auth_mode: McpAuthMode::OAuth,
             auth_profile_id: "connection-1".to_string(),
             provider_options: std::collections::BTreeMap::from([
-                ("read_only".to_string(), "true".to_string()),
+                ("read_only".to_string(), "false".to_string()),
                 ("features".to_string(), "account,database,docs".to_string()),
             ]),
             ..McpServerConfig::default()
         };
         assert!(super::validate_native_mcp_provider(&server).is_ok());
 
+        let mut legacy = server.clone();
+        legacy.url =
+            "https://mcp.supabase.com/mcp?read_only=false&features=account%2Cdatabase%2Cdocs"
+                .to_string();
+        assert!(super::validate_native_mcp_provider(&legacy).is_ok());
+
         let mut injected_project = server;
-        injected_project.url = "https://mcp.supabase.com/mcp?project_ref=other&read_only=true&features=account%2Cdatabase%2Cdocs".to_string();
+        injected_project.url =
+            "https://mcp.supabase.com/mcp?project_ref=other&features=account%2Cdatabase%2Cdocs"
+                .to_string();
         assert!(super::validate_native_mcp_provider(&injected_project).is_err());
     }
 

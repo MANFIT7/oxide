@@ -1894,8 +1894,8 @@ svg { width: 17px; height: 17px; flex-shrink: 0; }
 .activity-card.running { border-color: rgba(224,145,58,.4); }
 .activity-card.fail { border-color: rgba(239,93,93,.4); }
 .activity-text { font-family: ui-monospace, Menlo, monospace; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; flex: 1 1 auto; }
-/* Streamed tool arguments can contain long JSON/string tokens. Preparing rows
-   use the transcript width and wrap anywhere instead of growing the scroll area. */
+/* Preparing rows stay compact. Semantic previews are rendered by Rust, so the
+   transcript no longer needs to expose or wrap a raw JSON argument envelope. */
 .activity-card.activity-preparing {
   display: block;
   width: min(720px, calc(100% - 56px));
@@ -1904,14 +1904,14 @@ svg { width: 17px; height: 17px; flex-shrink: 0; }
 .activity-card.activity-preparing .activity-sum {
   min-width: 0;
   width: 100%;
-  align-items: flex-start;
+  align-items: center;
 }
 .activity-card.activity-preparing .activity-text {
-  white-space: normal;
-  overflow: visible;
-  text-overflow: clip;
-  overflow-wrap: anywhere;
-  word-break: break-word;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  overflow-wrap: normal;
+  word-break: normal;
   line-height: 1.45;
 }
 .activity-card.running .activity-text { color: var(--text); }
@@ -2208,6 +2208,7 @@ svg { width: 17px; height: 17px; flex-shrink: 0; }
 .mcp-catalog-card ul { display: grid; gap: 5px; margin: 12px 0 16px; list-style: none; color: var(--muted); font-size: 10.5px; }
 .mcp-catalog-card li { display: flex; align-items: center; gap: 6px; }
 .mcp-catalog-card li svg { width: 11px; height: 11px; color: var(--ok); }
+.mcp-catalog-card .mcp-btn.wide + .mcp-btn.wide { margin-top: 7px; }
 
 .mcp-setup-panel { margin-top: 2px; padding: 16px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); animation: mcp-pane-in var(--dur-med) var(--ease-enter) both; }
 .mcp-setup-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; margin-bottom: 15px; }
@@ -2231,6 +2232,25 @@ svg { width: 17px; height: 17px; flex-shrink: 0; }
 .mcp-permission-head { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
 .mcp-permission-head strong { display: block; font-size: 11.5px; }
 .mcp-permission-head p { color: var(--faint); font-size: 10px; line-height: 1.4; margin-top: 2px; }
+.mcp-access-choice {
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px;
+  margin-top: 11px; padding: 4px; border-radius: 9px; background: var(--surface-hi);
+}
+.mcp-access-option {
+  min-width: 0; padding: 8px 10px; display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  border: 1px solid transparent; border-radius: 7px; background: transparent; color: var(--muted);
+  font-family: inherit; text-align: left; cursor: pointer;
+  transition: color var(--dur-fast) ease, background var(--dur-fast) ease, border-color var(--dur-fast) ease, transform var(--dur-fast) var(--ease-out);
+}
+.mcp-access-option:hover { color: var(--text); background: color-mix(in srgb, var(--text) 4%, transparent); }
+.mcp-access-option:active { transform: scale(.985); }
+.mcp-access-option.active {
+  color: var(--text); border-color: color-mix(in srgb, var(--syn-accent) 32%, var(--border));
+  background: color-mix(in srgb, var(--syn-accent) 9%, var(--surface));
+  box-shadow: inset 0 1px rgba(255,255,255,.025);
+}
+.mcp-access-option strong { font-size: 10.5px; font-weight: 650; }
+.mcp-access-option small { color: var(--faint); font-size: 9px; white-space: nowrap; }
 .mcp-feature-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 10px; color: var(--faint); font-size: 9.5px; }
 .mcp-feature-chip { padding: 2px 6px; border-radius: 5px; color: var(--muted); background: var(--surface-hi); font-family: ui-monospace, Menlo, monospace; }
 .mcp-write-warning { display: flex; align-items: flex-start; gap: 9px; margin-top: 11px; padding: 9px; border: 1px solid color-mix(in srgb, var(--warn) 30%, var(--border)); border-radius: 8px; background: color-mix(in srgb, var(--warn) 7%, transparent); color: var(--muted); font-size: 10px; line-height: 1.45; cursor: pointer; }
@@ -2278,6 +2298,7 @@ svg { width: 17px; height: 17px; flex-shrink: 0; }
   .mcp-setup-actions { align-items: stretch; flex-direction: column; }
   .mcp-setup-actions .mcp-btn { width: 100%; }
   .mcp-permission-head { flex-direction: column; }
+  .mcp-access-choice { grid-template-columns: 1fr; }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -4008,18 +4029,6 @@ details.bg-chip.bg-watch[open] { max-width: 100%; flex-basis: 100%; border-radiu
 @keyframes oxide-focus-in { from { opacity: 0; transform: translateY(2px); } to { opacity: 1; transform: none; } }
 .col.streaming .row.agent:last-of-type .agent-md:not(.live) { animation: oxide-focus-in .24s var(--ease-out) both; }
 
-/* Streaming text emerges from a soft bottom fade (Cursor/ChatGPT feel): the
-   last line stays slightly dimmed while live, so new tokens "rise" out of the
-   fade rather than snapping in. Ends at 55% alpha (not 0) so a short one-line
-   reply never looks fully ghosted. Removed the instant `live` class clears. */
-.agent-md.live {
-  -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 16px), rgba(0,0,0,.62));
-  mask-image: linear-gradient(to bottom, #000 calc(100% - 16px), rgba(0,0,0,.62));
-}
-@media (prefers-reduced-motion: reduce) {
-  .agent-md.live { -webkit-mask-image: none; mask-image: none; }
-}
-
 /* Tabular numerals so counts/elapsed don't jiggle width as they tick. */
 .diff-adds, .diff-dels, .status-elapsed, .usage-v, .edits-counts, .live-changes-counts,
 .bg-chip-text, .thread-time { font-variant-numeric: tabular-nums; }
@@ -4391,19 +4400,6 @@ textarea:focus-visible, select:focus-visible, [tabindex]:focus-visible {
 }
 @media (prefers-reduced-motion: reduce) {
   .typing .typing-shimmer { animation: none; -webkit-text-fill-color: currentColor; color: var(--muted); }
-}
-
-/* Cursor-style streaming fade: feather the LIVE bubble's tail so new text
-   "materializes" instead of popping in. Pure CSS — per-chunk animations are
-   impossible here (the live bubble's innerHTML repaints ~30fps, which would
-   restart any child animation = flicker). Mask is safe: .agent-text has no
-   backdrop-filter (see user-text note above). */
-.agent-md.live {
-  -webkit-mask-image: linear-gradient(180deg, #000 calc(100% - 26px), rgba(0, 0, 0, 0.35) 100%);
-  mask-image: linear-gradient(180deg, #000 calc(100% - 26px), rgba(0, 0, 0, 0.35) 100%);
-}
-@media (prefers-reduced-motion: reduce) {
-  .agent-md.live { -webkit-mask-image: none; mask-image: none; }
 }
 
 /* Streaming terminal: stop button tints danger while a command runs. */
@@ -4967,12 +4963,16 @@ details.changes-file[open] .diff-body { animation: disclosure-in 220ms ease-out;
   to { opacity: 1; transform: none; }
 }
 @keyframes oxide-thought-live-out {
-  0%, 35% { opacity: 1; transform: none; }
-  100% { opacity: 0; transform: translateY(-1px); }
+  from { opacity: 1; transform: translate3d(0, 0, 0); }
+  to { opacity: 0; transform: translate3d(0, -2px, 0); }
 }
 @keyframes oxide-thought-settled-in {
-  0%, 28% { opacity: 0; transform: translateY(1px); }
-  100% { opacity: 1; transform: none; }
+  from { opacity: 0; transform: translate3d(0, 2px, 0); }
+  to { opacity: 1; transform: translate3d(0, 0, 0); }
+}
+@keyframes oxide-reasoning-breathe {
+  0%, 100% { opacity: .68; }
+  50% { opacity: 1; }
 }
 @keyframes oxide-stream-rail {
   0%, 100% { opacity: .28; transform: scaleY(.42); }
@@ -5005,8 +5005,6 @@ details.changes-file[open] .diff-body { animation: disclosure-in 220ms ease-out;
 }
 .agent-md.live {
   animation: oxide-stream-first-token .2s var(--ease-enter) both;
-  -webkit-mask-image: linear-gradient(180deg, #000 calc(100% - 22px), rgba(0, 0, 0, .58) 100%);
-  mask-image: linear-gradient(180deg, #000 calc(100% - 22px), rgba(0, 0, 0, .58) 100%);
   will-change: opacity, transform;
 }
 .agent-md.live .live-tail {
@@ -5027,6 +5025,36 @@ details.changes-file[open] .diff-body { animation: disclosure-in 220ms ease-out;
 .activity-card {
   position: relative;
   transition: color .18s ease, opacity .18s ease;
+}
+.activity-sum {
+  width: 100%; min-width: 0; min-height: 27px; padding: 3px 6px; border-radius: 7px;
+  transition: background-color .18s ease;
+}
+.activity-card:hover .activity-sum,
+.activity-card:focus-within .activity-sum {
+  background: color-mix(in srgb, var(--text) 4%, transparent);
+}
+.activity-card .activity-verb {
+  font-size: 12px; font-weight: 570; letter-spacing: -.005em;
+}
+.activity-card .activity-text {
+  display: block; min-width: 0; max-width: 100%;
+  color: var(--muted); font-size: 12px; line-height: 1.45;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.activity-card.activity-command .activity-text,
+.activity-card.activity-preparing .activity-text {
+  padding: 2px 7px; border-radius: 5px;
+  background: color-mix(in srgb, var(--text) 4%, transparent);
+  color: color-mix(in srgb, var(--text) 76%, var(--muted));
+}
+.activity-card.running.activity-command .activity-text,
+.activity-card.running.activity-preparing .activity-text {
+  color: var(--text);
+}
+.activity-card.activity-preparing,
+.activity-card.activity-preparing .activity-sum {
+  min-width: 0;
 }
 .activity-card.no-out { cursor: default; }
 .activity-card.no-out .activity-sum { cursor: default; }
@@ -5282,6 +5310,13 @@ details.has-out .activity-out-n::after { content: none; }
   -webkit-text-fill-color: transparent;
   animation: ox-shimmer 2s linear infinite;
 }
+.thinking-glow {
+  background: none;
+  color: var(--muted);
+  -webkit-text-fill-color: currentColor;
+  animation: oxide-reasoning-breathe 1.8s ease-in-out infinite;
+  will-change: opacity;
+}
 .thinking-secs {
   font-size: 12px;
   opacity: .72;
@@ -5292,10 +5327,14 @@ details.has-out .activity-out-n::after { content: none; }
 }
 .thought-label-stack > span { grid-area: 1 / 1; }
 .thought-label-live {
-  animation: oxide-thought-live-out var(--dur-slow) var(--ease-exit) both;
+  animation: oxide-thought-live-out 160ms var(--ease-exit) both;
 }
 .thought-label-settled {
-  animation: oxide-thought-settled-in var(--dur-slow) var(--ease-enter) both;
+  animation: oxide-thought-settled-in 220ms var(--ease-enter) both;
+}
+.thought-row.settling .thought-label-stack > span {
+  backface-visibility: hidden;
+  will-change: opacity, transform;
 }
 .thinking-box::details-content,
 .thought-row::details-content {
@@ -5329,8 +5368,21 @@ details.has-out .activity-out-n::after { content: none; }
   overflow-wrap: anywhere;
 }
 .thinking-body { max-height: 240px; overflow-y: auto; }
+.thinking-box.live-thinking {
+  animation: none;
+}
+.thinking-box.live-thinking .thinking-body {
+  contain: layout style paint;
+  overflow-anchor: none;
+}
+.reasoning-stable,
+.reasoning-tail { min-width: 0; }
+.reasoning-tail {
+  min-height: 1.55em;
+  white-space: pre-wrap;
+}
 .thinking-box[open] > .thinking-body {
-  animation: oxide-reveal-down var(--dur-med) var(--ease-out) both;
+  animation: none;
 }
 .thought-body { max-height: 280px; overflow-y: auto; }
 .thinking-body p,

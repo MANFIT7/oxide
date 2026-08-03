@@ -87,9 +87,9 @@ def write_fixture(css: str) -> None:
 <div class="app" data-theme="dark">
   <main class="chat">
     <section class="col streaming">
-      <details class="thinking-box" open>
+      <details class="thinking-box live-thinking" open>
         <summary class="thinking-sum live"><span class="thinking-glow">Reasoning</span><span class="thinking-secs">3s</span></summary>
-        <div class="thinking-body">Inspecting harness routes, streamed tool args, and session metadata.</div>
+        <div class="thinking-body"><div class="reasoning-stable"><p>Inspecting harness routes and streamed tool args.</p></div><div class="reasoning-tail">Checking session metadata.</div></div>
       </details>
       <details class="thought-row settling">
         <summary class="thought-sum"><span class="thought-label-stack"><span class="thought-label-live">Reasoning</span><span class="thought-label-settled">Thought for 3s</span></span></summary>
@@ -100,11 +100,11 @@ def write_fixture(css: str) -> None:
         <div class="row activity"><span>Hidden until explicitly expanded</span></div>
       </details>
       <div class="row activity">
-        <details class="activity-card running activity-search activity-preparing no-out">
+        <details class="activity-card running activity-command activity-preparing no-out">
           <summary class="activity-sum">
             <span class="activity-status" role="status" aria-atomic="true" aria-label="Running"><!-- UNICODE_ACTIVITY --><span class="activity-ic ok">✓</span><span class="activity-ic fail">×</span></span>
             <span class="activity-verb">Preparing</span>
-            <span class="activity-text">ask_user · {"question":"This intentionally long streamed JSON argument must wrap inside the transcript instead of forcing a horizontal scrollbar across the entire chat surface."}</span>
+            <span class="activity-text" title="bun --eval 'import { createClient } from &quot;@supabase/supabase-js&quot;'">bun --eval 'import { createClient } from "@supabase/supabase-js"'</span>
           </summary>
         </details>
       </div>
@@ -667,6 +667,20 @@ def main() -> int:
         f"{rel(GUI)} and {rel(CSS)} animate only six keyed tail words while completed markdown remains stable",
     )
     require(
+        "streaming answer keeps full text contrast",
+        contains_all(
+            css,
+            [
+                ".agent-md.live {\n  animation: oxide-stream-first-token .2s var(--ease-enter) both;",
+                "will-change: opacity, transform;",
+            ],
+        )
+        and "last line stays slightly dimmed" not in css
+        and "feather the LIVE bubble's tail" not in css
+        and "rgba(0, 0, 0, .58)" not in css,
+        f"{rel(CSS)} keeps the latest streaming line fully legible without a bottom opacity mask",
+    )
+    require(
         "detached pane streaming coalesces deltas",
         contains_all(
             gui,
@@ -694,6 +708,34 @@ def main() -> int:
         )
         and nearby(gui, "let mut view_tab: u64", "macro_rules! flush_reasoning_live", 9000),
         f"{rel(GUI)} batches foreground answer/reasoning paints at frame cadence instead of re-rendering per token",
+    )
+    require(
+        "live reasoning keeps stable markdown outside the changing tail",
+        contains_all(
+            gui,
+            [
+                "fn live_reasoning_parts(",
+                "fn LiveReasoning(",
+                'class: "reasoning-stable"',
+                'class: "reasoning-tail"',
+                'class: "thinking-box live-thinking"',
+                "LiveReasoning { text: thinking.read().clone() }",
+                "if *think_secs.peek() != elapsed",
+                "fn live_reasoning_keeps_completed_paragraphs_stable()",
+            ],
+        )
+        and gui.count("LiveReasoning { text: thinking.read().clone() }") == 2
+        and contains_all(
+            css,
+            [
+                ".thinking-box.live-thinking {",
+                ".thinking-box.live-thinking .thinking-body {",
+                "contain: layout style paint;",
+                ".reasoning-tail {",
+                "white-space: pre-wrap;",
+            ],
+        ),
+        f"{rel(GUI)} and {rel(CSS)} avoid full live-reasoning DOM replacement and isolate its bounded repaint area",
     )
     require(
         "tool lifecycle uses stable status and disclosure slots",
@@ -788,7 +830,7 @@ def main() -> int:
         f"{rel(GUI)} and {rel(CSS)} interpolate disclosure height while preserving intent-based bottom anchoring",
     )
     require(
-        "active reasoning tool and edit labels share lifecycle shimmer",
+        "active labels use bounded lifecycle motion",
         contains_all(
             css,
             [
@@ -796,11 +838,13 @@ def main() -> int:
                 ".activity-card.running .activity-verb,",
                 ".composer-live-changes .live-changes-title {",
                 "animation: ox-shimmer 2s linear infinite;",
+                "@keyframes oxide-reasoning-breathe",
+                "animation: oxide-reasoning-breathe 1.8s ease-in-out infinite;",
                 ".col.streaming .row.diffrow,",
                 ".thinking-box[open] > .thinking-body {",
             ],
         ),
-        f"{rel(CSS)} keeps one Emdash-style shimmer per active tool plus reasoning/edit motion without repainting tool details",
+        f"{rel(CSS)} keeps tool/edit shimmer bounded while reasoning uses a compositor-friendly opacity pulse",
     )
     require(
         "approval lifecycle reuses the keyed tool row",
@@ -872,6 +916,9 @@ def main() -> int:
                 "@keyframes oxide-thought-live-out",
                 "@keyframes oxide-thought-settled-in",
                 ".thought-label-stack",
+                "animation: oxide-thought-live-out 160ms var(--ease-exit) both;",
+                "animation: oxide-thought-settled-in 220ms var(--ease-enter) both;",
+                "will-change: opacity, transform;",
             ],
         )
         and 'open: settling' not in gui,
@@ -1223,21 +1270,27 @@ def main() -> int:
         "Oxide auto-detects user-installed DCG for native/subscription shell tools and exposes its status in Access settings",
     )
     require(
-        "streamed tool arguments wrap within transcript",
+        "streamed tool arguments render as compact semantic previews",
         contains_all(
             gui,
-            ['activity-preparing', 'view.verb == "Preparing"'],
+            [
+                'activity-preparing',
+                'view.verb == "Preparing"',
+                "fn streamed_json_string_field(",
+                "fn tool_input_preview_detail(",
+                'title: "{view.detail}"',
+            ],
         )
         and contains_all(
             css,
             [
-                "overflow-x: hidden;",
                 ".activity-card.activity-preparing .activity-text",
-                "overflow-wrap: anywhere;",
-                "word-break: break-word;",
+                "white-space: nowrap;",
+                "text-overflow: ellipsis;",
+                ".activity-card.activity-command .activity-text,",
             ],
         ),
-        f"{rel(GUI)} and {rel(CSS)} keep long streamed JSON inside the transcript width",
+        f"{rel(GUI)} and {rel(CSS)} replace raw streamed JSON with one-line semantic tool previews",
     )
     require(
         "tool input delta protocol",
@@ -1665,21 +1718,30 @@ def main() -> int:
         "Settings uses a desktop side rail and a discoverable compact horizontal fallback instead of a clipped hidden scrollbar",
     )
     require(
-        "Supabase catalog opens OAuth directly with optional project scoping",
+        "Supabase catalog exposes direct full and read-only OAuth modes",
         contains_all(
             gui,
             [
                 "fn supabase_provider_url(",
-                '"account,database,docs"',
-                '"Connect with OAuth"',
+                '"account,branching,database,debugging,development,docs,functions"',
+                '"Connect full access"',
+                '"Connect read-only"',
                 '"Configure project scope"',
                 '"Project reference (optional)"',
+                'class: "mcp-access-choice"',
                 "McpControlAction::Authorize",
                 "Event::McpAuthorizationUrl { name, url }",
                 "open_external_http_url(url.clone())",
             ],
+        )
+        and contains_all(
+            css,
+            [
+                ".mcp-access-choice {",
+                ".mcp-access-option.active {",
+            ],
         ),
-        "the primary action launches browser OAuth immediately while advanced setup can still pin one project",
+        "the catalog launches either access mode directly while advanced setup keeps project scoping explicit",
     )
     require(
         "accessible chrome and dialogs",
@@ -1718,7 +1780,7 @@ def main() -> int:
         "Braille spinner",
         "streaming rail",
         "Reasoning",
-        "Preparing <tool>",
+        "compact semantic command/path/query preview",
         "status slot",
         "Reduce Motion",
         "Accept",

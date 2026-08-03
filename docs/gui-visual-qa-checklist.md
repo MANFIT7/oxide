@@ -18,10 +18,10 @@ It focuses on states that compile tests cannot prove.
 
 - Submit a normal prompt and confirm the empty live agent row shows a compact Braille spinner beside the subtle `Thinking…` shimmer.
 - Confirm the streaming rail breathes beside the active assistant row without restarting or flickering as each text chunk arrives.
-- Confirm the first token rises in once, while subsequent tokens remain stable and only the live tail uses the soft readability fade.
-- While reasoning streams, confirm the `Reasoning` panel appears inside the current turn, above the live answer, and does not jump when the turn finishes.
+- Confirm the first token rises in once, while subsequent tokens remain stable, the six newest words use only brief entrance motion, and the live tail keeps full contrast without a persistent fade mask.
+- While reasoning streams, confirm the `Reasoning` panel appears inside the current turn, above the live answer, updates without flicker or scroll hitching, and cross-fades smoothly into `Thought for Ns` when the turn finishes.
 - Confirm the final `Thought for Ns` row stays in transcript order above the final assistant text.
-- Trigger a tool call with streamed arguments, then confirm the activity row first shows `Preparing <tool> ...`, updates as args stream, and settles into the final tool label when execution starts.
+- Trigger a tool call with streamed arguments, then confirm the activity row shows `Preparing` with a compact semantic command/path/query preview (never raw JSON), updates as args stream, and settles into the final tool label when execution starts.
 - Confirm command/activity rows keep one fixed status slot: the Braille spinner cross-fades to a check or failure icon without nudging the label horizontally.
 - Confirm the agent and tool Braille sequence advances one fixed-width cell at a time without rotating, resizing, or shifting adjacent text.
 - While a command streams output, confirm its card opens automatically, stays near four lines tall, follows the newest line, and fades the old-output edge without moving the outer transcript sideways.
